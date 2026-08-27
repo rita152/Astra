@@ -141,6 +141,12 @@ fn main() {
         .unwrap_or(900.0);
     let sidebar_bottom = args.iter().any(|arg| arg == "--sidebar-bottom");
     let profile_menu_open = args.iter().any(|arg| arg == "--profile-menu-open");
+    let bottom_panel_open = args.iter().any(|arg| arg == "--bottom-panel-open");
+    let bottom_panel_menu_open = args.iter().any(|arg| arg == "--bottom-panel-menu-open");
+    let bottom_panel_append = args.iter().find_map(|arg| {
+        arg.strip_prefix("--bottom-panel-append=")
+            .map(ToOwned::to_owned)
+    });
     let right_panel_open = args.iter().any(|arg| arg == "--right-panel-open");
     let projects_menu_open = args.iter().any(|arg| arg == "--projects-menu-open");
     let project_menu_open = args.iter().find_map(|arg| {
@@ -239,6 +245,15 @@ fn main() {
                         let mut app = ChatApp::new(mode, sidebar_bottom, cx);
                         if profile_menu_open {
                             app.open_profile_menu(cx);
+                        }
+                        if bottom_panel_open {
+                            app.open_bottom_panel(cx);
+                        }
+                        if bottom_panel_menu_open {
+                            app.open_bottom_panel_menu(cx);
+                        }
+                        if let Some(name) = bottom_panel_append.as_deref() {
+                            app.append_bottom_panel_item_for_capture(name, cx);
                         }
                         if right_panel_open {
                             app.open_right_panel(cx);
