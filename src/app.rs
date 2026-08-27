@@ -2,8 +2,9 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     BoxShadow, Context, Div, Entity, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
-    PathPromptOptions, Render, StyleRefinement, Transformation, Window, WindowAppearance, div,
-    hsla, prelude::*, px, radians, rgba,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render, StyleRefinement,
+    Transformation, Window, WindowAppearance, canvas, div, hsla, linear_color_stop,
+    linear_gradient, prelude::*, px, radians, rgba,
 };
 
 gpui::actions!(permission_ui, [DismissPermissionUi]);
@@ -32,6 +33,16 @@ pub struct ChatApp {
     sidebar_animation_started_at: Option<Instant>,
     sidebar_animation_duration: Duration,
     sidebar_animation_running: bool,
+    right_panel_open: bool,
+    right_panel_mode: Option<RightPanelMode>,
+    right_panel_focused_item: usize,
+    right_panel_keyboard_focus: bool,
+    right_panel_focus: FocusHandle,
+    right_panel_focus_pending: bool,
+    right_panel_width: Option<f32>,
+    right_panel_resize_hovered: bool,
+    right_panel_resize_dragging: bool,
+    right_panel_resize_pointer_offset: f32,
     permission_confirmation_open: bool,
     project_creation_open: bool,
     project_creation_kind: ProjectCreationKind,
@@ -53,6 +64,21 @@ enum ProjectCreationStep {
     Kind,
     Remote,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RightPanelMode {
+    SideChat,
+    Browser,
+    Terminal,
+}
+
+const RIGHT_PANEL_ITEMS: &[(RightPanelMode, &str, &str, &str)] = &[
+    (RightPanelMode::SideChat, "侧边聊天", "⌥⌘S", "side-chat"),
+    (RightPanelMode::Browser, "浏览器", "⌘T", "panel-browser"),
+    (RightPanelMode::Terminal, "终端", "⌃`", "panel-terminal"),
+];
+const RIGHT_PANEL_MIN_WIDTH: f32 = 320.0;
+const RIGHT_PANEL_MAIN_MIN_WIDTH: f32 = 352.0;
 
 const SIDEBAR_TRANSITION_DURATION: Duration = Duration::from_millis(400);
 
@@ -80,6 +106,18 @@ fn sidebar_transition_ease(progress: f32) -> f32 {
     bezier((lower + upper) * 0.5, 1.0, 1.0)
 }
 
+fn right_panel_width_limit(viewport_width: f32, revealed_sidebar_width: f32) -> f32 {
+    (viewport_width - revealed_sidebar_width - RIGHT_PANEL_MAIN_MIN_WIDTH)
+        .max(RIGHT_PANEL_MIN_WIDTH)
+}
+
+fn clamp_right_panel_width(width: f32, viewport_width: f32, revealed_sidebar_width: f32) -> f32 {
+    width.clamp(
+        RIGHT_PANEL_MIN_WIDTH,
+        right_panel_width_limit(viewport_width, revealed_sidebar_width),
+    )
+}
+
 fn titlebar_interaction_area() -> impl IntoElement {
     div()
         .id("titlebar-interaction-area")
@@ -98,6 +136,7 @@ fn titlebar_interaction_area() -> impl IntoElement {
 fn titlebar_icon_button(
     name: &'static str,
     disabled: bool,
+    active: bool,
     theme: Theme,
 ) -> gpui::Stateful<gpui::Div> {
     let glyph = icon(name, theme.text_tertiary.into())
@@ -114,6 +153,7 @@ fn titlebar_icon_button(
         .flex()
         .items_center()
         .justify_center()
+        .when(active, |button| button.bg(theme.text.alpha(0.05)))
         .when(disabled, |button| button.opacity(0.4).cursor_default())
         .when(!disabled, |button| {
             button
@@ -177,6 +217,16 @@ impl ChatApp {
             sidebar_animation_started_at: None,
             sidebar_animation_duration: Duration::ZERO,
             sidebar_animation_running: false,
+            right_panel_open: false,
+            right_panel_mode: None,
+            right_panel_focused_item: 0,
+            right_panel_keyboard_focus: false,
+            right_panel_focus: cx.focus_handle().tab_stop(true),
+            right_panel_focus_pending: false,
+            right_panel_width: None,
+            right_panel_resize_hovered: false,
+            right_panel_resize_dragging: false,
+            right_panel_resize_pointer_offset: 0.0,
             permission_confirmation_open: false,
             project_creation_open: false,
             project_creation_kind: ProjectCreationKind::Local,
@@ -406,6 +456,100 @@ impl ChatApp {
                 3 => self.close_project_creation(cx),
                 _ => {}
             },
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub fn open_right_panel(&mut self, cx: &mut Context<Self>) {
+        self.right_panel_open = true;
+        self.right_panel_mode = None;
+        self.right_panel_focused_item = 0;
+        self.right_panel_keyboard_focus = false;
+        self.right_panel_focus_pending = true;
+        cx.notify();
+    }
+
+    fn close_right_panel(&mut self, cx: &mut Context<Self>) {
+        if self.right_panel_open {
+            self.right_panel_open = false;
+            self.right_panel_mode = None;
+            self.right_panel_keyboard_focus = false;
+            self.right_panel_focus_pending = false;
+            self.right_panel_resize_hovered = false;
+            self.right_panel_resize_dragging = false;
+            cx.notify();
+        }
+    }
+
+    fn toggle_right_panel(&mut self, cx: &mut Context<Self>) {
+        if self.right_panel_open {
+            self.close_right_panel(cx);
+        } else {
+            self.open_right_panel(cx);
+        }
+    }
+
+    fn select_right_panel_item(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some((mode, _, _, _)) = RIGHT_PANEL_ITEMS.get(index) else {
+            return;
+        };
+        self.right_panel_mode = Some(*mode);
+        self.right_panel_keyboard_focus = false;
+        cx.notify();
+    }
+
+    fn handle_right_panel_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.right_panel_open {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "down" | "tab" if !event.keystroke.modifiers.shift => {
+                self.right_panel_focused_item = if self.right_panel_keyboard_focus {
+                    (self.right_panel_focused_item + 1) % RIGHT_PANEL_ITEMS.len()
+                } else {
+                    0
+                };
+                self.right_panel_keyboard_focus = true;
+            }
+            "up" => {
+                self.right_panel_focused_item = if self.right_panel_keyboard_focus {
+                    (self.right_panel_focused_item + RIGHT_PANEL_ITEMS.len() - 1)
+                        % RIGHT_PANEL_ITEMS.len()
+                } else {
+                    RIGHT_PANEL_ITEMS.len() - 1
+                };
+                self.right_panel_keyboard_focus = true;
+            }
+            "tab" => {
+                self.right_panel_focused_item = if self.right_panel_keyboard_focus {
+                    (self.right_panel_focused_item + RIGHT_PANEL_ITEMS.len() - 1)
+                        % RIGHT_PANEL_ITEMS.len()
+                } else {
+                    RIGHT_PANEL_ITEMS.len() - 1
+                };
+                self.right_panel_keyboard_focus = true;
+            }
+            "home" => {
+                self.right_panel_focused_item = 0;
+                self.right_panel_keyboard_focus = true;
+            }
+            "end" => {
+                self.right_panel_focused_item = RIGHT_PANEL_ITEMS.len() - 1;
+                self.right_panel_keyboard_focus = true;
+            }
+            "enter" | "space" if self.right_panel_mode.is_none() => {
+                self.select_right_panel_item(self.right_panel_focused_item, cx);
+            }
+            // The docked panel is persistent. Escape belongs to the active
+            // conversation/tool and must not hide the panel.
+            "escape" => return,
             _ => return,
         }
         cx.stop_propagation();
@@ -981,6 +1125,307 @@ impl ChatApp {
                 ProjectCreationStep::Remote => self.project_creation_remote_dialog(theme, cx),
             })
     }
+
+    fn right_panel_menu_item(
+        &self,
+        index: usize,
+        label: &'static str,
+        shortcut: &'static str,
+        glyph: &'static str,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let focused = self.right_panel_keyboard_focus && self.right_panel_focused_item == index;
+        div()
+            .id(("right-panel-menu-item", index))
+            .w_full()
+            .h(px(40.0))
+            .px(px(10.0))
+            .py(px(8.0))
+            .rounded(px(10.0))
+            .bg(theme.text.alpha(0.03))
+            .shadow(project_creation_focus_shadow(theme, focused))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.text.alpha(0.08)))
+            .active(move |style| style.bg(theme.text.alpha(0.08)))
+            .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                if *hovered {
+                    this.right_panel_focused_item = index;
+                    this.right_panel_keyboard_focus = false;
+                    this.right_panel_focus.focus(window, cx);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.select_right_panel_item(index, cx);
+            }))
+            .child(
+                icon(glyph, theme.text.alpha(0.65).into())
+                    .size(px(16.0))
+                    .flex_none(),
+            )
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .text_size(px(13.0))
+                    .line_height(px(18.5714))
+                    .font_weight(gpui::FontWeight::NORMAL)
+                    .text_color(theme.text)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(16.0))
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(10.0))
+                    .bg(theme.text.alpha(0.065))
+                    .text_size(px(12.0))
+                    .line_height(px(12.0))
+                    .font_weight(gpui::FontWeight::NORMAL)
+                    .text_color(theme.text.alpha(0.65))
+                    .flex()
+                    .items_center()
+                    .child(shortcut),
+            )
+    }
+
+    fn right_panel_resize_handle(
+        &self,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let entity = cx.entity();
+        let line_visible = self.right_panel_resize_hovered || self.right_panel_resize_dragging;
+        let input_layer = canvas(
+            |bounds, _, _| bounds,
+            move |bounds, _, window, _| {
+                let mouse_down_entity = entity.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, _, window, cx| {
+                    if event.button != MouseButton::Left || !bounds.contains(&event.position) {
+                        return;
+                    }
+                    mouse_down_entity.update(cx, |this, cx| {
+                        let divider_x = f32::from(bounds.origin.x) + 8.0;
+                        let current_width = f32::from(window.viewport_size().width) - divider_x;
+                        this.right_panel_resize_dragging = true;
+                        this.right_panel_resize_hovered = true;
+                        this.right_panel_resize_pointer_offset =
+                            divider_x - f32::from(event.position.x);
+                        // Resolve the responsive default to a persisted width as
+                        // soon as the user starts dragging it.
+                        if this.right_panel_width.is_none() {
+                            this.right_panel_width = Some(current_width);
+                        }
+                        cx.notify();
+                    });
+                });
+
+                let mouse_move_entity = entity.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, _, window, cx| {
+                    let pointer_inside = bounds.contains(&event.position);
+                    mouse_move_entity.update(cx, |this, cx| {
+                        let mut changed = false;
+                        if this.right_panel_resize_dragging {
+                            let viewport_width = f32::from(window.viewport_size().width);
+                            let revealed_sidebar_width =
+                                this.sidebar.read(cx).width() * this.sidebar_reveal;
+                            let divider_x = f32::from(event.position.x)
+                                + this.right_panel_resize_pointer_offset;
+                            let next_width = clamp_right_panel_width(
+                                viewport_width - divider_x,
+                                viewport_width,
+                                revealed_sidebar_width,
+                            );
+                            if this
+                                .right_panel_width
+                                .is_none_or(|width| (width - next_width).abs() > f32::EPSILON)
+                            {
+                                this.right_panel_width = Some(next_width);
+                                changed = true;
+                            }
+                        }
+                        let next_hovered = pointer_inside || this.right_panel_resize_dragging;
+                        if this.right_panel_resize_hovered != next_hovered {
+                            this.right_panel_resize_hovered = next_hovered;
+                            changed = true;
+                        }
+                        if changed {
+                            cx.notify();
+                        }
+                    });
+                });
+
+                let mouse_up_entity = entity.clone();
+                window.on_mouse_event(move |event: &MouseUpEvent, _, _, cx| {
+                    if event.button != MouseButton::Left {
+                        return;
+                    }
+                    mouse_up_entity.update(cx, |this, cx| {
+                        if !this.right_panel_resize_dragging {
+                            return;
+                        }
+                        this.right_panel_resize_dragging = false;
+                        this.right_panel_resize_hovered = bounds.contains(&event.position);
+                        cx.notify();
+                    });
+                });
+            },
+        )
+        .absolute()
+        .inset_0();
+
+        div()
+            .id("right-panel-resize-handle")
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(px(-8.0))
+            .w(px(16.0))
+            .cursor_col_resize()
+            .child(input_layer)
+            .when(line_visible, |handle| {
+                handle.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(7.5))
+                        .w(px(1.0))
+                        .flex()
+                        .flex_col()
+                        .child(div().flex_1().w_full().bg(linear_gradient(
+                            0.0,
+                            linear_color_stop(theme.text.alpha(0.0), 0.0),
+                            linear_color_stop(theme.text.alpha(0.25), 1.0),
+                        )))
+                        .child(div().flex_1().w_full().bg(linear_gradient(
+                            0.0,
+                            linear_color_stop(theme.text.alpha(0.25), 0.0),
+                            linear_color_stop(theme.text.alpha(0.0), 1.0),
+                        ))),
+                )
+            })
+    }
+
+    fn right_panel(
+        &self,
+        panel_width: gpui::Pixels,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let toolbar = div()
+            .h(px(46.0))
+            .w_full()
+            .flex_none()
+            .px(px(8.0))
+            .flex()
+            .items_center()
+            .when_some(self.right_panel_mode, |toolbar, mode| {
+                let (_, label, _, glyph) = RIGHT_PANEL_ITEMS
+                    .iter()
+                    .find(|(candidate, _, _, _)| *candidate == mode)
+                    .copied()
+                    .expect("right panel mode must have a launcher item");
+                toolbar.child(
+                    div()
+                        .id("right-panel-active-tab")
+                        .h(px(28.0))
+                        .max_w(px(156.0))
+                        .px(px(8.0))
+                        .rounded(px(10.0))
+                        .bg(theme.text.alpha(0.05))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(icon(glyph, theme.text.into()).size(px(16.0)))
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .text_size(px(13.0))
+                                .line_height(px(18.5714))
+                                .text_color(theme.text)
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .id("right-panel-close-tab")
+                                .size(px(20.0))
+                                .rounded(px(5.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(theme.sidebar_hover))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.right_panel_mode = None;
+                                    this.right_panel_keyboard_focus = false;
+                                    cx.notify();
+                                }))
+                                .child(
+                                    icon("close-dialog", theme.text_tertiary.into()).size(px(12.0)),
+                                ),
+                        ),
+                )
+            });
+
+        div()
+            .id("right-panel")
+            .w(panel_width)
+            .min_w(panel_width)
+            .h_full()
+            .flex_none()
+            .relative()
+            .border_l_1()
+            .border_color(theme.border)
+            .bg(theme.surface)
+            .track_focus(&self.right_panel_focus)
+            .on_key_down(cx.listener(Self::handle_right_panel_key))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .flex()
+            .flex_col()
+            .child(self.right_panel_resize_handle(theme, cx))
+            .child(toolbar)
+            .child(
+                div()
+                    .min_h(px(0.0))
+                    .flex_1()
+                    .p(px(8.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(self.right_panel_mode.is_none(), |body| {
+                        body.child(
+                            div()
+                                .w_full()
+                                .max_w(px(576.0))
+                                .px(px(20.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.0))
+                                .children(RIGHT_PANEL_ITEMS.iter().enumerate().map(
+                                    |(index, (_, label, shortcut, glyph))| {
+                                        self.right_panel_menu_item(
+                                            index, label, shortcut, glyph, theme, cx,
+                                        )
+                                    },
+                                )),
+                        )
+                    }),
+            )
+    }
 }
 
 impl Render for ChatApp {
@@ -990,9 +1435,29 @@ impl Render for ChatApp {
             self.project_creation_focus.focus(window, cx);
             self.project_creation_focus_pending = false;
         }
+        if self.right_panel_open && self.right_panel_focus_pending {
+            self.right_panel_focus.focus(window, cx);
+            self.right_panel_focus_pending = false;
+        }
         let sidebar_width = self.sidebar.read(cx).width();
         let sidebar_reveal = self.sidebar_reveal.clamp(0.0, 1.0);
         let revealed_sidebar_width = sidebar_width * sidebar_reveal;
+        // CDP at both 2560×1410 and the project's 1440×900 target showed a
+        // persisted 1418.21875 px panel, clamped to leave the main thread at
+        // its measured 773.09375 px right edge on narrower windows.
+        let viewport_width = f32::from(window.viewport_size().width);
+        let default_right_panel_width = (window.viewport_size().width - px(773.09375))
+            .min(px(1_418.218_8))
+            .max(px(RIGHT_PANEL_MIN_WIDTH));
+        let right_panel_width = self
+            .right_panel_width
+            .map_or(default_right_panel_width, |width| {
+                px(clamp_right_panel_width(
+                    width,
+                    viewport_width,
+                    revealed_sidebar_width,
+                ))
+            });
         div()
             .id(if self.showing_settings {
                 "app-shell-settings"
@@ -1064,6 +1529,9 @@ impl Render for ChatApp {
                                     .cached(StyleRefinement::default().size_full()),
                             ),
                     )
+                    .when(self.right_panel_open, |shell| {
+                        shell.child(self.right_panel(right_panel_width, theme, cx))
+                    })
             })
             .when(self.permission_confirmation_open, |shell| {
                 shell.child(
@@ -1204,16 +1672,16 @@ impl Render for ChatApp {
                             .flex()
                             .gap(px(4.0))
                             .child(
-                                titlebar_icon_button("sidebar-toggle", false, theme).on_click(
+                                titlebar_icon_button("sidebar-toggle", false, false, theme).on_click(
                                     cx.listener(|this, _, window, cx| {
                                         this.toggle_sidebar(window, cx);
                                     }),
                                 ),
                             )
-                            .child(titlebar_icon_button("back", false, theme))
+                            .child(titlebar_icon_button("back", false, false, theme))
                             // The captured reference has no forward history, so this
                             // control is intentionally disabled and 40% opaque.
-                            .child(titlebar_icon_button("forward", true, theme)),
+                            .child(titlebar_icon_button("forward", true, false, theme)),
                     )
                     .child(
                         div()
@@ -1222,8 +1690,22 @@ impl Render for ChatApp {
                             .right(px(8.0))
                             .flex()
                             .gap(px(6.0))
-                            .child(titlebar_icon_button("bottom-panel", false, theme))
-                            .child(titlebar_icon_button("right-sidebar", false, theme)),
+                            .child(titlebar_icon_button("bottom-panel", false, false, theme))
+                            .child(
+                                titlebar_icon_button(
+                                    "right-sidebar",
+                                    false,
+                                    self.right_panel_open,
+                                    theme,
+                                )
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_right_panel(cx);
+                                })),
+                            ),
                     )
             })
             .when(self.project_creation_open, |shell| {
@@ -1296,6 +1778,110 @@ mod tests {
         simulate_next_frame(&mut app, &window, 400);
         assert_eq!(window.read(|app, _| app.sidebar_reveal), 1.0);
         assert!(!window.read(|app, _| app.sidebar_animation_running));
+    }
+
+    #[test]
+    fn right_panel_stays_open_until_its_titlebar_toggle_is_clicked_again() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
+        );
+
+        window.draw();
+        let trigger = point(px(878.0), px(23.0));
+        window.simulate_click(trigger, MouseButton::Left);
+        assert!(window.read(|chat, _| chat.right_panel_open));
+
+        window.draw();
+        window.simulate_click(point(px(400.0), px(400.0)), MouseButton::Left);
+        assert!(window.read(|chat, _| chat.right_panel_open));
+
+        window.draw();
+        window.simulate_keystroke("escape");
+        assert!(window.read(|chat, _| chat.right_panel_open));
+
+        window.draw();
+        window.simulate_click(trigger, MouseButton::Left);
+        assert!(!window.read(|chat, _| chat.right_panel_open));
+    }
+
+    #[test]
+    fn right_panel_menu_supports_keyboard_selection() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
+        );
+
+        window.update(|chat, _, cx| chat.open_right_panel(cx));
+        window.draw();
+        window.simulate_keystroke("down");
+        window.simulate_keystroke("down");
+        assert_eq!(window.read(|chat, _| chat.right_panel_focused_item), 1);
+        window.simulate_keystroke("enter");
+        assert_eq!(
+            window.read(|chat, _| chat.right_panel_mode),
+            Some(super::RightPanelMode::Browser)
+        );
+    }
+
+    #[test]
+    fn right_panel_resize_handle_matches_reference_limits_without_hiding_the_panel() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(1440.0), px(900.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
+        );
+        window.update(|chat, _, cx| chat.open_right_panel(cx));
+        window.draw();
+
+        // CDP: a 16 px hit area is centered on the one-pixel divider.
+        window.simulate_mouse_move(point(px(773.09375), px(300.0)));
+        assert!(window.read(|chat, _| chat.right_panel_resize_hovered));
+        window.simulate_mouse_down(point(px(773.09375), px(300.0)), MouseButton::Left);
+        window.simulate_mouse_move(point(px(1100.0), px(300.0)));
+        window.simulate_mouse_up(point(px(1100.0), px(300.0)), MouseButton::Left);
+        let narrow_width = window.read(|chat, _| chat.right_panel_width.unwrap());
+        assert!((narrow_width - 339.09375).abs() < 0.2, "{narrow_width}");
+
+        window.draw();
+        window.simulate_mouse_down(point(px(1100.0), px(300.0)), MouseButton::Left);
+        window.simulate_mouse_move(point(px(400.0), px(300.0)));
+        window.simulate_mouse_up(point(px(400.0), px(300.0)), MouseButton::Left);
+        let expected_max = 1440.0 - 256.125 - super::RIGHT_PANEL_MAIN_MIN_WIDTH;
+        assert!(
+            (window.read(|chat, _| chat.right_panel_width.unwrap()) - expected_max).abs() < 0.2
+        );
+
+        window.draw();
+        let divider_x = 1440.0 - expected_max;
+        window.simulate_mouse_down(point(px(divider_x), px(300.0)), MouseButton::Left);
+        window.simulate_mouse_move(point(px(1300.0), px(300.0)));
+        window.simulate_mouse_up(point(px(1300.0), px(300.0)), MouseButton::Left);
+        assert!(window.read(|chat, _| chat.right_panel_open));
+        assert_eq!(
+            window.read(|chat, _| chat.right_panel_width),
+            Some(super::RIGHT_PANEL_MIN_WIDTH)
+        );
     }
 
     #[test]

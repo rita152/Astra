@@ -141,6 +141,7 @@ fn main() {
         .unwrap_or(900.0);
     let sidebar_bottom = args.iter().any(|arg| arg == "--sidebar-bottom");
     let profile_menu_open = args.iter().any(|arg| arg == "--profile-menu-open");
+    let right_panel_open = args.iter().any(|arg| arg == "--right-panel-open");
     let projects_menu_open = args.iter().any(|arg| arg == "--projects-menu-open");
     let project_menu_open = args.iter().find_map(|arg| {
         arg.strip_prefix("--project-menu-open=")?
@@ -238,6 +239,9 @@ fn main() {
                         let mut app = ChatApp::new(mode, sidebar_bottom, cx);
                         if profile_menu_open {
                             app.open_profile_menu(cx);
+                        }
+                        if right_panel_open {
+                            app.open_right_panel(cx);
                         }
                         if projects_menu_open {
                             app.open_projects_section_menu(cx);
