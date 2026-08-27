@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     BoxShadow, Context, Div, Entity, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
-    PathPromptOptions, Render, StyleRefinement, Transformation, Window, div, hsla, prelude::*, px,
-    radians, rgba,
+    PathPromptOptions, Render, StyleRefinement, Transformation, Window, WindowAppearance, div,
+    hsla, prelude::*, px, radians, rgba,
 };
 
 gpui::actions!(permission_ui, [DismissPermissionUi]);
@@ -146,6 +146,10 @@ impl ChatApp {
         .detach();
         cx.subscribe(&settings, |this, _, event: &ChangeTheme, cx| {
             this.mode = event.0;
+            cx.set_window_appearance(Some(match event.0 {
+                ThemeMode::Light => WindowAppearance::VibrantLight,
+                ThemeMode::Dark => WindowAppearance::VibrantDark,
+            }));
             this.sidebar.update(cx, |sidebar, cx| {
                 sidebar.set_mode(event.0, cx);
             });
@@ -996,7 +1000,10 @@ impl Render for ChatApp {
                 "app-shell"
             })
             .size_full()
-            .bg(theme.surface)
+            // Apply the subtle theme underlay above the native blurred
+            // material. The sidebar adds its measured tint on top, while the
+            // main pane below is painted fully opaque in its own child.
+            .bg(theme.surface_underlay)
             .relative()
             .flex()
             .on_click(cx.listener(|this, _, _, cx| {
@@ -1029,6 +1036,10 @@ impl Render for ChatApp {
                             .h_full()
                             .flex_none()
                             .overflow_hidden()
+                            // Electron paints the translucent surface on the
+                            // outer aside; only its inner contents fade while
+                            // the panel collapses.
+                            .bg(theme.sidebar_surface)
                             .child(
                                 div()
                                     .w(px(sidebar_width))
@@ -1042,11 +1053,16 @@ impl Render for ChatApp {
                     // much larger, static home/composer subtree cached so a wheel or
                     // trackpad frame does not rebuild and repaint the main pane.
                     .child(
-                        div().flex_1().min_w(px(0.0)).h_full().child(
-                            self.home
-                                .clone()
-                                .cached(StyleRefinement::default().size_full()),
-                        ),
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .h_full()
+                            .bg(theme.surface)
+                            .child(
+                                self.home
+                                    .clone()
+                                    .cached(StyleRefinement::default().size_full()),
+                            ),
                     )
             })
             .when(self.permission_confirmation_open, |shell| {

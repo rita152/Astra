@@ -19,6 +19,10 @@ impl ThemeMode {
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub surface: Rgba,
+    /// Theme underlay tint above the native blurred window material.
+    pub surface_underlay: Rgba,
+    /// The sidebar's actual translucent paint, matching the Electron shell.
+    pub sidebar_surface: Rgba,
     pub surface_under: Rgba,
     pub elevated: Rgba,
     pub model_picker_surface: Rgba,
@@ -59,7 +63,15 @@ impl Theme {
         match mode {
             ThemeMode::Light => Self {
                 surface: rgba(0xffffffff),
-                surface_under: rgba(0xfcfcfcff),
+                // The measured 28% sidebar tint combines with this 58%
+                // underlay to leave about 30% of the native material visible.
+                surface_underlay: rgba(0xf9f9f995),
+                // ChatGPT electron-light resolves editor #ededed66 and then
+                // mixes it at 70%, producing approximately 28% alpha.
+                sidebar_surface: rgba(0xededed47),
+                // Resolved sidebar color over the canonical underlay. Sticky
+                // overlays need this opaque value to avoid double compositing.
+                surface_under: rgba(0xf6f6f6ff),
                 elevated: rgba(0xffffffff),
                 model_picker_surface: rgba(0xfafafaff),
                 project_dialog_surface: rgba(0xfafafaff),
@@ -101,6 +113,12 @@ impl Theme {
             },
             ThemeMode::Dark => Self {
                 surface: rgba(0x181818ff),
+                // The measured 70% sidebar tint directly leaves about 30% of
+                // the native material visible; no second tint is required.
+                surface_underlay: rgba(0x00000000),
+                // CDP computed style on aside.app-shell-left-panel:
+                // color(srgb 0.156863 0.156863 0.156863 / 0.7).
+                sidebar_surface: rgba(0x282828b3),
                 surface_under: rgba(0x222222ff),
                 elevated: rgba(0x363636ff),
                 // Resolved result of elevated-secondary/90 over #181818.
@@ -143,5 +161,21 @@ impl Theme {
                 settings_button: rgba(0x292929ff),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Theme, ThemeMode};
+
+    #[test]
+    fn sidebar_surfaces_preserve_reference_alpha() {
+        let dark = Theme::for_mode(ThemeMode::Dark);
+        let light = Theme::for_mode(ThemeMode::Light);
+
+        assert!((dark.sidebar_surface.a - 179.0 / 255.0).abs() < f32::EPSILON);
+        assert!((light.sidebar_surface.a - 71.0 / 255.0).abs() < f32::EPSILON);
+        assert_eq!(dark.surface_underlay.a, 0.0);
+        assert!((light.surface_underlay.a - 149.0 / 255.0).abs() < f32::EPSILON);
     }
 }

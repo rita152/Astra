@@ -8,10 +8,62 @@ use std::{borrow::Cow, fs, path::PathBuf};
 use anyhow::Result;
 use app::ChatApp;
 use gpui::{
-    App, AppContext, AssetSource, Bounds, SharedString, WindowBounds, WindowOptions, px, size,
+    App, AppContext, AssetSource, Bounds, SharedString, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, px, size,
 };
 use gpui_platform::application;
 use theme::ThemeMode;
+
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)] // objc 0.2 macros probe the legacy cargo-clippy cfg.
+fn configure_native_blur_sampling(window: &mut gpui::Window) {
+    fn schedule(window: &mut gpui::Window, attempts_remaining: usize) {
+        window.on_next_frame(move |window, _| {
+            let configured = unsafe { apply() };
+            if !configured && attempts_remaining > 1 {
+                schedule(window, attempts_remaining - 1);
+            }
+        });
+    }
+
+    #[allow(unexpected_cfgs)]
+    unsafe fn apply() -> bool {
+        use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+
+        let application: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let mut native_window: *mut Object = msg_send![application, keyWindow];
+        if native_window.is_null() {
+            let windows: *mut Object = msg_send![application, windows];
+            let count: usize = msg_send![windows, count];
+            if count == 0 {
+                return false;
+            }
+            native_window = msg_send![windows, objectAtIndex: 0usize];
+        }
+
+        let content_view: *mut Object = msg_send![native_window, contentView];
+        let subviews: *mut Object = msg_send![content_view, subviews];
+        let count: usize = msg_send![subviews, count];
+        for index in 0..count {
+            let view: *mut Object = msg_send![subviews, objectAtIndex: index];
+            let is_visual_effect: bool = msg_send![view, isKindOfClass: class!(NSVisualEffectView)];
+            if is_visual_effect {
+                // NSVisualEffectBlendingModeBehindWindow = 0. GPUI creates
+                // this view but otherwise leaves AppKit's WithinWindow mode,
+                // which samples only our own clear surface and looks opaque.
+                let _: () = msg_send![view, setBlendingMode: 0isize];
+                let _: () = msg_send![view, setState: 1isize];
+                return true;
+            }
+        }
+        false
+    }
+
+    schedule(window, 8);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_native_blur_sampling(_window: &mut gpui::Window) {}
 
 struct Assets {
     base: PathBuf,
@@ -143,6 +195,10 @@ fn main() {
             base: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"),
         })
         .run(move |cx: &mut App| {
+            cx.set_window_appearance(Some(match mode {
+                ThemeMode::Light => WindowAppearance::VibrantLight,
+                ThemeMode::Dark => WindowAppearance::VibrantDark,
+            }));
             cx.bind_keys([gpui::KeyBinding::new(
                 "escape",
                 app::DismissPermissionUi,
@@ -162,10 +218,15 @@ fn main() {
                         appears_transparent: true,
                         traffic_light_position: Some(gpui::point(px(18.0), px(18.0))),
                     }),
+                    // Let the native macOS visual-effect layer participate in
+                    // the translucent sidebar composition. Opaque main-pane
+                    // content still masks the material on the right.
+                    window_background: WindowBackgroundAppearance::Blurred,
                     window_min_size: Some(size(px(900.0), px(620.0))),
                     ..Default::default()
                 },
                 move |window, cx| {
+                    configure_native_blur_sampling(window);
                     if maximize_after_open {
                         window.on_next_frame(|window, _| window.zoom_window());
                     }

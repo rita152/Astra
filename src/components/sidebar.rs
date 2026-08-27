@@ -3781,7 +3781,6 @@ impl SidebarView {
             .min_w(px(self.sidebar_width))
             .h_full()
             .pt(px(46.0))
-            .bg(theme.surface_under)
             .relative()
             .flex()
             .flex_col()
