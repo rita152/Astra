@@ -34,6 +34,12 @@ REGIONS = {
     "composer_footer_left": (484, 840, 620, 882),
     "composer_footer_right": (1025, 840, 1212, 882),
     "theme_frame": (1298, 826, 1428, 890),
+    "project_create_dialog": (379, 270, 1061, 631),
+    "project_create_heading": (399, 290, 1060, 348),
+    "project_create_cards": (399, 360, 1041, 539),
+    "project_create_footer": (950, 575, 1041, 611),
+    "project_remote_dialog": (459, 283, 981, 616),
+    "project_remote_form": (479, 303, 961, 597),
 }
 
 
@@ -50,6 +56,9 @@ def compare(reference: Path, actual: Path, output: Path, tolerance: int) -> dict
     matching = sum(max(pixel) <= tolerance for pixel in pixels)
     exact = sum(max(pixel) == 0 for pixel in pixels)
     absolute_error = sum(sum(pixel[:3]) for pixel in pixels)
+    tolerance_adjusted_error = sum(
+        sum(max(channel - tolerance, 0) for channel in pixel[:3]) for pixel in pixels
+    )
     max_error = total * 255 * 3
 
     ref_edges = ref.convert("L").filter(ImageFilter.FIND_EDGES)
@@ -83,12 +92,25 @@ def compare(reference: Path, actual: Path, output: Path, tolerance: int) -> dict
         ]
         region_total = len(indices)
         region_matching = sum(max(pixels[index]) <= tolerance for index in indices)
+        region_absolute_error = sum(
+            sum(pixels[index][:3]) for index in indices
+        )
+        region_adjusted_error = sum(
+            sum(max(channel - tolerance, 0) for channel in pixels[index][:3])
+            for index in indices
+        )
         region_edge_indices = [index for index in indices if edge_flags[index]]
         region_edge_matching = sum(
             max(pixels[index]) <= tolerance for index in region_edge_indices
         )
         region_reports[name] = {
             "pixel_consistency": round(region_matching / region_total * 100, 6),
+            "normalized_similarity": round(
+                (1 - region_absolute_error / (region_total * 255 * 3)) * 100, 6
+            ),
+            "tolerance_adjusted_similarity": round(
+                (1 - region_adjusted_error / (region_total * 255 * 3)) * 100, 6
+            ),
             "different_pixels": region_total - region_matching,
             "edge_pixel_consistency": (
                 round(region_edge_matching / len(region_edge_indices) * 100, 6)
@@ -111,6 +133,9 @@ def compare(reference: Path, actual: Path, output: Path, tolerance: int) -> dict
         "pixel_consistency": round(matching / total * 100, 6),
         "exact_pixel_consistency": round(exact / total * 100, 6),
         "normalized_similarity": round((1 - absolute_error / max_error) * 100, 6),
+        "tolerance_adjusted_similarity": round(
+            (1 - tolerance_adjusted_error / max_error) * 100, 6
+        ),
         "edge_pixel_consistency": round(edge_matching / edge_total * 100, 6),
         "edge_pixels": edge_total,
         "different_pixels": total - matching,
@@ -129,13 +154,17 @@ def main() -> None:
     parser.add_argument("--tolerance", type=int, default=0)
     parser.add_argument("--min-consistency", type=float, default=100.0)
     parser.add_argument("--min-edge-consistency", type=float, default=100.0)
+    parser.add_argument("--min-adjusted-similarity", type=float, default=0.0)
+    parser.add_argument("--score-region", choices=sorted(REGIONS))
     args = parser.parse_args()
 
     report = compare(args.reference, args.actual, args.output, args.tolerance)
     print(json.dumps(report, ensure_ascii=False, indent=2))
+    scored = report["regions"][args.score_region] if args.score_region else report
     if (
-        report["pixel_consistency"] < args.min_consistency
-        or report["edge_pixel_consistency"] < args.min_edge_consistency
+        scored["pixel_consistency"] < args.min_consistency
+        or scored["edge_pixel_consistency"] < args.min_edge_consistency
+        or scored["tolerance_adjusted_similarity"] < args.min_adjusted_similarity
     ):
         raise SystemExit(1)
 

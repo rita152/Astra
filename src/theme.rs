@@ -22,6 +22,7 @@ pub struct Theme {
     pub surface_under: Rgba,
     pub elevated: Rgba,
     pub model_picker_surface: Rgba,
+    pub project_dialog_surface: Rgba,
     pub control: Rgba,
     pub control_soft: Rgba,
     pub sidebar_hover: Rgba,
@@ -62,6 +63,7 @@ impl Theme {
                 surface_under: rgba(0xfcfcfcff),
                 elevated: rgba(0xffffffff),
                 model_picker_surface: rgba(0xfafafaff),
+                project_dialog_surface: rgba(0xfafafaff),
                 control: rgba(0xffffffff),
                 control_soft: rgba(0xffffffff),
                 // chat-reference: --color-background-primary-ghost-hover
@@ -105,6 +107,9 @@ impl Theme {
                 elevated: rgba(0x363636ff),
                 // Resolved result of elevated-secondary/90 over #181818.
                 model_picker_surface: rgba(0x2c2c2cff),
+                // Captured opaque result of elevated-secondary/90 over the
+                // canonical new-conversation background.
+                project_dialog_surface: rgba(0x2b2b2bff),
                 control: rgba(0x2d2d2dff),
                 control_soft: rgba(0x2d2d2dff),
                 // chat-reference: --color-background-primary-ghost-hover

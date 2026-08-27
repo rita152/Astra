@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use gpui::{
     Animation, AnimationExt, App, Bounds, ContentMask, Context, Div, FocusHandle, Hsla,
@@ -13,8 +16,10 @@ use crate::{
 };
 
 pub struct OpenSettings;
+pub struct OpenProjectCreation;
 
 impl gpui::EventEmitter<OpenSettings> for SidebarView {}
+impl gpui::EventEmitter<OpenProjectCreation> for SidebarView {}
 
 const PROJECTS: &[(&str, &[&str])] = &[
     ("oh-my-pi", &["分析项目中的 Web 工具"]),
@@ -372,6 +377,8 @@ pub struct SidebarView {
     projects_collapsed: bool,
     project_collapsed: Vec<bool>,
     project_show_all: Vec<bool>,
+    created_projects: Vec<String>,
+    selected_created_project: Option<usize>,
     selected_project: usize,
     selected_thread: Option<(usize, usize)>,
     selected_recent: Option<usize>,
@@ -384,6 +391,7 @@ pub struct SidebarView {
     projects_layout: ProjectsLayout,
     projects_sort: ProjectsSort,
     projects_heading_hovered: bool,
+    project_creation_trigger_open: bool,
     hovered_section_icon: Option<SectionHeaderIcon>,
     hovered_thread: Option<(usize, usize)>,
     recents_collapsed: bool,
@@ -433,6 +441,8 @@ impl SidebarView {
                 .map(|(name, _)| matches!(*name, "pi" | "语音输入法" | "LAG_创新"))
                 .collect(),
             project_show_all: vec![false; PROJECTS.len()],
+            created_projects: Vec::new(),
+            selected_created_project: None,
             selected_project: 4,
             selected_thread: None,
             selected_recent: None,
@@ -445,6 +455,7 @@ impl SidebarView {
             projects_layout: ProjectsLayout::Grouped,
             projects_sort: ProjectsSort::Priority,
             projects_heading_hovered: false,
+            project_creation_trigger_open: false,
             hovered_section_icon: None,
             hovered_thread: None,
             recents_collapsed: false,
@@ -538,6 +549,42 @@ impl SidebarView {
         self.projects_menu_focused_item = None;
         self.open_project_menu = None;
         self.profile_menu_open = false;
+        cx.notify();
+    }
+
+    pub fn set_project_creation_trigger_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.project_creation_trigger_open = open;
+        if open {
+            self.open_project_menu = None;
+            self.projects_section_menu_open = false;
+            self.profile_menu_open = false;
+        }
+        cx.notify();
+    }
+
+    pub fn add_local_project(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        if let Some(index) = self
+            .created_projects
+            .iter()
+            .position(|project| project == name)
+        {
+            self.selected_created_project = Some(index);
+        } else if let Some((index, _)) = PROJECTS
+            .iter()
+            .enumerate()
+            .find(|(_, (project, _))| *project == name)
+        {
+            self.selected_project = index;
+            self.selected_created_project = None;
+        } else {
+            self.created_projects.push(name.to_owned());
+            self.selected_created_project = Some(self.created_projects.len() - 1);
+        }
+        self.selected_thread = None;
+        self.selected_recent = None;
         cx.notify();
     }
 
@@ -1306,7 +1353,8 @@ impl SidebarView {
     ) -> gpui::Stateful<Div> {
         let flat = self.projects_layout == ProjectsLayout::Flat;
         let collapsed = !flat && self.project_collapsed[project_index];
-        let selected = self.selected_project == project_index;
+        let selected =
+            self.selected_created_project.is_none() && self.selected_project == project_index;
         let menu_open = self.open_project_menu == Some(project_index);
         let group_name = format!("project-row-{project_index}");
 
@@ -1329,6 +1377,7 @@ impl SidebarView {
                 cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.selected_project = project_index;
+                    this.selected_created_project = None;
                     this.selected_thread = None;
                     this.selected_recent = None;
                     this.open_project_menu = None;
@@ -1386,6 +1435,7 @@ impl SidebarView {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_project_menu = None;
                 this.project_collapsed[project_index] = !this.project_collapsed[project_index];
+                this.selected_created_project = None;
                 cx.notify();
             }));
 
@@ -1618,6 +1668,55 @@ impl SidebarView {
         group
     }
 
+    fn created_project_row(
+        &self,
+        project_index: usize,
+        name: String,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let selected = self.selected_created_project == Some(project_index);
+        div()
+            .id(("created-project-row", project_index))
+            .h(px(30.0))
+            .w_full()
+            .pl(px(1.0))
+            .pr(px(6.0))
+            .flex()
+            .items_center()
+            .rounded(px(9.0))
+            .text_size(px(14.0))
+            .font_weight(gpui::FontWeight(445.0))
+            .text_color(theme.sidebar_text)
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.sidebar_hover))
+            .when(selected, |row| row.bg(theme.sidebar_hover))
+            .child(
+                div()
+                    .size(px(30.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon("folder", theme.text_tertiary.into())),
+            )
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(name),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.selected_created_project = Some(project_index);
+                this.selected_thread = None;
+                this.selected_recent = None;
+                this.open_project_menu = None;
+                cx.notify();
+            }))
+    }
+
     fn native_scroll_content(
         &self,
         theme: Theme,
@@ -1636,6 +1735,9 @@ impl SidebarView {
         for (project_index, (name, rows)) in PROJECTS.iter().enumerate() {
             projects =
                 projects.child(self.project_group(project_index, name, rows, theme, window, cx));
+        }
+        for (project_index, name) in self.created_projects.iter().cloned().enumerate() {
+            projects = projects.child(self.created_project_row(project_index, name, theme, cx));
         }
         let show_recents_heading_icons = self.recents_heading_hovered;
         let recent_chevron_color = if self.hovered_recents_icon == Some(SectionHeaderIcon::Chevron)
@@ -1883,7 +1985,9 @@ impl SidebarView {
             }
         }
 
-        let show_heading_icons = self.projects_heading_hovered || self.projects_section_menu_open;
+        let show_heading_icons = self.projects_heading_hovered
+            || self.projects_section_menu_open
+            || self.project_creation_trigger_open;
         let chevron_highlighted = self.hovered_section_icon == Some(SectionHeaderIcon::Chevron);
         let chevron_color = if chevron_highlighted {
             theme.text
@@ -1938,7 +2042,8 @@ impl SidebarView {
             "projects-add-button",
             "add",
             theme,
-            self.hovered_section_icon == Some(SectionHeaderIcon::Add),
+            self.project_creation_trigger_open
+                || self.hovered_section_icon == Some(SectionHeaderIcon::Add),
             14.0,
         )
         .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
@@ -1948,8 +2053,11 @@ impl SidebarView {
                 cx.notify();
             }
         }))
-        .on_click(cx.listener(|_, _, _, cx| {
+        .on_click(cx.listener(|this, _, _, cx| {
             cx.stop_propagation();
+            this.project_creation_trigger_open = true;
+            cx.emit(OpenProjectCreation);
+            cx.notify();
         }));
 
         let heading_actions = div()
@@ -3305,6 +3413,31 @@ mod tests {
             window.read(|sidebar, _| sidebar.projects_sort),
             ProjectsSort::Priority
         );
+    }
+
+    #[test]
+    fn selected_local_folder_is_reused_as_project_data_without_examples() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(test_window_options(900.0), |_, _| {
+            SidebarView::new(ThemeMode::Dark, false)
+        });
+
+        window.update(|sidebar, _, cx| {
+            sidebar.add_local_project(std::path::Path::new("/tmp/real-worktree"), cx)
+        });
+        assert_eq!(
+            window.read(|sidebar, _| sidebar.created_projects.clone()),
+            ["real-worktree".to_owned()]
+        );
+        assert_eq!(
+            window.read(|sidebar, _| sidebar.selected_created_project),
+            Some(0)
+        );
+
+        window.update(|sidebar, _, cx| {
+            sidebar.add_local_project(std::path::Path::new("/tmp/real-worktree"), cx)
+        });
+        assert_eq!(window.read(|sidebar, _| sidebar.created_projects.len()), 1);
     }
 
     #[test]

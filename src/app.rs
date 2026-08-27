@@ -1,8 +1,9 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    BoxShadow, Context, Div, Entity, IntoElement, Render, StyleRefinement, Transformation, Window,
-    div, hsla, prelude::*, px, radians, rgba,
+    BoxShadow, Context, Div, Entity, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
+    PathPromptOptions, Render, StyleRefinement, Transformation, Window, div, hsla, prelude::*, px,
+    radians, rgba,
 };
 
 gpui::actions!(permission_ui, [DismissPermissionUi]);
@@ -12,7 +13,7 @@ use crate::{
         composer::RequestFullAccess,
         home::HomeView,
         icons::icon,
-        sidebar::{OpenSettings, SidebarView},
+        sidebar::{OpenProjectCreation, OpenSettings, SidebarView},
     },
     settings::{ChangeTheme, CloseSettings, SettingsView},
     theme::{Theme, ThemeMode},
@@ -32,6 +33,25 @@ pub struct ChatApp {
     sidebar_animation_duration: Duration,
     sidebar_animation_running: bool,
     permission_confirmation_open: bool,
+    project_creation_open: bool,
+    project_creation_kind: ProjectCreationKind,
+    project_creation_step: ProjectCreationStep,
+    project_creation_focused_item: usize,
+    project_creation_keyboard_focus: bool,
+    project_creation_focus: FocusHandle,
+    project_creation_focus_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectCreationKind {
+    Local,
+    Remote,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectCreationStep {
+    Kind,
+    Remote,
 }
 
 const SIDEBAR_TRANSITION_DURATION: Duration = Duration::from_millis(400);
@@ -115,6 +135,10 @@ impl ChatApp {
             cx.notify();
         })
         .detach();
+        cx.subscribe(&sidebar, |this, _, _: &OpenProjectCreation, cx| {
+            this.open_project_creation(cx);
+        })
+        .detach();
         cx.subscribe(&settings, |this, _, _: &CloseSettings, cx| {
             this.showing_settings = false;
             cx.notify();
@@ -150,6 +174,13 @@ impl ChatApp {
             sidebar_animation_duration: Duration::ZERO,
             sidebar_animation_running: false,
             permission_confirmation_open: false,
+            project_creation_open: false,
+            project_creation_kind: ProjectCreationKind::Local,
+            project_creation_step: ProjectCreationStep::Kind,
+            project_creation_focused_item: 0,
+            project_creation_keyboard_focus: false,
+            project_creation_focus: cx.focus_handle().tab_stop(true),
+            project_creation_focus_pending: false,
         }
     }
 
@@ -234,6 +265,140 @@ impl ChatApp {
 
     pub fn open_permission_confirmation(&mut self, cx: &mut Context<Self>) {
         self.permission_confirmation_open = true;
+        cx.notify();
+    }
+
+    pub fn open_project_creation(&mut self, cx: &mut Context<Self>) {
+        self.project_creation_open = true;
+        self.project_creation_focused_item = 0;
+        self.project_creation_keyboard_focus = false;
+        self.project_creation_focus_pending = true;
+        self.permission_confirmation_open = false;
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.close_transient_menus(cx);
+            sidebar.set_project_creation_trigger_open(true, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn open_project_creation_remote_for_capture(&mut self, cx: &mut Context<Self>) {
+        self.open_project_creation(cx);
+        self.project_creation_kind = ProjectCreationKind::Remote;
+        self.project_creation_step = ProjectCreationStep::Remote;
+        cx.notify();
+    }
+
+    fn close_project_creation(&mut self, cx: &mut Context<Self>) {
+        self.project_creation_open = false;
+        self.project_creation_keyboard_focus = false;
+        self.project_creation_focus_pending = false;
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_project_creation_trigger_open(false, cx)
+        });
+        cx.notify();
+    }
+
+    fn cancel_project_creation(&mut self, cx: &mut Context<Self>) {
+        self.project_creation_kind = ProjectCreationKind::Local;
+        self.project_creation_step = ProjectCreationStep::Kind;
+        self.close_project_creation(cx);
+    }
+
+    fn advance_project_creation(&mut self, cx: &mut Context<Self>) {
+        match self.project_creation_kind {
+            ProjectCreationKind::Local => {
+                self.close_project_creation(cx);
+                let paths = cx.prompt_for_paths(PathPromptOptions {
+                    files: false,
+                    directories: true,
+                    multiple: false,
+                    prompt: None,
+                });
+                #[cfg(not(test))]
+                {
+                    let sidebar = self.sidebar.clone();
+                    cx.spawn(async move |_, cx| {
+                        let Ok(Ok(Some(mut paths))) = paths.await else {
+                            return;
+                        };
+                        let Some(path) = paths.pop() else {
+                            return;
+                        };
+                        let _ =
+                            sidebar.update(cx, |sidebar, cx| sidebar.add_local_project(&path, cx));
+                    })
+                    .detach();
+                }
+                #[cfg(test)]
+                drop(paths);
+            }
+            ProjectCreationKind::Remote => {
+                self.project_creation_step = ProjectCreationStep::Remote;
+                self.project_creation_focused_item = 0;
+                self.project_creation_keyboard_focus = false;
+                cx.notify();
+            }
+        }
+    }
+
+    fn handle_project_creation_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.project_creation_open {
+            return;
+        }
+
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            self.close_project_creation(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.project_creation_step == ProjectCreationStep::Remote {
+            if key == "tab" {
+                let count = 4;
+                self.project_creation_focused_item = if event.keystroke.modifiers.shift {
+                    (self.project_creation_focused_item + count - 1) % count
+                } else {
+                    (self.project_creation_focused_item + 1) % count
+                };
+                self.project_creation_keyboard_focus = true;
+                cx.stop_propagation();
+                cx.notify();
+            } else if matches!(key, "enter" | "space") {
+                match self.project_creation_focused_item {
+                    2 => self.cancel_project_creation(cx),
+                    3 => self.close_project_creation(cx),
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }
+            return;
+        }
+
+        match key {
+            "tab" => {
+                let count = 4;
+                self.project_creation_focused_item = if event.keystroke.modifiers.shift {
+                    (self.project_creation_focused_item + count - 1) % count
+                } else {
+                    (self.project_creation_focused_item + 1) % count
+                };
+                self.project_creation_keyboard_focus = true;
+            }
+            "enter" | "space" => match self.project_creation_focused_item {
+                0 => self.project_creation_kind = ProjectCreationKind::Local,
+                1 => self.project_creation_kind = ProjectCreationKind::Remote,
+                2 => self.advance_project_creation(cx),
+                3 => self.close_project_creation(cx),
+                _ => {}
+            },
+            _ => return,
+        }
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -335,9 +500,486 @@ fn permission_risk_row(
         )
 }
 
+fn project_creation_focus_shadow(theme: Theme, visible: bool) -> Vec<BoxShadow> {
+    if visible {
+        vec![
+            BoxShadow::new(px(0.0), px(0.0), theme.accent.alpha(0.76).into())
+                .spread_radius(px(2.0)),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+impl ChatApp {
+    fn project_kind_card(
+        &self,
+        index: usize,
+        kind: ProjectCreationKind,
+        glyph: &'static str,
+        label: &'static str,
+        detail: &'static str,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let selected = self.project_creation_kind == kind;
+        let keyboard_focused =
+            self.project_creation_keyboard_focus && self.project_creation_focused_item == index;
+        let radio = div()
+            .size(px(20.0))
+            .flex_none()
+            .rounded_full()
+            .border_1()
+            .border_color(if selected { theme.accent } else { theme.text })
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(selected, |radio| {
+                radio.child(div().size(px(12.0)).rounded_full().bg(theme.accent))
+            });
+
+        div()
+            .id(("project-creation-kind", index))
+            .w(px(314.0))
+            .h(px(144.0))
+            .p(px(16.0))
+            .rounded(px(20.0))
+            .border_1()
+            .border_color(if selected {
+                rgba(0x00000000)
+            } else {
+                theme.border
+            })
+            .bg(if selected {
+                theme.text.alpha(0.05)
+            } else {
+                rgba(0x00000000)
+            })
+            .shadow(project_creation_focus_shadow(theme, keyboard_focused))
+            .flex()
+            .flex_col()
+            .justify_between()
+            .cursor_pointer()
+            .hover(move |style| {
+                if selected {
+                    style.bg(theme.text.alpha(0.05))
+                } else {
+                    style.bg(theme.text.alpha(0.03))
+                }
+            })
+            .active(move |style| {
+                if selected {
+                    style.bg(theme.text.alpha(0.05))
+                } else {
+                    style.bg(theme.text.alpha(0.03))
+                }
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.project_creation_kind = kind;
+                this.project_creation_focused_item = index;
+                this.project_creation_keyboard_focus = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .child(icon(glyph, theme.text_tertiary.into()).size(px(20.0)))
+                    .child(radio),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .ml(px(1.0))
+                    .child(
+                        div()
+                            .h(px(21.0))
+                            .text_size(px(14.0))
+                            .line_height(px(21.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .h(px(19.25))
+                            .text_size(px(14.0))
+                            .line_height(px(19.25))
+                            .font_weight(gpui::FontWeight::NORMAL)
+                            .text_color(theme.text_tertiary)
+                            .child(detail),
+                    ),
+            )
+    }
+
+    fn project_creation_close_button(
+        &self,
+        index: usize,
+        label: &'static str,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let keyboard_focused =
+            self.project_creation_keyboard_focus && self.project_creation_focused_item == index;
+        div()
+            .id("project-creation-close")
+            .absolute()
+            .top(px(16.0))
+            .right(px(16.0))
+            .size(px(24.0))
+            .rounded(px(4.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .text_color(theme.text.alpha(0.8))
+            .shadow(project_creation_focus_shadow(theme, keyboard_focused))
+            .hover(move |style| style.bg(theme.sidebar_hover))
+            .active(move |style| style.bg(theme.sidebar_hover))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.close_project_creation(cx);
+            }))
+            .child(icon("close-dialog", theme.text.alpha(0.8).into()).size(px(16.0)))
+            .child(div().invisible().absolute().child(label))
+    }
+
+    fn project_creation_kind_dialog(
+        &self,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let next_focused =
+            self.project_creation_keyboard_focus && self.project_creation_focused_item == 2;
+        div()
+            .id("project-creation-dialog")
+            .relative()
+            .w(px(680.0))
+            .h(px(357.796875))
+            .rounded(px(25.0))
+            .bg(theme.project_dialog_surface)
+            .shadow(vec![
+                BoxShadow::new(px(0.0), px(0.0), theme.border.into()).spread_radius(px(0.5)),
+                BoxShadow::new(px(0.0), px(4.0), hsla(0.0, 0.0, 0.0, 0.10))
+                    .blur_radius(px(8.0))
+                    .spread_radius(px(-2.0)),
+            ])
+            .font_family(".SystemUIFont")
+            .text_color(theme.text)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .size_full()
+                    .p(px(20.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(28.0))
+                    .child(
+                        div()
+                            .h(px(28.796875))
+                            .relative()
+                            .top(px(-1.0))
+                            .ml(px(1.0))
+                            // CoreText's system Chinese advances are slightly
+                            // narrower than Chromium's at the computed 24px.
+                            .text_size(px(25.0))
+                            .line_height(px(28.8))
+                            .font_weight(gpui::FontWeight(500.0))
+                            .child("创建项目"),
+                    )
+                    .child(
+                        div()
+                            .h(px(189.0))
+                            .pt(px(12.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.0))
+                            .child(
+                                div()
+                                    .h(px(21.0))
+                                    .text_size(px(14.0))
+                                    .line_height(px(21.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child("项目类型"),
+                            )
+                            .child(
+                                div()
+                                    .h(px(144.0))
+                                    .flex()
+                                    .gap(px(12.0))
+                                    .child(self.project_kind_card(
+                                        0,
+                                        ProjectCreationKind::Local,
+                                        "project-local",
+                                        "本地",
+                                        "在你的电脑上编辑、运行和测试文件",
+                                        theme,
+                                        cx,
+                                    ))
+                                    .child(self.project_kind_card(
+                                        1,
+                                        ProjectCreationKind::Remote,
+                                        "project-remote",
+                                        "远程",
+                                        "选择已连接计算机上的文件夹",
+                                        theme,
+                                        cx,
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div().h(px(44.0)).pt(px(12.0)).flex().justify_end().child(
+                            div()
+                                .id("project-creation-next")
+                                .h(px(32.0))
+                                .px(px(16.0))
+                                .rounded(px(12.5))
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.button)
+                                .text_color(theme.button_text)
+                                .shadow(project_creation_focus_shadow(theme, next_focused))
+                                .flex()
+                                .items_center()
+                                .text_size(px(14.0))
+                                .line_height(px(18.0))
+                                .font_weight(gpui::FontWeight(200.0))
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(theme.text.alpha(0.8)))
+                                .active(move |style| style.bg(theme.text.alpha(0.8)))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.project_creation_focused_item = 2;
+                                    this.project_creation_keyboard_focus = false;
+                                    this.advance_project_creation(cx);
+                                }))
+                                .child("下一步"),
+                        ),
+                    ),
+            )
+            .child(self.project_creation_close_button(3, "关闭", theme, cx))
+    }
+
+    fn project_creation_remote_dialog(
+        &self,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let keyboard_focus = |index| {
+            self.project_creation_keyboard_focus && self.project_creation_focused_item == index
+        };
+        div()
+            .id("project-creation-remote-dialog")
+            .relative()
+            .w(px(520.0))
+            .h(px(331.0))
+            .rounded(px(25.0))
+            .bg(theme.project_dialog_surface)
+            .shadow(vec![
+                BoxShadow::new(px(0.0), px(0.0), theme.border.into()).spread_radius(px(0.5)),
+                BoxShadow::new(px(0.0), px(4.0), hsla(0.0, 0.0, 0.0, 0.10))
+                    .blur_radius(px(8.0))
+                    .spread_radius(px(-2.0)),
+            ])
+            .p(px(20.0))
+            .font_family("PingFang SC")
+            .text_size(px(14.0))
+            .line_height(px(21.0))
+            .font_weight(gpui::FontWeight(300.0))
+            .text_color(theme.text)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .relative()
+                    .top(px(0.0))
+                    .ml(px(1.0))
+                    .font_family(".SystemUIFont")
+                    .text_size(px(20.5))
+                    .line_height(px(28.0))
+                    .font_weight(gpui::FontWeight(500.0))
+                    .child("新建远程项目"),
+            )
+            .child(
+                div()
+                    .mt(px(4.0))
+                    .relative()
+                    .top(px(1.0))
+                    .font_weight(gpui::FontWeight(200.0))
+                    .text_color(theme.text_tertiary)
+                    .child("先设置远程主机。然后可在此处选择主机和文件夹。"),
+            )
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .h(px(40.0))
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.control)
+                    .shadow(project_creation_focus_shadow(theme, keyboard_focus(0)))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .text_color(theme.text_tertiary)
+                    .child(
+                        div()
+                            .size(px(40.0))
+                            .border_r_1()
+                            .border_color(theme.border)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon("folder", theme.text_tertiary.into())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .line_height(px(18.5714))
+                            .child("项目名称"),
+                    ),
+            )
+            .child(
+                div()
+                    .mt(px(12.0))
+                    .relative()
+                    .top(px(1.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child("远程主机"),
+            )
+            .child(
+                div()
+                    .mt(px(8.0))
+                    .h(px(40.0))
+                    .px(px(12.0))
+                    .rounded(px(15.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.control)
+                    .shadow(project_creation_focus_shadow(theme, keyboard_focus(1)))
+                    .flex()
+                    .items_center()
+                    .text_size(px(13.0))
+                    .line_height(px(18.5714))
+                    .text_color(theme.text_tertiary)
+                    .child(div().flex_1().child("没有已连接的远程目标"))
+                    .child(icon("chevron-down", theme.text_tertiary.into())),
+            )
+            .child(
+                div()
+                    .mt(px(12.0))
+                    .relative()
+                    .top(px(1.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child("源文件夹"),
+            )
+            .child(
+                div()
+                    .h(px(68.0))
+                    .pt(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .h(px(24.0))
+                            .relative()
+                            .top(px(3.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .text_size(px(13.0))
+                            .line_height(px(20.0))
+                            .text_color(theme.warning)
+                            .child(icon("settings-warning", theme.warning.into()))
+                            .child("目前没有连接任何远程主机。"),
+                    )
+                    .child(
+                        div()
+                            .h(px(32.0))
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap(px(12.0))
+                            .child(
+                                div()
+                                    .id("project-creation-remote-cancel")
+                                    .h(px(32.0))
+                                    .px(px(16.0))
+                                    .rounded(px(12.5))
+                                    .border_1()
+                                    .border_color(rgba(0x00000000))
+                                    .shadow(project_creation_focus_shadow(theme, keyboard_focus(2)))
+                                    .text_color(theme.text_tertiary)
+                                    .flex()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .hover(move |style| style.bg(theme.sidebar_hover))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.cancel_project_creation(cx);
+                                    }))
+                                    .child(div().relative().left(px(2.0)).child("取消")),
+                            )
+                            .child(
+                                div()
+                                    .h(px(32.0))
+                                    .px(px(16.0))
+                                    .rounded(px(12.5))
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .bg(theme.button)
+                                    .text_color(theme.button_text)
+                                    .opacity(0.4)
+                                    .flex()
+                                    .items_center()
+                                    .child("添加项目"),
+                            ),
+                    ),
+            )
+            .child(self.project_creation_close_button(3, "关闭对话框", theme, cx))
+    }
+
+    fn project_creation_overlay(
+        &self,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        div()
+            .id("project-creation-overlay")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(rgba(0x00000022))
+            .flex()
+            .items_center()
+            .justify_center()
+            .track_focus(&self.project_creation_focus)
+            .on_key_down(cx.listener(Self::handle_project_creation_key))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.close_project_creation(cx);
+            }))
+            .child(match self.project_creation_step {
+                ProjectCreationStep::Kind => self.project_creation_kind_dialog(theme, cx),
+                ProjectCreationStep::Remote => self.project_creation_remote_dialog(theme, cx),
+            })
+    }
+}
+
 impl Render for ChatApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_mode(self.mode);
+        if self.project_creation_open && self.project_creation_focus_pending {
+            self.project_creation_focus.focus(window, cx);
+            self.project_creation_focus_pending = false;
+        }
         let sidebar_width = self.sidebar.read(cx).width();
         let sidebar_reveal = self.sidebar_reveal.clamp(0.0, 1.0);
         let revealed_sidebar_width = sidebar_width * sidebar_reveal;
@@ -356,8 +998,11 @@ impl Render for ChatApp {
                 this.sidebar
                     .update(cx, |sidebar, cx| sidebar.close_transient_menus(cx));
             }))
+            .on_key_down(cx.listener(Self::handle_project_creation_key))
             .on_action(cx.listener(|this, _: &DismissPermissionUi, _, cx| {
-                if this.permission_confirmation_open {
+                if this.project_creation_open {
+                    this.close_project_creation(cx);
+                } else if this.permission_confirmation_open {
                     this.permission_confirmation_open = false;
                     cx.notify();
                 } else {
@@ -559,6 +1204,9 @@ impl Render for ChatApp {
                             .child(titlebar_icon_button("right-sidebar", false, theme)),
                     )
             })
+            .when(self.project_creation_open, |shell| {
+                shell.child(self.project_creation_overlay(theme, cx))
+            })
             .into_any_element()
     }
 }
@@ -714,6 +1362,150 @@ mod tests {
         assert!(window.read(|app, cx| { app.sidebar.read(cx).projects_section_menu_is_open() }));
         window.simulate_click(point(px(600.0), px(350.0)), MouseButton::Left);
         assert!(!window.read(|app, cx| { app.sidebar.read(cx).projects_section_menu_is_open() }));
+    }
+
+    #[test]
+    fn project_creation_dialog_matches_reference_close_and_keyboard_behavior() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
+        );
+
+        window.update(|chat, _, cx| chat.open_project_creation(cx));
+        window.draw();
+        assert!(window.read(|chat, _| chat.project_creation_open));
+        assert_eq!(
+            window.read(|chat, _| chat.project_creation_kind),
+            super::ProjectCreationKind::Local
+        );
+
+        window.simulate_keystroke("tab");
+        assert_eq!(window.read(|chat, _| chat.project_creation_focused_item), 1);
+        window.simulate_keystroke("space");
+        assert_eq!(
+            window.read(|chat, _| chat.project_creation_kind),
+            super::ProjectCreationKind::Remote
+        );
+        window.simulate_keystroke("tab");
+        window.simulate_keystroke("tab");
+        assert_eq!(window.read(|chat, _| chat.project_creation_focused_item), 3);
+        window.simulate_keystroke("enter");
+        assert!(!window.read(|chat, _| chat.project_creation_open));
+
+        window.update(|chat, _, cx| chat.open_project_creation(cx));
+        window.draw();
+        window.simulate_click(point(px(50.0), px(80.0)), MouseButton::Left);
+        assert!(!window.read(|chat, _| chat.project_creation_open));
+
+        window.update(|chat, _, cx| chat.open_project_creation(cx));
+        window.draw();
+        window.simulate_keystroke("escape");
+        assert!(!window.read(|chat, _| chat.project_creation_open));
+    }
+
+    #[test]
+    fn local_project_next_closes_the_project_type_dialog() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
+        );
+
+        window.update(|chat, _, cx| chat.open_project_creation(cx));
+        window.draw();
+        window.simulate_click(point(px(732.0), px(493.0)), MouseButton::Left);
+        assert!(!window.read(|chat, _| chat.project_creation_open));
+    }
+
+    #[test]
+    fn remote_project_step_is_preserved_by_dismiss_and_reset_by_cancel() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window(|_, cx| ChatApp::new(ThemeMode::Dark, false, cx));
+
+        window.update(|chat, _, cx| {
+            chat.open_project_creation(cx);
+            chat.project_creation_kind = super::ProjectCreationKind::Remote;
+            chat.advance_project_creation(cx);
+            chat.close_project_creation(cx);
+            chat.open_project_creation(cx);
+        });
+        assert_eq!(
+            window.read(|chat, _| chat.project_creation_step),
+            super::ProjectCreationStep::Remote
+        );
+
+        window.update(|chat, _, cx| chat.cancel_project_creation(cx));
+        window.update(|chat, _, cx| chat.open_project_creation(cx));
+        assert_eq!(
+            window.read(|chat, _| chat.project_creation_step),
+            super::ProjectCreationStep::Kind
+        );
+        assert_eq!(
+            window.read(|chat, _| chat.project_creation_kind),
+            super::ProjectCreationKind::Local
+        );
+    }
+
+    #[test]
+    fn remote_project_keyboard_order_matches_the_native_dialog() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window(|_, cx| {
+            let mut chat = ChatApp::new(ThemeMode::Dark, false, cx);
+            chat.open_project_creation_remote_for_capture(cx);
+            chat
+        });
+
+        window.draw();
+        window.simulate_keystroke("tab");
+        assert_eq!(window.read(|chat, _| chat.project_creation_focused_item), 1);
+        window.simulate_keystroke("tab");
+        assert_eq!(window.read(|chat, _| chat.project_creation_focused_item), 2);
+        window.simulate_keystroke("enter");
+        assert!(!window.read(|chat, _| chat.project_creation_open));
+        assert_eq!(
+            window.read(|chat, _| chat.project_creation_step),
+            super::ProjectCreationStep::Kind
+        );
+    }
+
+    #[test]
+    fn project_creation_trigger_opens_and_the_same_screen_position_closes_on_the_overlay() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(1440.0), px(900.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
+        );
+
+        window.draw();
+        let trigger = point(px(219.0), px(267.0));
+        window.simulate_mouse_move(trigger);
+        window.draw();
+        window.simulate_click(trigger, MouseButton::Left);
+        app.run_until_parked();
+        assert!(window.read(|chat, _| chat.project_creation_open));
+
+        window.draw();
+        window.simulate_click(trigger, MouseButton::Left);
+        assert!(!window.read(|chat, _| chat.project_creation_open));
     }
 
     #[test]
