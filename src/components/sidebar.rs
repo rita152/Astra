@@ -392,6 +392,11 @@ pub struct SidebarView {
     pinned_menu_focused_item: Option<usize>,
     pinned_sort: ProjectsSort,
     open_project_menu: Option<usize>,
+    project_menu_focus: Option<FocusHandle>,
+    project_menu_focused_item: Option<usize>,
+    pinned_projects: Vec<bool>,
+    pinned_created_projects: Vec<bool>,
+    removed_projects: Vec<bool>,
     projects_section_menu_open: bool,
     projects_menu_focus: Option<FocusHandle>,
     projects_menu_focused_item: Option<usize>,
@@ -464,6 +469,11 @@ impl SidebarView {
             // The reference app initially uses manual ordering for pinned chats.
             pinned_sort: ProjectsSort::Manual,
             open_project_menu: None,
+            project_menu_focus: None,
+            project_menu_focused_item: None,
+            pinned_projects: vec![false; PROJECTS.len()],
+            pinned_created_projects: Vec::new(),
+            removed_projects: vec![false; PROJECTS.len()],
             projects_section_menu_open: false,
             projects_menu_focus: None,
             projects_menu_focused_item: None,
@@ -602,6 +612,7 @@ impl SidebarView {
             self.selected_created_project = None;
         } else {
             self.created_projects.push(name.to_owned());
+            self.pinned_created_projects.push(false);
             self.selected_created_project = Some(self.created_projects.len() - 1);
         }
         self.selected_thread = None;
@@ -619,6 +630,7 @@ impl SidebarView {
         self.projects_section_menu_open = false;
         self.projects_menu_focused_item = None;
         self.open_project_menu = None;
+        self.project_menu_focused_item = None;
         self.profile_menu_open = false;
         if changed {
             cx.notify();
@@ -628,6 +640,11 @@ impl SidebarView {
     #[cfg(test)]
     pub fn projects_section_menu_is_open(&self) -> bool {
         self.projects_section_menu_open
+    }
+
+    #[cfg(test)]
+    pub fn project_menu_is_open(&self) -> bool {
+        self.open_project_menu.is_some()
     }
 
     #[cfg(test)]
@@ -921,6 +938,9 @@ impl Render for SidebarView {
         if self.projects_menu_focus.is_none() {
             self.projects_menu_focus = Some(cx.focus_handle().tab_stop(true));
         }
+        if self.project_menu_focus.is_none() {
+            self.project_menu_focus = Some(cx.focus_handle().tab_stop(true));
+        }
         if std::mem::take(&mut self.scroll_to_bottom) {
             self.scroll.scroll_to_bottom();
         }
@@ -997,6 +1017,7 @@ fn action_icon_button(
         .id(id)
         .size(px(24.0))
         .flex_none()
+        .rounded(px(12.5))
         .flex()
         .items_center()
         .justify_center()
@@ -1028,35 +1049,6 @@ fn section_header_icon_button(
         .justify_center()
         .cursor_pointer()
         .child(icon(glyph, color.into()).size(px(icon_size)))
-}
-
-fn popup_surface(theme: Theme) -> Div {
-    div()
-        .min_w(px(176.0))
-        .p(px(4.0))
-        .rounded(px(10.0))
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.elevated)
-        .shadow(vec![
-            gpui::BoxShadow::new(px(0.0), px(8.0), theme.simple_scrim.into()).blur_radius(px(24.0)),
-        ])
-        .text_size(px(13.0))
-        .font_weight(gpui::FontWeight(445.0))
-        .text_color(theme.sidebar_text)
-}
-
-fn popup_item(label: &'static str, theme: Theme) -> gpui::Stateful<Div> {
-    div()
-        .id(label)
-        .h(px(30.0))
-        .px(px(8.0))
-        .rounded(px(7.0))
-        .flex()
-        .items_center()
-        .cursor_pointer()
-        .hover(move |style| style.bg(theme.sidebar_hover))
-        .child(label)
 }
 
 fn projects_menu_label(label: &'static str, theme: Theme) -> Div {
@@ -1374,6 +1366,12 @@ impl SidebarView {
             .font_family(".SystemUIFont")
             .text_color(theme.sidebar_text)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.open_project_menu = None;
+                this.project_menu_focused_item = None;
+                cx.notify();
+            }))
             .child(projects_menu_label("置顶聊天排序方式", theme))
             .child(self.pinned_menu_item(
                 0,
@@ -1575,6 +1573,280 @@ impl SidebarView {
             ))
     }
 
+    pub fn open_project_menu_for_capture(&mut self, project_index: usize, cx: &mut Context<Self>) {
+        if project_index < PROJECTS.len() && !self.removed_projects[project_index] {
+            self.open_project_menu = Some(project_index);
+            self.project_menu_focused_item = None;
+            self.pinned_menu_open = false;
+            self.projects_section_menu_open = false;
+            self.profile_menu_open = false;
+            cx.notify();
+        }
+    }
+
+    fn set_project_menu_open(
+        &mut self,
+        project: usize,
+        open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_project_menu = open.then_some(project);
+        self.project_menu_focused_item = None;
+        self.pinned_menu_open = false;
+        self.pinned_menu_focused_item = None;
+        self.projects_section_menu_open = false;
+        self.projects_menu_focused_item = None;
+        self.profile_menu_open = false;
+        if open && let Some(focus) = self.project_menu_focus.as_ref() {
+            focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn select_project_menu_item(&mut self, project: usize, item: usize, cx: &mut Context<Self>) {
+        if project >= PROJECTS.len() {
+            let created = project - PROJECTS.len();
+            if created >= self.created_projects.len() {
+                return;
+            }
+            match item {
+                0 => {
+                    self.pinned_created_projects[created] = !self.pinned_created_projects[created];
+                }
+                1..=4 => {}
+                5 => {
+                    self.created_projects.remove(created);
+                    self.pinned_created_projects.remove(created);
+                    self.selected_created_project =
+                        self.selected_created_project.and_then(|index| {
+                            if index == created {
+                                None
+                            } else if index > created {
+                                Some(index - 1)
+                            } else {
+                                Some(index)
+                            }
+                        });
+                }
+                _ => return,
+            }
+            self.open_project_menu = None;
+            self.project_menu_focused_item = None;
+            cx.notify();
+            return;
+        }
+        match item {
+            0 => self.pinned_projects[project] = !self.pinned_projects[project],
+            // Edit, Reveal in Finder, and Create permanent worktree are host-backed
+            // actions in the reference. This static replica has no invented paths
+            // or host service, so selecting them faithfully dismisses the native
+            // menu without fabricating external state.
+            1..=3 => {}
+            4 => {
+                for archived in &mut self.archived_threads[project] {
+                    *archived = true;
+                }
+                if self
+                    .selected_thread
+                    .is_some_and(|(owner, _)| owner == project)
+                {
+                    self.selected_thread = None;
+                }
+            }
+            5 => {
+                self.removed_projects[project] = true;
+                if self.selected_project == project {
+                    self.selected_thread = None;
+                }
+            }
+            _ => return,
+        }
+        self.open_project_menu = None;
+        self.project_menu_focused_item = None;
+        cx.notify();
+    }
+
+    fn handle_project_menu_key(
+        &mut self,
+        project: usize,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if self.open_project_menu != Some(project) {
+            if matches!(key, "enter" | "space" | "down") {
+                self.set_project_menu_open(project, true, window, cx);
+                if key == "down" {
+                    self.project_menu_focused_item = Some(0);
+                }
+                cx.stop_propagation();
+            }
+            return;
+        }
+        const ITEM_COUNT: usize = 6;
+        match key {
+            "down" => {
+                self.project_menu_focused_item = Some(
+                    self.project_menu_focused_item
+                        .map_or(0, |index| (index + 1) % ITEM_COUNT),
+                );
+            }
+            "up" => {
+                self.project_menu_focused_item = Some(
+                    self.project_menu_focused_item
+                        .map_or(ITEM_COUNT - 1, |index| {
+                            (index + ITEM_COUNT - 1) % ITEM_COUNT
+                        }),
+                );
+            }
+            "home" => self.project_menu_focused_item = Some(0),
+            "end" => self.project_menu_focused_item = Some(ITEM_COUNT - 1),
+            "enter" | "space" => {
+                if let Some(item) = self.project_menu_focused_item {
+                    self.select_project_menu_item(project, item, cx);
+                }
+            }
+            "escape" | "tab" => {
+                self.open_project_menu = None;
+                self.project_menu_focused_item = None;
+                cx.notify();
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn project_menu_item(
+        &self,
+        project: usize,
+        item: usize,
+        label: &'static str,
+        glyph: &'static str,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let focused = self.project_menu_focused_item == Some(item);
+        let glyph = icon(glyph, theme.sidebar_text.into())
+            .size(px(16.0))
+            .when(glyph == "settings-edit", |icon| {
+                icon.with_transformation(Transformation::translate(point(px(-0.4), px(0.0))))
+            });
+        div()
+            .id(("project-context-menu-item", project * 8 + item))
+            .h(px(25.0))
+            .px(px(6.0))
+            .rounded(px(5.0))
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .cursor_pointer()
+            .text_size(px(13.0))
+            .line_height(px(18.0))
+            .font_weight(gpui::FontWeight::NORMAL)
+            .text_color(theme.sidebar_text)
+            .when(focused, |row| row.bg(theme.sidebar_hover))
+            .hover(move |style| style.bg(theme.sidebar_hover))
+            .active(move |style| style.bg(theme.text.alpha(0.12)))
+            .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                if *hovered {
+                    this.project_menu_focused_item = Some(item);
+                    if let Some(focus) = this.project_menu_focus.as_ref() {
+                        focus.focus(window, cx);
+                    }
+                    cx.notify();
+                } else if this.project_menu_focused_item == Some(item) {
+                    this.project_menu_focused_item = None;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.select_project_menu_item(project, item, cx);
+            }))
+            .child(
+                div()
+                    .size(px(16.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(glyph),
+            )
+            .child(label)
+    }
+
+    fn project_menu_separator(theme: Theme) -> Div {
+        div()
+            .h(px(9.0))
+            .px(px(5.0))
+            .flex()
+            .items_center()
+            .child(div().h(px(0.5)).w_full().bg(theme.border))
+    }
+
+    fn project_context_menu(
+        &self,
+        project: usize,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let pinned = if project < PROJECTS.len() {
+            self.pinned_projects[project]
+        } else {
+            self.pinned_created_projects[project - PROJECTS.len()]
+        };
+        let pin_label = if pinned { "取消置顶" } else { "置顶" };
+        div()
+            .id(("project-context-menu", project))
+            .w(px(190.0))
+            .p(px(4.0))
+            .rounded(px(10.0))
+            .border(px(0.5))
+            .border_color(theme.border)
+            .bg(theme.model_picker_surface)
+            .shadow(vec![
+                gpui::BoxShadow::new(px(0.0), px(10.0), theme.profile_menu_shadow.into())
+                    .blur_radius(px(24.0))
+                    .spread_radius(px(-3.0)),
+            ])
+            .font_family(".SystemUIFont")
+            .text_color(theme.sidebar_text)
+            .when_some(self.project_menu_focus.as_ref(), |menu, focus| {
+                menu.track_focus(focus)
+            })
+            .on_key_down(cx.listener(move |this, event, window, cx| {
+                this.handle_project_menu_key(project, event, window, cx);
+            }))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(self.project_menu_item(project, 0, pin_label, "pin", theme, cx))
+            .child(self.project_menu_item(project, 1, "编辑", "settings-edit", theme, cx))
+            .child(Self::project_menu_separator(theme))
+            .child(self.project_menu_item(
+                project,
+                2,
+                "在 Finder 中显示",
+                "project-reveal",
+                theme,
+                cx,
+            ))
+            .child(self.project_menu_item(
+                project,
+                3,
+                "创建永久工作树",
+                "project-worktree",
+                theme,
+                cx,
+            ))
+            .child(Self::project_menu_separator(theme))
+            .child(self.project_menu_item(project, 4, "归档聊天", "archive", theme, cx))
+            .child(Self::project_menu_separator(theme))
+            .child(self.project_menu_item(project, 5, "移除项目", "close-dialog", theme, cx))
+    }
+
     fn project_group(
         &self,
         project_index: usize,
@@ -1596,14 +1868,18 @@ impl SidebarView {
             "more-horizontal",
             theme,
         )
-        .on_click(cx.listener(move |this, _, _, cx| {
+        .when(menu_open, |button| button.opacity(1.0))
+        .when_some(self.project_menu_focus.as_ref(), |button, focus| {
+            button.track_focus(focus)
+        })
+        .on_key_down(cx.listener(move |this, event, window, cx| {
+            this.handle_project_menu_key(project_index, event, window, cx);
+        }))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(move |this, _, window, cx| {
             cx.stop_propagation();
-            this.open_project_menu = if this.open_project_menu == Some(project_index) {
-                None
-            } else {
-                Some(project_index)
-            };
-            cx.notify();
+            let open = this.open_project_menu != Some(project_index);
+            this.set_project_menu_open(project_index, open, window, cx);
         }));
         let new_chat_button =
             action_icon_button(("project-new-chat", project_index), "new-chat", theme).on_click(
@@ -1640,7 +1916,7 @@ impl SidebarView {
             .pr(px(6.0))
             .flex()
             .items_center()
-            .rounded(px(9.0))
+            .rounded(px(12.5))
             .text_size(px(14.0))
             .font_weight(gpui::FontWeight(445.0))
             .text_color(theme.sidebar_text)
@@ -1868,38 +2144,32 @@ impl SidebarView {
         }
         // Paint the popup after the thread rows so it remains above them.
         if menu_open {
-            let start_chat = popup_item("在项目中开始新聊天", theme).on_click(cx.listener(
-                move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.selected_project = project_index;
-                    this.selected_thread = None;
-                    this.selected_recent = None;
-                    this.open_project_menu = None;
-                    cx.notify();
-                },
-            ));
-            let collapse_label = if collapsed {
-                "展开项目"
-            } else {
-                "折叠项目"
-            };
-            let toggle =
-                popup_item(collapse_label, theme).on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.project_collapsed[project_index] = !this.project_collapsed[project_index];
-                    this.open_project_menu = None;
-                    cx.notify();
-                }));
-            group = group.child(deferred(
-                popup_surface(theme)
-                    .id(("project-menu", project_index))
-                    .absolute()
-                    .top(px(29.0))
-                    .right(px(3.0))
-                    .child(start_chat)
-                    .child(toggle)
-                    .child(popup_item("项目设置", theme)),
-            ));
+            group = group
+                .child(deferred(
+                    self.project_context_menu(project_index, theme, cx)
+                        .absolute()
+                        // Electron opens the native menu at the pointer hotspot. The
+                        // CDP-measured trigger center is 171.8 px from this group.
+                        .left(px(171.5))
+                        .top(px(15.0)),
+                ))
+                // A native NSMenu consumes a second press at the trigger point
+                // and dismisses itself. Keep that hotspot above the GPUI popup.
+                .child(deferred(
+                    div()
+                        .id(("project-menu-dismiss-hotspot", project_index))
+                        .absolute()
+                        .left(px(165.0))
+                        .top(px(3.0))
+                        .size(px(24.0))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.open_project_menu = None;
+                            this.project_menu_focused_item = None;
+                            cx.notify();
+                        })),
+                ));
         }
         group
     }
@@ -1909,18 +2179,66 @@ impl SidebarView {
         project_index: usize,
         name: String,
         theme: Theme,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
+        let menu_project = PROJECTS.len() + project_index;
         let selected = self.selected_created_project == Some(project_index);
-        div()
+        let menu_open = self.open_project_menu == Some(menu_project);
+        let group_name = format!("created-project-row-{project_index}");
+        let menu_button = action_icon_button(
+            ("created-project-menu-button", project_index),
+            "more-horizontal",
+            theme,
+        )
+        .when(menu_open, |button| button.opacity(1.0))
+        .when_some(self.project_menu_focus.as_ref(), |button, focus| {
+            button.track_focus(focus)
+        })
+        .on_key_down(cx.listener(move |this, event, window, cx| {
+            this.handle_project_menu_key(menu_project, event, window, cx);
+        }))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(move |this, _, window, cx| {
+            cx.stop_propagation();
+            let open = this.open_project_menu != Some(menu_project);
+            this.set_project_menu_open(menu_project, open, window, cx);
+        }));
+        let new_chat_button = action_icon_button(
+            ("created-project-new-chat", project_index),
+            "new-chat",
+            theme,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            cx.stop_propagation();
+            this.selected_created_project = Some(project_index);
+            this.selected_thread = None;
+            this.selected_recent = None;
+            this.open_project_menu = None;
+            cx.notify();
+        }));
+        let trailing_actions = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .when(!menu_open, |actions| {
+                actions
+                    .invisible()
+                    .group_hover(group_name.clone(), |style| style.visible())
+            })
+            .child(menu_button)
+            .child(new_chat_button);
+
+        let row = div()
             .id(("created-project-row", project_index))
+            .group(group_name)
             .h(px(30.0))
             .w_full()
             .pl(px(1.0))
             .pr(px(6.0))
             .flex()
             .items_center()
-            .rounded(px(9.0))
+            .rounded(px(12.5))
             .text_size(px(14.0))
             .font_weight(gpui::FontWeight(445.0))
             .text_color(theme.sidebar_text)
@@ -1944,13 +2262,43 @@ impl SidebarView {
                     .whitespace_nowrap()
                     .child(name),
             )
+            .child(trailing_actions)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.selected_created_project = Some(project_index);
                 this.selected_thread = None;
                 this.selected_recent = None;
                 this.open_project_menu = None;
                 cx.notify();
-            }))
+            }));
+
+        div()
+            .id(("created-project-group", project_index))
+            .relative()
+            .child(row)
+            .when(menu_open, |group| {
+                group
+                    .child(deferred(
+                        self.project_context_menu(menu_project, theme, cx)
+                            .absolute()
+                            .left(px(171.5))
+                            .top(px(15.0)),
+                    ))
+                    .child(deferred(
+                        div()
+                            .id(("created-project-menu-dismiss-hotspot", project_index))
+                            .absolute()
+                            .left(px(165.0))
+                            .top(px(3.0))
+                            .size(px(24.0))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_project_menu = None;
+                                this.project_menu_focused_item = None;
+                                cx.notify();
+                            })),
+                    ))
+            })
     }
 
     fn pinned_thread_row(
@@ -2242,11 +2590,15 @@ impl SidebarView {
                     10.0
                 }));
         for (project_index, (name, rows)) in PROJECTS.iter().enumerate() {
+            if self.removed_projects[project_index] {
+                continue;
+            }
             projects =
                 projects.child(self.project_group(project_index, name, rows, theme, window, cx));
         }
         for (project_index, name) in self.created_projects.iter().cloned().enumerate() {
-            projects = projects.child(self.created_project_row(project_index, name, theme, cx));
+            projects =
+                projects.child(self.created_project_row(project_index, name, theme, window, cx));
         }
         let show_recents_heading_icons = self.recents_heading_hovered;
         let recent_chevron_color = if self.hovered_recents_icon == Some(SectionHeaderIcon::Chevron)
@@ -3872,6 +4224,47 @@ mod tests {
             window.simulate_click(point(px(215.5 - x_shift), px(295.0)), MouseButton::Left);
             assert!(window.read(|sidebar, _| sidebar.archived_threads[0][0]));
         }
+    }
+
+    #[test]
+    fn project_menu_matches_native_toggle_keyboard_and_selection_behavior() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(test_window_options(900.0), |_, _| {
+            SidebarView::new(ThemeMode::Dark, false)
+        });
+        window.draw();
+
+        window.simulate_mouse_move(point(px(100.0), px(299.0)));
+        window.draw();
+        window.simulate_click(point(px(185.0), px(299.0)), MouseButton::Left);
+        assert_eq!(window.read(|sidebar, _| sidebar.open_project_menu), Some(0));
+
+        window.draw();
+        window.simulate_keystroke("down");
+        assert_eq!(
+            window.read(|sidebar, _| sidebar.project_menu_focused_item),
+            Some(0)
+        );
+        window.simulate_keystroke("down");
+        assert_eq!(
+            window.read(|sidebar, _| sidebar.project_menu_focused_item),
+            Some(1)
+        );
+        window.simulate_keystroke("end");
+        assert_eq!(
+            window.read(|sidebar, _| sidebar.project_menu_focused_item),
+            Some(5)
+        );
+        window.simulate_keystroke("home");
+        window.simulate_keystroke("enter");
+        assert!(window.read(|sidebar, _| sidebar.pinned_projects[0]));
+        assert_eq!(window.read(|sidebar, _| sidebar.open_project_menu), None);
+
+        window.draw();
+        window.simulate_click(point(px(185.0), px(299.0)), MouseButton::Left);
+        window.draw();
+        window.simulate_keystroke("escape");
+        assert_eq!(window.read(|sidebar, _| sidebar.open_project_menu), None);
     }
 
     #[test]

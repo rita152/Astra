@@ -200,6 +200,12 @@ impl ChatApp {
         });
     }
 
+    pub fn open_project_menu_for_capture(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.open_project_menu_for_capture(index, cx)
+        });
+    }
+
     pub fn set_activity_scroll_for_capture(&mut self, offset: f32, cx: &mut Context<Self>) {
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_activity_scroll_for_capture(offset, cx)
@@ -1362,6 +1368,30 @@ mod tests {
         assert!(window.read(|app, cx| { app.sidebar.read(cx).projects_section_menu_is_open() }));
         window.simulate_click(point(px(600.0), px(350.0)), MouseButton::Left);
         assert!(!window.read(|app, cx| { app.sidebar.read(cx).projects_section_menu_is_open() }));
+    }
+
+    #[test]
+    fn project_menu_closes_when_the_main_surface_is_clicked() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| {
+                let mut app = ChatApp::new(ThemeMode::Dark, false, cx);
+                app.open_project_menu_for_capture(0, cx);
+                app
+            },
+        );
+
+        window.draw();
+        assert!(window.read(|app, cx| app.sidebar.read(cx).project_menu_is_open()));
+        window.simulate_click(point(px(600.0), px(350.0)), MouseButton::Left);
+        assert!(!window.read(|app, cx| app.sidebar.read(cx).project_menu_is_open()));
     }
 
     #[test]

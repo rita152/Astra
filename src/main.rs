@@ -90,6 +90,11 @@ fn main() {
     let sidebar_bottom = args.iter().any(|arg| arg == "--sidebar-bottom");
     let profile_menu_open = args.iter().any(|arg| arg == "--profile-menu-open");
     let projects_menu_open = args.iter().any(|arg| arg == "--projects-menu-open");
+    let project_menu_open = args.iter().find_map(|arg| {
+        arg.strip_prefix("--project-menu-open=")?
+            .parse::<usize>()
+            .ok()
+    });
     let project_create_open = args.iter().any(|arg| arg == "--project-create-open");
     let project_create_remote = args.iter().any(|arg| arg == "--project-create-remote");
     let activity_open = args.iter().any(|arg| arg == "--activity-open");
@@ -175,6 +180,9 @@ fn main() {
                         }
                         if projects_menu_open {
                             app.open_projects_section_menu(cx);
+                        }
+                        if let Some(index) = project_menu_open {
+                            app.open_project_menu_for_capture(index, cx);
                         }
                         if project_create_open {
                             app.open_project_creation(cx);

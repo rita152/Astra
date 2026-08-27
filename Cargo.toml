@@ -16,6 +16,12 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "a58fff13
 gpui = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2", features = ["test-support"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2", features = ["font-kit", "test-support"] }
 
+# block 0.1.6 declares an opaque Objective-C runtime symbol as an uninhabited
+# Rust enum. Keep the ABI address identical while giving the extern static an
+# inhabited byte type, avoiding Rust's future-incompatibility diagnostic.
+[patch.crates-io]
+block = { path = "vendor/block" }
+
 # GPUI's layout, text, and Metal submission paths are too expensive at Cargo's
 # default opt-level=0 on a fullscreen drawable. Keep local code debuggable while
 # compiling the framework hot paths at their production optimization level.
