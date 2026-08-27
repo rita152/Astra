@@ -1365,6 +1365,33 @@ mod tests {
     }
 
     #[test]
+    fn pinned_menu_closes_when_the_main_surface_is_clicked() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
+        );
+
+        window.draw();
+        window.simulate_mouse_move(point(px(100.0), px(331.0)));
+        window.draw();
+        window.simulate_click(point(px(188.5), px(331.0)), MouseButton::Left);
+        window.draw();
+        window.simulate_mouse_move(point(px(219.0), px(267.0)));
+        window.draw();
+        window.simulate_click(point(px(219.0), px(267.0)), MouseButton::Left);
+        assert!(window.read(|app, cx| app.sidebar.read(cx).pinned_menu_is_open()));
+        window.simulate_click(point(px(600.0), px(350.0)), MouseButton::Left);
+        assert!(!window.read(|app, cx| app.sidebar.read(cx).pinned_menu_is_open()));
+    }
+
+    #[test]
     fn project_creation_dialog_matches_reference_close_and_keyboard_behavior() {
         let mut app = TestApp::new();
         let mut window = app.open_window_with_options(

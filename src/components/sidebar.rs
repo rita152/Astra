@@ -384,6 +384,13 @@ pub struct SidebarView {
     selected_recent: Option<usize>,
     pinned_threads: Vec<Vec<bool>>,
     archived_threads: Vec<Vec<bool>>,
+    pinned_collapsed: bool,
+    pinned_heading_hovered: bool,
+    pinned_menu_button_hovered: bool,
+    pinned_menu_open: bool,
+    pinned_menu_focus: Option<FocusHandle>,
+    pinned_menu_focused_item: Option<usize>,
+    pinned_sort: ProjectsSort,
     open_project_menu: Option<usize>,
     projects_section_menu_open: bool,
     projects_menu_focus: Option<FocusHandle>,
@@ -448,6 +455,14 @@ impl SidebarView {
             selected_recent: None,
             pinned_threads: row_state(),
             archived_threads: row_state(),
+            pinned_collapsed: false,
+            pinned_heading_hovered: false,
+            pinned_menu_button_hovered: false,
+            pinned_menu_open: false,
+            pinned_menu_focus: None,
+            pinned_menu_focused_item: None,
+            // The reference app initially uses manual ordering for pinned chats.
+            pinned_sort: ProjectsSort::Manual,
             open_project_menu: None,
             projects_section_menu_open: false,
             projects_menu_focus: None,
@@ -536,6 +551,8 @@ impl SidebarView {
     ) {
         self.projects_section_menu_open = open;
         self.projects_menu_focused_item = None;
+        self.pinned_menu_open = false;
+        self.pinned_menu_focused_item = None;
         self.open_project_menu = None;
         self.profile_menu_open = false;
         if open && let Some(focus) = self.projects_menu_focus.as_ref() {
@@ -547,6 +564,8 @@ impl SidebarView {
     pub fn open_projects_section_menu_for_capture(&mut self, cx: &mut Context<Self>) {
         self.projects_section_menu_open = true;
         self.projects_menu_focused_item = None;
+        self.pinned_menu_open = false;
+        self.pinned_menu_focused_item = None;
         self.open_project_menu = None;
         self.profile_menu_open = false;
         cx.notify();
@@ -556,6 +575,8 @@ impl SidebarView {
         self.project_creation_trigger_open = open;
         if open {
             self.open_project_menu = None;
+            self.pinned_menu_open = false;
+            self.pinned_menu_focused_item = None;
             self.projects_section_menu_open = false;
             self.profile_menu_open = false;
         }
@@ -589,9 +610,12 @@ impl SidebarView {
     }
 
     pub fn close_transient_menus(&mut self, cx: &mut Context<Self>) {
-        let changed = self.projects_section_menu_open
+        let changed = self.pinned_menu_open
+            || self.projects_section_menu_open
             || self.open_project_menu.is_some()
             || self.profile_menu_open;
+        self.pinned_menu_open = false;
+        self.pinned_menu_focused_item = None;
         self.projects_section_menu_open = false;
         self.projects_menu_focused_item = None;
         self.open_project_menu = None;
@@ -604,6 +628,11 @@ impl SidebarView {
     #[cfg(test)]
     pub fn projects_section_menu_is_open(&self) -> bool {
         self.projects_section_menu_open
+    }
+
+    #[cfg(test)]
+    pub fn pinned_menu_is_open(&self) -> bool {
+        self.pinned_menu_open
     }
 
     fn reveal_scrollbar(&mut self, cx: &mut Context<Self>) {
@@ -886,6 +915,9 @@ impl SidebarView {
 
 impl Render for SidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pinned_menu_focus.is_none() {
+            self.pinned_menu_focus = Some(cx.focus_handle().tab_stop(true));
+        }
         if self.projects_menu_focus.is_none() {
             self.projects_menu_focus = Some(cx.focus_handle().tab_stop(true));
         }
@@ -1165,6 +1197,207 @@ fn profile_menu(theme: Theme, cx: &mut Context<SidebarView>) -> gpui::Stateful<D
 }
 
 impl SidebarView {
+    fn pinned_entries(&self) -> Vec<ActivityThread> {
+        let mut entries = Vec::new();
+        for (project, (_, rows)) in PROJECTS.iter().enumerate() {
+            for (row, title) in rows.iter().enumerate() {
+                let entry = ActivityThread::Project(project, row);
+                if *title != "展开显示"
+                    && self.pinned_threads[project][row]
+                    && !self.archived_threads[project][row]
+                {
+                    entries.push(entry);
+                }
+            }
+        }
+        for index in 0..RECENTS.len() {
+            if self.pinned_recents[index] && !self.archived_recents[index] {
+                entries.push(ActivityThread::Recent(index));
+            }
+        }
+
+        // The existing project data does not carry priority or update-time
+        // metadata. The reference preserves the visible order for the three
+        // captured threads in every mode, so keep this source order stable
+        // instead of inventing timestamps or priority values.
+        entries
+    }
+
+    fn select_pinned_menu_item(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.pinned_sort = match index {
+            0 => ProjectsSort::Priority,
+            1 => ProjectsSort::Recent,
+            2 => ProjectsSort::Manual,
+            _ => return,
+        };
+        self.pinned_menu_open = false;
+        self.pinned_menu_focused_item = None;
+        cx.notify();
+    }
+
+    fn set_pinned_menu_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.pinned_menu_open = open;
+        self.pinned_menu_focused_item = None;
+        self.projects_section_menu_open = false;
+        self.projects_menu_focused_item = None;
+        self.open_project_menu = None;
+        self.profile_menu_open = false;
+        if open && let Some(focus) = self.pinned_menu_focus.as_ref() {
+            focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn handle_pinned_menu_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if !self.pinned_menu_open {
+            if matches!(key, "enter" | "space" | "down") {
+                self.set_pinned_menu_open(true, window, cx);
+                if key == "down" {
+                    self.pinned_menu_focused_item = Some(0);
+                }
+                cx.stop_propagation();
+            }
+            return;
+        }
+
+        match key {
+            "down" => {
+                self.pinned_menu_focused_item = Some(
+                    self.pinned_menu_focused_item
+                        .map_or(0, |index| (index + 1) % 3),
+                );
+            }
+            "up" => {
+                self.pinned_menu_focused_item = Some(
+                    self.pinned_menu_focused_item
+                        .map_or(2, |index| (index + 2) % 3),
+                );
+            }
+            "home" => self.pinned_menu_focused_item = Some(0),
+            "end" => self.pinned_menu_focused_item = Some(2),
+            "enter" | "space" => {
+                if let Some(index) = self.pinned_menu_focused_item {
+                    self.select_pinned_menu_item(index, cx);
+                }
+            }
+            "escape" | "tab" => {
+                self.pinned_menu_open = false;
+                self.pinned_menu_focused_item = None;
+                cx.notify();
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn pinned_menu_item(
+        &self,
+        index: usize,
+        label: &'static str,
+        checked: bool,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let focused = self.pinned_menu_focused_item == Some(index);
+        div()
+            .id(("pinned-menu-item", index))
+            .h(px(28.5625))
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(12.5))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_pointer()
+            .text_size(px(13.0))
+            .line_height(px(PROFILE_MENU_LINE_HEIGHT))
+            .font_weight(gpui::FontWeight::NORMAL)
+            .text_color(theme.sidebar_text)
+            .when(focused, |item| item.bg(theme.sidebar_hover))
+            .hover(move |style| style.bg(theme.sidebar_hover))
+            .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                if *hovered {
+                    this.pinned_menu_focused_item = Some(index);
+                    if let Some(focus) = this.pinned_menu_focus.as_ref() {
+                        focus.focus(window, cx);
+                    }
+                    cx.notify();
+                } else if this.pinned_menu_focused_item == Some(index) {
+                    this.pinned_menu_focused_item = None;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.select_pinned_menu_item(index, cx);
+            }))
+            .child(
+                div()
+                    .size(px(16.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(!checked, |check| check.invisible())
+                    .child(
+                        icon("check", theme.text.into())
+                            .size(px(16.0))
+                            .opacity(if focused { 1.0 } else { 0.75 }),
+                    ),
+            )
+            .child(div().min_w(px(0.0)).flex_1().child(label))
+    }
+
+    fn pinned_menu(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        div()
+            .id("pinned-menu")
+            .w(px(172.0))
+            .p(px(4.0))
+            .m(px(1.0))
+            .rounded(px(15.0))
+            .border(px(0.5))
+            .border_color(theme.border)
+            .bg(theme.model_picker_surface)
+            .shadow(vec![
+                gpui::BoxShadow::new(px(0.0), px(8.0), theme.profile_menu_shadow.into())
+                    .blur_radius(px(16.0))
+                    .spread_radius(px(-4.0)),
+            ])
+            .font_family(".SystemUIFont")
+            .text_color(theme.sidebar_text)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(projects_menu_label("置顶聊天排序方式", theme))
+            .child(self.pinned_menu_item(
+                0,
+                "优先级",
+                self.pinned_sort == ProjectsSort::Priority,
+                theme,
+                cx,
+            ))
+            .child(self.pinned_menu_item(
+                1,
+                "最近更新",
+                self.pinned_sort == ProjectsSort::Recent,
+                theme,
+                cx,
+            ))
+            .child(self.pinned_menu_item(
+                2,
+                "手动排序",
+                self.pinned_sort == ProjectsSort::Manual,
+                theme,
+                cx,
+            ))
+    }
+
     fn select_projects_menu_item(&mut self, index: usize, cx: &mut Context<Self>) {
         match index {
             0 => self.projects_layout = ProjectsLayout::Grouped,
@@ -1485,6 +1718,9 @@ impl SidebarView {
 
                 let selected_thread = self.selected_thread == Some((project_index, row_index));
                 let pinned = self.pinned_threads[project_index][row_index];
+                if pinned {
+                    continue;
+                }
                 let thread_hovered = self.hovered_thread == Some((project_index, row_index));
                 let show_thread_actions = pinned || thread_hovered;
                 let title_viewport_width = sidebar_thread_title_viewport_width(
@@ -1717,12 +1953,285 @@ impl SidebarView {
             }))
     }
 
+    fn pinned_thread_row(
+        &self,
+        entry: ActivityThread,
+        theme: Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let title = Self::activity_title(entry);
+        let hovered = self.activity_hovered(entry);
+        let selected = match entry {
+            ActivityThread::Project(project, row) => self.selected_thread == Some((project, row)),
+            ActivityThread::Recent(index) => self.selected_recent == Some(index),
+        };
+        let title_viewport_width =
+            sidebar_thread_title_viewport_width(self.sidebar_width, true, true);
+        let title_width = Self::thread_title_width(title, window);
+        let title_overflows = title_width > title_viewport_width;
+        let title_scroll_offset = self.marquee_started_at.map_or(0.0, |started_at| {
+            marquee_offset(
+                if hovered {
+                    (title_width - title_viewport_width).max(0.0)
+                } else {
+                    0.0
+                },
+                cx.background_executor()
+                    .now()
+                    .saturating_duration_since(started_at),
+                cx.reduce_motion(),
+            )
+        });
+        let pin = action_icon_button(format!("pinned-thread-pin-{entry:?}"), "pin", theme)
+            .w(px(19.0))
+            .h(px(20.0))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                match entry {
+                    ActivityThread::Project(project, row) => {
+                        this.pinned_threads[project][row] = false
+                    }
+                    ActivityThread::Recent(index) => this.pinned_recents[index] = false,
+                }
+                if this.pinned_entries().is_empty() {
+                    this.pinned_menu_open = false;
+                    this.pinned_menu_focused_item = None;
+                }
+                cx.notify();
+            }));
+        let archive =
+            action_icon_button(format!("pinned-thread-archive-{entry:?}"), "archive", theme)
+                .w(px(19.0))
+                .h(px(20.0))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    match entry {
+                        ActivityThread::Project(project, row) => {
+                            this.archived_threads[project][row] = true;
+                            if this.selected_thread == Some((project, row)) {
+                                this.selected_thread = None;
+                            }
+                        }
+                        ActivityThread::Recent(index) => {
+                            this.archived_recents[index] = true;
+                            if this.selected_recent == Some(index) {
+                                this.selected_recent = None;
+                            }
+                        }
+                    }
+                    if this.pinned_entries().is_empty() {
+                        this.pinned_menu_open = false;
+                        this.pinned_menu_focused_item = None;
+                    }
+                    cx.notify();
+                }));
+        let actions = div()
+            .absolute()
+            .right(px(8.0))
+            .top(px(5.0))
+            .flex()
+            .gap(px(8.0))
+            .child(pin)
+            .child(archive);
+
+        div()
+            .id(format!("pinned-thread-row-{entry:?}"))
+            .h(px(30.0))
+            .pl(px(8.0))
+            .pr(px(5.0))
+            .flex()
+            .items_center()
+            .rounded(px(8.0))
+            .text_size(px(14.0))
+            .font_weight(gpui::FontWeight(445.0))
+            .text_color(theme.sidebar_text)
+            .relative()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.sidebar_hover))
+            .when(selected, |row| row.bg(theme.sidebar_hover))
+            .child(
+                div()
+                    .h_full()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .h(px(20.0))
+                            .child(activity_title_canvas(
+                                title,
+                                theme.sidebar_text.into(),
+                                title_scroll_offset,
+                                title_overflows,
+                            )),
+                    )
+                    .child(div().ml(px(3.0)).w(px(48.0)).min_w(px(48.0)).flex_none()),
+            )
+            .child(actions)
+            .on_hover(cx.listener(move |this, is_hovered: &bool, window, cx| {
+                if *is_hovered {
+                    match entry {
+                        ActivityThread::Project(project, row) => {
+                            this.hovered_thread = Some((project, row));
+                            this.hovered_recent_thread = None;
+                        }
+                        ActivityThread::Recent(index) => {
+                            this.hovered_recent_thread = Some(index);
+                            this.hovered_thread = None;
+                        }
+                    }
+                    this.start_marquee(title, title_viewport_width, window, cx);
+                } else if this.activity_hovered(entry) {
+                    this.hovered_thread = None;
+                    this.hovered_recent_thread = None;
+                    this.stop_marquee();
+                }
+                cx.notify();
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                match entry {
+                    ActivityThread::Project(project, row) => {
+                        this.selected_project = project;
+                        this.selected_thread = Some((project, row));
+                        this.selected_recent = None;
+                    }
+                    ActivityThread::Recent(index) => {
+                        this.selected_thread = None;
+                        this.selected_recent = Some(index);
+                    }
+                }
+                this.open_project_menu = None;
+                cx.notify();
+            }))
+    }
+
+    fn pinned_section(
+        &self,
+        entries: &[ActivityThread],
+        theme: Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let show_actions = self.pinned_heading_hovered || self.pinned_menu_open;
+        let chevron = icon("section-chevron", theme.sidebar_icon_muted.into())
+            .size(px(14.0))
+            .with_transformation(Transformation::rotate(radians(if self.pinned_collapsed {
+                -std::f32::consts::FRAC_PI_2
+            } else {
+                0.0
+            })));
+        let menu_button = section_header_icon_button(
+            "pinned-section-menu-button",
+            "more-horizontal",
+            theme,
+            self.pinned_menu_button_hovered,
+            16.0,
+        )
+        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+            if this.pinned_menu_button_hovered != *hovered {
+                this.pinned_menu_button_hovered = *hovered;
+                cx.notify();
+            }
+        }))
+        .when_some(self.pinned_menu_focus.as_ref(), |button, focus| {
+            button.track_focus(focus)
+        })
+        .on_key_down(cx.listener(Self::handle_pinned_menu_key))
+        // Radix opens and closes this menu on pointer-down, before release.
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                this.set_pinned_menu_open(!this.pinned_menu_open, window, cx);
+            }),
+        )
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .when(self.pinned_menu_open, |button| {
+            button.child(deferred(
+                self.pinned_menu(theme, cx)
+                    .absolute()
+                    .top(px(25.5))
+                    .right(px(-1.0)),
+            ))
+        });
+        let heading = div()
+            .id("pinned-section-heading")
+            .pl(px(8.0))
+            .pr(px(2.0))
+            .h(px(25.0))
+            .flex()
+            .items_center()
+            .text_size(px(14.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text_tertiary)
+            .child(
+                div()
+                    .id("pinned-section-toggle")
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .cursor_default()
+                    .child("置顶")
+                    .child(
+                        div()
+                            .size(px(14.0))
+                            .flex_none()
+                            .when(!show_actions, |icon| icon.invisible())
+                            .child(chevron),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.pinned_collapsed = !this.pinned_collapsed;
+                        this.pinned_menu_open = false;
+                        this.pinned_menu_focused_item = None;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .when(!show_actions, |actions| actions.invisible())
+                    .child(menu_button),
+            )
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if this.pinned_heading_hovered != *hovered {
+                    this.pinned_heading_hovered = *hovered;
+                    cx.notify();
+                }
+            }));
+        let mut section = div()
+            // The sidebar section stack is visually lifted four pixels in the
+            // reference; this also places the menu's inner surface at y=282
+            // when the trigger starts at y=255.5.
+            .relative()
+            .top(px(-4.0))
+            .px(px(8.0))
+            .pb(px(16.0))
+            .flex()
+            .flex_col()
+            .child(heading);
+        if !self.pinned_collapsed {
+            for entry in entries.iter().copied() {
+                section = section.child(self.pinned_thread_row(entry, theme, window, cx));
+            }
+        }
+        section
+    }
+
     fn native_scroll_content(
         &self,
         theme: Theme,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
+        let pinned_entries = self.pinned_entries();
         let mut projects =
             div()
                 .flex()
@@ -1862,6 +2371,9 @@ impl SidebarView {
                     continue;
                 }
                 let pinned = self.pinned_recents[recent_index];
+                if pinned {
+                    continue;
+                }
                 let hovered = self.hovered_recent_thread == Some(recent_index);
                 let selected_recent = self.selected_recent == Some(recent_index);
                 let show_actions = pinned || hovered;
@@ -2141,6 +2653,9 @@ impl SidebarView {
                     .child(nav_row("已安排", "scheduled", theme))
                     .child(nav_row("插件", "plugins", theme)),
             )
+            .when(!pinned_entries.is_empty(), |content| {
+                content.child(self.pinned_section(&pinned_entries, theme, window, cx))
+            })
             .child(section)
             .when(!self.projects_collapsed, |content| {
                 content.child(div().px(px(8.0)).child(projects))
@@ -3353,7 +3868,8 @@ mod tests {
             window.simulate_click(point(px(188.5 - x_shift), px(331.0)), MouseButton::Left);
             assert!(window.read(|sidebar, _| sidebar.pinned_threads[0][0]));
             window.draw();
-            window.simulate_click(point(px(215.5 - x_shift), px(331.0)), MouseButton::Left);
+            // Pinning moves the real thread into the top-level pinned section.
+            window.simulate_click(point(px(215.5 - x_shift), px(295.0)), MouseButton::Left);
             assert!(window.read(|sidebar, _| sidebar.archived_threads[0][0]));
         }
     }
@@ -3413,6 +3929,61 @@ mod tests {
             window.read(|sidebar, _| sidebar.projects_sort),
             ProjectsSort::Priority
         );
+    }
+
+    #[test]
+    fn pinning_moves_the_thread_and_pinned_menu_matches_radix_keyboard_behavior() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(test_window_options(900.0), |_, _| {
+            SidebarView::new(ThemeMode::Dark, false)
+        });
+        window.draw();
+
+        window.simulate_mouse_move(point(px(100.0), px(331.0)));
+        window.draw();
+        window.simulate_click(point(px(188.5), px(331.0)), MouseButton::Left);
+        assert!(window.read(|sidebar, _| sidebar.pinned_threads[0][0]));
+        assert_eq!(
+            window.read(|sidebar, _| sidebar.pinned_entries()),
+            [ActivityThread::Project(0, 0)]
+        );
+
+        window.draw();
+        window.simulate_mouse_move(point(px(219.0), px(267.0)));
+        window.draw();
+        window.simulate_click(point(px(219.0), px(267.0)), MouseButton::Left);
+        assert!(window.read(|sidebar, _| sidebar.pinned_menu_open));
+        assert_eq!(
+            window.read(|sidebar, _| sidebar.pinned_menu_focused_item),
+            None
+        );
+
+        window.simulate_keystroke("down");
+        assert_eq!(
+            window.read(|sidebar, _| sidebar.pinned_menu_focused_item),
+            Some(0)
+        );
+        window.simulate_keystroke("end");
+        assert_eq!(
+            window.read(|sidebar, _| sidebar.pinned_menu_focused_item),
+            Some(2)
+        );
+        window.simulate_keystroke("up");
+        assert_eq!(
+            window.read(|sidebar, _| sidebar.pinned_menu_focused_item),
+            Some(1)
+        );
+        window.simulate_keystroke("enter");
+        assert_eq!(
+            window.read(|sidebar, _| sidebar.pinned_sort),
+            ProjectsSort::Recent
+        );
+        assert!(!window.read(|sidebar, _| sidebar.pinned_menu_open));
+
+        window.draw();
+        window.simulate_click(point(px(219.0), px(267.0)), MouseButton::Left);
+        window.simulate_keystroke("escape");
+        assert!(!window.read(|sidebar, _| sidebar.pinned_menu_open));
     }
 
     #[test]
@@ -3476,7 +4047,7 @@ mod tests {
             window.simulate_click(point(px(188.5 - x_shift), px(330.0)), MouseButton::Left);
             assert!(window.read(|sidebar, _| sidebar.pinned_recents[0]));
             window.draw();
-            window.simulate_click(point(px(215.5 - x_shift), px(330.0)), MouseButton::Left);
+            window.simulate_click(point(px(215.5 - x_shift), px(295.0)), MouseButton::Left);
             assert!(window.read(|sidebar, _| sidebar.archived_recents[0]));
 
             window.draw();
