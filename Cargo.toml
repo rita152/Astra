@@ -1,0 +1,26 @@
+[package]
+name = "gpui-chat-clone"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+screenshot = ["gpui/test-support", "gpui_platform/test-support"]
+
+[dependencies]
+anyhow = "1"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2", features = ["font-kit"] }
+
+[dev-dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2", features = ["test-support"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2", features = ["font-kit", "test-support"] }
+
+# GPUI's layout, text, and Metal submission paths are too expensive at Cargo's
+# default opt-level=0 on a fullscreen drawable. Keep local code debuggable while
+# compiling the framework hot paths at their production optimization level.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

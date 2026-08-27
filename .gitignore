@@ -1,0 +1,23 @@
+.DS_Store
+
+# Rust build output
+/target/
+
+# Node dependencies
+/node_modules/
+
+# Generated visual regression output
+/artifacts/
+/verification/
+
+# Local reference captures
+/chat-reference/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local environment files
+.env
+.env.*
+!.env.example
