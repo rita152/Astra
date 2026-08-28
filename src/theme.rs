@@ -31,6 +31,10 @@ pub struct Theme {
     pub control_soft: Rgba,
     pub sidebar_hover: Rgba,
     pub sidebar_icon_muted: Rgba,
+    /// Product-title foreground, kept separate for the OpenAI Sans substitute.
+    pub sidebar_title_text: Rgba,
+    /// Secondary sidebar foreground measured from the ChatGPT desktop app.
+    pub sidebar_text_muted: Rgba,
     pub sidebar_resize_hover: Rgba,
     pub sidebar_resize_active: Rgba,
     pub text: Rgba,
@@ -63,12 +67,13 @@ impl Theme {
         match mode {
             ThemeMode::Light => Self {
                 surface: rgba(0xffffffff),
-                // The measured 28% sidebar tint combines with this 58%
-                // underlay to leave about 30% of the native material visible.
+                // A light underlay stabilizes the material before the stronger
+                // sidebar tint is composited above it.
                 surface_underlay: rgba(0xf9f9f995),
-                // ChatGPT electron-light resolves editor #ededed66 and then
-                // mixes it at 70%, producing approximately 28% alpha.
-                sidebar_surface: rgba(0xededed47),
+                // Keep the native material visible without letting a bright
+                // desktop dominate the sidebar. Combined with the underlay,
+                // roughly 23% of the sampled background remains visible.
+                sidebar_surface: rgba(0xededed73),
                 // Resolved sidebar color over the canonical underlay. Sticky
                 // overlays need this opaque value to avoid double compositing.
                 surface_under: rgba(0xf6f6f6ff),
@@ -80,7 +85,9 @@ impl Theme {
                 // chat-reference: --color-background-primary-ghost-hover
                 // rgba(26, 28, 31, 0.053), quantized to an 8-bit alpha.
                 sidebar_hover: rgba(0x1a1c1f0e),
-                sidebar_icon_muted: rgba(0x1a1c1f80),
+                sidebar_icon_muted: rgba(0x1a1c1f7f),
+                sidebar_title_text: rgba(0x1a1c1fd9),
+                sidebar_text_muted: rgba(0x1a1c1f7f),
                 sidebar_resize_hover: rgba(0x8b92994d),
                 sidebar_resize_active: rgba(0x8b929999),
                 text: rgba(0x1a1c1fff),
@@ -113,12 +120,13 @@ impl Theme {
             },
             ThemeMode::Dark => Self {
                 surface: rgba(0x181818ff),
-                // The measured 70% sidebar tint directly leaves about 30% of
-                // the native material visible; no second tint is required.
+                // Reduce native-material transparency from 30% to 18%. This
+                // retains the glass effect while preventing bright content
+                // behind the window from washing the dark sidebar toward gray.
                 surface_underlay: rgba(0x00000000),
-                // CDP computed style on aside.app-shell-left-panel:
-                // color(srgb 0.156863 0.156863 0.156863 / 0.7).
-                sidebar_surface: rgba(0x282828b3),
+                // Preserve the original #282828 material color while using a
+                // stronger alpha for reliable contrast over bright desktops.
+                sidebar_surface: rgba(0x282828d1),
                 surface_under: rgba(0x222222ff),
                 elevated: rgba(0x363636ff),
                 // Resolved result of elevated-secondary/90 over #181818.
@@ -131,7 +139,9 @@ impl Theme {
                 // chat-reference: --color-background-primary-ghost-hover
                 // rgba(255, 255, 255, 0.078), quantized to an 8-bit alpha.
                 sidebar_hover: rgba(0xffffff14),
-                sidebar_icon_muted: rgba(0xdfdfdf80),
+                sidebar_icon_muted: rgba(0xffffff7f),
+                sidebar_title_text: rgba(0xdfdfdfd9),
+                sidebar_text_muted: rgba(0xffffff7f),
                 sidebar_resize_hover: rgba(0x8b92994d),
                 sidebar_resize_active: rgba(0x8b929999),
                 text: rgba(0xdfdfdfff),
@@ -166,16 +176,91 @@ impl Theme {
 
 #[cfg(test)]
 mod tests {
+    use gpui::Rgba;
+
     use super::{Theme, ThemeMode};
 
+    fn composite(foreground: Rgba, background: Rgba) -> Rgba {
+        let alpha = foreground.a + background.a * (1.0 - foreground.a);
+        let channel = |foreground_channel: f32, background_channel: f32| {
+            (foreground_channel * foreground.a
+                + background_channel * background.a * (1.0 - foreground.a))
+                / alpha
+        };
+
+        Rgba {
+            r: channel(foreground.r, background.r),
+            g: channel(foreground.g, background.g),
+            b: channel(foreground.b, background.b),
+            a: alpha,
+        }
+    }
+
+    fn relative_luminance(color: Rgba) -> f32 {
+        let linear = |channel: f32| {
+            if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+    }
+
+    fn contrast_ratio(a: Rgba, b: Rgba) -> f32 {
+        let (lighter, darker) = if relative_luminance(a) > relative_luminance(b) {
+            (relative_luminance(a), relative_luminance(b))
+        } else {
+            (relative_luminance(b), relative_luminance(a))
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
     #[test]
-    fn sidebar_surfaces_preserve_reference_alpha() {
+    fn sidebar_surfaces_keep_reduced_transparency() {
         let dark = Theme::for_mode(ThemeMode::Dark);
         let light = Theme::for_mode(ThemeMode::Light);
 
-        assert!((dark.sidebar_surface.a - 179.0 / 255.0).abs() < f32::EPSILON);
-        assert!((light.sidebar_surface.a - 71.0 / 255.0).abs() < f32::EPSILON);
+        assert!((dark.sidebar_surface.a - 209.0 / 255.0).abs() < f32::EPSILON);
+        assert!((light.sidebar_surface.a - 115.0 / 255.0).abs() < f32::EPSILON);
+        assert!(dark.sidebar_surface.a < 1.0);
+        assert!(light.sidebar_surface.a < 1.0);
         assert_eq!(dark.surface_underlay.a, 0.0);
         assert!((light.surface_underlay.a - 149.0 / 255.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn sidebar_foreground_alpha_matches_the_desktop_app() {
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let theme = Theme::for_mode(mode);
+            assert!((theme.sidebar_text.a - 217.0 / 255.0).abs() < f32::EPSILON);
+            assert!((theme.sidebar_title_text.a - 217.0 / 255.0).abs() < f32::EPSILON);
+            assert!((theme.sidebar_text_muted.a - 127.0 / 255.0).abs() < f32::EPSILON);
+            assert!((theme.sidebar_icon_muted.a - 127.0 / 255.0).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn sidebar_text_remains_legible_when_native_material_samples_white() {
+        let white = Rgba {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        };
+
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let theme = Theme::for_mode(mode);
+            let underlay = composite(theme.surface_underlay, white);
+            let sidebar = composite(theme.sidebar_surface, underlay);
+            let primary_contrast = contrast_ratio(composite(theme.sidebar_text, sidebar), sidebar);
+            let muted_contrast =
+                contrast_ratio(composite(theme.sidebar_text_muted, sidebar), sidebar);
+            let icon_contrast =
+                contrast_ratio(composite(theme.sidebar_icon_muted, sidebar), sidebar);
+            assert!(primary_contrast >= 4.5, "{mode:?}: {primary_contrast}");
+            assert!(muted_contrast >= 3.0, "{mode:?}: {muted_contrast}");
+            assert!(icon_contrast >= 3.0, "{mode:?}: {icon_contrast}");
+        }
     }
 }

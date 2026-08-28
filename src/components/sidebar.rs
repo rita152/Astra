@@ -83,6 +83,13 @@ const MOUSE_WHEEL_MAX_PENDING_LINES: f32 = 5.0;
 const SIDEBAR_DEFAULT_WIDTH: f32 = 256.125;
 const SIDEBAR_MIN_WIDTH: f32 = 240.0;
 const SIDEBAR_MAX_WIDTH: f32 = 520.0;
+// Match the platform fonts reported by the reference app: body copy resolves
+// to SF/PingFang Regular, section labels to PingFang Medium, and the product
+// title to OpenAI Sans at 600. GPUI uses the system face for the title, so its
+// color is calibrated separately from body copy in the theme.
+const SIDEBAR_BODY_FONT_WEIGHT: gpui::FontWeight = gpui::FontWeight::NORMAL;
+const SIDEBAR_SECTION_FONT_WEIGHT: gpui::FontWeight = gpui::FontWeight::MEDIUM;
+const SIDEBAR_TITLE_FONT_WEIGHT: gpui::FontWeight = gpui::FontWeight::SEMIBOLD;
 const MAIN_MIN_WIDTH: f32 = 320.0;
 const MARQUEE_HOVER_DELAY: Duration = Duration::from_millis(350);
 const MARQUEE_SPEED: f32 = 28.0;
@@ -132,6 +139,10 @@ fn sidebar_thread_title_viewport_width(sidebar_width: f32, flat: bool, show_acti
     (sidebar_width - insets).max(0.0)
 }
 
+fn faded_sidebar_text_color(color: Hsla, fade: f32) -> Hsla {
+    color.alpha(color.a * fade)
+}
+
 fn activity_title_canvas(
     title: &'static str,
     color: Hsla,
@@ -141,7 +152,8 @@ fn activity_title_canvas(
     canvas(
         move |_, window, _| {
             let mut font = window.text_style().font();
-            font.weight = gpui::FontWeight(445.0);
+            font.family = ".SystemUIFont".into();
+            font.weight = SIDEBAR_BODY_FONT_WEIGHT;
             let shape = |alpha: f32| {
                 window.text_system().shape_line(
                     title.to_owned().into(),
@@ -149,7 +161,11 @@ fn activity_title_canvas(
                     &[TextRun {
                         len: title.len(),
                         font: font.clone(),
-                        color: color.alpha(alpha),
+                        // `Hsla::alpha` replaces alpha rather than multiplying
+                        // it. Preserve the sidebar foreground opacity so canvas
+                        // titles do not become fully opaque and look bolder than
+                        // adjacent DOM-like text rows.
+                        color: faded_sidebar_text_color(color, alpha),
                         background_color: None,
                         underline: None,
                         strikethrough: None,
@@ -863,7 +879,8 @@ impl SidebarView {
 
     fn thread_title_width(text: &str, window: &mut Window) -> f32 {
         let mut font = window.text_style().font();
-        font.weight = gpui::FontWeight(445.0);
+        font.family = ".SystemUIFont".into();
+        font.weight = SIDEBAR_BODY_FONT_WEIGHT;
         let run = TextRun {
             len: text.len(),
             font,
@@ -979,11 +996,11 @@ fn nav_row(label: &'static str, glyph: &'static str, theme: Theme) -> impl IntoE
         .text_size(px(14.0))
         .text_color(theme.sidebar_text)
         .hover(move |style| style.bg(theme.sidebar_hover))
-        .child(icon(glyph, theme.text.into()))
+        .child(icon(glyph, theme.sidebar_text.into()))
         .child(div().relative().left(px(0.25)).child(label))
         .child(div().flex_1())
         .when(label == "新对话", |row| {
-            row.child(icon("quick-chat", theme.text_tertiary.into()))
+            row.child(icon("quick-chat", theme.sidebar_text_muted.into()))
         })
 }
 
@@ -998,7 +1015,7 @@ fn sidebar_header_icon_button(name: &'static str, theme: Theme) -> impl IntoElem
         .justify_center()
         .cursor_pointer()
         .hover(move |style| style.bg(theme.sidebar_hover))
-        .child(icon(name, theme.text_tertiary.into()).size(px(16.0)))
+        .child(icon(name, theme.sidebar_text_muted.into()).size(px(16.0)))
 }
 
 fn action_icon_button(
@@ -1007,10 +1024,10 @@ fn action_icon_button(
     theme: Theme,
 ) -> gpui::Stateful<Div> {
     let glyph_icon = if glyph == "pin" {
-        icon(glyph, theme.text.into())
+        icon(glyph, theme.sidebar_icon_muted.into())
             .with_transformation(Transformation::translate(point(px(1.0), px(0.0))))
     } else {
-        icon(glyph, theme.text.into())
+        icon(glyph, theme.sidebar_icon_muted.into())
     };
 
     div()
@@ -1021,9 +1038,8 @@ fn action_icon_button(
         .flex()
         .items_center()
         .justify_center()
-        .opacity(0.5)
         .cursor_pointer()
-        .hover(|style| style.opacity(1.0))
+        .hover(move |style| style.bg(theme.sidebar_hover))
         .child(glyph_icon)
 }
 
@@ -1062,7 +1078,7 @@ fn projects_menu_label(label: &'static str, theme: Theme) -> Div {
         .text_size(px(13.0))
         .line_height(px(PROFILE_MENU_LINE_HEIGHT))
         .font_weight(gpui::FontWeight::NORMAL)
-        .text_color(theme.text_tertiary)
+        .text_color(theme.sidebar_text_muted)
         .child(label)
 }
 
@@ -1103,7 +1119,7 @@ fn profile_menu_item(
                     .when(label == "设置", |shortcut| {
                         shortcut.text_size(px(12.0)).line_height(px(16.0))
                     })
-                    .text_color(theme.text_tertiary)
+                    .text_color(theme.sidebar_text_muted)
                     .child(trailing),
             )
         })
@@ -1868,7 +1884,6 @@ impl SidebarView {
             "more-horizontal",
             theme,
         )
-        .when(menu_open, |button| button.opacity(1.0))
         .when_some(self.project_menu_focus.as_ref(), |button, focus| {
             button.track_focus(focus)
         })
@@ -1918,7 +1933,7 @@ impl SidebarView {
             .items_center()
             .rounded(px(12.5))
             .text_size(px(14.0))
-            .font_weight(gpui::FontWeight(445.0))
+            .font_weight(SIDEBAR_BODY_FONT_WEIGHT)
             .text_color(theme.sidebar_text)
             .cursor_pointer()
             .hover(move |style| style.bg(theme.sidebar_hover))
@@ -1930,7 +1945,7 @@ impl SidebarView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(icon("folder", theme.text_tertiary.into())),
+                    .child(icon("folder", theme.sidebar_text.into())),
             )
             .child(
                 div()
@@ -1979,9 +1994,9 @@ impl SidebarView {
                             .flex()
                             .items_center()
                             .text_size(px(14.0))
-                            .text_color(theme.text_tertiary)
+                            .text_color(theme.sidebar_text_muted)
                             .cursor_pointer()
-                            .hover(move |style| style.text_color(theme.text))
+                            .hover(move |style| style.text_color(theme.sidebar_text))
                             .child(if show_all { "收起" } else { "展开显示" })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.project_show_all[project_index] =
@@ -2075,7 +2090,7 @@ impl SidebarView {
                         .items_center()
                         .rounded(px(8.0))
                         .text_size(px(14.0))
-                        .font_weight(gpui::FontWeight(445.0))
+                        .font_weight(SIDEBAR_BODY_FONT_WEIGHT)
                         .text_color(theme.sidebar_text)
                         .relative()
                         .top(px(1.0))
@@ -2191,7 +2206,6 @@ impl SidebarView {
             "more-horizontal",
             theme,
         )
-        .when(menu_open, |button| button.opacity(1.0))
         .when_some(self.project_menu_focus.as_ref(), |button, focus| {
             button.track_focus(focus)
         })
@@ -2240,7 +2254,7 @@ impl SidebarView {
             .items_center()
             .rounded(px(12.5))
             .text_size(px(14.0))
-            .font_weight(gpui::FontWeight(445.0))
+            .font_weight(SIDEBAR_BODY_FONT_WEIGHT)
             .text_color(theme.sidebar_text)
             .cursor_pointer()
             .hover(move |style| style.bg(theme.sidebar_hover))
@@ -2252,7 +2266,7 @@ impl SidebarView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(icon("folder", theme.text_tertiary.into())),
+                    .child(icon("folder", theme.sidebar_text.into())),
             )
             .child(
                 div()
@@ -2392,7 +2406,7 @@ impl SidebarView {
             .items_center()
             .rounded(px(8.0))
             .text_size(px(14.0))
-            .font_weight(gpui::FontWeight(445.0))
+            .font_weight(SIDEBAR_BODY_FONT_WEIGHT)
             .text_color(theme.sidebar_text)
             .relative()
             .overflow_hidden()
@@ -2516,8 +2530,8 @@ impl SidebarView {
             .flex()
             .items_center()
             .text_size(px(14.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.text_tertiary)
+            .font_weight(SIDEBAR_SECTION_FONT_WEIGHT)
+            .text_color(theme.sidebar_text_muted)
             .child(
                 div()
                     .id("pinned-section-toggle")
@@ -2652,8 +2666,8 @@ impl SidebarView {
             .flex()
             .items_center()
             .text_size(px(14.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.text_tertiary)
+            .font_weight(SIDEBAR_SECTION_FONT_WEIGHT)
+            .text_color(theme.sidebar_text_muted)
             .child(
                 div()
                     .id("recents-section-toggle")
@@ -2794,7 +2808,7 @@ impl SidebarView {
                         .items_center()
                         .rounded(px(8.0))
                         .text_size(px(14.0))
-                        .font_weight(gpui::FontWeight(445.0))
+                        .font_weight(SIDEBAR_BODY_FONT_WEIGHT)
                         .text_color(theme.sidebar_text)
                         .relative()
                         .overflow_hidden()
@@ -2942,8 +2956,8 @@ impl SidebarView {
             .flex()
             .items_center()
             .text_size(px(14.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.text_tertiary)
+            .font_weight(SIDEBAR_SECTION_FONT_WEIGHT)
+            .text_color(theme.sidebar_text_muted)
             .child(
                 div()
                     .id("projects-section-toggle")
@@ -3167,8 +3181,8 @@ impl SidebarView {
             .items_center()
             .text_size(px(14.0))
             .line_height(px(21.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.text_tertiary.alpha(0.75))
+            .font_weight(SIDEBAR_SECTION_FONT_WEIGHT)
+            .text_color(theme.sidebar_text_muted)
             .child(div().flex_1().py(px(2.0)).child(label))
             .when(with_actions, |heading| {
                 heading.child(
@@ -3187,7 +3201,7 @@ impl SidebarView {
                                 .cursor_pointer()
                                 .hover(move |style| style.bg(theme.sidebar_hover))
                                 .child(
-                                    icon("more-horizontal", theme.text_tertiary.into())
+                                    icon("more-horizontal", theme.sidebar_icon_muted.into())
                                         .size(px(16.0)),
                                 ),
                         )
@@ -3202,7 +3216,7 @@ impl SidebarView {
                                 .cursor_pointer()
                                 .hover(move |style| style.bg(theme.sidebar_hover))
                                 .child(
-                                    icon("activity-clear-read", theme.text_tertiary.into())
+                                    icon("activity-clear-read", theme.sidebar_icon_muted.into())
                                         .size(px(16.0)),
                                 ),
                         ),
@@ -3289,7 +3303,7 @@ impl SidebarView {
             .when(!show_actions, |actions| actions.invisible())
             .child(pin)
             .child(archive);
-        let spinner = icon("dictation-spinner", theme.text_tertiary.alpha(0.85).into())
+        let spinner = icon("dictation-spinner", theme.sidebar_icon_muted.into())
             .size(px(20.0))
             .with_animation(
                 format!("activity-running-{entry:?}"),
@@ -3350,8 +3364,8 @@ impl SidebarView {
                             .gap(px(4.0))
                             .text_size(px(12.0))
                             .line_height(px(16.0))
-                            .text_color(theme.text_tertiary)
-                            .child(icon("folder", theme.text_tertiary.into()).size(px(12.0)))
+                            .text_color(theme.sidebar_text_muted)
+                            .child(icon("folder", theme.sidebar_icon_muted.into()).size(px(12.0)))
                             .child(source),
                     ),
             )
@@ -3636,7 +3650,7 @@ impl SidebarView {
         let activity_icon_color = if self.activity_open {
             theme.accent
         } else {
-            theme.text_tertiary
+            theme.sidebar_icon_muted
         };
         let activity_button = div()
             .id("sidebar-activity-button")
@@ -3780,6 +3794,10 @@ impl SidebarView {
             .w(px(self.sidebar_width))
             .min_w(px(self.sidebar_width))
             .h_full()
+            // This mirrors CSS's -apple-system stack. CoreText then resolves
+            // Latin glyphs to SF and Chinese glyphs to PingFang SC.
+            .font_family(".SystemUIFont")
+            .font_weight(SIDEBAR_BODY_FONT_WEIGHT)
             .pt(px(46.0))
             .relative()
             .flex()
@@ -3798,10 +3816,10 @@ impl SidebarView {
                             .items_center()
                             .gap(px(6.0))
                             .text_size(px(17.0))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme.sidebar_text)
+                            .font_weight(SIDEBAR_TITLE_FONT_WEIGHT)
+                            .text_color(theme.sidebar_title_text)
                             .child("Codex")
-                            .child(chevron(theme.text_tertiary.into())),
+                            .child(chevron(theme.sidebar_icon_muted.into()).size(px(14.0))),
                     )
                     .child(div().flex_1())
                     .child(
@@ -3906,7 +3924,7 @@ impl SidebarView {
                                     .font_family(".SystemUIFont")
                                     .text_size(px(PROFILE_TRIGGER_TEXT_SIZE))
                                     .line_height(px(PROFILE_TRIGGER_LINE_HEIGHT))
-                                    .font_weight(gpui::FontWeight::NORMAL)
+                                    .font_weight(SIDEBAR_BODY_FONT_WEIGHT)
                                     .text_color(theme.sidebar_text)
                                     .child("rita"),
                             ),
@@ -3922,7 +3940,7 @@ impl SidebarView {
                             .justify_center()
                             .cursor_pointer()
                             .hover(move |style| style.bg(theme.sidebar_hover))
-                            .child(icon("help", theme.text_tertiary.into()).size(px(20.0))),
+                            .child(icon("help", theme.sidebar_icon_muted.into()).size(px(20.0))),
                     ),
             )
             .when(self.profile_menu_open, |sidebar| {
@@ -3938,7 +3956,7 @@ mod tests {
 
     use gpui::{
         AppContext, Bounds, MouseButton, ScrollDelta, ScrollWheelEvent, TestApp, TestAppContext,
-        TestAppWindow, TouchPhase, WindowBounds, WindowOptions, point, px, size,
+        TestAppWindow, TouchPhase, WindowBounds, WindowOptions, hsla, point, px, size,
     };
 
     use super::{
@@ -3947,8 +3965,9 @@ mod tests {
         MOUSE_WHEEL_MAX_PENDING_LINES, PROJECTS, ProjectsLayout, ProjectsSort, RECENTS,
         SCROLLBAR_IDLE_DELAY, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
         SectionHeaderIcon, SidebarView, activity_section_height, activity_title_viewport_width,
-        marquee_duration, marquee_offset, mouse_wheel_scroll_plan, scrollbar_geometry,
-        sidebar_thread_title_viewport_width, sidebar_width_limit, smoothed_scroll_position,
+        faded_sidebar_text_color, marquee_duration, marquee_offset, mouse_wheel_scroll_plan,
+        scrollbar_geometry, sidebar_thread_title_viewport_width, sidebar_width_limit,
+        smoothed_scroll_position,
     };
     use crate::theme::ThemeMode;
 
@@ -4023,6 +4042,14 @@ mod tests {
     fn marquee_only_moves_overflowing_text_and_honors_reduced_motion() {
         assert_eq!(marquee_offset(0.0, Duration::from_secs(10), false), 0.0);
         assert_eq!(marquee_offset(120.0, Duration::from_secs(10), true), 0.0);
+    }
+
+    #[test]
+    fn canvas_thread_titles_preserve_the_sidebar_foreground_alpha() {
+        let foreground = hsla(0.0, 0.0, 0.9, 0.85);
+
+        assert!((faded_sidebar_text_color(foreground, 1.0).a - 0.85).abs() < f32::EPSILON);
+        assert!((faded_sidebar_text_color(foreground, 0.5).a - 0.425).abs() < f32::EPSILON);
     }
 
     #[test]

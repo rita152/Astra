@@ -1996,7 +1996,14 @@ impl Render for ChatApp {
                                     .w(px(sidebar_width))
                                     .min_w(px(sidebar_width))
                                     .h_full()
-                                    .opacity(sidebar_reveal)
+                                    // Avoid putting the settled sidebar foreground
+                                    // through an opacity context. On a translucent
+                                    // window, text already uses grayscale AA; an
+                                    // additional alpha blend makes glyph and SVG
+                                    // edges look soft over bright backgrounds.
+                                    .when(sidebar_reveal < 1.0, |content| {
+                                        content.opacity(sidebar_reveal)
+                                    })
                                     .child(self.sidebar.clone()),
                             ),
                     )
