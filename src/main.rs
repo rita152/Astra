@@ -270,7 +270,7 @@ fn main() {
                     // the translucent sidebar composition. Opaque main-pane
                     // content still masks the material on the right.
                     window_background: WindowBackgroundAppearance::Blurred,
-                    window_min_size: Some(size(px(900.0), px(620.0))),
+                    window_min_size: Some(size(px(960.0), px(620.0))),
                     ..Default::default()
                 },
                 move |window, cx| {

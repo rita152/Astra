@@ -116,7 +116,8 @@ const RIGHT_PANEL_ITEMS: &[(RightPanelMode, &str, &str, &str)] = &[
     (RightPanelMode::Terminal, "终端", "⌃`", "panel-terminal"),
 ];
 const RIGHT_PANEL_MIN_WIDTH: f32 = 320.0;
-const RIGHT_PANEL_MAIN_MIN_WIDTH: f32 = 352.0;
+const RIGHT_PANEL_MAIN_MIN_WIDTH: f32 = 384.0;
+const MAIN_CONTENT_HORIZONTAL_GUTTER: f32 = 24.0;
 
 const SIDEBAR_TRANSITION_DURATION: Duration = Duration::from_millis(400);
 
@@ -2050,6 +2051,11 @@ impl Render for ChatApp {
                                             .flex_1()
                                             .min_w(px(0.0))
                                             .h_full()
+                                            // Keep the conversation surface away from both
+                                            // workspace edges when a side panel narrows the main
+                                            // column. Max-width content remains unchanged on wide
+                                            // windows because HomeView still centers it internally.
+                                            .px(px(MAIN_CONTENT_HORIZONTAL_GUTTER))
                                             .bg(theme.surface)
                                             .child(
                                                 self.home.clone().cached(
