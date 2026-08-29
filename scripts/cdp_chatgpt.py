@@ -37,6 +37,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", default="http://127.0.0.1:9222")
     parser.add_argument("--expression")
+    parser.add_argument("--platform-fonts-selector")
     parser.add_argument("--click", nargs=2, type=float, metavar=("X", "Y"))
     parser.add_argument("--click-selector")
     parser.add_argument("--press", nargs=2, type=float, metavar=("X", "Y"))
@@ -128,6 +129,21 @@ def main() -> None:
             cdp.call("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x2, "y": y2, "button": "left", "buttons": 0, "clickCount": 1})
         time.sleep(0.12)
         output: dict = {}
+        if args.platform_fonts_selector:
+            cdp.call("DOM.enable")
+            cdp.call("CSS.enable")
+            document_id = cdp.call("DOM.getDocument")["root"]["nodeId"]
+            node_id = cdp.call(
+                "DOM.querySelector",
+                {"nodeId": document_id, "selector": args.platform_fonts_selector},
+            )["nodeId"]
+            if not node_id:
+                raise RuntimeError(
+                    f"selector did not match: {args.platform_fonts_selector}"
+                )
+            output["platform_fonts"] = cdp.call(
+                "CSS.getPlatformFontsForNode", {"nodeId": node_id}
+            )["fonts"]
         if args.expression:
             output["value"] = cdp.call(
                 "Runtime.evaluate",

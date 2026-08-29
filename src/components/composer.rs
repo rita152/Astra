@@ -754,17 +754,16 @@ impl ComposerView {
 
     pub fn set_command_tool_for_capture(&mut self, running: bool, cx: &mut Context<Self>) {
         let item_id = "exec-command-ui-capture".to_owned();
-        let command = "printf 'COMMAND_UI_REFERENCE_20260829\\n'".to_owned();
+        let command = "printf 'SHELLPIXEL20260830\\n'".to_owned();
         self.user_message = Some(
-            "请使用终端执行 printf 'COMMAND_UI_REFERENCE_20260829\\n'，等待命令执行完成后告诉我输出。"
+            "请使用终端执行 printf 'SHELLPIXEL20260830\\n'，等待命令执行完成后告诉我输出。"
                 .to_owned(),
         );
         self.user_message_time = Some("21:45".to_owned());
         self.assistant_message = if running {
             "我现在执行这条命令，完成后原样告诉你输出。".to_owned()
         } else {
-            "我现在执行这条命令，完成后原样告诉你输出。输出为：COMMAND_UI_REFERENCE_20260829"
-                .to_owned()
+            "我现在执行这条命令，完成后原样告诉你输出。输出为：SHELLPIXEL20260830".to_owned()
         };
         self.assistant_message_time = (!running).then(|| "21:45".to_owned());
         self.conversation_phase = if running {
@@ -781,7 +780,7 @@ impl ComposerView {
                 id: item_id,
                 command,
                 cwd: "/path/to/project".to_owned(),
-                output: "COMMAND_UI_REFERENCE_20260829\n".to_owned(),
+                output: "SHELLPIXEL20260830\n".to_owned(),
                 status: if running {
                     CommandExecutionStatus::InProgress
                 } else {
@@ -794,7 +793,7 @@ impl ComposerView {
             self.conversation_activity
                 .push(ConversationActivity::AssistantMessage {
                     item_id: "msg-command-final".to_owned(),
-                    text: "输出为：\n\nCOMMAND_UI_REFERENCE_20260829".to_owned(),
+                    text: "输出为：\n\nSHELLPIXEL20260830".to_owned(),
                 });
         }
         cx.emit(ConversationChanged);

@@ -5,9 +5,11 @@ const CDP_HTTP = "http://127.0.0.1:9222";
 const outputDir = path.resolve(
   process.argv.find((argument) => argument.startsWith("--artifact-dir="))
     ?.slice("--artifact-dir=".length) ||
-    "artifacts/chatgpt-command-tool-ui-2026-08-29",
+    "artifacts/chatgpt-command-tool-ui-2026-08-30",
 );
-const sentinel = "COMMAND_UI_REFERENCE_20260829";
+const sentinel =
+  process.argv.find((argument) => argument.startsWith("--sentinel="))
+    ?.slice("--sentinel=".length) || "SHELLPIXEL20260830";
 const prompt = `请使用终端执行 printf '${sentinel}\\n'，等待命令执行完成后告诉我输出。`;
 fs.mkdirSync(outputDir, { recursive: true });
 

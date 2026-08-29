@@ -6,7 +6,9 @@ use gpui::{Font, FontFallbacks, Rgba, font, rgba};
 /// CJK fallback keeps mixed Chinese/English runs on the same platform stack.
 pub const UI_FONT_FAMILY: &str = ".SystemUIFont";
 pub const UI_CJK_FALLBACK_FAMILY: &str = "PingFang SC";
-pub const UI_MONOSPACE_FONT_FAMILY: &str = "SFMono-Regular";
+// CDP's platform-font probe resolves ChatGPT's `ui-monospace` stack to Menlo
+// (PostScript face Menlo-Regular) on macOS.
+pub const UI_MONOSPACE_FONT_FAMILY: &str = "Menlo";
 
 pub fn ui_font() -> Font {
     let mut font = font(UI_FONT_FAMILY);
@@ -57,6 +59,14 @@ pub struct Theme {
     pub sidebar_text: Rgba,
     pub text_secondary: Rgba,
     pub text_tertiary: Rgba,
+    /// Shell/tool card fill measured from ChatGPT's `bg-secondary-soft-alpha`.
+    pub command_surface: Rgba,
+    /// Shell/tool card outline measured from ChatGPT's `border-strong`.
+    pub command_border: Rgba,
+    /// Shell foreground adjusted for GPUI/CoreText's heavier small-text coverage.
+    pub command_text: Rgba,
+    /// Precomposited tertiary text used by Shell prefixes and status labels.
+    pub command_muted: Rgba,
     pub home_mark: Rgba,
     pub border: Rgba,
     pub accent: Rgba,
@@ -110,6 +120,10 @@ impl Theme {
                 sidebar_text: rgba(0x1a1c1fd9),
                 text_secondary: rgba(0x5d5d5dff),
                 text_tertiary: rgba(0x1a1c1f7e),
+                command_surface: rgba(0x0000000d),
+                command_border: rgba(0x00000028),
+                command_text: rgba(0x1a1c1f99),
+                command_muted: rgba(0x898989ff),
                 home_mark: rgba(0xb8b9baff),
                 border: rgba(0x1a1c1f14),
                 accent: rgba(0x339cffff),
@@ -164,6 +178,11 @@ impl Theme {
                 sidebar_text: rgba(0xdfdfdfd9),
                 text_secondary: rgba(0xc3c3c3ff),
                 text_tertiary: rgba(0xffffff80),
+                // CDP: rgba(255, 255, 255, .05) and .157 respectively.
+                command_surface: rgba(0xffffff0d),
+                command_border: rgba(0xffffff28),
+                command_text: rgba(0xdfdfdf99),
+                command_muted: rgba(0x929292ff),
                 home_mark: rgba(0x565656ff),
                 border: rgba(0xffffff14),
                 accent: rgba(0x83c3ffff),

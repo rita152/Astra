@@ -65,6 +65,25 @@ const RESPONSE_ACTION_GAP: f32 = 2.0;
 const RESPONSE_TIME_MARGIN: f32 = 6.0;
 const RESPONSE_TIME_SIZE: f32 = 12.0;
 const RESPONSE_TIME_LINE_HEIGHT: f32 = 16.0;
+const COMMAND_ACTIVITY_ICON_SIZE: f32 = 16.0;
+const COMMAND_ACTIVITY_CONTENT_GAP: f32 = 6.0;
+const COMMAND_ACTIVITY_CHEVRON_SIZE: f32 = 14.0;
+const COMMAND_CARD_RADIUS: f32 = 12.5;
+const COMMAND_CARD_HEADER_SIZE: f32 = 13.0;
+const COMMAND_CARD_HEADER_LINE_HEIGHT: f32 = 18.5714;
+const COMMAND_CARD_TEXT_SIZE: f32 = 13.0;
+const COMMAND_CARD_LINE_HEIGHT: f32 = 19.5;
+const COMMAND_CARD_COMMAND_MAX_HEIGHT: f32 = 39.0;
+const COMMAND_CARD_OUTPUT_MAX_HEIGHT: f32 = 144.0;
+// GPUI rounds this box one device pixel shorter than Chromium at 27 CSS px.
+const COMMAND_CARD_STATUS_HEIGHT: f32 = 28.0;
+
+fn strip_terminal_line_ending(output: &str) -> &str {
+    output
+        .strip_suffix("\r\n")
+        .or_else(|| output.strip_suffix('\n'))
+        .unwrap_or(output)
+}
 
 fn superellipse_corner_points(
     center_x: f32,
@@ -966,7 +985,7 @@ fn command_activity(
     let status_color = if command.status == CommandExecutionStatus::Failed {
         theme.warning
     } else {
-        theme.text_tertiary
+        theme.command_muted
     };
     let display_command = if command.command.is_empty() {
         "命令".to_owned()
@@ -981,7 +1000,10 @@ fn command_activity(
             "（无输出）".to_owned()
         }
     } else {
-        command.output.clone()
+        // A terminal normally returns one final line ending. Browsers do not
+        // allocate another visible line for it in ChatGPT's shell card, while
+        // GPUI's text layout does, so omit exactly that transport delimiter.
+        strip_terminal_line_ending(&command.output).to_owned()
     };
     let command_for_body = display_command.clone();
     let scroll_handle_for_click = scroll_handle.clone();
@@ -1014,24 +1036,32 @@ fn command_activity(
                     });
                 })
                 .child(
-                    icon("panel-terminal", theme.text_tertiary.into())
-                        .size(px(16.0))
-                        .flex_none(),
-                )
-                .child(
                     div()
                         .min_w(px(0.0))
-                        .max_w(px(690.0))
-                        .truncate()
-                        .text_size(px(14.0))
-                        .line_height(px(21.0))
-                        .font_family(".SystemUIFont")
-                        .text_color(theme.text_tertiary)
-                        .child(header_text),
+                        .max_w(px(718.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(COMMAND_ACTIVITY_CONTENT_GAP))
+                        .text_color(theme.text.alpha(0.60))
+                        .child(
+                            icon("panel-terminal", theme.text.alpha(0.60).into())
+                                .size(px(COMMAND_ACTIVITY_ICON_SIZE))
+                                .flex_none(),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .max_w(px(696.0))
+                                .truncate()
+                                .text_size(px(14.0))
+                                .line_height(px(21.0))
+                                .font_family(".SystemUIFont")
+                                .child(header_text),
+                        ),
                 )
                 .child(
-                    icon("settings-chevron-right", theme.text_tertiary.into())
-                        .size(px(12.0))
+                    icon("settings-chevron-right", theme.text.alpha(0.60).into())
+                        .size(px(COMMAND_ACTIVITY_CHEVRON_SIZE))
                         .flex_none()
                         .opacity(if expanded { 1.0 } else { 0.0 })
                         .group_hover(hover_group, |chevron| chevron.opacity(1.0))
@@ -1048,64 +1078,72 @@ fn command_activity(
                     div()
                         .w_full()
                         .overflow_hidden()
-                        .rounded(px(8.0))
+                        .rounded(px(COMMAND_CARD_RADIUS))
                         .border(px(1.0))
-                        .border_color(theme.text.alpha(0.15))
-                        .bg(theme.text.alpha(0.04))
+                        .border_color(theme.command_border)
+                        .bg(theme.command_surface)
                         .child(
                             div()
-                                .h(px(29.0))
                                 .px(px(8.0))
+                                .py(px(4.0))
                                 .flex()
                                 .items_center()
-                                .text_size(px(14.0))
-                                .line_height(px(21.0))
+                                .text_size(px(COMMAND_CARD_HEADER_SIZE))
+                                .line_height(px(COMMAND_CARD_HEADER_LINE_HEIGHT))
+                                .font_weight(FontWeight::LIGHT)
                                 .font_family(".SystemUIFont")
-                                .text_color(theme.text_tertiary)
+                                .text_color(theme.command_text)
                                 .child("Shell"),
                         )
                         .child(
                             div()
                                 .px(px(8.0))
                                 .pt(px(8.0))
-                                .text_size(px(13.0))
-                                .line_height(px(20.0))
+                                .text_size(px(COMMAND_CARD_TEXT_SIZE))
+                                .line_height(px(COMMAND_CARD_LINE_HEIGHT))
+                                .font_weight(FontWeight::LIGHT)
                                 .font_family(UI_MONOSPACE_FONT_FAMILY)
-                                .text_color(theme.text_secondary)
+                                .text_color(theme.command_text)
                                 .child(
                                     div()
                                         .flex()
                                         .items_start()
+                                        .pr(px(24.0))
                                         .child(
                                             div()
                                                 .mr(px(8.0))
-                                                .text_color(theme.text_tertiary)
+                                                .text_color(theme.command_muted)
                                                 .child("$"),
                                         )
                                         .child(
-                                            div().min_w(px(0.0)).flex_1().child(command_for_body),
+                                            div()
+                                                .min_w(px(0.0))
+                                                .flex_1()
+                                                .max_h(px(COMMAND_CARD_COMMAND_MAX_HEIGHT))
+                                                .overflow_hidden()
+                                                .child(command_for_body),
                                         ),
                                 ),
                         )
                         .child(
                             div()
                                 .id(output_scroll_id)
-                                .max_h(px(144.0))
+                                .max_h(px(COMMAND_CARD_OUTPUT_MAX_HEIGHT))
                                 .overflow_scroll()
                                 .restrict_scroll_to_axis()
                                 .scrollbar_width(px(0.0))
                                 .track_scroll(&scroll_handle)
                                 .p(px(8.0))
-                                .text_size(px(13.0))
-                                .line_height(px(20.0))
-                                .font_weight(FontWeight::MEDIUM)
+                                .text_size(px(COMMAND_CARD_TEXT_SIZE))
+                                .line_height(px(COMMAND_CARD_LINE_HEIGHT))
+                                .font_weight(FontWeight::LIGHT)
                                 .font_family(UI_MONOSPACE_FONT_FAMILY)
-                                .text_color(theme.text_secondary)
+                                .text_color(theme.command_text)
                                 .child(output),
                         )
                         .child(
                             div()
-                                .h(px(27.0))
+                                .h(px(COMMAND_CARD_STATUS_HEIGHT))
                                 .px(px(10.0))
                                 .pt(px(2.0))
                                 .pb(px(4.0))
@@ -1115,6 +1153,7 @@ fn command_activity(
                                 .gap(px(4.0))
                                 .text_size(px(14.0))
                                 .line_height(px(21.0))
+                                .font_weight(FontWeight::LIGHT)
                                 .text_color(status_color)
                                 .child(icon(status_icon, status_color.into()).size(px(12.0)))
                                 .child(status_label),
@@ -1263,15 +1302,20 @@ mod tests {
     };
 
     use super::{
-        HomeView, RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT, RESPONSE_ACTION_FOOTER_HEIGHT,
+        COMMAND_ACTIVITY_CHEVRON_SIZE, COMMAND_ACTIVITY_CONTENT_GAP, COMMAND_ACTIVITY_ICON_SIZE,
+        COMMAND_CARD_COMMAND_MAX_HEIGHT, COMMAND_CARD_HEADER_LINE_HEIGHT, COMMAND_CARD_HEADER_SIZE,
+        COMMAND_CARD_LINE_HEIGHT, COMMAND_CARD_OUTPUT_MAX_HEIGHT, COMMAND_CARD_RADIUS,
+        COMMAND_CARD_STATUS_HEIGHT, COMMAND_CARD_TEXT_SIZE, HomeView,
+        RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT, RESPONSE_ACTION_FOOTER_HEIGHT,
         RESPONSE_ACTION_FOOTER_OFFSET, RESPONSE_ACTION_GAP, RESPONSE_ACTION_ICON_SIZE,
         RESPONSE_TIME_LINE_HEIGHT, RESPONSE_TIME_MARGIN, RESPONSE_TIME_SIZE,
         SUGGESTION_PRESSED_SCALE, THINKING_SHIMMER_DURATION, THINKING_SHIMMER_FRAME_INTERVAL,
         THINKING_SHIMMER_STEPS, THINKING_SHIMMER_WIDTH, USER_MESSAGE_BUBBLE_RADIUS,
         USER_MESSAGE_BUBBLE_SUPERELLIPSE, USER_MESSAGE_FOOTER_GAP, USER_MESSAGE_FOOTER_HEIGHT,
         USER_MESSAGE_FOOTER_OFFSET, USER_MESSAGE_FOOTER_SIDE_MARGIN, USER_MESSAGE_TIME_LINE_HEIGHT,
-        USER_MESSAGE_TIME_SIZE, conversation_status, thinking_shimmer_alpha,
-        thinking_shimmer_band_left, thinking_shimmer_progress, thinking_shimmer_step,
+        USER_MESSAGE_TIME_SIZE, conversation_status, strip_terminal_line_ending,
+        thinking_shimmer_alpha, thinking_shimmer_band_left, thinking_shimmer_progress,
+        thinking_shimmer_step,
     };
     use crate::components::composer::ConversationPhase;
     use crate::theme::ThemeMode;
@@ -1405,6 +1449,29 @@ mod tests {
     #[test]
     fn response_action_icons_use_the_css_resolved_size() {
         assert_eq!(RESPONSE_ACTION_ICON_SIZE, 16.0);
+    }
+
+    #[test]
+    fn command_card_matches_the_live_cdp_geometry() {
+        assert_eq!(COMMAND_ACTIVITY_ICON_SIZE, 16.0);
+        assert_eq!(COMMAND_ACTIVITY_CONTENT_GAP, 6.0);
+        assert_eq!(COMMAND_ACTIVITY_CHEVRON_SIZE, 14.0);
+        assert_eq!(COMMAND_CARD_RADIUS, 12.5);
+        assert_eq!(COMMAND_CARD_HEADER_SIZE, 13.0);
+        assert_eq!(COMMAND_CARD_HEADER_LINE_HEIGHT, 18.5714);
+        assert_eq!(COMMAND_CARD_TEXT_SIZE, 13.0);
+        assert_eq!(COMMAND_CARD_LINE_HEIGHT, 19.5);
+        assert_eq!(COMMAND_CARD_COMMAND_MAX_HEIGHT, 39.0);
+        assert_eq!(COMMAND_CARD_OUTPUT_MAX_HEIGHT, 144.0);
+        assert_eq!(COMMAND_CARD_STATUS_HEIGHT, 28.0);
+    }
+
+    #[test]
+    fn command_card_omits_one_terminal_line_ending() {
+        assert_eq!(strip_terminal_line_ending("one\n"), "one");
+        assert_eq!(strip_terminal_line_ending("one\r\n"), "one");
+        assert_eq!(strip_terminal_line_ending("one\n\n"), "one\n");
+        assert_eq!(strip_terminal_line_ending("one"), "one");
     }
 
     #[test]
