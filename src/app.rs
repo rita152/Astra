@@ -118,6 +118,9 @@ const RIGHT_PANEL_ITEMS: &[(RightPanelMode, &str, &str, &str)] = &[
 const RIGHT_PANEL_MIN_WIDTH: f32 = 320.0;
 const RIGHT_PANEL_MAIN_MIN_WIDTH: f32 = 384.0;
 const MAIN_CONTENT_HORIZONTAL_GUTTER: f32 = 24.0;
+// The native 14px traffic lights start at y=18px, so their center is y=25px.
+// Center the 28px leading titlebar controls on that same horizontal axis.
+const LEADING_TITLEBAR_CONTROLS_TOP: f32 = 11.0;
 
 const SIDEBAR_TRANSITION_DURATION: Duration = Duration::from_millis(400);
 
@@ -2210,7 +2213,7 @@ impl Render for ChatApp {
                     .child(
                         div()
                             .absolute()
-                            .top(px(9.0))
+                            .top(px(LEADING_TITLEBAR_CONTROLS_TOP))
                             .left(px(88.0))
                             .flex()
                             .gap(px(4.0))
@@ -2313,8 +2316,8 @@ mod tests {
         window.draw();
         assert!(!window.read(|app, _| app.sidebar_collapsed));
 
-        // The control remains at left: 88px, top: 9px in both states.
-        let toggle_center = point(px(102.0), px(23.0));
+        // The control remains at left: 88px, centered at y=25px in both states.
+        let toggle_center = point(px(102.0), px(25.0));
         window.simulate_click(toggle_center, MouseButton::Left);
         assert!(window.read(|app, _| app.sidebar_collapsed));
         assert!(window.read(|app, _| app.sidebar_animation_running));
