@@ -2,14 +2,18 @@ use std::{ops::Range, time::Duration};
 
 use gpui::{
     Animation, AnimationExt, App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window, div, fill, point, prelude::*,
-    px, relative, rgba, size,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
+    GlobalElementId, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PaintQuad, Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window,
+    div, fill, point, prelude::*, px, relative, rgba, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme::{Theme, ThemeMode};
+
+const PROMPT_FONT_SIZE: f32 = 14.0;
+const PROMPT_LINE_HEIGHT: f32 = 20.0;
+const PLACEHOLDER_OPACITY: f32 = 0.5;
 
 gpui::actions!(
     prompt_input,
@@ -470,7 +474,7 @@ impl Element for PromptTextElement {
     ) -> (LayoutId, ()) {
         let mut style = Style::default();
         style.size.width = relative(1.0).into();
-        style.size.height = px(22.0).into();
+        style.size.height = px(PROMPT_LINE_HEIGHT).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -495,9 +499,14 @@ impl Element for PromptTextElement {
         } else {
             self.text_color
         };
+        // CDP reports the Codex composer as system-ui 14/20 at weight 400.
+        // Pin the weight here because this text is shaped and painted manually;
+        // otherwise an ancestor's text style can silently change the glyph run.
+        let mut font = window.text_style().font();
+        font.weight = FontWeight::NORMAL;
         let run = TextRun {
             len: text.len(),
-            font: window.text_style().font(),
+            font,
             color,
             background_color: None,
             underline: None,
@@ -505,7 +514,7 @@ impl Element for PromptTextElement {
         };
         let line = window
             .text_system()
-            .shape_line(text, px(14.0), &[run], None);
+            .shape_line(text, px(PROMPT_FONT_SIZE), &[run], None);
         let selection = (!input.selected_range.is_empty()).then(|| {
             fill(
                 Bounds::from_corners(
@@ -563,7 +572,7 @@ impl Element for PromptTextElement {
             .line
             .paint(
                 bounds.origin,
-                px(22.0),
+                px(PROMPT_LINE_HEIGHT),
                 gpui::TextAlign::Left,
                 None,
                 window,
@@ -640,7 +649,12 @@ impl Render for PromptInput {
         let theme = Theme::for_mode(self.mode);
         self.element(
             theme.text.into(),
-            theme.text_tertiary.alpha(0.52).into(),
+            // Codex applies opacity: .5 to its tertiary-color placeholder.
+            // Preserve both layers instead of replacing the token's alpha.
+            theme
+                .text_tertiary
+                .alpha(theme.text_tertiary.a * PLACEHOLDER_OPACITY)
+                .into(),
             cx,
         )
     }

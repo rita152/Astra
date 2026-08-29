@@ -2096,6 +2096,9 @@ impl ComposerView {
                     ])
                     .flex()
                     .flex_col()
+                    // Composer labels are uniformly system-ui 400 in the
+                    // reference (placeholder 14/20; controls 13/18).
+                    .font_weight(gpui::FontWeight::NORMAL)
                     .px(px(8.0))
                     .py(px(12.0))
                     .child(self.prompt_input.clone())
