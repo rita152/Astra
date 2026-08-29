@@ -361,6 +361,11 @@ impl ChatApp {
         });
     }
 
+    pub fn submit_prompt_for_capture(&mut self, prompt: &str, cx: &mut Context<Self>) {
+        self.home
+            .update(cx, |home, cx| home.submit_prompt_for_capture(prompt, cx));
+    }
+
     pub fn set_permission_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
         self.home
             .update(cx, |home, cx| home.set_permission_mode(mode, cx));

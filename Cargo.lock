@@ -2058,9 +2058,12 @@ name = "gpui-chat-clone"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "gpui",
  "gpui_platform",
  "objc",
+ "serde_json",
+ "unicode-segmentation",
 ]
 
 [[package]]

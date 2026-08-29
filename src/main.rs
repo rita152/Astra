@@ -1,3 +1,4 @@
+mod agent;
 mod app;
 mod components;
 mod settings;
@@ -7,6 +8,10 @@ use std::{borrow::Cow, fs, path::PathBuf};
 
 use anyhow::Result;
 use app::ChatApp;
+use components::prompt_input::{
+    Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft,
+    SelectRight, Submit,
+};
 use gpui::{
     App, AppContext, AssetSource, Bounds, SharedString, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowOptions, px, size,
@@ -121,6 +126,19 @@ fn main() {
     let screenshot_path = args
         .iter()
         .find_map(|arg| arg.strip_prefix("--screenshot=").map(ToOwned::to_owned));
+    let screenshot_frames = args
+        .iter()
+        .find_map(|arg| {
+            arg.strip_prefix("--screenshot-frames=")?
+                .parse::<usize>()
+                .ok()
+        })
+        .unwrap_or(2);
+    #[cfg(not(feature = "screenshot"))]
+    let _ = screenshot_frames;
+    let submit_prompt = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--submit-prompt=").map(ToOwned::to_owned));
     #[cfg(not(feature = "screenshot"))]
     if screenshot_path.is_some() {
         eprintln!(
@@ -211,6 +229,21 @@ fn main() {
                 app::DismissPermissionUi,
                 None,
             )]);
+            cx.bind_keys([
+                gpui::KeyBinding::new("backspace", Backspace, Some("PromptInput")),
+                gpui::KeyBinding::new("delete", Delete, Some("PromptInput")),
+                gpui::KeyBinding::new("left", Left, Some("PromptInput")),
+                gpui::KeyBinding::new("right", Right, Some("PromptInput")),
+                gpui::KeyBinding::new("shift-left", SelectLeft, Some("PromptInput")),
+                gpui::KeyBinding::new("shift-right", SelectRight, Some("PromptInput")),
+                gpui::KeyBinding::new("cmd-a", SelectAll, Some("PromptInput")),
+                gpui::KeyBinding::new("cmd-v", Paste, Some("PromptInput")),
+                gpui::KeyBinding::new("cmd-c", Copy, Some("PromptInput")),
+                gpui::KeyBinding::new("cmd-x", Cut, Some("PromptInput")),
+                gpui::KeyBinding::new("home", Home, Some("PromptInput")),
+                gpui::KeyBinding::new("end", End, Some("PromptInput")),
+                gpui::KeyBinding::new("enter", Submit, Some("PromptInput")),
+            ]);
             let bounds = Bounds::centered(None, size(px(window_width), px(window_height)), cx);
             let initial_bounds = if start_maximized {
                 WindowBounds::Maximized(bounds)
@@ -239,7 +272,15 @@ fn main() {
                     }
                     #[cfg(feature = "screenshot")]
                     if let Some(path) = screenshot_path.clone() {
-                        schedule_screenshot(window, path, if maximize_after_open { 90 } else { 2 });
+                        schedule_screenshot(
+                            window,
+                            path,
+                            if maximize_after_open {
+                                screenshot_frames.max(90)
+                            } else {
+                                screenshot_frames
+                            },
+                        );
                     }
                     cx.new(|cx| {
                         let mut app = ChatApp::new(mode, sidebar_bottom, cx);
@@ -301,6 +342,9 @@ fn main() {
                         }
                         if permission_confirmation_open {
                             app.open_permission_confirmation(cx);
+                        }
+                        if let Some(prompt) = submit_prompt.as_deref() {
+                            app.submit_prompt_for_capture(prompt, cx);
                         }
                         if let Some(slug) = settings_page {
                             app.open_settings_page(slug, cx);

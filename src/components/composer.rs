@@ -1,12 +1,18 @@
 use std::time::Duration;
 
+use chrono::Local;
 use gpui::{
-    Animation, AnimationExt, BoxShadow, Context, Div, MouseButton, Render, Transformation, Window,
-    deferred, div, hsla, linear_color_stop, linear_gradient, prelude::*, px, radians, rgba,
+    Animation, AnimationExt, BoxShadow, Context, Div, Entity, FocusHandle, KeyDownEvent,
+    MouseButton, Render, Transformation, Window, deferred, div, hsla, linear_color_stop,
+    linear_gradient, prelude::*, px, radians, rgba,
 };
 
 use crate::{
-    components::icons::icon,
+    agent::{AgentBackend, AgentEvent, AgentRequest, CodexAppServerBackend},
+    components::{
+        icons::icon,
+        prompt_input::{PromptChanged, PromptInput, PromptSubmitted},
+    },
     theme::{Theme, ThemeMode},
 };
 
@@ -36,13 +42,31 @@ enum PermissionMode {
 pub struct RequestFullAccess;
 impl gpui::EventEmitter<RequestFullAccess> for ComposerView {}
 
+pub struct ConversationChanged;
+impl gpui::EventEmitter<ConversationChanged> for ComposerView {}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConversationPhase {
+    #[default]
+    Empty,
+    Starting,
+    Thinking,
+    Streaming,
+    Complete,
+    Failed,
+}
+
 const MODEL_PICKER_WIDTH: f32 = 224.0;
 const MODEL_PICKER_SUBMENU_GAP: f32 = 1.0;
 const MODEL_PICKER_RIGHT_INSET: f32 = 63.0;
 const MODEL_PICKER_MIN_SUBMENU_WIDTH: f32 = 180.0;
-const HOME_COMPOSER_MAX_WIDTH: f32 = 786.0;
+const HOME_COMPOSER_MAX_WIDTH: f32 = 748.0;
 const APP_SIDEBAR_WIDTH: f32 = 256.125;
 const PARTICLE_TIMELINE_MS: f32 = 120_000.0;
+
+fn current_local_time_label() -> String {
+    Local::now().format("%H:%M").to_string()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SubmenuLayout {
@@ -137,6 +161,18 @@ fn particle_layers(slider_index: usize, fast_mode: bool) -> (bool, bool) {
 
 pub struct ComposerView {
     mode: ThemeMode,
+    prompt_input: Entity<PromptInput>,
+    user_message: Option<String>,
+    user_message_time: Option<String>,
+    assistant_message: String,
+    assistant_message_time: Option<String>,
+    conversation_phase: ConversationPhase,
+    conversation_cycle: u64,
+    model_menu_focus: FocusHandle,
+    model_menu_focused_item: usize,
+    model_menu_keyboard_focus: bool,
+    submenu_focused_item: usize,
+    submenu_keyboard_focus: bool,
     menu_open: bool,
     advanced_expanded: bool,
     submenu: Option<PickerSubmenu>,
@@ -152,9 +188,30 @@ pub struct ComposerView {
 }
 
 impl ComposerView {
-    pub fn new(mode: ThemeMode) -> Self {
+    pub fn new(mode: ThemeMode, cx: &mut Context<Self>) -> Self {
+        let prompt_input = cx.new(|cx| PromptInput::new(mode, cx));
+        cx.subscribe(&prompt_input, |_, _, _: &PromptChanged, cx| {
+            cx.notify();
+        })
+        .detach();
+        cx.subscribe(&prompt_input, |this, _, event: &PromptSubmitted, cx| {
+            this.submit_prompt(event.0.clone(), cx);
+        })
+        .detach();
         Self {
             mode,
+            prompt_input,
+            user_message: None,
+            user_message_time: None,
+            assistant_message: String::new(),
+            assistant_message_time: None,
+            conversation_phase: ConversationPhase::Empty,
+            conversation_cycle: 0,
+            model_menu_focus: cx.focus_handle(),
+            model_menu_focused_item: 0,
+            model_menu_keyboard_focus: false,
+            submenu_focused_item: 0,
+            submenu_keyboard_focus: false,
             menu_open: false,
             advanced_expanded: true,
             submenu: None,
@@ -170,8 +227,245 @@ impl ComposerView {
         }
     }
 
+    pub fn conversation_snapshot(
+        &self,
+    ) -> (
+        ConversationPhase,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+    ) {
+        (
+            self.conversation_phase,
+            self.user_message.clone(),
+            self.user_message_time.clone(),
+            self.assistant_message.clone(),
+            self.assistant_message_time.clone(),
+        )
+    }
+
+    fn submit_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
+        if prompt.trim().is_empty()
+            || matches!(
+                self.conversation_phase,
+                ConversationPhase::Starting
+                    | ConversationPhase::Thinking
+                    | ConversationPhase::Streaming
+            )
+        {
+            return;
+        }
+
+        self.user_message = Some(prompt.clone());
+        self.user_message_time = Some(current_local_time_label());
+        self.assistant_message.clear();
+        self.assistant_message_time = None;
+        self.conversation_phase = ConversationPhase::Starting;
+        self.conversation_cycle = self.conversation_cycle.wrapping_add(1);
+        let cycle = self.conversation_cycle;
+        self.menu_open = false;
+        self.permission_menu_open = false;
+        self.submenu = None;
+        self.prompt_input.update(cx, |input, cx| input.clear(cx));
+        cx.emit(ConversationChanged);
+        cx.notify();
+
+        let receiver = CodexAppServerBackend::new().run_prompt(AgentRequest {
+            prompt,
+            cwd: std::env::current_dir().unwrap_or_default(),
+        });
+        cx.spawn(async move |this, cx| {
+            loop {
+                let mut finished = false;
+                while let Ok(event) = receiver.try_recv() {
+                    let result = this.update(cx, |this, cx| {
+                        if this.conversation_cycle != cycle {
+                            finished = true;
+                            return;
+                        }
+                        match event {
+                            AgentEvent::Started => {
+                                this.conversation_phase = ConversationPhase::Thinking;
+                            }
+                            AgentEvent::TextDelta(delta) => {
+                                this.assistant_message.push_str(&delta);
+                                this.conversation_phase = ConversationPhase::Streaming;
+                            }
+                            AgentEvent::Completed => {
+                                this.assistant_message_time = Some(current_local_time_label());
+                                this.conversation_phase = ConversationPhase::Complete;
+                                finished = true;
+                            }
+                            AgentEvent::Failed(error) => {
+                                this.assistant_message = error;
+                                this.assistant_message_time = Some(current_local_time_label());
+                                this.conversation_phase = ConversationPhase::Failed;
+                                finished = true;
+                            }
+                        }
+                        cx.emit(ConversationChanged);
+                        cx.notify();
+                    });
+                    if result.is_err() || finished {
+                        return;
+                    }
+                }
+                if finished {
+                    return;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn stop_generation(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.conversation_phase,
+            ConversationPhase::Starting
+                | ConversationPhase::Thinking
+                | ConversationPhase::Streaming
+        ) {
+            self.conversation_cycle = self.conversation_cycle.wrapping_add(1);
+            self.assistant_message_time = Some(current_local_time_label());
+            self.conversation_phase = ConversationPhase::Complete;
+            cx.emit(ConversationChanged);
+            cx.notify();
+        }
+    }
+
+    fn handle_model_menu_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.menu_open {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        if let Some(submenu) = self.submenu {
+            let count = match submenu {
+                PickerSubmenu::Model => 7,
+                PickerSubmenu::Effort => 6,
+                PickerSubmenu::Speed => 2,
+            };
+            match key {
+                "down" => {
+                    self.submenu_focused_item = if self.submenu_keyboard_focus {
+                        (self.submenu_focused_item + 1) % count
+                    } else {
+                        0
+                    };
+                    self.submenu_keyboard_focus = true;
+                }
+                "up" => {
+                    self.submenu_focused_item = if self.submenu_keyboard_focus {
+                        (self.submenu_focused_item + count - 1) % count
+                    } else {
+                        count - 1
+                    };
+                    self.submenu_keyboard_focus = true;
+                }
+                "home" => {
+                    self.submenu_focused_item = 0;
+                    self.submenu_keyboard_focus = true;
+                }
+                "end" => {
+                    self.submenu_focused_item = count - 1;
+                    self.submenu_keyboard_focus = true;
+                }
+                "left" | "escape" => {
+                    self.submenu = None;
+                    self.submenu_keyboard_focus = false;
+                }
+                "enter" | "space" => {
+                    if !self.submenu_keyboard_focus {
+                        return;
+                    }
+                    match submenu {
+                        PickerSubmenu::Model => {
+                            const VALUES: [&str; 7] = [
+                                "5.6 Sol",
+                                "5.6 Terra",
+                                "5.6 Luna",
+                                "5.5",
+                                "5.4",
+                                "5.4 Mini",
+                                "5.3 Codex Spark",
+                            ];
+                            self.selected_model = VALUES[self.submenu_focused_item];
+                        }
+                        PickerSubmenu::Effort => {
+                            const VALUES: [&str; 6] = ["轻度", "中", "高", "极高", "最高", "Ultra"];
+                            self.selected_effort = VALUES[self.submenu_focused_item];
+                        }
+                        PickerSubmenu::Speed => {
+                            const VALUES: [&str; 2] = ["标准", "快速"];
+                            self.selected_speed = VALUES[self.submenu_focused_item];
+                        }
+                    }
+                    self.menu_open = false;
+                    self.submenu = None;
+                }
+                "tab" => return,
+                _ => return,
+            }
+        } else {
+            match key {
+                "down" => {
+                    self.model_menu_focused_item = if self.model_menu_keyboard_focus {
+                        (self.model_menu_focused_item + 1) % 4
+                    } else {
+                        0
+                    };
+                    self.model_menu_keyboard_focus = true;
+                }
+                "up" => {
+                    self.model_menu_focused_item = if self.model_menu_keyboard_focus {
+                        (self.model_menu_focused_item + 3) % 4
+                    } else {
+                        3
+                    };
+                    self.model_menu_keyboard_focus = true;
+                }
+                "home" => {
+                    self.model_menu_focused_item = 0;
+                    self.model_menu_keyboard_focus = true;
+                }
+                "end" => {
+                    self.model_menu_focused_item = 3;
+                    self.model_menu_keyboard_focus = true;
+                }
+                "right" | "enter" | "space" if self.model_menu_focused_item < 3 => {
+                    self.submenu = Some(match self.model_menu_focused_item {
+                        0 => PickerSubmenu::Model,
+                        1 => PickerSubmenu::Effort,
+                        _ => PickerSubmenu::Speed,
+                    });
+                    self.submenu_keyboard_focus = false;
+                }
+                "enter" | "space" => {
+                    self.advanced_expanded = !self.advanced_expanded;
+                }
+                "escape" | "tab" => {
+                    self.menu_open = false;
+                    self.submenu = None;
+                }
+                _ => return,
+            }
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     pub fn set_mode(&mut self, mode: ThemeMode, cx: &mut Context<Self>) {
         self.mode = mode;
+        self.prompt_input
+            .update(cx, |input, cx| input.set_mode(mode, cx));
         cx.notify();
     }
 
@@ -238,6 +532,10 @@ impl ComposerView {
             _ => DictationState::Idle,
         };
         cx.notify();
+    }
+
+    pub fn submit_prompt_for_capture(&mut self, prompt: &str, cx: &mut Context<Self>) {
+        self.submit_prompt(prompt.to_owned(), cx);
     }
 
     #[cfg(test)]
@@ -443,6 +741,7 @@ fn context_toolbar(theme: Theme) -> Div {
 impl ComposerView {
     fn picker_row(
         &self,
+        index: usize,
         id: &'static str,
         label: &'static str,
         value: &'static str,
@@ -451,6 +750,7 @@ impl ComposerView {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
         let selected = self.submenu == Some(submenu);
+        let focused = self.model_menu_keyboard_focus && self.model_menu_focused_item == index;
         div()
             .id(id)
             .h(px(28.5625))
@@ -463,7 +763,7 @@ impl ComposerView {
             .font_weight(gpui::FontWeight::NORMAL)
             .text_color(theme.text)
             .cursor_pointer()
-            .when(selected, |row| row.bg(theme.sidebar_hover))
+            .when(selected || focused, |row| row.bg(theme.sidebar_hover))
             .hover(move |style| style.bg(theme.sidebar_hover))
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
@@ -498,6 +798,7 @@ impl ComposerView {
         title: &'static str,
         detail: Option<&'static str>,
         selected: bool,
+        focused: bool,
         theme: Theme,
     ) -> gpui::Stateful<Div> {
         div()
@@ -510,6 +811,7 @@ impl ComposerView {
             .items_center()
             .gap(px(8.0))
             .cursor_pointer()
+            .when(focused, |row| row.bg(theme.sidebar_hover))
             .hover(move |style| style.bg(theme.sidebar_hover))
             .child(
                 div()
@@ -597,6 +899,7 @@ impl ComposerView {
                             option,
                             None,
                             self.selected_model == option,
+                            self.submenu_keyboard_focus && self.submenu_focused_item == index,
                             theme,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -639,6 +942,7 @@ impl ComposerView {
                             option,
                             detail,
                             self.selected_effort == option,
+                            self.submenu_keyboard_focus && self.submenu_focused_item == index,
                             theme,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -685,6 +989,7 @@ impl ComposerView {
                             option,
                             Some(detail),
                             self.selected_speed == option,
+                            self.submenu_keyboard_focus && self.submenu_focused_item == index,
                             theme,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -717,6 +1022,10 @@ impl ComposerView {
                     .items_center()
                     .text_color(theme.text_tertiary)
                     .cursor_pointer()
+                    .when(
+                        self.model_menu_keyboard_focus && self.model_menu_focused_item == 3,
+                        |row| row.bg(theme.sidebar_hover),
+                    )
                     .hover(move |style| style.bg(theme.sidebar_hover))
                     .on_click(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
@@ -1082,6 +1391,8 @@ impl ComposerView {
     ) -> gpui::Stateful<Div> {
         let mut menu = div()
             .id("model-picker-menu")
+            .track_focus(&self.model_menu_focus)
+            .on_key_down(cx.listener(Self::handle_model_menu_key))
             .absolute()
             .right(px(MODEL_PICKER_RIGHT_INSET))
             .bottom(px(46.0))
@@ -1105,6 +1416,7 @@ impl ComposerView {
         if self.advanced_expanded {
             menu = menu
                 .child(self.picker_row(
+                    0,
                     "model-picker-model-row",
                     "模型",
                     self.selected_model,
@@ -1113,6 +1425,7 @@ impl ComposerView {
                     cx,
                 ))
                 .child(self.picker_row(
+                    1,
                     "model-picker-effort-row",
                     "推理强度",
                     self.selected_effort,
@@ -1121,6 +1434,7 @@ impl ComposerView {
                     cx,
                 ))
                 .child(self.picker_row(
+                    2,
                     "model-picker-speed-row",
                     "速度",
                     self.selected_speed,
@@ -1460,16 +1774,26 @@ impl ComposerView {
 
     fn render_composer(&self, viewport_width: f32, theme: Theme, cx: &mut Context<Self>) -> Div {
         let (permission_label, permission_icon, permission_color) = self.permission_label();
+        let prompt_is_empty = self.prompt_input.read(cx).text().is_empty();
+        let conversation_started = self.conversation_phase != ConversationPhase::Empty;
+        let generation_active = matches!(
+            self.conversation_phase,
+            ConversationPhase::Starting
+                | ConversationPhase::Thinking
+                | ConversationPhase::Streaming
+        );
         div()
             .w_full()
             .relative()
             .flex()
             .flex_col()
             .gap(px(0.0))
-            .child(context_toolbar(theme))
+            .when(!conversation_started, |composer| {
+                composer.child(context_toolbar(theme))
+            })
             .child(
                 div()
-                    .h(px(100.0))
+                    .h(px(98.0))
                     .w_full()
                     .rounded(px(24.0))
                     .bg(theme.control_soft)
@@ -1487,7 +1811,7 @@ impl ComposerView {
                     .flex_col()
                     .px(px(8.0))
                     .py(px(12.0))
-                    .child(div().flex_1())
+                    .child(self.prompt_input.clone())
                     .when(self.dictation_state == DictationState::Idle, |composer| {
                         composer.child(
                             div()
@@ -1583,12 +1907,16 @@ impl ComposerView {
                                                     button.bg(theme.sidebar_hover)
                                                 })
                                                 .hover(move |style| style.bg(theme.sidebar_hover))
-                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                .on_click(cx.listener(|this, _, window, cx| {
                                                     cx.stop_propagation();
                                                     this.permission_menu_open = false;
                                                     this.menu_open = !this.menu_open;
                                                     if !this.menu_open {
                                                         this.submenu = None;
+                                                    } else {
+                                                        this.model_menu_keyboard_focus = false;
+                                                        this.submenu_keyboard_focus = false;
+                                                        window.focus(&this.model_menu_focus, cx);
                                                     }
                                                     cx.notify();
                                                 }))
@@ -1651,10 +1979,60 @@ impl ComposerView {
                                                         .flex()
                                                         .items_center()
                                                         .justify_center()
-                                                        .cursor_pointer()
+                                                        .when(
+                                                            prompt_is_empty
+                                                                && conversation_started
+                                                                && !generation_active,
+                                                            |button| button.opacity(0.4),
+                                                        )
+                                                        .when(
+                                                            !prompt_is_empty
+                                                                || generation_active
+                                                                || !conversation_started,
+                                                            |button| button.cursor_pointer(),
+                                                        )
+                                                        .when(!generation_active, |button| {
+                                                            button.on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    this.prompt_input.update(
+                                                                        cx,
+                                                                        |input, cx| {
+                                                                            input.submit(cx)
+                                                                        },
+                                                                    );
+                                                                },
+                                                            ))
+                                                        })
+                                                        .when(generation_active, |button| {
+                                                            button.on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    this.stop_generation(cx)
+                                                                },
+                                                            ))
+                                                        })
                                                         .child(
-                                                            icon("voice", theme.button_text.into())
-                                                                .size(px(16.0)),
+                                                            icon(
+                                                                if generation_active {
+                                                                    "composer-stop"
+                                                                } else if !prompt_is_empty
+                                                                    || conversation_started
+                                                                {
+                                                                    "dictation-send"
+                                                                } else {
+                                                                    "voice"
+                                                                },
+                                                                theme.button_text.into(),
+                                                            )
+                                                            .size(px(
+                                                                if generation_active
+                                                                    || !prompt_is_empty
+                                                                    || conversation_started
+                                                                {
+                                                                    20.0
+                                                                } else {
+                                                                    16.0
+                                                                },
+                                                            )),
                                                         ),
                                                 ),
                                         ),
@@ -1687,18 +2065,48 @@ impl Render for ComposerView {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposerView, SubmenuLayout, max_particle_drift, particle_layers, particle_transition_ease,
-        submenu_layout,
+        ComposerView, ConversationPhase, SubmenuLayout, current_local_time_label,
+        max_particle_drift, particle_layers, particle_transition_ease, submenu_layout,
     };
     use crate::theme::ThemeMode;
-    use gpui::{Bounds, MouseButton, TestApp, WindowBounds, WindowOptions, point, px, size};
+    use gpui::{
+        Bounds, Focusable, MouseButton, TestApp, WindowBounds, WindowOptions, point, px, size,
+    };
     use std::time::Duration;
+
+    #[test]
+    fn sent_message_time_uses_the_local_twenty_four_hour_label() {
+        let label = current_local_time_label();
+        assert_eq!(label.len(), 5);
+        assert_eq!(&label[2..3], ":");
+        assert!(label[..2].parse::<u8>().is_ok_and(|hour| hour < 24));
+        assert!(label[3..].parse::<u8>().is_ok_and(|minute| minute < 60));
+    }
+
+    #[test]
+    fn stopping_generation_records_the_response_completion_time() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+
+        app.update_entity(&composer, |composer, cx| {
+            composer.conversation_phase = ConversationPhase::Streaming;
+            composer.assistant_message_time = None;
+            composer.stop_generation(cx);
+        });
+
+        let (phase, _, _, _, completed_at) =
+            app.read_entity(&composer, |composer, _| composer.conversation_snapshot());
+        assert_eq!(phase, ConversationPhase::Complete);
+        let completed_at = completed_at.expect("stopped response should retain its end time");
+        assert_eq!(completed_at.len(), 5);
+        assert_eq!(&completed_at[2..3], ":");
+    }
 
     #[test]
     fn submenu_clamps_to_the_trailing_edge_at_reference_width() {
         let layout = submenu_layout(1440.0, 280.0);
         assert!(!layout.open_left);
-        assert!(layout.width > 260.0 && layout.width < 262.0);
+        assert!((layout.width - 279.9375).abs() < 0.001);
 
         assert_eq!(
             submenu_layout(1440.0, 180.0),
@@ -1722,7 +2130,8 @@ mod tests {
 
     #[test]
     fn slider_positions_match_the_cdp_observed_model_and_effort_labels() {
-        let mut composer = ComposerView::new(ThemeMode::Dark);
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
         let expected = [
             ("5.6 Terra", "轻度"),
             ("5.6 Sol", "轻度"),
@@ -1733,16 +2142,22 @@ mod tests {
         ];
 
         for (index, (model, effort)) in expected.into_iter().enumerate() {
-            composer.set_slider_index(index);
-            assert_eq!(composer.selected_model, model);
-            assert_eq!(composer.selected_effort, effort);
+            app.update_entity(&composer, |composer, _| composer.set_slider_index(index));
+            assert_eq!(
+                app.read_entity(&composer, |composer, _| composer.selected_model),
+                model
+            );
+            assert_eq!(
+                app.read_entity(&composer, |composer, _| composer.selected_effort),
+                effort
+            );
         }
     }
 
     #[test]
     fn permission_modes_update_the_label_and_outside_close_dismisses_the_menu() {
         let mut app = TestApp::new();
-        let composer = app.new_entity(|_| ComposerView::new(ThemeMode::Dark));
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
 
         assert_eq!(
             app.read_entity(&composer, |c, _| c.permission_mode_name()),
@@ -1786,7 +2201,7 @@ mod tests {
     #[test]
     fn dictation_can_start_and_cancel_without_leaving_transcribed_content() {
         let mut app = TestApp::new();
-        let composer = app.new_entity(|_| ComposerView::new(ThemeMode::Dark));
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
 
         app.update_entity(&composer, |composer, cx| composer.start_dictation(cx));
         assert_eq!(
@@ -1804,7 +2219,7 @@ mod tests {
     #[test]
     fn stopping_dictation_shows_processing_then_returns_to_idle() {
         let mut app = TestApp::new();
-        let composer = app.new_entity(|_| ComposerView::new(ThemeMode::Dark));
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
 
         app.update_entity(&composer, |composer, cx| composer.start_dictation(cx));
         app.update_entity(&composer, |composer, cx| composer.stop_dictation(cx));
@@ -1832,7 +2247,7 @@ mod tests {
                 })),
                 ..Default::default()
             },
-            |_, _| ComposerView::new(ThemeMode::Dark),
+            |_, cx| ComposerView::new(ThemeMode::Dark, cx),
         );
 
         window.draw();
@@ -1872,7 +2287,7 @@ mod tests {
                 })),
                 ..Default::default()
             },
-            |_, _| ComposerView::new(ThemeMode::Dark),
+            |_, cx| ComposerView::new(ThemeMode::Dark, cx),
         );
 
         window.draw();
@@ -1881,5 +2296,81 @@ mod tests {
         assert!(window.read(|composer, _| composer.permission_menu_open));
         window.simulate_mouse_up(point(px(83.0), px(111.0)), MouseButton::Left);
         assert!(window.read(|composer, _| composer.permission_menu_open));
+    }
+
+    #[test]
+    fn prompt_accepts_native_text_and_clears_without_a_stale_ime_range() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(748.0), px(138.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ComposerView::new(ThemeMode::Dark, cx),
+        );
+        window.draw();
+        // Reproduces the real crash: clicking to the right of the empty
+        // placeholder used to store a placeholder byte index in an empty value.
+        window.simulate_click(point(px(350.0), px(60.0)), MouseButton::Left);
+        window.update(|composer, window, cx| {
+            assert!(
+                composer
+                    .prompt_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
+        window.simulate_input("hello");
+        assert_eq!(
+            window.read(|composer, cx| composer.prompt_input.read(cx).text().to_owned()),
+            "hello"
+        );
+        window.update(|composer, _, cx| {
+            composer
+                .prompt_input
+                .update(cx, |input, cx| input.clear(cx));
+        });
+        assert_eq!(
+            window.read(|composer, cx| composer.prompt_input.read(cx).text().to_owned()),
+            ""
+        );
+    }
+
+    #[test]
+    fn model_picker_keyboard_navigation_enters_selects_and_escapes_submenus() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(748.0), px(400.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ComposerView::new(ThemeMode::Dark, cx),
+        );
+        window.update(|composer, window, cx| {
+            composer.open_picker(cx);
+            window.focus(&composer.model_menu_focus, cx);
+        });
+        window.draw();
+        window.simulate_keystrokes("down right down down enter");
+        assert_eq!(
+            window.read(|composer, _| composer.selected_model),
+            "5.6 Terra"
+        );
+        assert!(!window.read(|composer, _| composer.menu_open));
+
+        window.update(|composer, window, cx| {
+            composer.open_picker(cx);
+            window.focus(&composer.model_menu_focus, cx);
+        });
+        window.draw();
+        window.simulate_keystrokes("down right escape escape");
+        assert!(!window.read(|composer, _| composer.menu_open));
     }
 }
