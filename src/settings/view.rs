@@ -5,7 +5,7 @@ use gpui::{
     prelude::*, px, svg,
 };
 
-use crate::theme::{Theme, ThemeMode};
+use crate::theme::{Theme, ThemeMode, UI_FONT_FAMILY};
 
 use super::{ControlSpec, PageKind, PageSpec, RowSpec, SectionSpec, page, pages};
 
@@ -7435,7 +7435,7 @@ impl SettingsView {
                                 div()
                                     .relative()
                                     .top(px(-1.0))
-                                    .font_family("PingFang SC")
+                                    .font_family(UI_FONT_FAMILY)
                                     .text_size(px(24.0))
                                     .line_height(px(31.0))
                                     .font_weight(gpui::FontWeight(300.0))
@@ -9404,7 +9404,7 @@ impl SettingsView {
                     .gap(px(4.0))
                     .text_size(px(14.0))
                     .line_height(px(18.0))
-                    .font_family("PingFang SC")
+                    .font_family(UI_FONT_FAMILY)
                     .text_color(if danger { danger_text } else { primary_text })
                     .whitespace_nowrap();
                 if let Some((path, size)) = icon {
@@ -9666,7 +9666,7 @@ impl SettingsView {
                     .gap(px(4.0))
                     .text_size(px(14.0))
                     .line_height(px(18.0))
-                    .font_family("PingFang SC")
+                    .font_family(UI_FONT_FAMILY)
                     .font_weight(gpui::FontWeight(300.0))
                     .text_color(if danger { danger_text } else { theme.text })
                     .whitespace_nowrap();
@@ -9709,7 +9709,7 @@ impl SettingsView {
             .gap(px(8.0))
             .text_size(px(14.0))
             .line_height(px(18.0))
-            .font_family("PingFang SC")
+            .font_family(UI_FONT_FAMILY)
             .text_color(theme.settings_description)
             .child(
                 svg()
@@ -9727,7 +9727,7 @@ impl SettingsView {
             .border_1()
             .border_color(card_border)
             .bg(theme.settings_panel)
-            .font_family("PingFang SC")
+            .font_family(UI_FONT_FAMILY)
             .flex()
             .items_center()
             .justify_between()
@@ -9764,7 +9764,7 @@ impl SettingsView {
             .border_1()
             .border_color(theme.border)
             .bg(theme.settings_panel)
-            .font_family("PingFang SC")
+            .font_family(UI_FONT_FAMILY)
             .flex()
             .items_center()
             .justify_between()
@@ -9931,7 +9931,7 @@ impl SettingsView {
                             .relative()
                             .top(px(0.0))
                             .left(px(0.0))
-                            .font_family("PingFang SC")
+                            .font_family(UI_FONT_FAMILY)
                             .text_size(px(24.0))
                             .line_height(px(28.8))
                             .font_weight(gpui::FontWeight::NORMAL)
@@ -10807,7 +10807,7 @@ impl Render for SettingsView {
             .id("settings-shell")
             .size_full()
             .bg(theme.surface)
-            .font_family("PingFang SC")
+            .font_family(UI_FONT_FAMILY)
             .text_color(theme.text)
             .flex()
             .child(

@@ -1,4 +1,20 @@
-use gpui::{Rgba, rgba};
+use gpui::{Font, FontFallbacks, Rgba, font, rgba};
+
+/// ChatGPT's computed CSS uses `-apple-system, system-ui, "Segoe UI", sans-serif`.
+/// On macOS CDP reports `.SF NS` for Latin glyphs and PingFang SC for Simplified
+/// Chinese. GPUI maps this special family to `.AppleSystemUIFont`; the explicit
+/// CJK fallback keeps mixed Chinese/English runs on the same platform stack.
+pub const UI_FONT_FAMILY: &str = ".SystemUIFont";
+pub const UI_CJK_FALLBACK_FAMILY: &str = "PingFang SC";
+pub const UI_MONOSPACE_FONT_FAMILY: &str = "SFMono-Regular";
+
+pub fn ui_font() -> Font {
+    let mut font = font(UI_FONT_FAMILY);
+    font.fallbacks = Some(FontFallbacks::from_fonts(vec![
+        UI_CJK_FALLBACK_FAMILY.to_owned(),
+    ]));
+    font
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemeMode {
@@ -176,9 +192,9 @@ impl Theme {
 
 #[cfg(test)]
 mod tests {
-    use gpui::Rgba;
+    use gpui::{FontWeight, Rgba};
 
-    use super::{Theme, ThemeMode};
+    use super::{Theme, ThemeMode, UI_CJK_FALLBACK_FAMILY, UI_FONT_FAMILY, ui_font};
 
     fn composite(foreground: Rgba, background: Rgba) -> Rgba {
         let alpha = foreground.a + background.a * (1.0 - foreground.a);
@@ -214,6 +230,17 @@ mod tests {
             (relative_luminance(b), relative_luminance(a))
         };
         (lighter + 0.05) / (darker + 0.05)
+    }
+
+    #[test]
+    fn global_ui_font_uses_the_chatgpt_macos_stack() {
+        let font = ui_font();
+        assert_eq!(font.family.as_ref(), UI_FONT_FAMILY);
+        assert_eq!(font.weight, FontWeight::NORMAL);
+        assert_eq!(
+            font.fallbacks.expect("CJK fallback").fallback_list(),
+            &[UI_CJK_FALLBACK_FAMILY.to_owned()]
+        );
     }
 
     #[test]

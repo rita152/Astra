@@ -139,6 +139,14 @@ fn main() {
     let submit_prompt = args
         .iter()
         .find_map(|arg| arg.strip_prefix("--submit-prompt=").map(ToOwned::to_owned));
+    let command_tool_state = args.iter().find_map(|arg| {
+        arg.strip_prefix("--command-tool-state=")
+            .map(ToOwned::to_owned)
+    });
+    let command_tool_expanded = args.iter().any(|arg| arg == "--command-tool-expanded");
+    let user_message_actions_visible = args
+        .iter()
+        .any(|arg| arg == "--user-message-actions-visible");
     #[cfg(not(feature = "screenshot"))]
     if screenshot_path.is_some() {
         eprintln!(
@@ -345,6 +353,16 @@ fn main() {
                         }
                         if let Some(prompt) = submit_prompt.as_deref() {
                             app.submit_prompt_for_capture(prompt, cx);
+                        }
+                        if user_message_actions_visible {
+                            app.show_user_message_actions_for_capture(cx);
+                        }
+                        if let Some(state) = command_tool_state.as_deref() {
+                            app.set_command_tool_for_capture(
+                                state.eq_ignore_ascii_case("running"),
+                                command_tool_expanded,
+                                cx,
+                            );
                         }
                         if let Some(slug) = settings_page {
                             app.open_settings_page(slug, cx);

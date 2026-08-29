@@ -2058,6 +2058,7 @@ name = "gpui-chat-clone"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "chrono",
  "gpui",
  "gpui_platform",

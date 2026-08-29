@@ -1,17 +1,24 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 use gpui::{
     App, Bounds, ContentMask, Context, Div, Entity, FontWeight, MouseButton, PathBuilder, Pixels,
-    Render, ShapedLine, SharedString, TextAlign, TextRun, Window, canvas, div, point, prelude::*,
-    px, relative, rgba,
+    Render, ScrollHandle, ShapedLine, SharedString, TextAlign, TextRun, Transformation, Window,
+    canvas, div, point, prelude::*, px, radians, relative, rgba,
 };
 
 use crate::{
+    agent::{CommandExecution, CommandExecutionStatus},
     components::{
-        composer::{ComposerView, ConversationChanged, ConversationPhase, RequestFullAccess},
+        composer::{
+            ComposerView, ConversationActivity, ConversationChanged, ConversationPhase,
+            RequestFullAccess,
+        },
         icons::{icon, suggestion_icon},
     },
-    theme::{Theme, ThemeMode},
+    theme::{Theme, ThemeMode, UI_MONOSPACE_FONT_FAMILY},
 };
 
 pub struct HomeView {
@@ -27,6 +34,9 @@ pub struct HomeView {
     thinking_shimmer_cycle: u64,
     thinking_shimmer_running: bool,
     response_feedback: i8,
+    user_message_actions_visible_for_capture: bool,
+    expanded_commands: HashSet<String>,
+    command_scroll_handles: HashMap<String, ScrollHandle>,
 }
 
 impl gpui::EventEmitter<RequestFullAccess> for HomeView {}
@@ -43,6 +53,8 @@ const USER_MESSAGE_BUBBLE_RADIUS: f32 = 22.0;
 const USER_MESSAGE_BUBBLE_SUPERELLIPSE: f32 = 1.5;
 const USER_MESSAGE_FOOTER_OFFSET: f32 = 3.0;
 const USER_MESSAGE_FOOTER_HEIGHT: f32 = 26.0;
+const USER_MESSAGE_FOOTER_SIDE_MARGIN: f32 = 4.0;
+const USER_MESSAGE_FOOTER_GAP: f32 = 8.0;
 const USER_MESSAGE_TIME_SIZE: f32 = 12.0;
 const USER_MESSAGE_TIME_LINE_HEIGHT: f32 = 16.0;
 const RESPONSE_ACTION_ICON_SIZE: f32 = 16.0;
@@ -175,7 +187,7 @@ impl HomeView {
         })
         .detach();
         cx.subscribe(&composer, |this, composer, _: &ConversationChanged, cx| {
-            let phase = composer.read(cx).conversation_snapshot().0;
+            let phase = composer.read(cx).conversation_phase();
             this.sync_thinking_shimmer(phase, cx);
             cx.notify();
         })
@@ -193,6 +205,9 @@ impl HomeView {
             thinking_shimmer_cycle: 0,
             thinking_shimmer_running: false,
             response_feedback: 0,
+            user_message_actions_visible_for_capture: false,
+            expanded_commands: HashSet::new(),
+            command_scroll_handles: HashMap::new(),
         }
     }
 
@@ -298,6 +313,28 @@ impl HomeView {
         self.composer.update(cx, |composer, cx| {
             composer.submit_prompt_for_capture(prompt, cx)
         });
+    }
+
+    pub fn show_user_message_actions_for_capture(&mut self, cx: &mut Context<Self>) {
+        self.user_message_actions_visible_for_capture = true;
+        cx.notify();
+    }
+
+    pub fn set_command_tool_for_capture(
+        &mut self,
+        running: bool,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.expanded_commands.clear();
+        if expanded {
+            self.expanded_commands
+                .insert("exec-command-ui-capture".to_owned());
+        }
+        self.composer.update(cx, |composer, cx| {
+            composer.set_command_tool_for_capture(running, cx)
+        });
+        cx.notify();
     }
 
     fn set_suggestion_pressed(
@@ -435,7 +472,7 @@ impl HomeView {
                     .items_center()
                     .gap(px(7.0 * scale))
                     .text_size(px(13.0 * scale))
-                    .font_weight(gpui::FontWeight(445.0))
+                    .font_weight(gpui::FontWeight::NORMAL)
                     .text_color(theme.text_tertiary)
                     .hover(move |style| style.text_color(theme.text))
                     .child(
@@ -452,8 +489,25 @@ impl HomeView {
 impl Render for HomeView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_mode(self.mode);
-        let (phase, user_message, user_message_time, assistant_message, assistant_message_time) =
-            self.composer.read(cx).conversation_snapshot();
+        let (
+            phase,
+            user_message,
+            user_message_time,
+            assistant_message,
+            assistant_message_time,
+            conversation_activity,
+        ) = self.composer.read(cx).conversation_render_snapshot();
+        for activity in &conversation_activity {
+            if let ConversationActivity::Command(command) = activity {
+                let scroll_handle = self
+                    .command_scroll_handles
+                    .entry(command.id.clone())
+                    .or_insert_with(ScrollHandle::new);
+                if command.status == CommandExecutionStatus::InProgress {
+                    scroll_handle.scroll_to_bottom();
+                }
+            }
+        }
         home(
             cx.entity(),
             theme,
@@ -463,8 +517,12 @@ impl Render for HomeView {
             user_message_time,
             assistant_message,
             assistant_message_time,
+            conversation_activity,
             self.thinking_shimmer_progress,
             self.response_feedback,
+            self.user_message_actions_visible_for_capture,
+            self.expanded_commands.clone(),
+            self.command_scroll_handles.clone(),
             self.suggestion(
                 0,
                 "Prove plugin upgrades never mutate an active run",
@@ -490,8 +548,12 @@ fn home(
     user_message_time: Option<String>,
     assistant_message: String,
     assistant_message_time: Option<String>,
+    conversation_activity: Vec<ConversationActivity>,
     thinking_shimmer_progress: f32,
     response_feedback: i8,
+    user_message_actions_visible_for_capture: bool,
+    expanded_commands: HashSet<String>,
+    command_scroll_handles: HashMap<String, ScrollHandle>,
     first_suggestion: impl IntoElement,
     second_suggestion: impl IntoElement,
 ) -> Div {
@@ -550,8 +612,12 @@ fn home(
                 user_message_time.unwrap_or_default(),
                 assistant_message,
                 assistant_message_time,
+                conversation_activity,
                 thinking_shimmer_progress,
                 response_feedback,
+                user_message_actions_visible_for_capture,
+                expanded_commands,
+                command_scroll_handles,
             ))
         })
         .child(
@@ -592,8 +658,12 @@ fn conversation(
     user_message_time: String,
     assistant_message: String,
     assistant_message_time: Option<String>,
+    conversation_activity: Vec<ConversationActivity>,
     thinking_shimmer_progress: f32,
     response_feedback: i8,
+    user_message_actions_visible_for_capture: bool,
+    expanded_commands: HashSet<String>,
+    command_scroll_handles: HashMap<String, ScrollHandle>,
 ) -> Div {
     let status = conversation_status(phase);
     let user_message_hover_group: SharedString = "user-message-hover".into();
@@ -651,17 +721,21 @@ fn conversation(
                         .child(
                             div()
                                 .mt(px(USER_MESSAGE_FOOTER_OFFSET))
+                                .mx(px(USER_MESSAGE_FOOTER_SIDE_MARGIN))
                                 .h(px(USER_MESSAGE_FOOTER_HEIGHT))
-                                .w_full()
                                 .flex()
                                 .items_center()
-                                .justify_between()
+                                .gap(px(USER_MESSAGE_FOOTER_GAP))
                                 .child(
                                     div()
                                         .text_size(px(USER_MESSAGE_TIME_SIZE))
                                         .line_height(px(USER_MESSAGE_TIME_LINE_HEIGHT))
                                         .text_color(theme.text_tertiary)
-                                        .opacity(0.0)
+                                        .opacity(if user_message_actions_visible_for_capture {
+                                            1.0
+                                        } else {
+                                            0.0
+                                        })
                                         .group_hover(user_message_hover_group.clone(), |time| {
                                             time.opacity(1.0)
                                         })
@@ -672,7 +746,11 @@ fn conversation(
                                         .id("user-message-copy")
                                         .size(px(26.0))
                                         .rounded(px(10.0))
-                                        .opacity(0.0)
+                                        .opacity(if user_message_actions_visible_for_capture {
+                                            1.0
+                                        } else {
+                                            0.0
+                                        })
                                         .group_hover(user_message_hover_group, |button| {
                                             button.opacity(1.0)
                                         })
@@ -712,9 +790,22 @@ fn conversation(
                 .when_some(status, |answer, _| {
                     answer.child(thinking_shimmer(theme, thinking_shimmer_progress))
                 })
-                .when(!assistant_message.is_empty(), |answer| {
-                    answer.child(div().w_full().child(assistant_message.clone()))
-                })
+                .when(
+                    !assistant_message.is_empty() || !conversation_activity.is_empty(),
+                    |answer| {
+                        if conversation_activity.is_empty() {
+                            answer.child(div().w_full().child(assistant_message.clone()))
+                        } else {
+                            answer.child(activity_stream(
+                                home_entity.clone(),
+                                conversation_activity,
+                                expanded_commands,
+                                command_scroll_handles,
+                                theme,
+                            ))
+                        }
+                    },
+                )
                 .when(complete, |answer| {
                     answer.child(
                         div()
@@ -793,6 +884,244 @@ fn conversation(
                     )
                 }),
         )
+}
+
+fn activity_stream(
+    home_entity: Entity<HomeView>,
+    activities: Vec<ConversationActivity>,
+    expanded_commands: HashSet<String>,
+    command_scroll_handles: HashMap<String, ScrollHandle>,
+    theme: Theme,
+) -> Div {
+    activities.into_iter().fold(
+        div().w_full().flex().flex_col().gap(px(16.0)),
+        |stream, activity| match activity {
+            ConversationActivity::AssistantMessage { text, .. } if !text.is_empty() => {
+                stream.child(div().w_full().child(text))
+            }
+            ConversationActivity::Command(command) => {
+                let expanded = expanded_commands.contains(&command.id);
+                let scroll_handle = command_scroll_handles
+                    .get(&command.id)
+                    .cloned()
+                    .unwrap_or_else(ScrollHandle::new);
+                stream.child(command_activity(
+                    home_entity.clone(),
+                    command,
+                    expanded,
+                    scroll_handle,
+                    theme,
+                ))
+            }
+            ConversationActivity::Error { message } => stream.child(
+                div()
+                    .w_full()
+                    .px(px(12.0))
+                    .py(px(9.0))
+                    .flex()
+                    .items_start()
+                    .gap(px(8.0))
+                    .rounded(px(8.0))
+                    .border(px(1.0))
+                    .border_color(theme.warning.alpha(0.24))
+                    .bg(theme.warning.alpha(0.08))
+                    .text_color(theme.warning)
+                    .child(
+                        icon("settings-warning", theme.warning.into())
+                            .size(px(16.0))
+                            .mt(px(2.0))
+                            .flex_none(),
+                    )
+                    .child(div().min_w(px(0.0)).child(message)),
+            ),
+            _ => stream,
+        },
+    )
+}
+
+fn command_activity(
+    home_entity: Entity<HomeView>,
+    command: CommandExecution,
+    expanded: bool,
+    scroll_handle: ScrollHandle,
+    theme: Theme,
+) -> Div {
+    let item_id = command.id.clone();
+    let output_scroll_id: SharedString = format!("command-output-{item_id}").into();
+    let hover_group: SharedString = format!("command-activity-{item_id}").into();
+    let command_label = match command.status {
+        CommandExecutionStatus::InProgress => "正在运行",
+        CommandExecutionStatus::Completed => "已运行",
+        CommandExecutionStatus::Failed => "运行失败",
+    };
+    let status_label = match command.status {
+        CommandExecutionStatus::InProgress => "运行中",
+        CommandExecutionStatus::Completed => "成功",
+        CommandExecutionStatus::Failed => "失败",
+    };
+    let status_icon = match command.status {
+        CommandExecutionStatus::Failed => "settings-warning",
+        _ => "check",
+    };
+    let status_color = if command.status == CommandExecutionStatus::Failed {
+        theme.warning
+    } else {
+        theme.text_tertiary
+    };
+    let display_command = if command.command.is_empty() {
+        "命令".to_owned()
+    } else {
+        command.command.clone()
+    };
+    let header_text = format!("{command_label} {display_command}");
+    let output = if command.output.is_empty() {
+        if command.status == CommandExecutionStatus::InProgress {
+            "等待输出…".to_owned()
+        } else {
+            "（无输出）".to_owned()
+        }
+    } else {
+        command.output.clone()
+    };
+    let command_for_body = display_command.clone();
+    let scroll_handle_for_click = scroll_handle.clone();
+
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .items_start()
+        .child(
+            div()
+                .id(SharedString::from(format!("command-activity-{item_id}")))
+                .group(hover_group.clone())
+                .h(px(21.0))
+                .max_w_full()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    home_entity.update(cx, |home, cx| {
+                        if !home.expanded_commands.remove(&item_id) {
+                            home.expanded_commands.insert(item_id.clone());
+                            scroll_handle_for_click.scroll_to_bottom();
+                        }
+                        cx.notify();
+                    });
+                })
+                .child(
+                    icon("panel-terminal", theme.text_tertiary.into())
+                        .size(px(16.0))
+                        .flex_none(),
+                )
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .max_w(px(690.0))
+                        .truncate()
+                        .text_size(px(14.0))
+                        .line_height(px(21.0))
+                        .font_family(".SystemUIFont")
+                        .text_color(theme.text_tertiary)
+                        .child(header_text),
+                )
+                .child(
+                    icon("settings-chevron-right", theme.text_tertiary.into())
+                        .size(px(12.0))
+                        .flex_none()
+                        .opacity(if expanded { 1.0 } else { 0.0 })
+                        .group_hover(hover_group, |chevron| chevron.opacity(1.0))
+                        .when(expanded, |chevron| {
+                            chevron.with_transformation(Transformation::rotate(radians(
+                                std::f32::consts::FRAC_PI_2,
+                            )))
+                        }),
+                ),
+        )
+        .when(expanded, |activity| {
+            activity.child(
+                div().w_full().pt(px(8.0)).pb(px(4.0)).child(
+                    div()
+                        .w_full()
+                        .overflow_hidden()
+                        .rounded(px(8.0))
+                        .border(px(1.0))
+                        .border_color(theme.text.alpha(0.15))
+                        .bg(theme.text.alpha(0.04))
+                        .child(
+                            div()
+                                .h(px(29.0))
+                                .px(px(8.0))
+                                .flex()
+                                .items_center()
+                                .text_size(px(14.0))
+                                .line_height(px(21.0))
+                                .font_family(".SystemUIFont")
+                                .text_color(theme.text_tertiary)
+                                .child("Shell"),
+                        )
+                        .child(
+                            div()
+                                .px(px(8.0))
+                                .pt(px(8.0))
+                                .text_size(px(13.0))
+                                .line_height(px(20.0))
+                                .font_family(UI_MONOSPACE_FONT_FAMILY)
+                                .text_color(theme.text_secondary)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_start()
+                                        .child(
+                                            div()
+                                                .mr(px(8.0))
+                                                .text_color(theme.text_tertiary)
+                                                .child("$"),
+                                        )
+                                        .child(
+                                            div().min_w(px(0.0)).flex_1().child(command_for_body),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id(output_scroll_id)
+                                .max_h(px(144.0))
+                                .overflow_scroll()
+                                .restrict_scroll_to_axis()
+                                .scrollbar_width(px(0.0))
+                                .track_scroll(&scroll_handle)
+                                .p(px(8.0))
+                                .text_size(px(13.0))
+                                .line_height(px(20.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .font_family(UI_MONOSPACE_FONT_FAMILY)
+                                .text_color(theme.text_secondary)
+                                .child(output),
+                        )
+                        .child(
+                            div()
+                                .h(px(27.0))
+                                .px(px(10.0))
+                                .pt(px(2.0))
+                                .pb(px(4.0))
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .gap(px(4.0))
+                                .text_size(px(14.0))
+                                .line_height(px(21.0))
+                                .text_color(status_color)
+                                .child(icon(status_icon, status_color.into()).size(px(12.0)))
+                                .child(status_label),
+                        ),
+                ),
+            )
+        })
 }
 
 fn conversation_status(phase: ConversationPhase) -> Option<&'static str> {
@@ -939,10 +1268,10 @@ mod tests {
         RESPONSE_TIME_LINE_HEIGHT, RESPONSE_TIME_MARGIN, RESPONSE_TIME_SIZE,
         SUGGESTION_PRESSED_SCALE, THINKING_SHIMMER_DURATION, THINKING_SHIMMER_FRAME_INTERVAL,
         THINKING_SHIMMER_STEPS, THINKING_SHIMMER_WIDTH, USER_MESSAGE_BUBBLE_RADIUS,
-        USER_MESSAGE_BUBBLE_SUPERELLIPSE, USER_MESSAGE_FOOTER_HEIGHT, USER_MESSAGE_FOOTER_OFFSET,
-        USER_MESSAGE_TIME_LINE_HEIGHT, USER_MESSAGE_TIME_SIZE, conversation_status,
-        thinking_shimmer_alpha, thinking_shimmer_band_left, thinking_shimmer_progress,
-        thinking_shimmer_step,
+        USER_MESSAGE_BUBBLE_SUPERELLIPSE, USER_MESSAGE_FOOTER_GAP, USER_MESSAGE_FOOTER_HEIGHT,
+        USER_MESSAGE_FOOTER_OFFSET, USER_MESSAGE_FOOTER_SIDE_MARGIN, USER_MESSAGE_TIME_LINE_HEIGHT,
+        USER_MESSAGE_TIME_SIZE, conversation_status, thinking_shimmer_alpha,
+        thinking_shimmer_band_left, thinking_shimmer_progress, thinking_shimmer_step,
     };
     use crate::components::composer::ConversationPhase;
     use crate::theme::ThemeMode;
@@ -1094,6 +1423,8 @@ mod tests {
     fn user_message_footer_matches_the_live_cdp_geometry() {
         assert_eq!(USER_MESSAGE_FOOTER_OFFSET, 3.0);
         assert_eq!(USER_MESSAGE_FOOTER_HEIGHT, 26.0);
+        assert_eq!(USER_MESSAGE_FOOTER_SIDE_MARGIN, 4.0);
+        assert_eq!(USER_MESSAGE_FOOTER_GAP, 8.0);
         assert_eq!(USER_MESSAGE_TIME_SIZE, 12.0);
         assert_eq!(USER_MESSAGE_TIME_LINE_HEIGHT, 16.0);
     }
@@ -1116,10 +1447,10 @@ mod tests {
         window.draw();
 
         // The 736px conversation column is centered in this 900px test
-        // window. Its trailing 26px footer action occupies x=792..818 and
-        // y=123..149, matching the layout measured over CDP.
-        window.simulate_mouse_move(point(px(805.0), px(136.0)));
-        window.simulate_click(point(px(805.0), px(136.0)), MouseButton::Left);
+        // window. ChatGPT insets the trailing 26px action by 4px, so it
+        // occupies x=788..814 and y=123..149.
+        window.simulate_mouse_move(point(px(801.0), px(136.0)));
+        window.simulate_click(point(px(801.0), px(136.0)), MouseButton::Left);
 
         assert_eq!(
             app.read_from_clipboard().and_then(|item| item.text()),

@@ -2,6 +2,7 @@
 
 > 基准版本：`codex-cli 0.150.1`
 > 生成日期：2026-08-28
+> 接入状态更新：2026-08-30
 > 范围：`codex app-server generate-json-schema --experimental` 输出的全部方法，并与默认 schema 对比标注能力门槛。
 
 ## 结论
@@ -45,18 +46,22 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 
 ## 已接入范围
 
-当前最小实现通过统一的 `AgentBackend::run_prompt(AgentRequest) -> Receiver<AgentEvent>` 接口隔离具体 coding agent。Codex 适配器位于 `src/agent/codex.rs`，UI 只依赖 `AgentEvent`，不直接依赖 Codex JSON-RPC。
+当前实现通过统一的 `AgentBackend::run_prompt(AgentRequest) -> Receiver<AgentEvent>` 接口隔离具体 coding agent。Codex 适配器位于 `src/agent/codex.rs`，UI 只依赖内部协议 `AgentEvent`，不直接依赖 Codex JSON-RPC。流式事件由 `ComposerView::apply_agent_event_batch` 批量消费。
 
-| 已接入协议 | 内部职责 |
-|---|---|
-| `initialize`、`initialized` | 建立一条 app-server 连接的初始化握手 |
-| `thread/start` | 为本次 prompt 创建临时、只读线程 |
-| `turn/start` | 提交文本 prompt |
-| `item/agentMessage/delta` | 将流式文本转换为 `AgentEvent::TextDelta` |
-| `item/completed` | 当服务端没有发送 delta 时，使用完整 agent message 兜底 |
-| `turn/completed` | 转换为统一的完成或失败事件，并结束 UI loading 状态 |
+| 已接入 JSON-RPC 方法 | 方向 | 内部协议 | 接入职责 |
+|---|---|---|---|
+| `initialize`、`initialized` | 客户端 → 服务端 | `drive_session` 连接生命周期（无 `AgentEvent`） | 建立一条 app-server 连接的初始化握手 |
+| `thread/start` | 客户端 → 服务端 | `drive_session` 请求/响应生命周期（无 `AgentEvent`） | 为本次 prompt 创建临时、只读线程 |
+| `turn/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 提交文本 prompt |
+| `item/started` | 服务端 → 客户端 | `AgentEvent::AssistantMessageStarted { item_id }` / `AgentEvent::CommandStarted(CommandExecution)` | 建立 assistant message 或 command activity |
+| `item/agentMessage/delta` | 服务端 → 客户端 | `AgentEvent::TextDelta(String)` | 追加流式 assistant 文本 |
+| `item/commandExecution/outputDelta` | 服务端 → 客户端 | `AgentEvent::CommandOutputDelta { item_id, delta }` | 按 `item_id` 将流式输出追加到对应 command activity |
+| `item/completed` | 服务端 → 客户端 | `AgentEvent::CommandCompleted(CommandExecution)` / `AgentEvent::TextDelta(String)` | 完成 command activity；未收到文本 delta 时用完整 agent message 兜底 |
+| `turn/completed` | 服务端 → 客户端 | `AgentEvent::Completed` / `AgentEvent::Failed(String)` | 结束本轮流式状态并更新最终结果 |
 
-未接入的服务端反向请求会收到 `-32601`，因此当前实现固定使用 `approvalPolicy: "never"`、`sandbox: "read-only"`，只覆盖最基础的一轮文本问答，不执行需要用户审批的操作。
+未接入的服务端反向请求会收到 `-32601`，因此当前实现固定使用 `approvalPolicy: "never"`、`sandbox: "read-only"`。该策略下 app-server 自行执行的 `commandExecution` 可展示开始状态、增量输出和完成状态；需要用户审批或交互的操作仍未接入。
+
+下方总表中，“是”表示消息已转换为内部协议并由应用消费；“已知（no-op）”表示适配器会显式接受该通知，但不生成 `AgentEvent`；“否”表示尚未定义或接入，实际收到时会进入未定义方法错误处理。
 
 ## 全部方法
 
@@ -245,8 +250,8 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 | # | Method | 消息形式 | Params schema | 能力门槛 / 状态 | 内部方法 | 是否接入 |
 |---:|---|---|---|---|---|:---:|
 | 1 | `error` | 通知（无 `id`） | `ErrorNotification` | 默认 | — | 否 |
-| 2 | `thread/started` | 通知（无 `id`） | `ThreadStartedNotification` | 默认 | — | 否 |
-| 3 | `thread/status/changed` | 通知（无 `id`） | `ThreadStatusChangedNotification` | 默认 | — | 否 |
+| 2 | `thread/started` | 通知（无 `id`） | `ThreadStartedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
+| 3 | `thread/status/changed` | 通知（无 `id`） | `ThreadStatusChangedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
 | 4 | `thread/archived` | 通知（无 `id`） | `ThreadArchivedNotification` | 默认 | — | 否 |
 | 5 | `thread/deleted` | 通知（无 `id`） | `ThreadDeletedNotification` | 默认 | — | 否 |
 | 6 | `thread/unarchived` | 通知（无 `id`） | `ThreadUnarchivedNotification` | 默认 | — | 否 |
@@ -262,36 +267,36 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 | 16 | `thread/environment/connected` | 通知（无 `id`） | `EnvironmentConnectionNotification` | 默认 | — | 否 |
 | 17 | `thread/environment/disconnected` | 通知（无 `id`） | `EnvironmentConnectionNotification` | 默认 | — | 否 |
 | 18 | `thread/settings/updated` | 通知（无 `id`） | `ThreadSettingsUpdatedNotification` | 默认 | — | 否 |
-| 19 | `thread/tokenUsage/updated` | 通知（无 `id`） | `ThreadTokenUsageUpdatedNotification` | 默认 | — | 否 |
-| 20 | `turn/started` | 通知（无 `id`） | `TurnStartedNotification` | 默认 | — | 否 |
+| 19 | `thread/tokenUsage/updated` | 通知（无 `id`） | `ThreadTokenUsageUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
+| 20 | `turn/started` | 通知（无 `id`） | `TurnStartedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
 | 21 | `hook/started` | 通知（无 `id`） | `HookStartedNotification` | 默认 | — | 否 |
-| 22 | `turn/completed` | 通知（无 `id`） | `TurnCompletedNotification` | 默认 | `drive_session` → `AgentEvent::{Completed, Failed}` → `HomeView::apply_agent_event` | 是 |
+| 22 | `turn/completed` | 通知（无 `id`） | `TurnCompletedNotification` | 默认 | `drive_session` → `AgentEvent::Completed` / `AgentEvent::Failed(String)` → `ComposerView::apply_agent_event_batch` | 是 |
 | 23 | `hook/completed` | 通知（无 `id`） | `HookCompletedNotification` | 默认 | — | 否 |
 | 24 | `turn/diff/updated` | 通知（无 `id`） | `TurnDiffUpdatedNotification` | 默认 | — | 否 |
-| 25 | `turn/plan/updated` | 通知（无 `id`） | `TurnPlanUpdatedNotification` | 默认 | — | 否 |
-| 26 | `item/started` | 通知（无 `id`） | `ItemStartedNotification` | 默认 | — | 否 |
+| 25 | `turn/plan/updated` | 通知（无 `id`） | `TurnPlanUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
+| 26 | `item/started` | 通知（无 `id`） | `ItemStartedNotification` | 默认 | `drive_session` → `AgentEvent::AssistantMessageStarted { item_id }` / `AgentEvent::CommandStarted(CommandExecution)` → `ComposerView::apply_agent_event_batch` | 是（`agentMessage`、`commandExecution`） |
 | 27 | `item/autoApprovalReview/started` | 通知（无 `id`） | `ItemGuardianApprovalReviewStartedNotification` | 默认 | — | 否 |
 | 28 | `item/autoApprovalReview/completed` | 通知（无 `id`） | `ItemGuardianApprovalReviewCompletedNotification` | 默认 | — | 否 |
 | 29 | `autoApprovalReview/strictReviewRequired` | 通知（无 `id`） | `StrictReviewRequiredNotification` | 默认 | — | 否 |
-| 30 | `item/completed` | 通知（无 `id`） | `ItemCompletedNotification` | 默认 | `drive_session` → `AgentEvent::TextDelta`（无 delta 时兜底） | 是 |
-| 31 | `item/agentMessage/delta` | 通知（无 `id`） | `AgentMessageDeltaNotification` | 默认 | `drive_session` → `AgentEvent::TextDelta` → `HomeView::apply_agent_event` | 是 |
+| 30 | `item/completed` | 通知（无 `id`） | `ItemCompletedNotification` | 默认 | `drive_session` → `AgentEvent::CommandCompleted(CommandExecution)` / `AgentEvent::TextDelta(String)` → `ComposerView::apply_agent_event_batch` | 是（`agentMessage`、`commandExecution`） |
+| 31 | `item/agentMessage/delta` | 通知（无 `id`） | `AgentMessageDeltaNotification` | 默认 | `drive_session` → `AgentEvent::TextDelta(String)` → `ComposerView::apply_agent_event_batch` | 是 |
 | 32 | `item/plan/delta` | 通知（无 `id`） | `PlanDeltaNotification` | 默认 | — | 否 |
 | 33 | `command/exec/outputDelta` | 通知（无 `id`） | `CommandExecOutputDeltaNotification` | 默认 | — | 否 |
 | 34 | `process/outputDelta` | 通知（无 `id`） | `ProcessOutputDeltaNotification` | 默认 | — | 否 |
 | 35 | `process/exited` | 通知（无 `id`） | `ProcessExitedNotification` | 默认 | — | 否 |
-| 36 | `item/commandExecution/outputDelta` | 通知（无 `id`） | `CommandExecutionOutputDeltaNotification` | 默认 | — | 否 |
+| 36 | `item/commandExecution/outputDelta` | 通知（无 `id`） | `CommandExecutionOutputDeltaNotification` | 默认 | `drive_session` → `AgentEvent::CommandOutputDelta { item_id, delta }` → `ComposerView::apply_agent_event_batch` | 是 |
 | 37 | `item/commandExecution/terminalInteraction` | 通知（无 `id`） | `TerminalInteractionNotification` | 默认 | — | 否 |
 | 38 | `item/fileChange/outputDelta` | 通知（无 `id`） | `FileChangeOutputDeltaNotification` | 默认；已弃用 | — | 否 |
 | 39 | `item/fileChange/patchUpdated` | 通知（无 `id`） | `FileChangePatchUpdatedNotification` | 默认 | — | 否 |
 | 40 | `serverRequest/resolved` | 通知（无 `id`） | `ServerRequestResolvedNotification` | 默认 | — | 否 |
 | 41 | `item/mcpToolCall/progress` | 通知（无 `id`） | `McpToolCallProgressNotification` | 默认 | — | 否 |
 | 42 | `mcpServer/oauthLogin/completed` | 通知（无 `id`） | `McpServerOauthLoginCompletedNotification` | 默认 | — | 否 |
-| 43 | `mcpServer/startupStatus/updated` | 通知（无 `id`） | `McpServerStatusUpdatedNotification` | 默认 | — | 否 |
+| 43 | `mcpServer/startupStatus/updated` | 通知（无 `id`） | `McpServerStatusUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
 | 44 | `mcpServer/event/stream/notification` | 通知（无 `id`） | `McpServerEventStreamNotification` | 默认 | — | 否 |
 | 45 | `account/updated` | 通知（无 `id`） | `AccountUpdatedNotification` | 默认 | — | 否 |
-| 46 | `account/rateLimits/updated` | 通知（无 `id`） | `AccountRateLimitsUpdatedNotification` | 默认 | — | 否 |
+| 46 | `account/rateLimits/updated` | 通知（无 `id`） | `AccountRateLimitsUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
 | 47 | `app/list/updated` | 通知（无 `id`） | `AppListUpdatedNotification` | 默认 | — | 否 |
-| 48 | `remoteControl/status/changed` | 通知（无 `id`） | `RemoteControlStatusChangedNotification` | 默认 | — | 否 |
+| 48 | `remoteControl/status/changed` | 通知（无 `id`） | `RemoteControlStatusChangedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
 | 49 | `externalAgentConfig/import/progress` | 通知（无 `id`） | `ExternalAgentConfigImportProgressNotification` | 默认 | — | 否 |
 | 50 | `externalAgentConfig/import/completed` | 通知（无 `id`） | `ExternalAgentConfigImportCompletedNotification` | 默认 | — | 否 |
 | 51 | `fs/changed` | 通知（无 `id`） | `FsChangedNotification` | 默认 | — | 否 |

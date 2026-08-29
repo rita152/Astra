@@ -17,7 +17,7 @@ use crate::{
         sidebar::{OpenProjectCreation, OpenSettings, SidebarView},
     },
     settings::{ChangeTheme, CloseSettings, SettingsView},
-    theme::{Theme, ThemeMode},
+    theme::{Theme, ThemeMode, UI_FONT_FAMILY, ui_font},
 };
 
 pub struct ChatApp {
@@ -364,6 +364,23 @@ impl ChatApp {
     pub fn submit_prompt_for_capture(&mut self, prompt: &str, cx: &mut Context<Self>) {
         self.home
             .update(cx, |home, cx| home.submit_prompt_for_capture(prompt, cx));
+    }
+
+    pub fn show_user_message_actions_for_capture(&mut self, cx: &mut Context<Self>) {
+        self.home.update(cx, |home, cx| {
+            home.show_user_message_actions_for_capture(cx)
+        });
+    }
+
+    pub fn set_command_tool_for_capture(
+        &mut self,
+        running: bool,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.home.update(cx, |home, cx| {
+            home.set_command_tool_for_capture(running, expanded, cx)
+        });
     }
 
     pub fn set_permission_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
@@ -1157,7 +1174,7 @@ impl ChatApp {
                     .spread_radius(px(-2.0)),
             ])
             .p(px(20.0))
-            .font_family("PingFang SC")
+            .font_family(UI_FONT_FAMILY)
             .text_size(px(14.0))
             .line_height(px(21.0))
             .font_weight(gpui::FontWeight(300.0))
@@ -1959,6 +1976,7 @@ impl Render for ChatApp {
             .bg(theme.surface_underlay)
             .relative()
             .flex()
+            .font(ui_font())
             .on_click(cx.listener(|this, _, _, cx| {
                 this.home.update(cx, |home, cx| home.close_model_picker(cx));
                 this.sidebar
@@ -1984,7 +2002,6 @@ impl Render for ChatApp {
             })
             .when(!self.showing_settings, |shell| {
                 shell
-                    .font_weight(gpui::FontWeight(445.0))
                     .child(
                         div()
                             .w(px(revealed_sidebar_width))

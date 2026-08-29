@@ -8,7 +8,10 @@ use gpui::{
 };
 
 use crate::{
-    agent::{AgentBackend, AgentEvent, AgentRequest, CodexAppServerBackend},
+    agent::{
+        AgentBackend, AgentEvent, AgentRequest, CodexAppServerBackend, CommandExecution,
+        CommandExecutionStatus,
+    },
     components::{
         icons::icon,
         prompt_input::{PromptChanged, PromptInput, PromptSubmitted},
@@ -56,6 +59,13 @@ pub enum ConversationPhase {
     Failed,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConversationActivity {
+    AssistantMessage { item_id: String, text: String },
+    Command(CommandExecution),
+    Error { message: String },
+}
+
 const MODEL_PICKER_WIDTH: f32 = 224.0;
 const MODEL_PICKER_SUBMENU_GAP: f32 = 1.0;
 const MODEL_PICKER_RIGHT_INSET: f32 = 63.0;
@@ -63,9 +73,70 @@ const MODEL_PICKER_MIN_SUBMENU_WIDTH: f32 = 180.0;
 const HOME_COMPOSER_MAX_WIDTH: f32 = 748.0;
 const APP_SIDEBAR_WIDTH: f32 = 256.125;
 const PARTICLE_TIMELINE_MS: f32 = 120_000.0;
+// Collect for half a 60 Hz frame after the first event. This catches protocol
+// micro-bursts while leaving enough time for GPUI's next 60/120 Hz paint.
+const STREAM_UPDATE_INTERVAL: Duration = Duration::from_millis(8);
+// Keep an unexpectedly large command-output burst from monopolizing the UI
+// executor. Adjacent deltas are merged before they touch view state.
+const STREAM_EVENTS_PER_UPDATE: usize = 512;
+const STREAM_DISCONNECTED_MESSAGE: &str = "Codex 事件流意外断开";
 
 fn current_local_time_label() -> String {
     Local::now().format("%H:%M").to_string()
+}
+
+fn push_coalesced_agent_event(batch: &mut Vec<AgentEvent>, event: AgentEvent) {
+    match event {
+        AgentEvent::TextDelta(delta) => {
+            if let Some(AgentEvent::TextDelta(buffered)) = batch.last_mut() {
+                buffered.push_str(&delta);
+            } else {
+                batch.push(AgentEvent::TextDelta(delta));
+            }
+        }
+        AgentEvent::CommandOutputDelta { item_id, delta } => {
+            if let Some(AgentEvent::CommandOutputDelta {
+                item_id: buffered_item_id,
+                delta: buffered,
+            }) = batch.last_mut()
+                && buffered_item_id == &item_id
+            {
+                buffered.push_str(&delta);
+            } else {
+                batch.push(AgentEvent::CommandOutputDelta { item_id, delta });
+            }
+        }
+        event => batch.push(event),
+    }
+}
+
+fn collect_ready_agent_events(
+    receiver: &async_channel::Receiver<AgentEvent>,
+    first_event: AgentEvent,
+) -> (Vec<AgentEvent>, bool) {
+    let mut batch = Vec::with_capacity(16);
+    push_coalesced_agent_event(&mut batch, first_event);
+    let mut channel_closed = false;
+    for _ in 1..STREAM_EVENTS_PER_UPDATE {
+        match receiver.try_recv() {
+            Ok(event) => push_coalesced_agent_event(&mut batch, event),
+            Err(async_channel::TryRecvError::Empty) => break,
+            Err(async_channel::TryRecvError::Closed) => {
+                channel_closed = true;
+                break;
+            }
+        }
+    }
+    (batch, channel_closed)
+}
+
+fn ensure_closed_batch_is_terminal(batch: &mut Vec<AgentEvent>) {
+    if !batch
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Completed | AgentEvent::Failed(_)))
+    {
+        batch.push(AgentEvent::Failed(STREAM_DISCONNECTED_MESSAGE.to_owned()));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -165,6 +236,7 @@ pub struct ComposerView {
     user_message: Option<String>,
     user_message_time: Option<String>,
     assistant_message: String,
+    conversation_activity: Vec<ConversationActivity>,
     assistant_message_time: Option<String>,
     conversation_phase: ConversationPhase,
     conversation_cycle: u64,
@@ -204,6 +276,7 @@ impl ComposerView {
             user_message: None,
             user_message_time: None,
             assistant_message: String::new(),
+            conversation_activity: Vec::new(),
             assistant_message_time: None,
             conversation_phase: ConversationPhase::Empty,
             conversation_cycle: 0,
@@ -227,6 +300,7 @@ impl ComposerView {
         }
     }
 
+    #[cfg(test)]
     pub fn conversation_snapshot(
         &self,
     ) -> (
@@ -245,6 +319,49 @@ impl ComposerView {
         )
     }
 
+    #[cfg(test)]
+    pub fn conversation_activity_snapshot(&self) -> Vec<ConversationActivity> {
+        self.conversation_activity.clone()
+    }
+
+    pub fn conversation_phase(&self) -> ConversationPhase {
+        self.conversation_phase
+    }
+
+    pub fn conversation_render_snapshot(
+        &self,
+    ) -> (
+        ConversationPhase,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        Vec<ConversationActivity>,
+    ) {
+        // While activities are present they are the render source of truth.
+        // Avoid cloning the same growing assistant response a second time on
+        // every streaming frame; the aggregate is only needed for fallback
+        // rendering and the completed response actions.
+        let assistant_message = if self.conversation_activity.is_empty()
+            || matches!(
+                self.conversation_phase,
+                ConversationPhase::Complete | ConversationPhase::Failed
+            ) {
+            self.assistant_message.clone()
+        } else {
+            String::new()
+        };
+
+        (
+            self.conversation_phase,
+            self.user_message.clone(),
+            self.user_message_time.clone(),
+            assistant_message,
+            self.assistant_message_time.clone(),
+            self.conversation_activity.clone(),
+        )
+    }
+
     fn submit_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
         if prompt.trim().is_empty()
             || matches!(
@@ -260,6 +377,7 @@ impl ComposerView {
         self.user_message = Some(prompt.clone());
         self.user_message_time = Some(current_local_time_label());
         self.assistant_message.clear();
+        self.conversation_activity.clear();
         self.assistant_message_time = None;
         self.conversation_phase = ConversationPhase::Starting;
         self.conversation_cycle = self.conversation_cycle.wrapping_add(1);
@@ -275,51 +393,147 @@ impl ComposerView {
             prompt,
             cwd: std::env::current_dir().unwrap_or_default(),
         });
+        self.consume_agent_events(receiver, cycle, cx);
+    }
+
+    fn consume_agent_events(
+        &mut self,
+        receiver: async_channel::Receiver<AgentEvent>,
+        cycle: u64,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             loop {
-                let mut finished = false;
-                while let Ok(event) = receiver.try_recv() {
-                    let result = this.update(cx, |this, cx| {
-                        if this.conversation_cycle != cycle {
-                            finished = true;
-                            return;
-                        }
-                        match event {
-                            AgentEvent::Started => {
-                                this.conversation_phase = ConversationPhase::Thinking;
+                let first_event = match receiver.recv().await {
+                    Ok(event) => event,
+                    Err(_) => {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.conversation_cycle != cycle {
+                                return;
                             }
-                            AgentEvent::TextDelta(delta) => {
-                                this.assistant_message.push_str(&delta);
-                                this.conversation_phase = ConversationPhase::Streaming;
-                            }
-                            AgentEvent::Completed => {
-                                this.assistant_message_time = Some(current_local_time_label());
-                                this.conversation_phase = ConversationPhase::Complete;
-                                finished = true;
-                            }
-                            AgentEvent::Failed(error) => {
-                                this.assistant_message = error;
-                                this.assistant_message_time = Some(current_local_time_label());
-                                this.conversation_phase = ConversationPhase::Failed;
-                                finished = true;
-                            }
-                        }
-                        cx.emit(ConversationChanged);
-                        cx.notify();
-                    });
-                    if result.is_err() || finished {
+                            this.apply_agent_event_batch(vec![AgentEvent::Failed(
+                                STREAM_DISCONNECTED_MESSAGE.to_owned(),
+                            )]);
+                            cx.emit(ConversationChanged);
+                            cx.notify();
+                        });
                         return;
                     }
+                };
+
+                // Once the first event wakes us, leave a short collection
+                // window for the rest of its protocol burst. No timer runs
+                // while the channel is idle.
+                cx.background_executor().timer(STREAM_UPDATE_INTERVAL).await;
+
+                let (mut batch, channel_closed) =
+                    collect_ready_agent_events(&receiver, first_event);
+                if channel_closed {
+                    ensure_closed_batch_is_terminal(&mut batch);
                 }
-                if finished {
+
+                // Commit every frame's protocol burst atomically. Previously
+                // each token emitted and notified independently, repeatedly
+                // rebuilding the full conversation before the same paint.
+                let result = this.update(cx, |this, cx| {
+                    if this.conversation_cycle != cycle {
+                        return true;
+                    }
+                    let finished = this.apply_agent_event_batch(batch);
+                    cx.emit(ConversationChanged);
+                    cx.notify();
+                    finished
+                });
+                if result.unwrap_or(true) || channel_closed {
                     return;
                 }
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
             }
         })
         .detach();
+    }
+
+    fn apply_agent_event_batch(&mut self, events: Vec<AgentEvent>) -> bool {
+        let mut finished = false;
+        for event in events {
+            match event {
+                AgentEvent::Started => {
+                    self.conversation_phase = ConversationPhase::Thinking;
+                }
+                AgentEvent::AssistantMessageStarted { item_id } => {
+                    if !self.conversation_activity.iter().any(|activity| {
+                        matches!(
+                            activity,
+                            ConversationActivity::AssistantMessage {
+                                item_id: existing,
+                                ..
+                            } if existing == &item_id
+                        )
+                    }) {
+                        self.conversation_activity
+                            .push(ConversationActivity::AssistantMessage {
+                                item_id,
+                                text: String::new(),
+                            });
+                    }
+                }
+                AgentEvent::TextDelta(delta) => {
+                    self.assistant_message.push_str(&delta);
+                    if let Some(ConversationActivity::AssistantMessage { text, .. }) = self
+                        .conversation_activity
+                        .iter_mut()
+                        .rev()
+                        .find(|activity| {
+                            matches!(activity, ConversationActivity::AssistantMessage { .. })
+                        })
+                    {
+                        text.push_str(&delta);
+                    }
+                    self.conversation_phase = ConversationPhase::Streaming;
+                }
+                AgentEvent::CommandStarted(command) => {
+                    upsert_command_activity(&mut self.conversation_activity, command);
+                    self.conversation_phase = ConversationPhase::Streaming;
+                }
+                AgentEvent::CommandOutputDelta { item_id, delta } => {
+                    if let Some(command) =
+                        find_command_activity_mut(&mut self.conversation_activity, &item_id)
+                    {
+                        command.output.push_str(&delta);
+                    } else {
+                        self.conversation_activity
+                            .push(ConversationActivity::Command(CommandExecution {
+                                id: item_id,
+                                command: String::new(),
+                                cwd: String::new(),
+                                output: delta,
+                                status: CommandExecutionStatus::InProgress,
+                                exit_code: None,
+                            }));
+                    }
+                    self.conversation_phase = ConversationPhase::Streaming;
+                }
+                AgentEvent::CommandCompleted(command) => {
+                    upsert_command_activity(&mut self.conversation_activity, command);
+                    self.conversation_phase = ConversationPhase::Streaming;
+                }
+                AgentEvent::Completed => {
+                    self.assistant_message_time = Some(current_local_time_label());
+                    self.conversation_phase = ConversationPhase::Complete;
+                    finished = true;
+                    break;
+                }
+                AgentEvent::Failed(error) => {
+                    self.assistant_message = error.clone();
+                    self.conversation_activity
+                        .push(ConversationActivity::Error { message: error });
+                    self.assistant_message_time = Some(current_local_time_label());
+                    self.conversation_phase = ConversationPhase::Failed;
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        finished
     }
 
     fn stop_generation(&mut self, cx: &mut Context<Self>) {
@@ -538,6 +752,55 @@ impl ComposerView {
         self.submit_prompt(prompt.to_owned(), cx);
     }
 
+    pub fn set_command_tool_for_capture(&mut self, running: bool, cx: &mut Context<Self>) {
+        let item_id = "exec-command-ui-capture".to_owned();
+        let command = "printf 'COMMAND_UI_REFERENCE_20260829\\n'".to_owned();
+        self.user_message = Some(
+            "请使用终端执行 printf 'COMMAND_UI_REFERENCE_20260829\\n'，等待命令执行完成后告诉我输出。"
+                .to_owned(),
+        );
+        self.user_message_time = Some("21:45".to_owned());
+        self.assistant_message = if running {
+            "我现在执行这条命令，完成后原样告诉你输出。".to_owned()
+        } else {
+            "我现在执行这条命令，完成后原样告诉你输出。输出为：COMMAND_UI_REFERENCE_20260829"
+                .to_owned()
+        };
+        self.assistant_message_time = (!running).then(|| "21:45".to_owned());
+        self.conversation_phase = if running {
+            ConversationPhase::Streaming
+        } else {
+            ConversationPhase::Complete
+        };
+        self.conversation_activity = vec![
+            ConversationActivity::AssistantMessage {
+                item_id: "msg-command-preamble".to_owned(),
+                text: "我现在执行这条命令，完成后原样告诉你输出。".to_owned(),
+            },
+            ConversationActivity::Command(CommandExecution {
+                id: item_id,
+                command,
+                cwd: "/path/to/project".to_owned(),
+                output: "COMMAND_UI_REFERENCE_20260829\n".to_owned(),
+                status: if running {
+                    CommandExecutionStatus::InProgress
+                } else {
+                    CommandExecutionStatus::Completed
+                },
+                exit_code: (!running).then_some(0),
+            }),
+        ];
+        if !running {
+            self.conversation_activity
+                .push(ConversationActivity::AssistantMessage {
+                    item_id: "msg-command-final".to_owned(),
+                    text: "输出为：\n\nCOMMAND_UI_REFERENCE_20260829".to_owned(),
+                });
+        }
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
     #[cfg(test)]
     fn dictation_state_name(&self) -> &'static str {
         match self.dictation_state {
@@ -611,6 +874,30 @@ impl ComposerView {
     }
 }
 
+fn find_command_activity_mut<'a>(
+    activities: &'a mut [ConversationActivity],
+    item_id: &str,
+) -> Option<&'a mut CommandExecution> {
+    activities.iter_mut().find_map(|activity| match activity {
+        ConversationActivity::Command(command) if command.id == item_id => Some(command),
+        _ => None,
+    })
+}
+
+fn upsert_command_activity(
+    activities: &mut Vec<ConversationActivity>,
+    mut incoming: CommandExecution,
+) {
+    if let Some(existing) = find_command_activity_mut(activities, &incoming.id) {
+        if incoming.output.is_empty() {
+            incoming.output = std::mem::take(&mut existing.output);
+        }
+        *existing = incoming;
+    } else {
+        activities.push(ConversationActivity::Command(incoming));
+    }
+}
+
 fn utility(
     id: &'static str,
     label: &'static str,
@@ -630,7 +917,7 @@ fn utility(
         .gap(px(4.0))
         .text_size(px(13.0))
         .line_height(px(18.0))
-        .font_weight(gpui::FontWeight(445.0))
+        .font_weight(gpui::FontWeight::NORMAL)
         .text_color(theme.text)
         .cursor_pointer()
         .hover(move |style| style.bg(hover_fill))
@@ -659,7 +946,7 @@ fn project_utility(theme: Theme) -> impl IntoElement {
                 .gap(px(4.0))
                 .text_size(px(13.0))
                 .line_height(px(18.0))
-                .font_weight(gpui::FontWeight(445.0))
+                .font_weight(gpui::FontWeight::NORMAL)
                 .text_color(theme.text)
                 .cursor_pointer()
                 .group_hover(group, move |style| style.bg(hover_fill))
@@ -2065,14 +2352,327 @@ impl Render for ComposerView {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposerView, ConversationPhase, SubmenuLayout, current_local_time_label,
-        max_particle_drift, particle_layers, particle_transition_ease, submenu_layout,
+        ComposerView, ConversationActivity, ConversationChanged, ConversationPhase,
+        STREAM_EVENTS_PER_UPDATE, STREAM_UPDATE_INTERVAL, SubmenuLayout,
+        collect_ready_agent_events, current_local_time_label, ensure_closed_batch_is_terminal,
+        find_command_activity_mut, max_particle_drift, particle_layers, particle_transition_ease,
+        push_coalesced_agent_event, submenu_layout, upsert_command_activity,
     };
+    use crate::agent::{AgentEvent, CommandExecution, CommandExecutionStatus};
     use crate::theme::ThemeMode;
     use gpui::{
         Bounds, Focusable, MouseButton, TestApp, WindowBounds, WindowOptions, point, px, size,
     };
-    use std::time::Duration;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    #[test]
+    fn command_output_deltas_are_reconciled_with_completion() {
+        let mut activities = vec![ConversationActivity::Command(CommandExecution {
+            id: "exec_1".into(),
+            command: "printf hello".into(),
+            cwd: "/tmp".into(),
+            output: String::new(),
+            status: CommandExecutionStatus::InProgress,
+            exit_code: None,
+        })];
+        find_command_activity_mut(&mut activities, "exec_1")
+            .unwrap()
+            .output
+            .push_str("hel");
+        find_command_activity_mut(&mut activities, "exec_1")
+            .unwrap()
+            .output
+            .push_str("lo\n");
+
+        upsert_command_activity(
+            &mut activities,
+            CommandExecution {
+                id: "exec_1".into(),
+                command: "printf hello".into(),
+                cwd: "/tmp".into(),
+                output: "hello\n".into(),
+                status: CommandExecutionStatus::Completed,
+                exit_code: Some(0),
+            },
+        );
+
+        let command = find_command_activity_mut(&mut activities, "exec_1").unwrap();
+        assert_eq!(command.output, "hello\n");
+        assert_eq!(command.status, CommandExecutionStatus::Completed);
+        assert_eq!(command.exit_code, Some(0));
+    }
+
+    #[test]
+    fn adjacent_stream_deltas_are_coalesced_without_reordering_boundaries() {
+        let mut batch = Vec::new();
+        for event in [
+            AgentEvent::Started,
+            AgentEvent::AssistantMessageStarted {
+                item_id: "message_1".into(),
+            },
+            AgentEvent::TextDelta("你".into()),
+            AgentEvent::TextDelta("好".into()),
+            AgentEvent::CommandOutputDelta {
+                item_id: "command_1".into(),
+                delta: "hel".into(),
+            },
+            AgentEvent::CommandOutputDelta {
+                item_id: "command_1".into(),
+                delta: "lo\n".into(),
+            },
+            AgentEvent::TextDelta("世界".into()),
+        ] {
+            push_coalesced_agent_event(&mut batch, event);
+        }
+
+        assert_eq!(
+            batch,
+            vec![
+                AgentEvent::Started,
+                AgentEvent::AssistantMessageStarted {
+                    item_id: "message_1".into(),
+                },
+                AgentEvent::TextDelta("你好".into()),
+                AgentEvent::CommandOutputDelta {
+                    item_id: "command_1".into(),
+                    delta: "hello\n".into(),
+                },
+                AgentEvent::TextDelta("世界".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn live_stream_commits_one_change_for_an_entire_protocol_burst() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        let (sender, receiver) = async_channel::unbounded();
+        let changed_count = Arc::new(AtomicUsize::new(0));
+        let emitter = composer.clone();
+        let changed_count_for_subscription = changed_count.clone();
+
+        app.update_entity(&composer, move |composer, cx| {
+            composer.conversation_cycle = 7;
+            cx.subscribe(&emitter, move |_, _, _: &ConversationChanged, _| {
+                changed_count_for_subscription.fetch_add(1, Ordering::Relaxed);
+            })
+            .detach();
+            composer.consume_agent_events(receiver, 7, cx);
+        });
+
+        for event in [
+            AgentEvent::Started,
+            AgentEvent::AssistantMessageStarted {
+                item_id: "message_1".into(),
+            },
+            AgentEvent::TextDelta("平滑".into()),
+            AgentEvent::TextDelta("输出".into()),
+        ] {
+            sender.send_blocking(event).unwrap();
+        }
+        app.run_until_parked();
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer.conversation_phase()),
+            ConversationPhase::Empty
+        );
+
+        app.advance_clock(STREAM_UPDATE_INTERVAL);
+        app.run_until_parked();
+        let (phase, _, _, text, _) =
+            app.read_entity(&composer, |composer, _| composer.conversation_snapshot());
+        assert_eq!(phase, ConversationPhase::Streaming);
+        assert_eq!(text, "平滑输出");
+        assert_eq!(changed_count.load(Ordering::Relaxed), 1);
+
+        sender.send_blocking(AgentEvent::Completed).unwrap();
+        drop(sender);
+        app.run_until_parked();
+        app.advance_clock(STREAM_UPDATE_INTERVAL);
+        app.run_until_parked();
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer.conversation_phase()),
+            ConversationPhase::Complete
+        );
+        assert_eq!(changed_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn unexpected_live_stream_disconnect_fails_only_its_own_cycle() {
+        let mut app = TestApp::new();
+        let current = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        let stale = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        let (current_sender, current_receiver) = async_channel::unbounded();
+        let (stale_sender, stale_receiver) = async_channel::unbounded();
+
+        app.update_entity(&current, |composer, cx| {
+            composer.conversation_cycle = 3;
+            composer.consume_agent_events(current_receiver, 3, cx);
+        });
+        app.update_entity(&stale, |composer, cx| {
+            composer.conversation_cycle = 5;
+            composer.conversation_phase = ConversationPhase::Starting;
+            composer.consume_agent_events(stale_receiver, 4, cx);
+        });
+
+        drop(current_sender);
+        drop(stale_sender);
+        app.run_until_parked();
+
+        assert_eq!(
+            app.read_entity(&current, |composer, _| composer.conversation_phase()),
+            ConversationPhase::Failed
+        );
+        assert_eq!(
+            app.read_entity(&stale, |composer, _| composer.conversation_phase()),
+            ConversationPhase::Starting
+        );
+    }
+
+    #[test]
+    fn a_stream_batch_applies_all_text_before_its_terminal_event() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+
+        app.update_entity(&composer, |composer, _| {
+            assert!(composer.apply_agent_event_batch(vec![
+                AgentEvent::Started,
+                AgentEvent::AssistantMessageStarted {
+                    item_id: "message_1".into(),
+                },
+                AgentEvent::TextDelta("流式".into()),
+                AgentEvent::TextDelta("内容".into()),
+                AgentEvent::Completed,
+                AgentEvent::TextDelta("不应越过终止事件".into()),
+            ]));
+        });
+
+        let (phase, _, _, text, completed_at) =
+            app.read_entity(&composer, |composer, _| composer.conversation_snapshot());
+        assert_eq!(phase, ConversationPhase::Complete);
+        assert_eq!(text, "流式内容");
+        assert!(completed_at.is_some());
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer
+                .conversation_activity_snapshot()),
+            vec![ConversationActivity::AssistantMessage {
+                item_id: "message_1".into(),
+                text: "流式内容".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn stream_batch_limit_defers_excess_events_without_losing_text() {
+        let (sender, receiver) = async_channel::unbounded();
+        for _ in 0..=STREAM_EVENTS_PER_UPDATE {
+            sender
+                .send_blocking(AgentEvent::TextDelta("x".into()))
+                .unwrap();
+        }
+        sender.send_blocking(AgentEvent::Completed).unwrap();
+        drop(sender);
+
+        let first_event = receiver.try_recv().unwrap();
+        let (first_batch, first_closed) = collect_ready_agent_events(&receiver, first_event);
+        assert!(!first_closed);
+        assert_eq!(
+            first_batch,
+            vec![AgentEvent::TextDelta("x".repeat(STREAM_EVENTS_PER_UPDATE))]
+        );
+
+        let first_event = receiver.try_recv().unwrap();
+        let (mut second_batch, second_closed) = collect_ready_agent_events(&receiver, first_event);
+        assert!(second_closed);
+        ensure_closed_batch_is_terminal(&mut second_batch);
+
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        app.update_entity(&composer, |composer, _| {
+            assert!(!composer.apply_agent_event_batch(first_batch));
+            assert!(composer.apply_agent_event_batch(second_batch));
+        });
+        let (phase, _, _, text, _) =
+            app.read_entity(&composer, |composer, _| composer.conversation_snapshot());
+        assert_eq!(phase, ConversationPhase::Complete);
+        assert_eq!(text, "x".repeat(STREAM_EVENTS_PER_UPDATE + 1));
+    }
+
+    #[test]
+    fn a_closed_stream_without_a_terminal_event_becomes_failed() {
+        let mut batch = vec![
+            AgentEvent::AssistantMessageStarted {
+                item_id: "message_1".into(),
+            },
+            AgentEvent::TextDelta("partial".into()),
+        ];
+        ensure_closed_batch_is_terminal(&mut batch);
+
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        app.update_entity(&composer, |composer, _| {
+            assert!(composer.apply_agent_event_batch(batch));
+        });
+        let (phase, _, _, message, completed_at) =
+            app.read_entity(&composer, |composer, _| composer.conversation_snapshot());
+        assert_eq!(phase, ConversationPhase::Failed);
+        assert_eq!(message, super::STREAM_DISCONNECTED_MESSAGE);
+        assert!(completed_at.is_some());
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer
+                .conversation_activity_snapshot()),
+            vec![
+                ConversationActivity::AssistantMessage {
+                    item_id: "message_1".into(),
+                    text: "partial".into(),
+                },
+                ConversationActivity::Error {
+                    message: super::STREAM_DISCONNECTED_MESSAGE.into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn render_snapshot_only_copies_the_aggregate_when_the_view_needs_it() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        app.update_entity(&composer, |composer, _| {
+            composer.apply_agent_event_batch(vec![
+                AgentEvent::AssistantMessageStarted {
+                    item_id: "message_1".into(),
+                },
+                AgentEvent::TextDelta("正在流式输出".into()),
+            ]);
+        });
+
+        let streaming = app.read_entity(&composer, |composer, _| {
+            composer.conversation_render_snapshot()
+        });
+        assert_eq!(streaming.0, ConversationPhase::Streaming);
+        assert!(streaming.3.is_empty());
+        assert_eq!(
+            streaming.5,
+            vec![ConversationActivity::AssistantMessage {
+                item_id: "message_1".into(),
+                text: "正在流式输出".into(),
+            }]
+        );
+
+        app.update_entity(&composer, |composer, _| {
+            composer.apply_agent_event_batch(vec![AgentEvent::Completed]);
+        });
+        let complete = app.read_entity(&composer, |composer, _| {
+            composer.conversation_render_snapshot()
+        });
+        assert_eq!(complete.0, ConversationPhase::Complete);
+        assert_eq!(complete.3, "正在流式输出");
+    }
 
     #[test]
     fn sent_message_time_uses_the_local_twenty_four_hour_label() {
