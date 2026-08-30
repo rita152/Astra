@@ -1,6 +1,10 @@
 use std::{
     io::{BufRead, BufReader, Write},
-    process::{Command, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -9,13 +13,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    AgentBackend, AgentEvent, AgentModel, AgentModelCatalog, AgentReasoningEffort, AgentRequest,
-    AgentServiceTier, CommandExecution, CommandExecutionStatus,
+    AgentBackend, AgentEvent, AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome,
+    AgentModel, AgentModelCatalog, AgentReasoningEffort, AgentRequest, AgentRun, AgentServiceTier,
+    CommandExecution, CommandExecutionStatus,
 };
 
 const INITIALIZE_ID: u64 = 1;
 const THREAD_START_ID: u64 = 2;
 const TURN_START_ID: u64 = 3;
+const TURN_INTERRUPT_ID: u64 = 4;
 const MODEL_LIST_FIRST_ID: u64 = 2;
 const MODEL_LIST_PAGE_SIZE: u32 = 50;
 const UNDEFINED_METHOD_PARAMS_LIMIT: usize = 2_000;
@@ -73,6 +79,252 @@ struct ModelServiceTier {
     description: String,
 }
 
+#[derive(Default)]
+struct TurnSessionState {
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    interrupt_requested: bool,
+    interrupt_sent: bool,
+    terminal: bool,
+}
+
+struct AppServerProcess {
+    child: Mutex<Option<Child>>,
+    reaped: AtomicBool,
+}
+
+impl AppServerProcess {
+    fn new(child: Child) -> Self {
+        Self {
+            child: Mutex::new(Some(child)),
+            reaped: AtomicBool::new(false),
+        }
+    }
+
+    fn kill(&self) {
+        let Ok(mut child) = self.child.lock() else {
+            return;
+        };
+        if let Some(child) = child.as_mut()
+            && child.try_wait().ok().flatten().is_none()
+        {
+            let _ = child.kill();
+        }
+    }
+
+    fn terminate_and_wait(&self) -> Result<()> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow!("Codex app-server 子进程锁已损坏"))?
+            .take();
+        let Some(mut child) = child.take() else {
+            return Ok(());
+        };
+
+        if child.try_wait()?.is_none()
+            && let Err(kill_error) = child.kill()
+            && child.try_wait()?.is_none()
+        {
+            self.child
+                .lock()
+                .map_err(|_| anyhow!("Codex app-server 子进程锁已损坏"))?
+                .replace(child);
+            return Err(kill_error).context("无法终止 Codex app-server 子进程");
+        }
+        child
+            .wait()
+            .context("等待 Codex app-server 子进程退出失败")?;
+        self.reaped.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn is_reaped(&self) -> bool {
+        self.reaped.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for AppServerProcess {
+    fn drop(&mut self) {
+        let _ = self.terminate_and_wait();
+    }
+}
+
+struct CodexTurnSession<W> {
+    writer: Mutex<Option<W>>,
+    state: Mutex<TurnSessionState>,
+    process: Option<Arc<AppServerProcess>>,
+}
+
+impl<W: Write + Send> CodexTurnSession<W> {
+    fn new(writer: W, process: Option<Arc<AppServerProcess>>) -> Self {
+        Self {
+            writer: Mutex::new(Some(writer)),
+            state: Mutex::new(TurnSessionState::default()),
+            process,
+        }
+    }
+
+    fn send(&self, message: Value) -> Result<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| anyhow!("Codex app-server stdin 锁已损坏"))?;
+        let writer = writer.as_mut().context("Codex app-server 连接已经关闭")?;
+        send(writer, message)
+    }
+
+    fn activate_turn(&self, thread_id: String, turn_id: String) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Codex turn 会话状态锁已损坏"))?;
+        state.thread_id = Some(thread_id.clone());
+        state.turn_id = Some(turn_id.clone());
+        if state.interrupt_requested && !state.interrupt_sent && !state.terminal {
+            self.send(turn_interrupt_request(&thread_id, &turn_id))?;
+            state.interrupt_sent = true;
+        }
+        Ok(())
+    }
+
+    fn request_interrupt_inner(&self) -> Result<AgentInterruptOutcome> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Codex turn 会话状态锁已损坏"))?;
+        if state.terminal {
+            return Ok(AgentInterruptOutcome::AlreadyFinished);
+        }
+        if state.interrupt_requested {
+            return Ok(AgentInterruptOutcome::AlreadyRequested);
+        }
+
+        state.interrupt_requested = true;
+        let Some((thread_id, turn_id)) = state.thread_id.clone().zip(state.turn_id.clone()) else {
+            return Ok(AgentInterruptOutcome::Requested);
+        };
+        if let Err(error) = self.send(turn_interrupt_request(&thread_id, &turn_id)) {
+            state.terminal = true;
+            drop(state);
+            self.close_writer();
+            if let Some(process) = &self.process {
+                process.kill();
+            }
+            return Err(error);
+        }
+        state.interrupt_sent = true;
+        Ok(AgentInterruptOutcome::Requested)
+    }
+
+    fn mark_terminal(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.terminal = true;
+        }
+    }
+
+    fn ensure_current_turn(&self, turn_id: &str) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Codex turn 会话状态锁已损坏"))?;
+        let current_turn_id = state
+            .turn_id
+            .as_deref()
+            .context("收到 turn/completed 时尚未保存当前 turnId")?;
+        if current_turn_id != turn_id {
+            bail!("turn/completed 的 turnId `{turn_id}` 与当前 turnId `{current_turn_id}` 不一致");
+        }
+        Ok(())
+    }
+
+    fn close_writer(&self) {
+        if let Ok(mut writer) = self.writer.lock() {
+            writer.take();
+        }
+    }
+
+    fn finish(&self) -> Result<()> {
+        self.mark_terminal();
+        self.close_writer();
+        if let Some(process) = &self.process {
+            process.terminate_and_wait()?;
+        }
+        Ok(())
+    }
+
+    fn abandon_inner(&self) {
+        let should_kill = self
+            .state
+            .lock()
+            .map(|mut state| {
+                if state.terminal {
+                    false
+                } else {
+                    state.terminal = true;
+                    true
+                }
+            })
+            .unwrap_or(true);
+        if should_kill {
+            self.close_writer();
+            if let Some(process) = &self.process {
+                process.kill();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> (Option<String>, Option<String>, bool, bool, bool) {
+        let state = self.state.lock().unwrap();
+        (
+            state.thread_id.clone(),
+            state.turn_id.clone(),
+            state.interrupt_requested,
+            state.interrupt_sent,
+            state.terminal,
+        )
+    }
+}
+
+impl<W: Write + Send + 'static> AgentInterruptControl for CodexTurnSession<W> {
+    fn request_interrupt(&self) -> Result<AgentInterruptOutcome, String> {
+        self.request_interrupt_inner()
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn abandon(&self) {
+        self.abandon_inner();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnOutcome {
+    Completed,
+    Interrupted,
+}
+
+impl TurnOutcome {
+    fn into_event(self) -> AgentEvent {
+        match self {
+            Self::Completed => AgentEvent::Completed,
+            Self::Interrupted => AgentEvent::Interrupted,
+        }
+    }
+}
+
+fn turn_interrupt_request(thread_id: &str, turn_id: &str) -> Value {
+    json!({
+        "method": "turn/interrupt",
+        "id": TURN_INTERRUPT_ID,
+        "params": {
+            "threadId": thread_id,
+            "turnId": turn_id
+        }
+    })
+}
+
 impl From<ModelListEntry> for AgentModel {
     fn from(entry: ModelListEntry) -> Self {
         Self {
@@ -124,14 +376,36 @@ impl AgentBackend for CodexAppServerBackend {
         catalog_rx
     }
 
-    fn run_prompt(&self, request: AgentRequest) -> Receiver<AgentEvent> {
+    fn run_prompt(&self, request: AgentRequest) -> AgentRun {
         let (events_tx, events_rx) = async_channel::unbounded();
-        std::thread::spawn(move || {
-            if let Err(error) = run_prompt_process(&request, &events_tx) {
-                let _ = events_tx.send_blocking(AgentEvent::Failed(format!("{error:#}")));
+        let interrupt = match spawn_prompt_session() {
+            Ok((mut reader, session)) => {
+                let control: Arc<dyn AgentInterruptControl> = session.clone();
+                let interrupt = AgentInterruptHandle::new(control);
+                std::thread::spawn(move || {
+                    let result = drive_session(&mut reader, &session, &request, &events_tx);
+                    session.mark_terminal();
+                    let cleanup = session.finish();
+                    let event = match (result, cleanup) {
+                        (Ok(outcome), Ok(())) => outcome.into_event(),
+                        (Err(error), Ok(())) => AgentEvent::Failed(format!("{error:#}")),
+                        (Ok(_), Err(error)) => AgentEvent::Failed(format!(
+                            "Codex turn 已结束，但 app-server 资源回收失败：{error:#}"
+                        )),
+                        (Err(error), Err(cleanup_error)) => AgentEvent::Failed(format!(
+                            "{error:#}\nCodex app-server 资源回收同时失败：{cleanup_error:#}"
+                        )),
+                    };
+                    let _ = events_tx.send_blocking(event);
+                });
+                Some(interrupt)
             }
-        });
-        events_rx
+            Err(error) => {
+                let _ = events_tx.send_blocking(AgentEvent::Failed(format!("{error:#}")));
+                None
+            }
+        };
+        AgentRun::new(events_rx, interrupt)
     }
 }
 
@@ -162,7 +436,7 @@ fn run_model_catalog_process() -> Result<AgentModelCatalog> {
     result
 }
 
-fn run_prompt_process(request: &AgentRequest, events: &Sender<AgentEvent>) -> Result<()> {
+fn spawn_prompt_session() -> Result<(BufReader<ChildStdout>, Arc<CodexTurnSession<ChildStdin>>)> {
     let mut child = Command::new("codex")
         .args(["app-server", "--stdio"])
         .stdin(Stdio::piped())
@@ -171,21 +445,19 @@ fn run_prompt_process(request: &AgentRequest, events: &Sender<AgentEvent>) -> Re
         .spawn()
         .context("无法启动 `codex app-server --stdio`；请确认 Codex CLI 已安装并完成登录")?;
 
-    let stdout = child
-        .stdout
-        .take()
-        .context("无法读取 Codex app-server stdout")?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("无法写入 Codex app-server stdin")?;
-    let mut reader = BufReader::new(stdout);
-    let result = drive_session(&mut reader, &mut stdin, request, events);
-
-    drop(stdin);
-    let _ = child.kill();
-    let _ = child.wait();
-    result
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("无法读取 Codex app-server stdout");
+    };
+    let Some(stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("无法写入 Codex app-server stdin");
+    };
+    let process = Arc::new(AppServerProcess::new(child));
+    let session = Arc::new(CodexTurnSession::new(stdin, Some(process)));
+    Ok((BufReader::new(stdout), session))
 }
 
 fn initialize_connection<R: BufRead, W: Write>(
@@ -209,6 +481,26 @@ fn initialize_connection<R: BufRead, W: Write>(
     )?;
     wait_for_response(reader, writer, INITIALIZE_ID, events)?;
     send(writer, json!({ "method": "initialized", "params": {} }))
+}
+
+fn initialize_turn_connection<R: BufRead, W: Write + Send>(
+    reader: &mut R,
+    session: &CodexTurnSession<W>,
+    events: &Sender<AgentEvent>,
+) -> Result<()> {
+    session.send(json!({
+        "method": "initialize",
+        "id": INITIALIZE_ID,
+        "params": {
+            "clientInfo": {
+                "name": "gpui_chat_clone",
+                "title": "GPUI Chat Clone",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }
+    }))?;
+    wait_for_session_response(reader, session, INITIALIZE_ID, events)?;
+    session.send(json!({ "method": "initialized", "params": {} }))
 }
 
 fn drive_model_catalog<R: BufRead, W: Write>(
@@ -266,56 +558,57 @@ fn drive_model_catalog<R: BufRead, W: Write>(
     Ok(AgentModelCatalog { models })
 }
 
-fn drive_session<R: BufRead, W: Write>(
+fn drive_session<R: BufRead, W: Write + Send>(
     reader: &mut R,
-    writer: &mut W,
+    session: &CodexTurnSession<W>,
     request: &AgentRequest,
     events: &Sender<AgentEvent>,
-) -> Result<()> {
-    initialize_connection(reader, writer, Some(events))?;
-    send(
-        writer,
-        json!({
-            "method": "thread/start",
-            "id": THREAD_START_ID,
-            "params": {
-                "cwd": request.cwd,
-                "approvalPolicy": "never",
-                "sandbox": "read-only",
-                "ephemeral": true,
-                "serviceName": "gpui-chat-clone",
-                "model": request.model,
-                "serviceTier": request.service_tier
-            }
-        }),
-    )?;
-    let thread_response = wait_for_response(reader, writer, THREAD_START_ID, Some(events))?;
+) -> Result<TurnOutcome> {
+    initialize_turn_connection(reader, session, events)?;
+    session.send(json!({
+        "method": "thread/start",
+        "id": THREAD_START_ID,
+        "params": {
+            "cwd": request.cwd,
+            "approvalPolicy": "never",
+            "sandbox": "read-only",
+            "ephemeral": true,
+            "serviceName": "gpui-chat-clone",
+            "model": request.model,
+            "serviceTier": request.service_tier
+        }
+    }))?;
+    let thread_response = wait_for_session_response(reader, session, THREAD_START_ID, events)?;
     let thread_id = thread_response
         .pointer("/result/thread/id")
         .and_then(Value::as_str)
+        .map(str::to_owned)
         .context("thread/start 响应缺少 result.thread.id")?;
 
-    send(
-        writer,
-        json!({
-            "method": "turn/start",
-            "id": TURN_START_ID,
-            "params": {
-                "threadId": thread_id,
-                "input": [{ "type": "text", "text": request.prompt }],
-                "model": request.model,
-                "effort": request.effort,
-                "serviceTier": request.service_tier
-            }
-        }),
-    )?;
-    wait_for_response(reader, writer, TURN_START_ID, Some(events))?;
+    session.send(json!({
+        "method": "turn/start",
+        "id": TURN_START_ID,
+        "params": {
+            "threadId": thread_id,
+            "input": [{ "type": "text", "text": request.prompt }],
+            "model": request.model,
+            "effort": request.effort,
+            "serviceTier": request.service_tier
+        }
+    }))?;
+    let turn_response = wait_for_session_response(reader, session, TURN_START_ID, events)?;
+    let turn_id = turn_response
+        .pointer("/result/turn/id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .context("turn/start 响应缺少 result.turn.id")?;
+    session.activate_turn(thread_id, turn_id)?;
     let _ = events.send_blocking(AgentEvent::Started);
 
     let mut streamed_text = false;
     loop {
         let message = read_message(reader)?;
-        respond_to_server_request(writer, &message)?;
+        respond_to_server_request_on_session(session, &message)?;
         forward_model_notification(&message, events)?;
         ensure_server_method_is_defined(&message)?;
 
@@ -378,15 +671,22 @@ fn drive_session<R: BufRead, W: Write>(
                 }
             }
             Some("turn/completed") => {
+                let completed_turn_id = message
+                    .pointer("/params/turn/id")
+                    .and_then(Value::as_str)
+                    .context("turn/completed 通知缺少 params.turn.id")?;
+                session.ensure_current_turn(completed_turn_id)?;
                 let status = message
                     .pointer("/params/turn/status")
                     .and_then(Value::as_str)
-                    .unwrap_or("completed");
-                if status == "completed" {
-                    let _ = events.send_blocking(AgentEvent::Completed);
-                    return Ok(());
-                }
-                bail!("Codex turn 结束，状态为 {status}");
+                    .context("turn/completed 通知缺少 params.turn.status")?;
+                let outcome = match status {
+                    "completed" => TurnOutcome::Completed,
+                    "interrupted" => TurnOutcome::Interrupted,
+                    _ => bail!("Codex turn 结束，状态为 {status}"),
+                };
+                session.mark_terminal();
+                return Ok(outcome);
             }
             Some("model/rerouted" | "model/verification" | "model/safetyBuffering/updated") => {}
             Some(method) if PASSIVE_SERVER_METHODS.contains(&method) => {}
@@ -627,6 +927,27 @@ fn wait_for_response(
     }
 }
 
+fn wait_for_session_response<R: BufRead, W: Write + Send>(
+    reader: &mut R,
+    session: &CodexTurnSession<W>,
+    expected_id: u64,
+    events: &Sender<AgentEvent>,
+) -> Result<Value> {
+    loop {
+        let message = read_message(reader)?;
+        respond_to_server_request_on_session(session, &message)?;
+        forward_model_notification(&message, events)?;
+        ensure_server_method_is_defined(&message)?;
+        if message.get("id").and_then(Value::as_u64) != Some(expected_id) {
+            continue;
+        }
+        if let Some(error) = message.get("error") {
+            return Err(anyhow!("Codex JSON-RPC 请求 {expected_id} 失败：{error}"));
+        }
+        return Ok(message);
+    }
+}
+
 fn respond_to_server_request(writer: &mut impl Write, message: &Value) -> Result<()> {
     let Some(id) = message.get("id") else {
         return Ok(());
@@ -646,17 +967,41 @@ fn respond_to_server_request(writer: &mut impl Write, message: &Value) -> Result
     )
 }
 
+fn respond_to_server_request_on_session<W: Write + Send>(
+    session: &CodexTurnSession<W>,
+    message: &Value,
+) -> Result<()> {
+    let Some(id) = message.get("id") else {
+        return Ok(());
+    };
+    if message.get("method").is_none() {
+        return Ok(());
+    }
+    session.send(json!({
+        "id": id,
+        "error": {
+            "code": -32601,
+            "message": "This minimal client does not implement server-initiated requests"
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, path::PathBuf};
+    use std::{io::Cursor, path::PathBuf, process::Command, sync::Arc};
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
-        AgentEvent, AgentRequest, INITIALIZE_ID, MODEL_LIST_PAGE_SIZE, PASSIVE_SERVER_METHODS,
-        UNDEFINED_METHOD_PARAMS_LIMIT, drive_model_catalog, drive_session,
-        ensure_server_method_is_defined, wait_for_response,
+        AgentEvent, AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome,
+        AgentRequest, AppServerProcess, CodexTurnSession, INITIALIZE_ID, MODEL_LIST_PAGE_SIZE,
+        PASSIVE_SERVER_METHODS, TurnOutcome, UNDEFINED_METHOD_PARAMS_LIMIT, drive_model_catalog,
+        drive_session, ensure_server_method_is_defined, wait_for_response,
     };
+
+    fn take_session_output(session: &CodexTurnSession<Vec<u8>>) -> Vec<u8> {
+        session.writer.lock().unwrap().take().unwrap()
+    }
 
     #[test]
     fn drives_one_complete_prompt_and_normalizes_stream_events() {
@@ -671,14 +1016,14 @@ mod tests {
             "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec_1\",\"command\":\"/bin/zsh -lc pwd\",\"cwd\":\"/tmp/project\",\"status\":\"inProgress\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"pwd\"}],\"aggregatedOutput\":null,\"exitCode\":null}}}\n",
             "{\"method\":\"item/commandExecution/outputDelta\",\"params\":{\"itemId\":\"exec_1\",\"delta\":\"/tmp/project\\n\"}}\n",
             "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec_1\",\"command\":\"/bin/zsh -lc pwd\",\"cwd\":\"/tmp/project\",\"status\":\"completed\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"pwd\"}],\"aggregatedOutput\":\"/tmp/project\\n\",\"exitCode\":0}}}\n",
-            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"status\":\"completed\"}}}\n"
+            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
-        let mut output = Vec::new();
+        let session = CodexTurnSession::new(Vec::new(), None);
         let (tx, rx) = async_channel::unbounded();
-        drive_session(
+        let outcome = drive_session(
             &mut reader,
-            &mut output,
+            &session,
             &AgentRequest {
                 prompt: "打个招呼".into(),
                 cwd: PathBuf::from("/tmp/project"),
@@ -689,6 +1034,8 @@ mod tests {
             &tx,
         )
         .unwrap();
+        assert_eq!(outcome, TurnOutcome::Completed);
+        tx.send_blocking(outcome.into_event()).unwrap();
         drop(tx);
 
         let mut received = Vec::new();
@@ -728,7 +1075,7 @@ mod tests {
             ]
         );
 
-        let sent = String::from_utf8(output).unwrap();
+        let sent = String::from_utf8(take_session_output(&session)).unwrap();
         assert!(sent.contains("\"method\":\"initialize\""));
         assert!(sent.contains("\"method\":\"initialized\""));
         assert!(sent.contains("\"method\":\"thread/start\""));
@@ -781,6 +1128,126 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("priority")
         );
+    }
+
+    #[test]
+    fn pending_interrupt_uses_the_active_thread_and_turn_and_waits_for_terminal_status() {
+        let input = concat!(
+            "{\"id\":1,\"result\":{}}\n",
+            "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_interrupt\"}}}\n",
+            "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_interrupt\"}}}\n",
+            "{\"id\":4,\"result\":{}}\n",
+            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn_interrupt\",\"status\":\"interrupted\"}}}\n"
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let session = CodexTurnSession::new(Vec::new(), None);
+        let (tx, rx) = async_channel::unbounded();
+
+        assert_eq!(
+            session.request_interrupt_inner().unwrap(),
+            AgentInterruptOutcome::Requested
+        );
+        assert_eq!(session.snapshot(), (None, None, true, false, false));
+
+        let outcome = drive_session(
+            &mut reader,
+            &session,
+            &AgentRequest {
+                prompt: "interrupt me".into(),
+                cwd: PathBuf::from("/tmp/project"),
+                model: "gpt-test".into(),
+                effort: "medium".into(),
+                service_tier: None,
+            },
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(outcome, TurnOutcome::Interrupted);
+        assert_eq!(
+            session.snapshot(),
+            (
+                Some("thr_interrupt".into()),
+                Some("turn_interrupt".into()),
+                true,
+                true,
+                true,
+            )
+        );
+
+        tx.send_blocking(outcome.into_event()).unwrap();
+        drop(tx);
+        assert_eq!(rx.try_recv().unwrap(), AgentEvent::Started);
+        assert_eq!(rx.try_recv().unwrap(), AgentEvent::Interrupted);
+        assert!(rx.try_recv().is_err());
+
+        let sent: Vec<Value> = String::from_utf8(take_session_output(&session))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let interrupts: Vec<_> = sent
+            .iter()
+            .filter(|message| {
+                message.get("method").and_then(Value::as_str) == Some("turn/interrupt")
+            })
+            .collect();
+        assert_eq!(interrupts.len(), 1);
+        assert_eq!(interrupts[0].get("id").and_then(Value::as_u64), Some(4));
+        assert_eq!(
+            interrupts[0]
+                .pointer("/params/threadId")
+                .and_then(Value::as_str),
+            Some("thr_interrupt")
+        );
+        assert_eq!(
+            interrupts[0]
+                .pointer("/params/turnId")
+                .and_then(Value::as_str),
+            Some("turn_interrupt")
+        );
+    }
+
+    #[test]
+    fn duplicate_and_finished_interrupts_do_not_write_again() {
+        let session = CodexTurnSession::new(Vec::new(), None);
+        session
+            .activate_turn("thr_1".into(), "turn_1".into())
+            .unwrap();
+
+        assert_eq!(
+            session.request_interrupt_inner().unwrap(),
+            AgentInterruptOutcome::Requested
+        );
+        assert_eq!(
+            session.request_interrupt_inner().unwrap(),
+            AgentInterruptOutcome::AlreadyRequested
+        );
+        session.mark_terminal();
+        assert_eq!(
+            session.request_interrupt_inner().unwrap(),
+            AgentInterruptOutcome::AlreadyFinished
+        );
+
+        let sent = String::from_utf8(take_session_output(&session)).unwrap();
+        assert_eq!(sent.matches("\"method\":\"turn/interrupt\"").count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_session_kills_and_reaps_its_child_process() {
+        let process = Arc::new(AppServerProcess::new(
+            Command::new("sleep").arg("30").spawn().unwrap(),
+        ));
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), Some(process.clone())));
+        let control: Arc<dyn AgentInterruptControl> = session.clone();
+        let handle = AgentInterruptHandle::new(control);
+
+        drop(handle);
+        session.finish().unwrap();
+
+        assert!(process.is_reaped());
+        assert!(process.child.lock().unwrap().is_none());
+        assert!(session.writer.lock().unwrap().is_none());
     }
 
     #[test]
@@ -915,15 +1382,15 @@ mod tests {
             "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n",
             "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_1\"}}}\n",
             "{\"method\":\"item/brandNew/delta\",\"params\":{\"delta\":\"diagnostic payload\"}}\n",
-            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"status\":\"completed\"}}}\n"
+            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
-        let mut output = Vec::new();
+        let session = CodexTurnSession::new(Vec::new(), None);
         let (tx, rx) = async_channel::unbounded();
 
         let error = drive_session(
             &mut reader,
-            &mut output,
+            &session,
             &AgentRequest {
                 prompt: "probe".into(),
                 cwd: PathBuf::from("/tmp/project"),
@@ -960,15 +1427,15 @@ mod tests {
             "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec_1\",\"command\":\"pwd\",\"cwd\":\"/tmp/project\",\"status\":\"inProgress\"}}}\n",
             "{\"method\":\"item/commandExecution/outputDelta\",\"params\":{\"itemId\":\"exec_1\",\"delta\":\"/tmp/project\\n\"}}\n",
             "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec_1\",\"command\":\"pwd\",\"cwd\":\"/tmp/project\",\"status\":\"completed\",\"aggregatedOutput\":\"/tmp/project\\n\",\"exitCode\":0}}}\n",
-            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"status\":\"completed\"}}}\n"
+            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
         );
 
         let mut reader = Cursor::new(input.as_bytes());
-        let mut output = Vec::new();
+        let session = CodexTurnSession::new(Vec::new(), None);
         let (tx, rx) = async_channel::unbounded();
-        drive_session(
+        let outcome = drive_session(
             &mut reader,
-            &mut output,
+            &session,
             &AgentRequest {
                 prompt: "深入分析当前项目".into(),
                 cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
@@ -979,6 +1446,8 @@ mod tests {
             &tx,
         )
         .unwrap();
+        assert_eq!(outcome, TurnOutcome::Completed);
+        tx.send_blocking(outcome.into_event()).unwrap();
         drop(tx);
 
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
@@ -1001,14 +1470,14 @@ mod tests {
             "{\"method\":\"model/safetyBuffering/updated\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"model\":\"model-b\",\"useCases\":[\"cyber\"],\"reasons\":[\"review\"],\"showBufferingUi\":true,\"fasterModel\":\"model-c\"}}\n",
             "{\"method\":\"model/safetyBuffering/updated\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"model\":\"model-b\",\"useCases\":[],\"reasons\":[],\"showBufferingUi\":false,\"fasterModel\":null}}\n",
             "{\"method\":\"model/verification\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"verifications\":[\"trustedAccessForCyber\"]}}\n",
-            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"status\":\"completed\"}}}\n"
+            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
-        let mut output = Vec::new();
+        let session = CodexTurnSession::new(Vec::new(), None);
         let (tx, rx) = async_channel::unbounded();
-        drive_session(
+        let outcome = drive_session(
             &mut reader,
-            &mut output,
+            &session,
             &AgentRequest {
                 prompt: "probe".into(),
                 cwd: PathBuf::from("/tmp/project"),
@@ -1019,6 +1488,8 @@ mod tests {
             &tx,
         )
         .unwrap();
+        assert_eq!(outcome, TurnOutcome::Completed);
+        tx.send_blocking(outcome.into_event()).unwrap();
         drop(tx);
 
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();

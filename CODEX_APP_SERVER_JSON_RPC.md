@@ -42,11 +42,12 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 | 3 | `thread/start` 或 `thread/resume` | 创建或恢复会话线程 |
 | 4 | `turn/start` | 向指定线程提交用户输入并开始一次执行 |
 | 5 | 监听 `turn/*`、`item/*` 等通知 | 接收增量文本、工具进度、文件修改和状态变化 |
-| 6 | `turn/completed` | 一次 turn 的最终状态通知 |
+| 6（可选） | `turn/interrupt` | 在同一连接上携带当前 `threadId`、`turnId` 请求取消活动 turn |
+| 7 | `turn/completed` | 一次 turn 的最终状态通知；取消成功最终为 `status: "interrupted"` |
 
 ## 已接入范围
 
-当前实现通过统一的 `AgentBackend` 接口隔离具体 coding agent：`load_model_catalog()` 返回 agent-neutral 的 `AgentModelCatalog`，`run_prompt(AgentRequest)` 返回 `AgentEvent` 流。Codex 适配器位于 `src/agent/codex.rs`；`model/list` 的分页、camelCase 字段、请求 id、通知 payload 和 JSON-RPC 错误都封装在该模块。UI 只依赖 `AgentModel`、`AgentRequest` 和 `AgentEvent`，不直接依赖 Codex JSON-RPC。流式事件由 `ComposerView::apply_agent_event_batch` 批量消费。
+当前实现通过统一的 `AgentBackend` 接口隔离具体 coding agent：`load_model_catalog()` 返回 agent-neutral 的 `AgentModelCatalog`，`run_prompt(AgentRequest)` 返回包含 `AgentEvent` 流和 `AgentInterruptHandle` 的 `AgentRun`。Codex 适配器位于 `src/agent/codex.rs`；`model/list` 的分页、camelCase 字段、请求 id、通知 payload 和 JSON-RPC 错误都封装在该模块。UI 只依赖 agent-neutral 类型，不直接依赖 Codex JSON-RPC。流式事件仍由 `ComposerView::apply_agent_event_batch` 批量消费。
 
 | 已接入 JSON-RPC 方法 | 方向 | 内部协议 | 接入职责 |
 |---|---|---|---|
@@ -54,6 +55,7 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 | `model/list` | 客户端 → 服务端 | `CodexAppServerBackend::load_model_catalog` → `AgentModelCatalog` | 使用 `cursor`/`nextCursor` 拉取全部可见页；映射 model、`displayName`、默认模型、effort 与 service tier |
 | `thread/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 为本次 prompt 创建临时、只读线程，并传入所选 `model`、`serviceTier` |
 | `turn/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 提交文本 prompt，并传入所选 `model`、`effort`、`serviceTier` |
+| `turn/interrupt` | 客户端 → 服务端 | `AgentInterruptHandle::interrupt` → `CodexTurnSession` | 在原 stdio 连接上使用已保存的 `threadId`、`turnId` 发送一次中断；开始阶段的停止请求会排队，重复请求及已结束 turn 不会重复写入 |
 | `item/started` | 服务端 → 客户端 | `AgentEvent::AssistantMessageStarted { item_id }` / `AgentEvent::CommandStarted(CommandExecution)` | 建立 assistant message 或 command activity |
 | `item/agentMessage/delta` | 服务端 → 客户端 | `AgentEvent::TextDelta(String)` | 追加流式 assistant 文本 |
 | `item/commandExecution/outputDelta` | 服务端 → 客户端 | `AgentEvent::CommandOutputDelta { item_id, delta }` | 按 `item_id` 将流式输出追加到对应 command activity |
@@ -61,7 +63,9 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 | `model/rerouted` | 服务端 → 客户端 | `AgentEvent::ModelRerouted` | 更新本轮实际模型，并在选择器触发器中显示 reroute 状态 |
 | `model/verification` | 服务端 → 客户端 | `AgentEvent::ModelVerificationRequired` | 将额外账户验证要求转换为可见的失败状态 |
 | `model/safetyBuffering/updated` | 服务端 → 客户端 | `AgentEvent::ModelSafetyBufferingUpdated` | 更新实际模型和暂态安全检查提示，结束 buffering 时清除提示 |
-| `turn/completed` | 服务端 → 客户端 | `AgentEvent::Completed` / `AgentEvent::Failed(String)` | 结束本轮流式状态并更新最终结果 |
+| `turn/completed` | 服务端 → 客户端 | `AgentEvent::Completed` / `AgentEvent::Interrupted` / `AgentEvent::Failed(String)` | 按 `completed`、`interrupted`、`failed` 终态结束本轮，并在终态后回收 stdin 与 app-server 子进程 |
+
+Prompt 会话的 stdin 由可并发写入的 `CodexTurnSession` 持续持有，当前 `threadId` 与 `turnId` 会保留到终态。点击停止后 Composer 只进入 `Stopping`，不会截断事件流或伪造本地完成；只有收到匹配 turn 的 `turn/completed` 且状态为 `interrupted` 后才转为 `Stopped`。若任务先自然完成，则保留 `Complete`；若中断写入或连接失败，则进入 `Failed`。控制句柄丢弃、协议异常和正常终态都走幂等的关闭、kill、wait 路径，避免重复停止与退出竞态留下子进程。
 
 选择器不再维护模型硬编码目录。目录加载完成后优先选择 `isDefault: true` 的模型（缺失时退回首项），使用该模型的 `defaultReasoningEffort` 和 `defaultServiceTier`；切换模型时重新应用目标模型的默认项。高级菜单、键盘导航及简化 effort 滑杆都按当前目录长度动态生成。`ThreadStartParams` 的本机 schema 没有 `effort` 字段，因此 effort 按 schema 仅发送给 `turn/start`，没有通过未定义字段塞入 `thread/start`。
 
@@ -163,7 +167,7 @@ Composer 的视觉层以本机 ChatGPT App（CDP `127.0.0.1:9222`）的实际计
 | 84 | `plugin/uninstall` | 请求（有 `id`） | `PluginUninstallParams` | 默认 | — | 否 |
 | 85 | `turn/start` | 请求（有 `id`） | `TurnStartParams` | 默认 | `AgentRequest` → `drive_session`（`model`、`effort`、`serviceTier`） | 是 |
 | 86 | `turn/steer` | 请求（有 `id`） | `TurnSteerParams` | 默认 | — | 否 |
-| 87 | `turn/interrupt` | 请求（有 `id`） | `TurnInterruptParams` | 默认 | — | 否 |
+| 87 | `turn/interrupt` | 请求（有 `id`） | `TurnInterruptParams` | 默认 | `AgentInterruptHandle` → `CodexTurnSession::request_interrupt_inner`（`threadId`、`turnId`） | 是 |
 | 88 | `thread/realtime/start` | 请求（有 `id`） | `ThreadRealtimeStartParams` | 实验性 | — | 否 |
 | 89 | `thread/realtime/appendAudio` | 请求（有 `id`） | `ThreadRealtimeAppendAudioParams` | 实验性 | — | 否 |
 | 90 | `thread/realtime/appendText` | 请求（有 `id`） | `ThreadRealtimeAppendTextParams` | 实验性 | — | 否 |
@@ -278,7 +282,7 @@ Composer 的视觉层以本机 ChatGPT App（CDP `127.0.0.1:9222`）的实际计
 | 19 | `thread/tokenUsage/updated` | 通知（无 `id`） | `ThreadTokenUsageUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
 | 20 | `turn/started` | 通知（无 `id`） | `TurnStartedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
 | 21 | `hook/started` | 通知（无 `id`） | `HookStartedNotification` | 默认 | — | 否 |
-| 22 | `turn/completed` | 通知（无 `id`） | `TurnCompletedNotification` | 默认 | `drive_session` → `AgentEvent::Completed` / `AgentEvent::Failed(String)` → `ComposerView::apply_agent_event_batch` | 是 |
+| 22 | `turn/completed` | 通知（无 `id`） | `TurnCompletedNotification` | 默认 | `drive_session` → `AgentEvent::Completed` / `AgentEvent::Interrupted` / `AgentEvent::Failed(String)` → `ComposerView::apply_agent_event_batch` | 是 |
 | 23 | `hook/completed` | 通知（无 `id`） | `HookCompletedNotification` | 默认 | — | 否 |
 | 24 | `turn/diff/updated` | 通知（无 `id`） | `TurnDiffUpdatedNotification` | 默认 | — | 否 |
 | 25 | `turn/plan/updated` | 通知（无 `id`） | `TurnPlanUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
@@ -343,8 +347,8 @@ Composer 的视觉层以本机 ChatGPT App（CDP `127.0.0.1:9222`）的实际计
 - 重新执行 `codex app-server generate-json-schema --experimental` 和默认 schema 生成；实验 schema 仍为 153 个 ClientRequest、11 个 ServerRequest、1 个 ClientNotification、79 个 ServerNotification（合计 244），默认 schema 合计 185。
 - 对真实 app-server 以 `limit: 2` 调用 `model/list`：通过 4 页及连续 `nextCursor` 拉取到 7 个可见模型；响应包含 `displayName`、`isDefault`、`supportedReasoningEfforts`、`defaultReasoningEffort`、`serviceTiers`、`defaultServiceTier`，与本机生成 schema 一致。
 - `cargo fmt -- --check`：通过。
-- `cargo test`：104 个测试全部通过，覆盖目录分页/解析、默认选择、模型切换、动态 effort、参数透传、三类模型通知的 adapter/UI 状态处理，以及 ChatGPT CDP 实测菜单几何与默认重置行为。
-- `cargo check --all-targets` 与 `cargo build --features screenshot`：通过；真实 GPUI 截图确认 7 个动态模型按 `displayName` 单行渲染，模型、推理强度和速度子菜单均按 ChatGPT 实测尺寸向上展开且未触底裁切，Ultra 副文案完整显示“更快消耗使用额度”。
+- `cargo test`：111 个测试全部通过；新增覆盖 `turn/interrupt` 的 `threadId`/`turnId` 参数、开始阶段排队、重复/结束后停止、`Stopping` → `Stopped`/`Failed` 状态转换，以及子进程 kill + wait 回收；原有模型目录、流式文本、命令输出和 UI 行为测试继续通过。
+- `cargo check --all-targets`：通过。
 
 ## Schema 生成与版本同步
 

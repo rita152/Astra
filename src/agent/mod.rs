@@ -1,6 +1,6 @@
 mod codex;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use async_channel::Receiver;
 
@@ -45,6 +45,56 @@ pub struct AgentRequest {
     pub model: String,
     pub effort: String,
     pub service_tier: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentInterruptOutcome {
+    Requested,
+    AlreadyRequested,
+    AlreadyFinished,
+}
+
+pub(crate) trait AgentInterruptControl: Send + Sync {
+    fn request_interrupt(&self) -> Result<AgentInterruptOutcome, String>;
+    fn abandon(&self);
+}
+
+pub struct AgentInterruptHandle {
+    control: Arc<dyn AgentInterruptControl>,
+}
+
+impl AgentInterruptHandle {
+    pub(crate) fn new(control: Arc<dyn AgentInterruptControl>) -> Self {
+        Self { control }
+    }
+
+    pub fn interrupt(&self) -> Result<AgentInterruptOutcome, String> {
+        self.control.request_interrupt()
+    }
+}
+
+impl Drop for AgentInterruptHandle {
+    fn drop(&mut self) {
+        self.control.abandon();
+    }
+}
+
+pub struct AgentRun {
+    events: Receiver<AgentEvent>,
+    interrupt: Option<AgentInterruptHandle>,
+}
+
+impl AgentRun {
+    pub(crate) fn new(
+        events: Receiver<AgentEvent>,
+        interrupt: Option<AgentInterruptHandle>,
+    ) -> Self {
+        Self { events, interrupt }
+    }
+
+    pub fn into_parts(self) -> (Receiver<AgentEvent>, Option<AgentInterruptHandle>) {
+        (self.events, self.interrupt)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +144,7 @@ pub enum AgentEvent {
         faster_model: Option<String>,
     },
     Completed,
+    Interrupted,
     Failed(String),
 }
 
@@ -101,5 +152,5 @@ pub enum AgentEvent {
 pub trait AgentBackend: Send + Sync {
     #[cfg_attr(test, allow(dead_code))]
     fn load_model_catalog(&self) -> Receiver<Result<AgentModelCatalog, String>>;
-    fn run_prompt(&self, request: AgentRequest) -> Receiver<AgentEvent>;
+    fn run_prompt(&self, request: AgentRequest) -> AgentRun;
 }

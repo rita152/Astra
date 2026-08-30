@@ -9,8 +9,9 @@ use gpui::{
 
 use crate::{
     agent::{
-        AgentBackend, AgentEvent, AgentModel, AgentModelCatalog, AgentRequest,
-        CodexAppServerBackend, CommandExecution, CommandExecutionStatus,
+        AgentBackend, AgentEvent, AgentInterruptHandle, AgentInterruptOutcome, AgentModel,
+        AgentModelCatalog, AgentRequest, CodexAppServerBackend, CommandExecution,
+        CommandExecutionStatus,
     },
     components::{
         icons::icon,
@@ -58,7 +59,9 @@ pub enum ConversationPhase {
     Starting,
     Thinking,
     Streaming,
+    Stopping,
     Complete,
+    Stopped,
     Failed,
 }
 
@@ -146,10 +149,12 @@ fn collect_ready_agent_events(
 }
 
 fn ensure_closed_batch_is_terminal(batch: &mut Vec<AgentEvent>) {
-    if !batch
-        .iter()
-        .any(|event| matches!(event, AgentEvent::Completed | AgentEvent::Failed(_)))
-    {
+    if !batch.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::Completed | AgentEvent::Interrupted | AgentEvent::Failed(_)
+        )
+    }) {
         batch.push(AgentEvent::Failed(STREAM_DISCONNECTED_MESSAGE.to_owned()));
     }
 }
@@ -255,6 +260,7 @@ pub struct ComposerView {
     assistant_message_time: Option<String>,
     conversation_phase: ConversationPhase,
     conversation_cycle: u64,
+    active_turn: Option<AgentInterruptHandle>,
     model_menu_focus: FocusHandle,
     model_menu_focused_item: usize,
     model_menu_keyboard_focus: bool,
@@ -300,6 +306,7 @@ impl ComposerView {
             assistant_message_time: None,
             conversation_phase: ConversationPhase::Empty,
             conversation_cycle: 0,
+            active_turn: None,
             model_menu_focus: cx.focus_handle(),
             model_menu_focused_item: 0,
             model_menu_keyboard_focus: false,
@@ -654,7 +661,9 @@ impl ComposerView {
         let assistant_message = if self.conversation_activity.is_empty()
             || matches!(
                 self.conversation_phase,
-                ConversationPhase::Complete | ConversationPhase::Failed
+                ConversationPhase::Complete
+                    | ConversationPhase::Stopped
+                    | ConversationPhase::Failed
             ) {
             self.assistant_message.clone()
         } else {
@@ -678,6 +687,7 @@ impl ComposerView {
                 ConversationPhase::Starting
                     | ConversationPhase::Thinking
                     | ConversationPhase::Streaming
+                    | ConversationPhase::Stopping
             )
         {
             return;
@@ -728,13 +738,15 @@ impl ComposerView {
         cx.emit(ConversationChanged);
         cx.notify();
 
-        let receiver = CodexAppServerBackend::new().run_prompt(AgentRequest {
+        let run = CodexAppServerBackend::new().run_prompt(AgentRequest {
             prompt,
             cwd: std::env::current_dir().unwrap_or_default(),
             model,
             effort,
             service_tier,
         });
+        let (receiver, interrupt) = run.into_parts();
+        self.active_turn = interrupt;
         self.consume_agent_events(receiver, cycle, cx);
     }
 
@@ -799,7 +811,9 @@ impl ComposerView {
         for event in events {
             match event {
                 AgentEvent::Started => {
-                    self.conversation_phase = ConversationPhase::Thinking;
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Thinking;
+                    }
                 }
                 AgentEvent::AssistantMessageStarted { item_id } => {
                     if !self.conversation_activity.iter().any(|activity| {
@@ -830,11 +844,15 @@ impl ComposerView {
                     {
                         text.push_str(&delta);
                     }
-                    self.conversation_phase = ConversationPhase::Streaming;
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Streaming;
+                    }
                 }
                 AgentEvent::CommandStarted(command) => {
                     upsert_command_activity(&mut self.conversation_activity, command);
-                    self.conversation_phase = ConversationPhase::Streaming;
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Streaming;
+                    }
                 }
                 AgentEvent::CommandOutputDelta { item_id, delta } => {
                     if let Some(command) =
@@ -852,11 +870,15 @@ impl ComposerView {
                                 exit_code: None,
                             }));
                     }
-                    self.conversation_phase = ConversationPhase::Streaming;
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Streaming;
+                    }
                 }
                 AgentEvent::CommandCompleted(command) => {
                     upsert_command_activity(&mut self.conversation_activity, command);
-                    self.conversation_phase = ConversationPhase::Streaming;
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Streaming;
+                    }
                 }
                 AgentEvent::ModelRerouted {
                     from_model,
@@ -927,6 +949,13 @@ impl ComposerView {
                     finished = true;
                     break;
                 }
+                AgentEvent::Interrupted => {
+                    self.assistant_message_time = Some(current_local_time_label());
+                    self.conversation_phase = ConversationPhase::Stopped;
+                    self.safety_buffering = false;
+                    finished = true;
+                    break;
+                }
                 AgentEvent::Failed(error) => {
                     self.assistant_message = error.clone();
                     self.conversation_activity
@@ -939,6 +968,9 @@ impl ComposerView {
                 }
             }
         }
+        if finished {
+            self.active_turn.take();
+        }
         finished
     }
 
@@ -948,10 +980,24 @@ impl ComposerView {
             ConversationPhase::Starting
                 | ConversationPhase::Thinking
                 | ConversationPhase::Streaming
+                | ConversationPhase::Stopping
         ) {
-            self.conversation_cycle = self.conversation_cycle.wrapping_add(1);
-            self.assistant_message_time = Some(current_local_time_label());
-            self.conversation_phase = ConversationPhase::Complete;
+            let result = self
+                .active_turn
+                .as_ref()
+                .map(AgentInterruptHandle::interrupt)
+                .unwrap_or_else(|| Err("当前 Codex turn 没有可用的中断连接".to_owned()));
+            match result {
+                Ok(AgentInterruptOutcome::Requested | AgentInterruptOutcome::AlreadyRequested) => {
+                    self.conversation_phase = ConversationPhase::Stopping;
+                }
+                Ok(AgentInterruptOutcome::AlreadyFinished) => {}
+                Err(error) => {
+                    self.apply_agent_event_batch(vec![AgentEvent::Failed(format!(
+                        "无法中断 Codex turn：{error}"
+                    ))]);
+                }
+            }
             cx.emit(ConversationChanged);
             cx.notify();
         }
@@ -2640,6 +2686,7 @@ impl ComposerView {
             ConversationPhase::Starting
                 | ConversationPhase::Thinking
                 | ConversationPhase::Streaming
+                | ConversationPhase::Stopping
         );
         div()
             .w_full()
@@ -2925,8 +2972,9 @@ mod tests {
         submenu_layout, upsert_command_activity,
     };
     use crate::agent::{
-        AgentEvent, AgentModel, AgentModelCatalog, AgentReasoningEffort, AgentServiceTier,
-        CommandExecution, CommandExecutionStatus,
+        AgentEvent, AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome, AgentModel,
+        AgentModelCatalog, AgentReasoningEffort, AgentServiceTier, CommandExecution,
+        CommandExecutionStatus,
     };
     use crate::theme::ThemeMode;
     use gpui::{
@@ -2935,7 +2983,7 @@ mod tests {
     use std::{
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -2982,6 +3030,51 @@ mod tests {
                     is_default: true,
                 },
             ],
+        }
+    }
+
+    struct TestInterruptControl {
+        requested: AtomicBool,
+        writes: AtomicUsize,
+        abandoned: AtomicBool,
+        error: Option<&'static str>,
+    }
+
+    impl TestInterruptControl {
+        fn working() -> Self {
+            Self {
+                requested: AtomicBool::new(false),
+                writes: AtomicUsize::new(0),
+                abandoned: AtomicBool::new(false),
+                error: None,
+            }
+        }
+
+        fn failing(message: &'static str) -> Self {
+            Self {
+                requested: AtomicBool::new(false),
+                writes: AtomicUsize::new(0),
+                abandoned: AtomicBool::new(false),
+                error: Some(message),
+            }
+        }
+    }
+
+    impl AgentInterruptControl for TestInterruptControl {
+        fn request_interrupt(&self) -> Result<AgentInterruptOutcome, String> {
+            if let Some(error) = self.error {
+                return Err(error.to_owned());
+            }
+            if self.requested.swap(true, Ordering::AcqRel) {
+                Ok(AgentInterruptOutcome::AlreadyRequested)
+            } else {
+                self.writes.fetch_add(1, Ordering::Relaxed);
+                Ok(AgentInterruptOutcome::Requested)
+            }
+        }
+
+        fn abandon(&self) {
+            self.abandoned.store(true, Ordering::Release);
         }
     }
 
@@ -3298,22 +3391,64 @@ mod tests {
     }
 
     #[test]
-    fn stopping_generation_records_the_response_completion_time() {
+    fn stopping_generation_waits_for_the_interrupted_terminal_event() {
         let mut app = TestApp::new();
         let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        let control = Arc::new(TestInterruptControl::working());
+        let erased: Arc<dyn AgentInterruptControl> = control.clone();
 
         app.update_entity(&composer, |composer, cx| {
             composer.conversation_phase = ConversationPhase::Streaming;
             composer.assistant_message_time = None;
+            composer.active_turn = Some(AgentInterruptHandle::new(erased));
             composer.stop_generation(cx);
         });
 
         let (phase, _, _, _, completed_at) =
             app.read_entity(&composer, |composer, _| composer.conversation_snapshot());
-        assert_eq!(phase, ConversationPhase::Complete);
+        assert_eq!(phase, ConversationPhase::Stopping);
+        assert!(completed_at.is_none());
+        assert_eq!(control.writes.load(Ordering::Relaxed), 1);
+
+        app.update_entity(&composer, |composer, cx| composer.stop_generation(cx));
+        assert_eq!(control.writes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer.conversation_phase()),
+            ConversationPhase::Stopping
+        );
+
+        app.update_entity(&composer, |composer, _| {
+            assert!(composer.apply_agent_event_batch(vec![AgentEvent::Interrupted]));
+        });
+        let (phase, _, _, _, completed_at) =
+            app.read_entity(&composer, |composer, _| composer.conversation_snapshot());
+        assert_eq!(phase, ConversationPhase::Stopped);
         let completed_at = completed_at.expect("stopped response should retain its end time");
         assert_eq!(completed_at.len(), 5);
         assert_eq!(&completed_at[2..3], ":");
+        assert!(control.abandoned.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn interrupt_connection_failure_transitions_to_failed_and_releases_the_handle() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        let control = Arc::new(TestInterruptControl::failing("broken pipe"));
+        let erased: Arc<dyn AgentInterruptControl> = control.clone();
+
+        app.update_entity(&composer, |composer, cx| {
+            composer.conversation_phase = ConversationPhase::Thinking;
+            composer.active_turn = Some(AgentInterruptHandle::new(erased));
+            composer.stop_generation(cx);
+        });
+
+        let (phase, _, _, message, completed_at) =
+            app.read_entity(&composer, |composer, _| composer.conversation_snapshot());
+        assert_eq!(phase, ConversationPhase::Failed);
+        assert!(message.contains("无法中断 Codex turn"));
+        assert!(message.contains("broken pipe"));
+        assert!(completed_at.is_some());
+        assert!(control.abandoned.load(Ordering::Acquire));
     }
 
     #[test]
