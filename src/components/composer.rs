@@ -45,6 +45,9 @@ enum PermissionMode {
 pub struct RequestFullAccess;
 impl gpui::EventEmitter<RequestFullAccess> for ComposerView {}
 
+pub struct ModelCatalogLoadFinished;
+impl gpui::EventEmitter<ModelCatalogLoadFinished> for ComposerView {}
+
 pub struct ConversationChanged;
 impl gpui::EventEmitter<ConversationChanged> for ComposerView {}
 
@@ -261,7 +264,6 @@ pub struct ComposerView {
     advanced_expanded: bool,
     submenu: Option<PickerSubmenu>,
     models: Vec<AgentModel>,
-    model_catalog_loading: bool,
     model_catalog_error: Option<String>,
     selected_model: String,
     selected_effort: String,
@@ -307,7 +309,6 @@ impl ComposerView {
             advanced_expanded: true,
             submenu: None,
             models: Vec::new(),
-            model_catalog_loading: true,
             model_catalog_error: None,
             selected_model: String::new(),
             selected_effort: String::new(),
@@ -342,6 +343,7 @@ impl ComposerView {
                     Ok(catalog) => this.apply_model_catalog(catalog),
                     Err(error) => this.set_model_catalog_error(error),
                 }
+                cx.emit(ModelCatalogLoadFinished);
                 cx.notify();
             });
         })
@@ -354,7 +356,6 @@ impl ComposerView {
         let previous_service_tier = self.selected_service_tier.clone();
 
         self.models = catalog.models;
-        self.model_catalog_loading = false;
         self.model_catalog_error = None;
         if self.models.is_empty() {
             self.set_model_catalog_error("Codex 未返回可用模型".to_owned());
@@ -378,7 +379,6 @@ impl ComposerView {
 
     fn set_model_catalog_error(&mut self, error: String) {
         self.models.clear();
-        self.model_catalog_loading = false;
         self.model_catalog_error = Some(error);
         self.selected_model.clear();
         self.selected_effort.clear();
@@ -491,11 +491,7 @@ impl ComposerView {
 
     fn selected_model_label(&self) -> String {
         if self.selected_model.is_empty() {
-            if self.model_catalog_loading {
-                "正在加载模型…".to_owned()
-            } else {
-                "模型不可用".to_owned()
-            }
+            "模型不可用".to_owned()
         } else {
             self.model_display_name(&self.selected_model).to_owned()
         }
@@ -688,13 +684,10 @@ impl ComposerView {
         }
 
         let selection = if self.selected_model.is_empty() || self.selected_effort.is_empty() {
-            Err(self.model_catalog_error.clone().unwrap_or_else(|| {
-                if self.model_catalog_loading {
-                    "Codex 模型目录仍在加载，请稍后重试".to_owned()
-                } else {
-                    "没有可用的 Codex 模型".to_owned()
-                }
-            }))
+            Err(self
+                .model_catalog_error
+                .clone()
+                .unwrap_or_else(|| "没有可用的 Codex 模型".to_owned()))
         } else {
             Ok((
                 self.selected_model.clone(),
@@ -1625,13 +1618,10 @@ impl ComposerView {
         match kind {
             PickerSubmenu::Model => {
                 if self.models.is_empty() {
-                    let message = self.model_catalog_error.clone().unwrap_or_else(|| {
-                        if self.model_catalog_loading {
-                            "正在加载模型目录…".to_owned()
-                        } else {
-                            "没有可用模型".to_owned()
-                        }
-                    });
+                    let message = self
+                        .model_catalog_error
+                        .clone()
+                        .unwrap_or_else(|| "没有可用模型".to_owned());
                     menu = menu.child(self.option_row(
                         ("model-option", 0),
                         &message,
@@ -3413,6 +3403,17 @@ mod tests {
             )
         });
         assert_eq!(switched, ("model-a".into(), "low".into(), None));
+    }
+
+    #[test]
+    fn empty_model_picker_never_exposes_intermediate_loading_copy() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer.selected_model_label()),
+            "模型不可用"
+        );
     }
 
     #[test]

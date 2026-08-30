@@ -14,7 +14,7 @@ use crate::{
     components::{
         composer::{
             ComposerView, ConversationActivity, ConversationChanged, ConversationPhase,
-            RequestFullAccess,
+            ModelCatalogLoadFinished, RequestFullAccess,
         },
         icons::{icon, suggestion_icon},
     },
@@ -40,6 +40,7 @@ pub struct HomeView {
 }
 
 impl gpui::EventEmitter<RequestFullAccess> for HomeView {}
+impl gpui::EventEmitter<ModelCatalogLoadFinished> for HomeView {}
 
 const SUGGESTION_PRESSED_SCALE: f32 = 0.99;
 const SUGGESTION_TRANSITION_DURATION: Duration = Duration::from_millis(150);
@@ -203,6 +204,10 @@ impl HomeView {
         let composer = cx.new(|cx| ComposerView::new(mode, cx));
         cx.subscribe(&composer, |_, _, _: &RequestFullAccess, cx| {
             cx.emit(RequestFullAccess);
+        })
+        .detach();
+        cx.subscribe(&composer, |_, _, _: &ModelCatalogLoadFinished, cx| {
+            cx.emit(ModelCatalogLoadFinished);
         })
         .detach();
         cx.subscribe(&composer, |this, composer, _: &ConversationChanged, cx| {

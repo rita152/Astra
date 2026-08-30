@@ -1,17 +1,17 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    BoxShadow, Context, Div, Entity, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render, StyleRefinement,
-    Transformation, Window, WindowAppearance, canvas, deferred, div, hsla, linear_color_stop,
-    linear_gradient, prelude::*, px, radians, rgba,
+    Animation, AnimationExt, BoxShadow, Context, Div, Entity, FocusHandle, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
+    Render, Role, StyleRefinement, Transformation, Window, WindowAppearance, canvas, deferred, div,
+    hsla, linear_color_stop, linear_gradient, prelude::*, px, radians, rgba,
 };
 
 gpui::actions!(permission_ui, [DismissPermissionUi]);
 
 use crate::{
     components::{
-        composer::RequestFullAccess,
+        composer::{ModelCatalogLoadFinished, RequestFullAccess},
         home::HomeView,
         icons::icon,
         sidebar::{OpenProjectCreation, OpenSettings, SidebarView},
@@ -22,6 +22,8 @@ use crate::{
 
 pub struct ChatApp {
     mode: ThemeMode,
+    startup_model_catalog_resolved: bool,
+    startup_minimum_duration_elapsed: bool,
     sidebar: Entity<SidebarView>,
     home: Entity<HomeView>,
     settings: Entity<SettingsView>,
@@ -121,6 +123,9 @@ const MAIN_CONTENT_HORIZONTAL_GUTTER: f32 = 24.0;
 // The native 14px traffic lights start at y=18px, so their center is y=25px.
 // Center the 28px leading titlebar controls on that same horizontal axis.
 const LEADING_TITLEBAR_CONTROLS_TOP: f32 = 11.0;
+const STARTUP_LOADING_LOGO_SIZE: f32 = 48.0;
+const STARTUP_LOADING_BLINK_DURATION: Duration = Duration::from_millis(1_200);
+const STARTUP_LOADING_MINIMUM_DURATION: Duration = Duration::from_secs(1);
 
 const SIDEBAR_TRANSITION_DURATION: Duration = Duration::from_millis(400);
 
@@ -173,6 +178,41 @@ fn titlebar_interaction_area() -> impl IntoElement {
                 window.zoom_window();
             }
         })
+}
+
+fn startup_loading_logo_opacity(progress: f32) -> f32 {
+    let blink = ((progress.clamp(0.0, 1.0) * std::f32::consts::TAU).cos() + 1.0) * 0.5;
+    0.32 + blink * 0.68
+}
+
+fn startup_loading_view(theme: Theme) -> impl IntoElement {
+    let logo = icon("home-mark", theme.home_mark.into())
+        .size(px(STARTUP_LOADING_LOGO_SIZE))
+        .with_animation(
+            "startup-loading-logo-blink",
+            Animation::new(STARTUP_LOADING_BLINK_DURATION).repeat(),
+            |logo, progress| logo.opacity(startup_loading_logo_opacity(progress)),
+        );
+
+    div()
+        .id("startup-loading-screen")
+        .role(Role::ProgressIndicator)
+        .aria_label("GPUI 正在加载")
+        .size_full()
+        .relative()
+        // Match the normal sidebar's material stack across the entire window:
+        // a theme underlay above the native blur, then the sidebar tint.
+        .bg(theme.surface_underlay)
+        .child(
+            div()
+                .size_full()
+                .bg(theme.sidebar_surface)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(logo),
+        )
+        .child(titlebar_interaction_area())
 }
 
 fn titlebar_icon_button(
@@ -247,8 +287,27 @@ impl ChatApp {
             cx.notify();
         })
         .detach();
+        cx.subscribe(&home, |this, _, _: &ModelCatalogLoadFinished, cx| {
+            this.startup_model_catalog_resolved = true;
+            cx.notify();
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(STARTUP_LOADING_MINIMUM_DURATION)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.startup_minimum_duration_elapsed = true;
+                cx.notify();
+            });
+        })
+        .detach();
         Self {
             mode,
+            // Unit tests intentionally exercise the full shell without spawning
+            // the external Codex model-catalog process.
+            startup_model_catalog_resolved: cfg!(test),
+            startup_minimum_duration_elapsed: cfg!(test),
             sidebar,
             home,
             settings,
@@ -1936,6 +1995,9 @@ impl ChatApp {
 impl Render for ChatApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_mode(self.mode);
+        if !(self.startup_model_catalog_resolved && self.startup_minimum_duration_elapsed) {
+            return startup_loading_view(theme).into_any_element();
+        }
         if self.project_creation_open && self.project_creation_focus_pending {
             self.project_creation_focus.focus(window, cx);
             self.project_creation_focus_pending = false;
@@ -2284,8 +2346,8 @@ mod tests {
         point, px, size,
     };
 
-    use super::ChatApp;
-    use crate::components::sidebar::OpenSettings;
+    use super::{ChatApp, startup_loading_logo_opacity};
+    use crate::components::{composer::ModelCatalogLoadFinished, sidebar::OpenSettings};
     use crate::theme::ThemeMode;
 
     fn simulate_next_frame(app: &mut TestApp, window: &TestAppWindow<ChatApp>, elapsed_ms: u64) {
@@ -2297,6 +2359,56 @@ mod tests {
             })
             .unwrap()
         });
+    }
+
+    #[test]
+    fn startup_logo_blinks_in_place_without_disappearing() {
+        assert_eq!(startup_loading_logo_opacity(0.0), 1.0);
+        assert!((startup_loading_logo_opacity(0.5) - 0.32).abs() < f32::EPSILON);
+        assert_eq!(startup_loading_logo_opacity(1.0), 1.0);
+    }
+
+    #[test]
+    fn startup_loading_screen_waits_for_the_catalog_and_one_second_minimum() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
+        );
+
+        window.update(|chat, _, cx| {
+            chat.startup_model_catalog_resolved = false;
+            chat.startup_minimum_duration_elapsed = false;
+            cx.notify();
+        });
+        window.draw();
+
+        let sidebar_toggle_center = point(px(102.0), px(25.0));
+        window.simulate_click(sidebar_toggle_center, MouseButton::Left);
+        assert!(!window.read(|chat, _| chat.sidebar_collapsed));
+
+        let home = window.read(|chat, _| chat.home.clone());
+        app.update(|cx| home.update(cx, |_, cx| cx.emit(ModelCatalogLoadFinished)));
+        assert!(window.read(|chat, _| chat.startup_model_catalog_resolved));
+        assert!(!window.read(|chat, _| chat.startup_minimum_duration_elapsed));
+
+        app.advance_clock(Duration::from_millis(999));
+        app.run_until_parked();
+        assert!(!window.read(|chat, _| chat.startup_minimum_duration_elapsed));
+
+        app.advance_clock(Duration::from_millis(1));
+        app.run_until_parked();
+        assert!(window.read(|chat, _| chat.startup_minimum_duration_elapsed));
+
+        window.draw();
+        window.simulate_click(sidebar_toggle_center, MouseButton::Left);
+        assert!(window.read(|chat, _| chat.sidebar_collapsed));
     }
 
     #[test]
