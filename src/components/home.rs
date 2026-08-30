@@ -1,12 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
 use gpui::{
-    App, Bounds, ContentMask, Context, Div, Entity, FontWeight, MouseButton, PathBuilder, Pixels,
-    Render, ScrollHandle, ShapedLine, SharedString, TextAlign, TextRun, Transformation, Window,
-    canvas, div, point, prelude::*, px, radians, relative, rgba,
+    App, Bounds, BoxShadow, ContentMask, Context, Div, Entity, FontWeight, MouseButton,
+    PathBuilder, Pixels, Render, Role, ScrollHandle, ShapedLine, SharedString, TextAlign, TextRun,
+    Transformation, Window, canvas, div, point, prelude::*, px, radians, relative, rgba,
 };
 
 use crate::{
@@ -78,6 +79,15 @@ const COMMAND_CARD_COMMAND_MAX_HEIGHT: f32 = 39.0;
 const COMMAND_CARD_OUTPUT_MAX_HEIGHT: f32 = 144.0;
 // GPUI rounds this box one device pixel shorter than Chromium at 27 CSS px.
 const COMMAND_CARD_STATUS_HEIGHT: f32 = 28.0;
+const NOTICE_RADIUS: f32 = 20.0;
+const NOTICE_TEXT_SIZE: f32 = 13.0;
+const NOTICE_LINE_HEIGHT: f32 = 20.0;
+const NOTICE_ICON_SIZE: f32 = 18.0;
+const NOTICE_ERROR_GAP: f32 = 12.0;
+const NOTICE_WARNING_GAP: f32 = 16.0;
+const NOTICE_ERROR_CONTENT_GAP: f32 = 6.0;
+const NOTICE_WARNING_CONTENT_GAP: f32 = 8.0;
+const NOTICE_BUTTON_HEIGHT: f32 = 24.0;
 
 fn strip_terminal_line_ending(output: &str) -> &str {
     output
@@ -917,9 +927,9 @@ fn activity_stream(
     command_scroll_handles: HashMap<String, ScrollHandle>,
     theme: Theme,
 ) -> Div {
-    activities.into_iter().fold(
+    activities.into_iter().enumerate().fold(
         div().w_full().flex().flex_col().gap(px(16.0)),
-        |stream, activity| match activity {
+        |stream, (index, activity)| match activity {
             ConversationActivity::AssistantMessage { text, .. } if !text.is_empty() => {
                 stream.child(div().w_full().child(text))
             }
@@ -937,30 +947,258 @@ fn activity_stream(
                     theme,
                 ))
             }
-            ConversationActivity::Error { message } => stream.child(
-                div()
-                    .w_full()
-                    .px(px(12.0))
-                    .py(px(9.0))
-                    .flex()
-                    .items_start()
-                    .gap(px(8.0))
-                    .rounded(px(8.0))
-                    .border(px(1.0))
-                    .border_color(theme.warning.alpha(0.24))
-                    .bg(theme.warning.alpha(0.08))
-                    .text_color(theme.warning)
-                    .child(
-                        icon("settings-warning", theme.warning.into())
-                            .size(px(16.0))
-                            .mt(px(2.0))
-                            .flex_none(),
-                    )
-                    .child(div().min_w(px(0.0)).child(message)),
-            ),
+            ConversationActivity::ProtocolError {
+                message,
+                details,
+                will_retry: true,
+            } => stream.child(retrying_error_activity(index, message, details, theme)),
+            ConversationActivity::ProtocolError {
+                message,
+                details,
+                will_retry: false,
+            } => stream.child(notice_activity(
+                message,
+                details,
+                None,
+                "Codex 错误",
+                NOTICE_ERROR_GAP,
+                NOTICE_ERROR_CONTENT_GAP,
+                index,
+                theme,
+            )),
+            ConversationActivity::SettingsUpdated { summary, cwd } => {
+                stream.child(settings_updated_activity(index, summary, cwd, theme))
+            }
+            ConversationActivity::Warning { message } => stream.child(notice_activity(
+                message,
+                None,
+                None,
+                "Codex 警告",
+                NOTICE_WARNING_GAP,
+                NOTICE_WARNING_CONTENT_GAP,
+                index,
+                theme,
+            )),
+            ConversationActivity::ConfigWarning(warning) => {
+                let file = warning.path.map(|path| ConfigWarningFile {
+                    path,
+                    line: warning.line,
+                    column: warning.column,
+                });
+                stream.child(notice_activity(
+                    warning.summary,
+                    warning.details,
+                    file,
+                    "Codex 配置警告",
+                    NOTICE_WARNING_GAP,
+                    NOTICE_WARNING_CONTENT_GAP,
+                    index,
+                    theme,
+                ))
+            }
+            ConversationActivity::Error { message } => stream.child(notice_activity(
+                message,
+                None,
+                None,
+                "Codex turn 失败",
+                NOTICE_ERROR_GAP,
+                NOTICE_ERROR_CONTENT_GAP,
+                index,
+                theme,
+            )),
             _ => stream,
         },
     )
+}
+
+#[derive(Clone)]
+struct ConfigWarningFile {
+    path: String,
+    line: Option<u64>,
+    column: Option<u64>,
+}
+
+fn retrying_error_activity(
+    index: usize,
+    message: String,
+    details: Option<String>,
+    theme: Theme,
+) -> impl IntoElement {
+    let mut accessible_label = format!("Codex 错误，正在重试：{message}");
+    if let Some(details) = details
+        .as_deref()
+        .filter(|details| !details.trim().is_empty())
+    {
+        accessible_label.push_str(&format!("；{details}"));
+    }
+    div()
+        .id(("conversation-retrying-error", index))
+        .role(Role::Alert)
+        .aria_label(accessible_label)
+        .w_full()
+        .flex()
+        .items_start()
+        .gap(px(6.0))
+        .text_size(px(14.0))
+        .line_height(px(21.0))
+        .text_color(theme.text_tertiary)
+        .child(
+            icon("settings-hooks-refresh", theme.text_tertiary.into())
+                .size(px(16.0))
+                .mt(px(2.0))
+                .flex_none(),
+        )
+        .child(div().min_w(px(0.0)).flex_1().child(message).when_some(
+            details.filter(|details| !details.trim().is_empty()),
+            |text, details| {
+                text.child(
+                    div()
+                        .text_size(px(NOTICE_TEXT_SIZE))
+                        .line_height(px(NOTICE_LINE_HEIGHT))
+                        .text_color(theme.text_tertiary)
+                        .child(details),
+                )
+            },
+        ))
+}
+
+fn settings_updated_activity(
+    index: usize,
+    summary: String,
+    cwd: String,
+    theme: Theme,
+) -> impl IntoElement {
+    let accessible_label = format!("{summary}；工作目录：{cwd}");
+    div()
+        .id(("conversation-settings-updated", index))
+        .role(Role::Status)
+        .aria_label(accessible_label)
+        .w_full()
+        .flex()
+        .items_start()
+        .gap(px(6.0))
+        .text_color(theme.text_tertiary)
+        .child(
+            icon("check", theme.command_muted.into())
+                .size(px(16.0))
+                .mt(px(2.0))
+                .flex_none(),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .text_size(px(14.0))
+                .line_height(px(21.0))
+                .child(summary)
+                .child(
+                    div()
+                        .text_size(px(NOTICE_TEXT_SIZE))
+                        .line_height(px(NOTICE_LINE_HEIGHT))
+                        .text_color(theme.text_tertiary)
+                        .child(cwd),
+                ),
+        )
+}
+
+fn notice_activity(
+    summary: String,
+    details: Option<String>,
+    file: Option<ConfigWarningFile>,
+    accessible_kind: &'static str,
+    outer_gap: f32,
+    content_gap: f32,
+    index: usize,
+    theme: Theme,
+) -> impl IntoElement {
+    let file_label = file.as_ref().map(|file| {
+        let mut label = format!("文件：{}", file.path);
+        match (file.line, file.column) {
+            (Some(line), Some(column)) => {
+                label.push_str(&format!("（第 {line} 行，第 {column} 列）"));
+            }
+            (Some(line), None) => label.push_str(&format!("（第 {line} 行）")),
+            _ => {}
+        }
+        label
+    });
+    let mut accessible_label = format!("{accessible_kind}：{summary}");
+    if let Some(details) = details
+        .as_deref()
+        .filter(|details| !details.trim().is_empty())
+    {
+        accessible_label.push_str(&format!("；{details}"));
+    }
+    if let Some(file_label) = &file_label {
+        accessible_label.push_str(&format!("；{file_label}"));
+    }
+    let content = div()
+        .min_w(px(0.0))
+        .flex_1()
+        .flex()
+        .flex_col()
+        .gap(px(content_gap))
+        .text_size(px(NOTICE_TEXT_SIZE))
+        .line_height(px(NOTICE_LINE_HEIGHT))
+        .text_color(theme.text)
+        .child(summary)
+        .when_some(
+            details.filter(|details| !details.trim().is_empty()),
+            |content, details| content.child(div().text_color(theme.text_secondary).child(details)),
+        )
+        .when_some(file_label, |content, file_label| {
+            content.child(div().text_color(theme.text_secondary).child(file_label))
+        });
+
+    div()
+        .id(("conversation-notice", index))
+        .role(Role::Alert)
+        .aria_label(accessible_label)
+        .w_full()
+        .py(px(8.0))
+        .pl(px(12.0))
+        .pr(px(8.0))
+        .flex()
+        .items_center()
+        .gap(px(outer_gap))
+        .rounded(px(NOTICE_RADIUS))
+        .bg(theme.surface)
+        .shadow(vec![
+            BoxShadow::new(px(0.0), px(0.0), theme.command_border.into()).spread_radius(px(0.5)),
+            BoxShadow::new(px(0.0), px(1.0), rgba(0x0000000d).into()).blur_radius(px(2.0)),
+        ])
+        .child(
+            icon("settings-warning", theme.warning.into())
+                .size(px(NOTICE_ICON_SIZE))
+                .flex_none(),
+        )
+        .child(content)
+        .when_some(file, |notice, file| {
+            let path = PathBuf::from(&file.path);
+            notice.child(
+                div()
+                    .id(("config-warning-open", index))
+                    .role(Role::Button)
+                    .aria_label(format!("打开配置文件 {}", file.path))
+                    .h(px(NOTICE_BUTTON_HEIGHT))
+                    .px(px(8.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(9999.0))
+                    .border(px(1.0))
+                    .border_color(theme.border)
+                    .bg(theme.command_surface)
+                    .text_size(px(NOTICE_TEXT_SIZE))
+                    .line_height(px(18.0))
+                    .text_color(theme.text)
+                    .cursor_pointer()
+                    .hover(|button| button.bg(theme.sidebar_hover))
+                    .on_click(move |_, _, cx| cx.open_with_system(&path))
+                    .child("打开文件"),
+            )
+        })
 }
 
 fn command_activity(
@@ -1310,7 +1548,9 @@ mod tests {
         COMMAND_ACTIVITY_CHEVRON_SIZE, COMMAND_ACTIVITY_CONTENT_GAP, COMMAND_ACTIVITY_ICON_SIZE,
         COMMAND_CARD_COMMAND_MAX_HEIGHT, COMMAND_CARD_HEADER_LINE_HEIGHT, COMMAND_CARD_HEADER_SIZE,
         COMMAND_CARD_LINE_HEIGHT, COMMAND_CARD_OUTPUT_MAX_HEIGHT, COMMAND_CARD_RADIUS,
-        COMMAND_CARD_STATUS_HEIGHT, COMMAND_CARD_TEXT_SIZE, HomeView,
+        COMMAND_CARD_STATUS_HEIGHT, COMMAND_CARD_TEXT_SIZE, HomeView, NOTICE_BUTTON_HEIGHT,
+        NOTICE_ERROR_CONTENT_GAP, NOTICE_ERROR_GAP, NOTICE_ICON_SIZE, NOTICE_LINE_HEIGHT,
+        NOTICE_RADIUS, NOTICE_TEXT_SIZE, NOTICE_WARNING_CONTENT_GAP, NOTICE_WARNING_GAP,
         RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT, RESPONSE_ACTION_FOOTER_HEIGHT,
         RESPONSE_ACTION_FOOTER_OFFSET, RESPONSE_ACTION_GAP, RESPONSE_ACTION_ICON_SIZE,
         RESPONSE_TIME_LINE_HEIGHT, RESPONSE_TIME_MARGIN, RESPONSE_TIME_SIZE,
@@ -1378,6 +1618,19 @@ mod tests {
             conversation_status(ConversationPhase::Thinking),
             Some("正在思考")
         );
+    }
+
+    #[test]
+    fn event_notices_match_the_live_cdp_geometry() {
+        assert_eq!(NOTICE_RADIUS, 20.0);
+        assert_eq!(NOTICE_TEXT_SIZE, 13.0);
+        assert_eq!(NOTICE_LINE_HEIGHT, 20.0);
+        assert_eq!(NOTICE_ICON_SIZE, 18.0);
+        assert_eq!(NOTICE_ERROR_GAP, 12.0);
+        assert_eq!(NOTICE_WARNING_GAP, 16.0);
+        assert_eq!(NOTICE_ERROR_CONTENT_GAP, 6.0);
+        assert_eq!(NOTICE_WARNING_CONTENT_GAP, 8.0);
+        assert_eq!(NOTICE_BUTTON_HEIGHT, 24.0);
     }
 
     #[test]

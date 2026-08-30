@@ -114,10 +114,37 @@ pub struct CommandExecution {
     pub exit_code: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentThreadSettings {
+    pub model: String,
+    pub effort: Option<String>,
+    pub service_tier: Option<String>,
+    pub cwd: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentConfigWarning {
+    pub summary: String,
+    pub details: Option<String>,
+    pub path: Option<String>,
+    pub line: Option<u64>,
+    pub column: Option<u64>,
+}
+
 /// Agent-neutral output consumed by the UI.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
     Started,
+    Error {
+        message: String,
+        details: Option<String>,
+        will_retry: bool,
+    },
+    ThreadSettingsUpdated(AgentThreadSettings),
+    Warning {
+        message: String,
+    },
+    ConfigWarning(AgentConfigWarning),
     AssistantMessageStarted {
         item_id: String,
     },

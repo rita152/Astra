@@ -13,9 +13,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    AgentBackend, AgentEvent, AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome,
-    AgentModel, AgentModelCatalog, AgentReasoningEffort, AgentRequest, AgentRun, AgentServiceTier,
-    CommandExecution, CommandExecutionStatus,
+    AgentBackend, AgentConfigWarning, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
+    AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentReasoningEffort, AgentRequest,
+    AgentRun, AgentServiceTier, AgentThreadSettings, CommandExecution, CommandExecutionStatus,
 };
 
 const INITIALIZE_ID: u64 = 1;
@@ -28,13 +28,13 @@ const UNDEFINED_METHOD_PARAMS_LIMIT: usize = 2_000;
 
 // These protocol methods are intentionally recognized even though this view
 // does not render them yet. Keep the list exact: a prefix match or wildcard
-// would hide new app-server surface area instead of reporting it.
+// would hide new app-server surface area instead of reporting it. Every method
+// with a user-facing event is handled outside this list.
 const PASSIVE_SERVER_METHODS: &[&str] = &[
     "remoteControl/status/changed",
     "thread/started",
     "mcpServer/startupStatus/updated",
     "thread/status/changed",
-    "turn/started",
     "turn/plan/updated",
     "thread/tokenUsage/updated",
     "account/rateLimits/updated",
@@ -224,11 +224,20 @@ impl<W: Write + Send> CodexTurnSession<W> {
         }
     }
 
-    fn ensure_current_turn(&self, turn_id: &str) -> Result<()> {
+    fn ensure_current_turn(&self, thread_id: &str, turn_id: &str) -> Result<()> {
         let state = self
             .state
             .lock()
             .map_err(|_| anyhow!("Codex turn 会话状态锁已损坏"))?;
+        let current_thread_id = state
+            .thread_id
+            .as_deref()
+            .context("收到 turn/completed 时尚未保存当前 threadId")?;
+        if current_thread_id != thread_id {
+            bail!(
+                "turn/completed 的 threadId `{thread_id}` 与当前 threadId `{current_thread_id}` 不一致"
+            );
+        }
         let current_turn_id = state
             .turn_id
             .as_deref()
@@ -299,10 +308,11 @@ impl<W: Write + Send + 'static> AgentInterruptControl for CodexTurnSession<W> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum TurnOutcome {
     Completed,
     Interrupted,
+    Failed(String),
 }
 
 impl TurnOutcome {
@@ -310,6 +320,7 @@ impl TurnOutcome {
         match self {
             Self::Completed => AgentEvent::Completed,
             Self::Interrupted => AgentEvent::Interrupted,
+            Self::Failed(message) => AgentEvent::Failed(message),
         }
     }
 }
@@ -389,6 +400,11 @@ impl AgentBackend for CodexAppServerBackend {
                     let event = match (result, cleanup) {
                         (Ok(outcome), Ok(())) => outcome.into_event(),
                         (Err(error), Ok(())) => AgentEvent::Failed(format!("{error:#}")),
+                        (Ok(TurnOutcome::Failed(message)), Err(error)) => {
+                            AgentEvent::Failed(format!(
+                                "{message}\nCodex turn 已失败，且 app-server 资源回收失败：{error:#}"
+                            ))
+                        }
                         (Ok(_), Err(error)) => AgentEvent::Failed(format!(
                             "Codex turn 已结束，但 app-server 资源回收失败：{error:#}"
                         )),
@@ -603,13 +619,12 @@ fn drive_session<R: BufRead, W: Write + Send>(
         .map(str::to_owned)
         .context("turn/start 响应缺少 result.turn.id")?;
     session.activate_turn(thread_id, turn_id)?;
-    let _ = events.send_blocking(AgentEvent::Started);
 
     let mut streamed_text = false;
     loop {
         let message = read_message(reader)?;
         respond_to_server_request_on_session(session, &message)?;
-        forward_model_notification(&message, events)?;
+        forward_agent_notification(&message, events)?;
         ensure_server_method_is_defined(&message)?;
 
         match message.get("method").and_then(Value::as_str) {
@@ -671,11 +686,15 @@ fn drive_session<R: BufRead, W: Write + Send>(
                 }
             }
             Some("turn/completed") => {
+                let completed_thread_id = message
+                    .pointer("/params/threadId")
+                    .and_then(Value::as_str)
+                    .context("turn/completed 通知缺少 params.threadId")?;
                 let completed_turn_id = message
                     .pointer("/params/turn/id")
                     .and_then(Value::as_str)
                     .context("turn/completed 通知缺少 params.turn.id")?;
-                session.ensure_current_turn(completed_turn_id)?;
+                session.ensure_current_turn(completed_thread_id, completed_turn_id)?;
                 let status = message
                     .pointer("/params/turn/status")
                     .and_then(Value::as_str)
@@ -683,12 +702,22 @@ fn drive_session<R: BufRead, W: Write + Send>(
                 let outcome = match status {
                     "completed" => TurnOutcome::Completed,
                     "interrupted" => TurnOutcome::Interrupted,
-                    _ => bail!("Codex turn 结束，状态为 {status}"),
+                    "failed" => TurnOutcome::Failed(turn_failure_message(&message)?),
+                    _ => bail!("Codex turn 结束，状态为未知值 `{status}`"),
                 };
                 session.mark_terminal();
                 return Ok(outcome);
             }
-            Some("model/rerouted" | "model/verification" | "model/safetyBuffering/updated") => {}
+            Some(
+                "turn/started"
+                | "error"
+                | "thread/settings/updated"
+                | "warning"
+                | "configWarning"
+                | "model/rerouted"
+                | "model/verification"
+                | "model/safetyBuffering/updated",
+            ) => {}
             Some(method) if PASSIVE_SERVER_METHODS.contains(&method) => {}
             Some(method) => return Err(undefined_server_method_error(method, &message)),
             None => {}
@@ -703,7 +732,12 @@ fn is_defined_server_method(method: &str) -> bool {
             | "item/agentMessage/delta"
             | "item/commandExecution/outputDelta"
             | "item/completed"
+            | "turn/started"
             | "turn/completed"
+            | "error"
+            | "thread/settings/updated"
+            | "warning"
+            | "configWarning"
             | "model/rerouted"
             | "model/verification"
             | "model/safetyBuffering/updated"
@@ -759,8 +793,123 @@ fn required_nullable_notification_string(message: &Value, field: &str) -> Result
     }
 }
 
-fn parse_model_notification(message: &Value) -> Result<Option<AgentEvent>> {
+fn required_string_at(message: &Value, pointer: &str, field: &str) -> Result<String> {
+    message
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| {
+            let method = message
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("未知方法");
+            format!("{method} 通知缺少字符串字段 {field}")
+        })
+}
+
+fn optional_string_at(message: &Value, pointer: &str, field: &str) -> Result<Option<String>> {
+    match message.pointer(pointer) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => {
+            let method = message
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("未知方法");
+            bail!("{method} 通知字段 {field} 必须是字符串或 null")
+        }
+    }
+}
+
+fn parse_agent_notification(message: &Value) -> Result<Option<AgentEvent>> {
     let event = match message.get("method").and_then(Value::as_str) {
+        Some("turn/started") => {
+            let _ = required_notification_string(message, "threadId")?;
+            let _ = required_string_at(message, "/params/turn/id", "params.turn.id")?;
+            let status = required_string_at(message, "/params/turn/status", "params.turn.status")?;
+            if status != "inProgress" {
+                bail!(
+                    "turn/started 通知的 params.turn.status 必须是 `inProgress`，实际为 `{status}`"
+                );
+            }
+            AgentEvent::Started
+        }
+        Some("error") => {
+            let _ = required_notification_string(message, "threadId")?;
+            let _ = required_notification_string(message, "turnId")?;
+            AgentEvent::Error {
+                message: required_string_at(
+                    message,
+                    "/params/error/message",
+                    "params.error.message",
+                )?,
+                details: optional_string_at(
+                    message,
+                    "/params/error/additionalDetails",
+                    "params.error.additionalDetails",
+                )?,
+                will_retry: message
+                    .pointer("/params/willRetry")
+                    .and_then(Value::as_bool)
+                    .context("error 通知缺少布尔字段 params.willRetry")?,
+            }
+        }
+        Some("thread/settings/updated") => {
+            let _ = required_notification_string(message, "threadId")?;
+            AgentEvent::ThreadSettingsUpdated(AgentThreadSettings {
+                model: required_string_at(
+                    message,
+                    "/params/threadSettings/model",
+                    "params.threadSettings.model",
+                )?,
+                effort: optional_string_at(
+                    message,
+                    "/params/threadSettings/effort",
+                    "params.threadSettings.effort",
+                )?,
+                service_tier: optional_string_at(
+                    message,
+                    "/params/threadSettings/serviceTier",
+                    "params.threadSettings.serviceTier",
+                )?,
+                cwd: required_string_at(
+                    message,
+                    "/params/threadSettings/cwd",
+                    "params.threadSettings.cwd",
+                )?,
+            })
+        }
+        Some("warning") => {
+            let _ = optional_string_at(message, "/params/threadId", "params.threadId")?;
+            AgentEvent::Warning {
+                message: required_notification_string(message, "message")?,
+            }
+        }
+        Some("configWarning") => {
+            let range = match message.pointer("/params/range") {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(_)) => Some((
+                    message
+                        .pointer("/params/range/start/line")
+                        .and_then(Value::as_u64)
+                        .context("configWarning 通知缺少无符号整数字段 params.range.start.line")?,
+                    message
+                        .pointer("/params/range/start/column")
+                        .and_then(Value::as_u64)
+                        .context(
+                            "configWarning 通知缺少无符号整数字段 params.range.start.column",
+                        )?,
+                )),
+                Some(_) => bail!("configWarning 通知字段 params.range 必须是对象或 null"),
+            };
+            AgentEvent::ConfigWarning(AgentConfigWarning {
+                summary: required_notification_string(message, "summary")?,
+                details: optional_string_at(message, "/params/details", "params.details")?,
+                path: optional_string_at(message, "/params/path", "params.path")?,
+                line: range.map(|(line, _)| line),
+                column: range.map(|(_, column)| column),
+            })
+        }
         Some("model/rerouted") => {
             let _ = required_notification_string(message, "threadId")?;
             let _ = required_notification_string(message, "turnId")?;
@@ -798,11 +947,31 @@ fn parse_model_notification(message: &Value) -> Result<Option<AgentEvent>> {
     Ok(Some(event))
 }
 
-fn forward_model_notification(message: &Value, events: &Sender<AgentEvent>) -> Result<()> {
-    if let Some(event) = parse_model_notification(message)? {
+fn forward_agent_notification(message: &Value, events: &Sender<AgentEvent>) -> Result<()> {
+    if let Some(event) = parse_agent_notification(message)? {
         let _ = events.send_blocking(event);
     }
     Ok(())
+}
+
+fn turn_failure_message(message: &Value) -> Result<String> {
+    let message_text = optional_string_at(
+        message,
+        "/params/turn/error/message",
+        "params.turn.error.message",
+    )?
+    .filter(|message| !message.trim().is_empty())
+    .unwrap_or_else(|| "Codex turn 失败".to_owned());
+    let details = optional_string_at(
+        message,
+        "/params/turn/error/additionalDetails",
+        "params.turn.error.additionalDetails",
+    )?
+    .filter(|details| !details.trim().is_empty());
+    Ok(match details {
+        Some(details) if !message_text.contains(&details) => format!("{message_text}\n{details}"),
+        _ => message_text,
+    })
 }
 
 fn ensure_server_method_is_defined(message: &Value) -> Result<()> {
@@ -910,11 +1079,15 @@ fn wait_for_response(
         let message = read_message(reader)?;
         respond_to_server_request(writer, &message)?;
         if let Some(events) = events {
-            forward_model_notification(&message, events)?;
-        } else {
-            // Validate model notifications even on non-turn connections so a
-            // changed wire shape fails at the adapter boundary.
-            let _ = parse_model_notification(&message)?;
+            forward_agent_notification(&message, events)?;
+        } else if parse_agent_notification(&message)?.is_some() {
+            let method = message
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("未知方法");
+            bail!(
+                "Codex 模型目录连接收到需要可见 UI 承接的通知 `{method}`，但该连接没有 turn 事件流"
+            );
         }
         ensure_server_method_is_defined(&message)?;
         if message.get("id").and_then(Value::as_u64) != Some(expected_id) {
@@ -936,7 +1109,7 @@ fn wait_for_session_response<R: BufRead, W: Write + Send>(
     loop {
         let message = read_message(reader)?;
         respond_to_server_request_on_session(session, &message)?;
-        forward_model_notification(&message, events)?;
+        forward_agent_notification(&message, events)?;
         ensure_server_method_is_defined(&message)?;
         if message.get("id").and_then(Value::as_u64) != Some(expected_id) {
             continue;
@@ -993,10 +1166,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        AgentEvent, AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome,
-        AgentRequest, AppServerProcess, CodexTurnSession, INITIALIZE_ID, MODEL_LIST_PAGE_SIZE,
-        PASSIVE_SERVER_METHODS, TurnOutcome, UNDEFINED_METHOD_PARAMS_LIMIT, drive_model_catalog,
-        drive_session, ensure_server_method_is_defined, wait_for_response,
+        AgentConfigWarning, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
+        AgentInterruptOutcome, AgentRequest, AgentThreadSettings, AppServerProcess,
+        CodexTurnSession, INITIALIZE_ID, MODEL_LIST_PAGE_SIZE, PASSIVE_SERVER_METHODS, TurnOutcome,
+        UNDEFINED_METHOD_PARAMS_LIMIT, drive_model_catalog, drive_session,
+        ensure_server_method_is_defined, wait_for_response,
     };
 
     fn take_session_output(session: &CodexTurnSession<Vec<u8>>) -> Vec<u8> {
@@ -1008,6 +1182,7 @@ mod tests {
         let input = concat!(
             "{\"id\":1,\"result\":{}}\n",
             "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n",
+            "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"items\":[],\"status\":\"inProgress\"}}}\n",
             "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_1\"}}}\n",
             "{\"method\":\"thread/status/changed\",\"params\":{\"threadId\":\"thr_1\"}}\n",
             "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_1\",\"text\":\"\"}}}\n",
@@ -1016,7 +1191,7 @@ mod tests {
             "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec_1\",\"command\":\"/bin/zsh -lc pwd\",\"cwd\":\"/tmp/project\",\"status\":\"inProgress\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"pwd\"}],\"aggregatedOutput\":null,\"exitCode\":null}}}\n",
             "{\"method\":\"item/commandExecution/outputDelta\",\"params\":{\"itemId\":\"exec_1\",\"delta\":\"/tmp/project\\n\"}}\n",
             "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec_1\",\"command\":\"/bin/zsh -lc pwd\",\"cwd\":\"/tmp/project\",\"status\":\"completed\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"pwd\"}],\"aggregatedOutput\":\"/tmp/project\\n\",\"exitCode\":0}}}\n",
-            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
+            "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
         let session = CodexTurnSession::new(Vec::new(), None);
@@ -1136,8 +1311,9 @@ mod tests {
             "{\"id\":1,\"result\":{}}\n",
             "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_interrupt\"}}}\n",
             "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_interrupt\"}}}\n",
+            "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_interrupt\",\"turn\":{\"id\":\"turn_interrupt\",\"items\":[],\"status\":\"inProgress\"}}}\n",
             "{\"id\":4,\"result\":{}}\n",
-            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn_interrupt\",\"status\":\"interrupted\"}}}\n"
+            "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_interrupt\",\"turn\":{\"id\":\"turn_interrupt\",\"status\":\"interrupted\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
         let session = CodexTurnSession::new(Vec::new(), None);
@@ -1311,6 +1487,153 @@ mod tests {
     }
 
     #[test]
+    fn user_facing_methods_are_defined_and_never_passive() {
+        for method in [
+            "turn/started",
+            "error",
+            "turn/completed",
+            "thread/settings/updated",
+            "warning",
+            "configWarning",
+        ] {
+            assert!(!PASSIVE_SERVER_METHODS.contains(&method));
+            ensure_server_method_is_defined(&json!({
+                "method": method,
+                "params": {}
+            }))
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn user_facing_notifications_are_normalized_without_ending_the_turn() {
+        let input = concat!(
+            "{\"method\":\"configWarning\",\"params\":{\"summary\":\"配置值已弃用\",\"details\":\"请迁移到新键\",\"path\":\"/tmp/project/config.toml\",\"range\":{\"start\":{\"line\":8,\"column\":4},\"end\":{\"line\":8,\"column\":12}}}}\n",
+            "{\"id\":1,\"result\":{}}\n",
+            "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_notices\"}}}\n",
+            "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_notices\",\"turn\":{\"id\":\"turn_notices\",\"items\":[],\"status\":\"inProgress\"}}}\n",
+            "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_notices\"}}}\n",
+            "{\"method\":\"thread/settings/updated\",\"params\":{\"threadId\":\"thr_notices\",\"threadSettings\":{\"model\":\"model-b\",\"effort\":\"high\",\"serviceTier\":\"priority\",\"cwd\":\"/tmp/project/updated\"}}}\n",
+            "{\"method\":\"warning\",\"params\":{\"threadId\":null,\"message\":\"上下文窗口即将用尽\"}}\n",
+            "{\"method\":\"error\",\"params\":{\"threadId\":\"thr_notices\",\"turnId\":\"turn_notices\",\"error\":{\"message\":\"连接暂时中断\",\"additionalDetails\":\"2 秒后重试\"},\"willRetry\":true}}\n",
+            "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_notices\",\"turn\":{\"id\":\"turn_notices\",\"status\":\"completed\"}}}\n"
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let session = CodexTurnSession::new(Vec::new(), None);
+        let (tx, rx) = async_channel::unbounded();
+
+        let outcome = drive_session(
+            &mut reader,
+            &session,
+            &AgentRequest {
+                prompt: "probe notices".into(),
+                cwd: PathBuf::from("/tmp/project"),
+                model: "model-a".into(),
+                effort: "medium".into(),
+                service_tier: None,
+            },
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(outcome, TurnOutcome::Completed);
+        tx.send_blocking(outcome.into_event()).unwrap();
+        drop(tx);
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::ConfigWarning(AgentConfigWarning {
+                    summary: "配置值已弃用".into(),
+                    details: Some("请迁移到新键".into()),
+                    path: Some("/tmp/project/config.toml".into()),
+                    line: Some(8),
+                    column: Some(4),
+                }),
+                AgentEvent::Started,
+                AgentEvent::ThreadSettingsUpdated(AgentThreadSettings {
+                    model: "model-b".into(),
+                    effort: Some("high".into()),
+                    service_tier: Some("priority".into()),
+                    cwd: "/tmp/project/updated".into(),
+                }),
+                AgentEvent::Warning {
+                    message: "上下文窗口即将用尽".into(),
+                },
+                AgentEvent::Error {
+                    message: "连接暂时中断".into(),
+                    details: Some("2 秒后重试".into()),
+                    will_retry: true,
+                },
+                AgentEvent::Completed,
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_turn_completion_is_the_terminal_event_and_keeps_error_details() {
+        let input = concat!(
+            "{\"id\":1,\"result\":{}}\n",
+            "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_failed\"}}}\n",
+            "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_failed\"}}}\n",
+            "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_failed\",\"turn\":{\"id\":\"turn_failed\",\"items\":[],\"status\":\"inProgress\"}}}\n",
+            "{\"method\":\"error\",\"params\":{\"threadId\":\"thr_failed\",\"turnId\":\"turn_failed\",\"error\":{\"message\":\"模型请求失败\",\"additionalDetails\":\"上游返回 503\"},\"willRetry\":false}}\n",
+            "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_failed\",\"turn\":{\"id\":\"turn_failed\",\"status\":\"failed\",\"error\":{\"message\":\"模型请求失败\",\"additionalDetails\":\"上游返回 503\"}}}}\n"
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let session = CodexTurnSession::new(Vec::new(), None);
+        let (tx, rx) = async_channel::unbounded();
+
+        let outcome = drive_session(
+            &mut reader,
+            &session,
+            &AgentRequest {
+                prompt: "fail".into(),
+                cwd: PathBuf::from("/tmp/project"),
+                model: "model-a".into(),
+                effort: "medium".into(),
+                service_tier: None,
+            },
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            TurnOutcome::Failed("模型请求失败\n上游返回 503".into())
+        );
+        tx.send_blocking(outcome.into_event()).unwrap();
+        drop(tx);
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::Started,
+                AgentEvent::Error {
+                    message: "模型请求失败".into(),
+                    details: Some("上游返回 503".into()),
+                    will_retry: false,
+                },
+                AgentEvent::Failed("模型请求失败\n上游返回 503".into()),
+            ]
+        );
+        assert!(session.snapshot().4);
+    }
+
+    #[test]
+    fn non_turn_connection_does_not_silently_drop_visible_notifications() {
+        let mut reader =
+            Cursor::new(b"{\"method\":\"warning\",\"params\":{\"message\":\"visible warning\"}}\n");
+        let mut output = Vec::new();
+
+        let error = wait_for_response(&mut reader, &mut output, INITIALIZE_ID, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("需要可见 UI 承接"));
+        assert!(error.contains("warning"));
+    }
+
+    #[test]
     fn unknown_method_error_contains_its_kind_name_and_params() {
         let error = ensure_server_method_is_defined(&json!({
             "method": "item/futureTool/progress",
@@ -1381,8 +1704,9 @@ mod tests {
             "{\"id\":1,\"result\":{}}\n",
             "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n",
             "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_1\"}}}\n",
+            "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"items\":[],\"status\":\"inProgress\"}}}\n",
             "{\"method\":\"item/brandNew/delta\",\"params\":{\"delta\":\"diagnostic payload\"}}\n",
-            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
+            "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
         let session = CodexTurnSession::new(Vec::new(), None);
@@ -1420,14 +1744,14 @@ mod tests {
             "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n",
             "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_1\"}}}\n",
             "{\"method\":\"thread/status/changed\",\"params\":{}}\n",
-            "{\"method\":\"turn/started\",\"params\":{}}\n",
+            "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"items\":[],\"status\":\"inProgress\"}}}\n",
             "{\"method\":\"turn/plan/updated\",\"params\":{}}\n",
             "{\"method\":\"thread/tokenUsage/updated\",\"params\":{}}\n",
             "{\"method\":\"account/rateLimits/updated\",\"params\":{}}\n",
             "{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec_1\",\"command\":\"pwd\",\"cwd\":\"/tmp/project\",\"status\":\"inProgress\"}}}\n",
             "{\"method\":\"item/commandExecution/outputDelta\",\"params\":{\"itemId\":\"exec_1\",\"delta\":\"/tmp/project\\n\"}}\n",
             "{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"exec_1\",\"command\":\"pwd\",\"cwd\":\"/tmp/project\",\"status\":\"completed\",\"aggregatedOutput\":\"/tmp/project\\n\",\"exitCode\":0}}}\n",
-            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
+            "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
         );
 
         let mut reader = Cursor::new(input.as_bytes());
@@ -1466,11 +1790,12 @@ mod tests {
             "{\"id\":1,\"result\":{}}\n",
             "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n",
             "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_1\"}}}\n",
+            "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"items\":[],\"status\":\"inProgress\"}}}\n",
             "{\"method\":\"model/rerouted\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"fromModel\":\"model-a\",\"toModel\":\"model-b\",\"reason\":\"highRiskCyberActivity\"}}\n",
             "{\"method\":\"model/safetyBuffering/updated\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"model\":\"model-b\",\"useCases\":[\"cyber\"],\"reasons\":[\"review\"],\"showBufferingUi\":true,\"fasterModel\":\"model-c\"}}\n",
             "{\"method\":\"model/safetyBuffering/updated\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"model\":\"model-b\",\"useCases\":[],\"reasons\":[],\"showBufferingUi\":false,\"fasterModel\":null}}\n",
             "{\"method\":\"model/verification\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"verifications\":[\"trustedAccessForCyber\"]}}\n",
-            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
+            "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
         let session = CodexTurnSession::new(Vec::new(), None);

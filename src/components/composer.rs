@@ -9,8 +9,8 @@ use gpui::{
 
 use crate::{
     agent::{
-        AgentBackend, AgentEvent, AgentInterruptHandle, AgentInterruptOutcome, AgentModel,
-        AgentModelCatalog, AgentRequest, CodexAppServerBackend, CommandExecution,
+        AgentBackend, AgentConfigWarning, AgentEvent, AgentInterruptHandle, AgentInterruptOutcome,
+        AgentModel, AgentModelCatalog, AgentRequest, CodexAppServerBackend, CommandExecution,
         CommandExecutionStatus,
     },
     components::{
@@ -67,9 +67,27 @@ pub enum ConversationPhase {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConversationActivity {
-    AssistantMessage { item_id: String, text: String },
+    AssistantMessage {
+        item_id: String,
+        text: String,
+    },
     Command(CommandExecution),
-    Error { message: String },
+    ProtocolError {
+        message: String,
+        details: Option<String>,
+        will_retry: bool,
+    },
+    SettingsUpdated {
+        summary: String,
+        cwd: String,
+    },
+    Warning {
+        message: String,
+    },
+    ConfigWarning(AgentConfigWarning),
+    Error {
+        message: String,
+    },
 }
 
 const MODEL_PICKER_WIDTH: f32 = 224.0;
@@ -815,6 +833,59 @@ impl ComposerView {
                         self.conversation_phase = ConversationPhase::Thinking;
                     }
                 }
+                AgentEvent::Error {
+                    message,
+                    details,
+                    will_retry,
+                } => {
+                    self.conversation_activity
+                        .push(ConversationActivity::ProtocolError {
+                            message,
+                            details,
+                            will_retry,
+                        });
+                }
+                AgentEvent::ThreadSettingsUpdated(settings) => {
+                    let model_label = self.model_display_name(&settings.model).to_owned();
+                    let mut summary_parts = vec![model_label];
+                    if let Some(effort) = settings.effort.as_deref() {
+                        summary_parts.push(format!("{}推理", Self::effort_label(effort)));
+                    }
+                    if let Some(service_tier) = settings.service_tier.as_deref() {
+                        summary_parts.push(service_tier.to_owned());
+                    }
+
+                    self.selected_model = settings.model.clone();
+                    if let Some(effort) = &settings.effort {
+                        self.selected_effort = effort.clone();
+                    }
+                    self.selected_service_tier = settings.service_tier.clone();
+                    self.slider_index = self
+                        .selected_model_entry()
+                        .and_then(|model| {
+                            model
+                                .supported_reasoning_efforts
+                                .iter()
+                                .position(|effort| effort.id == self.selected_effort)
+                        })
+                        .unwrap_or(0);
+                    self.actual_model = Some(settings.model);
+                    self.model_status = Some("设置已更新".to_owned());
+                    self.safety_buffering = false;
+                    self.conversation_activity
+                        .push(ConversationActivity::SettingsUpdated {
+                            summary: format!("线程设置已更新：{}", summary_parts.join(" · ")),
+                            cwd: settings.cwd,
+                        });
+                }
+                AgentEvent::Warning { message } => {
+                    self.conversation_activity
+                        .push(ConversationActivity::Warning { message });
+                }
+                AgentEvent::ConfigWarning(warning) => {
+                    self.conversation_activity
+                        .push(ConversationActivity::ConfigWarning(warning));
+                }
                 AgentEvent::AssistantMessageStarted { item_id } => {
                     if !self.conversation_activity.iter().any(|activity| {
                         matches!(
@@ -958,8 +1029,20 @@ impl ComposerView {
                 }
                 AgentEvent::Failed(error) => {
                     self.assistant_message = error.clone();
-                    self.conversation_activity
-                        .push(ConversationActivity::Error { message: error });
+                    let already_visible = self.conversation_activity.iter().rev().any(|activity| {
+                        matches!(
+                            activity,
+                            ConversationActivity::ProtocolError {
+                                message,
+                                will_retry: false,
+                                ..
+                            } if error.starts_with(message)
+                        )
+                    });
+                    if !already_visible {
+                        self.conversation_activity
+                            .push(ConversationActivity::Error { message: error });
+                    }
                     self.assistant_message_time = Some(current_local_time_label());
                     self.conversation_phase = ConversationPhase::Failed;
                     self.safety_buffering = false;
@@ -2972,9 +3055,9 @@ mod tests {
         submenu_layout, upsert_command_activity,
     };
     use crate::agent::{
-        AgentEvent, AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome, AgentModel,
-        AgentModelCatalog, AgentReasoningEffort, AgentServiceTier, CommandExecution,
-        CommandExecutionStatus,
+        AgentConfigWarning, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
+        AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentReasoningEffort,
+        AgentServiceTier, AgentThreadSettings, CommandExecution, CommandExecutionStatus,
     };
     use crate::theme::ThemeMode;
     use gpui::{
@@ -3669,6 +3752,103 @@ mod tests {
             app.read_entity(&composer, |composer, _| composer.conversation_snapshot());
         assert_eq!(phase, ConversationPhase::Failed);
         assert!(message.contains("trustedAccessForCyber"));
+    }
+
+    #[test]
+    fn server_notices_stay_visible_and_non_terminal_until_failed_completion() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        app.update_entity(&composer, |composer, _| {
+            composer.apply_model_catalog(test_model_catalog());
+            composer.conversation_phase = ConversationPhase::Starting;
+            assert!(!composer.apply_agent_event_batch(vec![
+                AgentEvent::Started,
+                AgentEvent::Error {
+                    message: "连接暂时中断".into(),
+                    details: Some("2 秒后重试".into()),
+                    will_retry: true,
+                },
+                AgentEvent::Warning {
+                    message: "上下文窗口即将用尽".into(),
+                },
+                AgentEvent::ConfigWarning(AgentConfigWarning {
+                    summary: "配置值已弃用".into(),
+                    details: Some("请迁移到新键".into()),
+                    path: Some("/tmp/project/config.toml".into()),
+                    line: Some(8),
+                    column: Some(4),
+                }),
+                AgentEvent::ThreadSettingsUpdated(AgentThreadSettings {
+                    model: "model-b".into(),
+                    effort: Some("high".into()),
+                    service_tier: Some("priority".into()),
+                    cwd: "/tmp/project/updated".into(),
+                }),
+            ]));
+        });
+
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer.conversation_phase),
+            ConversationPhase::Thinking
+        );
+        assert!(app.read_entity(&composer, |composer, _| {
+            composer.model_status.as_deref() == Some("设置已更新")
+                && composer.selected_model == "model-b"
+                && composer.selected_effort == "high"
+                && composer.selected_service_tier.as_deref() == Some("priority")
+        }));
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer
+                .conversation_activity
+                .clone()),
+            vec![
+                ConversationActivity::ProtocolError {
+                    message: "连接暂时中断".into(),
+                    details: Some("2 秒后重试".into()),
+                    will_retry: true,
+                },
+                ConversationActivity::Warning {
+                    message: "上下文窗口即将用尽".into(),
+                },
+                ConversationActivity::ConfigWarning(AgentConfigWarning {
+                    summary: "配置值已弃用".into(),
+                    details: Some("请迁移到新键".into()),
+                    path: Some("/tmp/project/config.toml".into()),
+                    line: Some(8),
+                    column: Some(4),
+                }),
+                ConversationActivity::SettingsUpdated {
+                    summary: "线程设置已更新：Model B · 高推理 · priority".into(),
+                    cwd: "/tmp/project/updated".into(),
+                },
+            ]
+        );
+
+        app.update_entity(&composer, |composer, _| {
+            assert!(!composer.apply_agent_event_batch(vec![AgentEvent::Error {
+                message: "模型请求失败".into(),
+                details: Some("上游返回 503".into()),
+                will_retry: false,
+            }]));
+            assert!(composer.apply_agent_event_batch(vec![AgentEvent::Failed(
+                "模型请求失败\n上游返回 503".into(),
+            )]));
+        });
+
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer.conversation_phase),
+            ConversationPhase::Failed
+        );
+        assert!(app.read_entity(&composer, |composer, _| {
+            matches!(
+                composer.conversation_activity.last(),
+                Some(ConversationActivity::ProtocolError {
+                    message,
+                    details: Some(details),
+                    will_retry: false,
+                }) if message == "模型请求失败" && details == "上游返回 503"
+            )
+        }));
     }
 
     #[test]

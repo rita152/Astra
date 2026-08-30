@@ -56,6 +56,11 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 | `thread/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 为本次 prompt 创建临时、只读线程，并传入所选 `model`、`serviceTier` |
 | `turn/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 提交文本 prompt，并传入所选 `model`、`effort`、`serviceTier` |
 | `turn/interrupt` | 客户端 → 服务端 | `AgentInterruptHandle::interrupt` → `CodexTurnSession` | 在原 stdio 连接上使用已保存的 `threadId`、`turnId` 发送一次中断；开始阶段的停止请求会排队，重复请求及已结束 turn 不会重复写入 |
+| `turn/started` | 服务端 → 客户端 | `AgentEvent::Started` | 将 `Starting` 推进到可见的 `Thinking` 运行态；保留停止按钮与活动状态，不结束事件流 |
+| `error` | 服务端 → 客户端 | `AgentEvent::Error { message, details, will_retry }` | `willRetry: true` 显示低强调重试活动行，`false` 显示错误 Notice；两者都保持非终止，等待 `turn/completed` 决定最终状态 |
+| `thread/settings/updated` | 服务端 → 客户端 | `AgentEvent::ThreadSettingsUpdated` | 更新模型、effort、service tier 的有效选择，并显示包含工作目录的“线程设置已更新”状态行 |
+| `warning` | 服务端 → 客户端 | `AgentEvent::Warning` | 显示带警告图标和可访问 alert 语义的 Notice；保持非终止 |
+| `configWarning` | 服务端 → 客户端 | `AgentEvent::ConfigWarning` | 显示 summary、details、文件与行列位置；存在 path 时提供“打开文件”按钮；保持非终止 |
 | `item/started` | 服务端 → 客户端 | `AgentEvent::AssistantMessageStarted { item_id }` / `AgentEvent::CommandStarted(CommandExecution)` | 建立 assistant message 或 command activity |
 | `item/agentMessage/delta` | 服务端 → 客户端 | `AgentEvent::TextDelta(String)` | 追加流式 assistant 文本 |
 | `item/commandExecution/outputDelta` | 服务端 → 客户端 | `AgentEvent::CommandOutputDelta { item_id, delta }` | 按 `item_id` 将流式输出追加到对应 command activity |
@@ -63,7 +68,7 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 | `model/rerouted` | 服务端 → 客户端 | `AgentEvent::ModelRerouted` | 更新本轮实际模型，并在选择器触发器中显示 reroute 状态 |
 | `model/verification` | 服务端 → 客户端 | `AgentEvent::ModelVerificationRequired` | 将额外账户验证要求转换为可见的失败状态 |
 | `model/safetyBuffering/updated` | 服务端 → 客户端 | `AgentEvent::ModelSafetyBufferingUpdated` | 更新实际模型和暂态安全检查提示，结束 buffering 时清除提示 |
-| `turn/completed` | 服务端 → 客户端 | `AgentEvent::Completed` / `AgentEvent::Interrupted` / `AgentEvent::Failed(String)` | 按 `completed`、`interrupted`、`failed` 终态结束本轮，并在终态后回收 stdin 与 app-server 子进程 |
+| `turn/completed` | 服务端 → 客户端 | `AgentEvent::Completed` / `AgentEvent::Interrupted` / `AgentEvent::Failed(String)` | 校验匹配的 `threadId`、`turnId`，按 `completed`、`interrupted`、`failed` 终态结束本轮；失败会合并 `error.message` 与 `additionalDetails`，终态后回收 stdin 与 app-server 子进程 |
 
 Prompt 会话的 stdin 由可并发写入的 `CodexTurnSession` 持续持有，当前 `threadId` 与 `turnId` 会保留到终态。点击停止后 Composer 只进入 `Stopping`，不会截断事件流或伪造本地完成；只有收到匹配 turn 的 `turn/completed` 且状态为 `interrupted` 后才转为 `Stopped`。若任务先自然完成，则保留 `Complete`；若中断写入或连接失败，则进入 `Failed`。控制句柄丢弃、协议异常和正常终态都走幂等的关闭、kill、wait 路径，避免重复停止与退出竞态留下子进程。
 
@@ -71,7 +76,11 @@ Prompt 会话的 stdin 由可并发写入的 `CodexTurnSession` 持续持有，�
 
 Composer 的视觉层以本机 ChatGPT App（CDP `127.0.0.1:9222`）的实际计算样式为基准：展开触发器和主菜单宽 224 px，模型子菜单宽 280 px，推理强度子菜单宽 180 px，速度子菜单宽 233 px；行高、内边距、圆角、悬停/选中态、勾选图标、子菜单底部对齐和“重置为默认设置”行为均按实测值实现。模型子菜单只显示 `model/list` 返回的 `displayName`；推理强度和速度选项仍由目录动态决定，其中 ChatGPT UI 专属的 Ultra 副文案固定本地化为“更快消耗使用额度”，不使用协议中的英文 effort 描述替代该界面文案。
 
+本批事件也通过同一 CDP 入口在真实 ChatGPT App 中临时注入并还原状态后取样：运行态使用 14 px / 21 px、60% 前景的计时状态；`error(willRetry: true)` 使用透明背景、6 px 间距的低强调活动行；不可重试错误和配置警告使用 20 px 圆角、`8px 8px 8px 12px` 内边距、0.5 px 强边框 ring 的 Notice。`configWarning` 的图标为 18 px，正文为 13 px / 20 px，可选“打开文件”按钮为 24 px 高、8 px 水平内边距，并保留 hover 反馈。实现同时为错误和警告添加 `Alert` 角色、为设置变更添加 `Status` 角色，避免只靠颜色传达状态。
+
 未接入的服务端反向请求会收到 `-32601`，因此当前实现固定使用 `approvalPolicy: "never"`、`sandbox: "read-only"`。该策略下 app-server 自行执行的 `commandExecution` 可展示开始状态、增量输出和完成状态；需要用户审批或交互的操作仍未接入。
+
+本批明确不接入审批请求、自动审批、文件 Diff、用户输入/MCP 表单和 `permissionProfile/list`；这些方法在下表中继续保持“否”，没有新增本地自动审批或静默兜底。
 
 下方总表中，“是”表示消息已转换为内部协议并由应用消费；“已知（no-op）”表示适配器会显式接受该通知，但不生成 `AgentEvent`；“否”表示尚未定义或接入，实际收到时会进入未定义方法错误处理。
 
@@ -261,7 +270,7 @@ Composer 的视觉层以本机 ChatGPT App（CDP `127.0.0.1:9222`）的实际计
 
 | # | Method | 消息形式 | Params schema | 能力门槛 / 状态 | 内部方法 | 是否接入 |
 |---:|---|---|---|---|---|:---:|
-| 1 | `error` | 通知（无 `id`） | `ErrorNotification` | 默认 | — | 否 |
+| 1 | `error` | 通知（无 `id`） | `ErrorNotification` | 默认 | `parse_agent_notification` → `AgentEvent::Error` → 重试活动行 / 错误 Notice（非终止） | 是 |
 | 2 | `thread/started` | 通知（无 `id`） | `ThreadStartedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
 | 3 | `thread/status/changed` | 通知（无 `id`） | `ThreadStatusChangedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
 | 4 | `thread/archived` | 通知（无 `id`） | `ThreadArchivedNotification` | 默认 | — | 否 |
@@ -278,11 +287,11 @@ Composer 的视觉层以本机 ChatGPT App（CDP `127.0.0.1:9222`）的实际计
 | 15 | `thread/project/updated` | 通知（无 `id`） | `ThreadProjectUpdatedNotification` | 默认 | — | 否 |
 | 16 | `thread/environment/connected` | 通知（无 `id`） | `EnvironmentConnectionNotification` | 默认 | — | 否 |
 | 17 | `thread/environment/disconnected` | 通知（无 `id`） | `EnvironmentConnectionNotification` | 默认 | — | 否 |
-| 18 | `thread/settings/updated` | 通知（无 `id`） | `ThreadSettingsUpdatedNotification` | 默认 | — | 否 |
+| 18 | `thread/settings/updated` | 通知（无 `id`） | `ThreadSettingsUpdatedNotification` | 默认 | `parse_agent_notification` → `AgentEvent::ThreadSettingsUpdated` → 有效模型设置 + 状态行（非终止） | 是 |
 | 19 | `thread/tokenUsage/updated` | 通知（无 `id`） | `ThreadTokenUsageUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
-| 20 | `turn/started` | 通知（无 `id`） | `TurnStartedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
+| 20 | `turn/started` | 通知（无 `id`） | `TurnStartedNotification` | 默认 | `parse_agent_notification` → `AgentEvent::Started` → `ConversationPhase::Thinking`（非终止） | 是 |
 | 21 | `hook/started` | 通知（无 `id`） | `HookStartedNotification` | 默认 | — | 否 |
-| 22 | `turn/completed` | 通知（无 `id`） | `TurnCompletedNotification` | 默认 | `drive_session` → `AgentEvent::Completed` / `AgentEvent::Interrupted` / `AgentEvent::Failed(String)` → `ComposerView::apply_agent_event_batch` | 是 |
+| 22 | `turn/completed` | 通知（无 `id`） | `TurnCompletedNotification` | 默认 | `drive_session` 校验 thread/turn → `AgentEvent::Completed` / `Interrupted` / `Failed(String)` → 终止状态 | 是 |
 | 23 | `hook/completed` | 通知（无 `id`） | `HookCompletedNotification` | 默认 | — | 否 |
 | 24 | `turn/diff/updated` | 通知（无 `id`） | `TurnDiffUpdatedNotification` | 默认 | — | 否 |
 | 25 | `turn/plan/updated` | 通知（无 `id`） | `TurnPlanUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
@@ -320,10 +329,10 @@ Composer 的视觉层以本机 ChatGPT App（CDP `127.0.0.1:9222`）的实际计
 | 57 | `model/verification` | 通知（无 `id`） | `ModelVerificationNotification` | 默认 | `drive_session` → `AgentEvent::ModelVerificationRequired` → `ComposerView::apply_agent_event_batch` | 是 |
 | 58 | `turn/moderationMetadata` | 通知（无 `id`） | `TurnModerationMetadataNotification` | 默认 | — | 否 |
 | 59 | `model/safetyBuffering/updated` | 通知（无 `id`） | `ModelSafetyBufferingUpdatedNotification` | 默认 | `drive_session` → `AgentEvent::ModelSafetyBufferingUpdated` → `ComposerView::apply_agent_event_batch` | 是 |
-| 60 | `warning` | 通知（无 `id`） | `WarningNotification` | 默认 | — | 否 |
+| 60 | `warning` | 通知（无 `id`） | `WarningNotification` | 默认 | `parse_agent_notification` → `AgentEvent::Warning` → 警告 Notice（非终止） | 是 |
 | 61 | `guardianWarning` | 通知（无 `id`） | `GuardianWarningNotification` | 默认 | — | 否 |
 | 62 | `deprecationNotice` | 通知（无 `id`） | `DeprecationNoticeNotification` | 默认 | — | 否 |
-| 63 | `configWarning` | 通知（无 `id`） | `ConfigWarningNotification` | 默认 | — | 否 |
+| 63 | `configWarning` | 通知（无 `id`） | `ConfigWarningNotification` | 默认 | `parse_agent_notification` → `AgentEvent::ConfigWarning` → 配置警告 Notice + 可选打开文件（非终止） | 是 |
 | 64 | `fuzzyFileSearch/sessionUpdated` | 通知（无 `id`） | `FuzzyFileSearchSessionUpdatedNotification` | 默认 | — | 否 |
 | 65 | `fuzzyFileSearch/sessionCompleted` | 通知（无 `id`） | `FuzzyFileSearchSessionCompletedNotification` | 默认 | — | 否 |
 | 66 | `thread/realtime/started` | 通知（无 `id`） | `ThreadRealtimeStartedNotification` | 默认 | — | 否 |
@@ -347,7 +356,7 @@ Composer 的视觉层以本机 ChatGPT App（CDP `127.0.0.1:9222`）的实际计
 - 重新执行 `codex app-server generate-json-schema --experimental` 和默认 schema 生成；实验 schema 仍为 153 个 ClientRequest、11 个 ServerRequest、1 个 ClientNotification、79 个 ServerNotification（合计 244），默认 schema 合计 185。
 - 对真实 app-server 以 `limit: 2` 调用 `model/list`：通过 4 页及连续 `nextCursor` 拉取到 7 个可见模型；响应包含 `displayName`、`isDefault`、`supportedReasoningEfforts`、`defaultReasoningEffort`、`serviceTiers`、`defaultServiceTier`，与本机生成 schema 一致。
 - `cargo fmt -- --check`：通过。
-- `cargo test`：111 个测试全部通过；新增覆盖 `turn/interrupt` 的 `threadId`/`turnId` 参数、开始阶段排队、重复/结束后停止、`Stopping` → `Stopped`/`Failed` 状态转换，以及子进程 kill + wait 回收；原有模型目录、流式文本、命令输出和 UI 行为测试继续通过。
+- `cargo test`：117 个测试全部通过；本批新增覆盖六个可见方法不进入 `PASSIVE_SERVER_METHODS`、通知 payload 归一化、握手阶段通知转发、`error`/`warning`/`configWarning`/`thread/settings/updated` 的非终止语义、`turn/completed(status=failed)` 的唯一终止语义及错误详情保留、Composer 可见 activity 映射和 Notice 的 CDP 几何常量。原有中断、模型目录、流式文本、命令输出和 UI 行为测试继续通过。
 - `cargo check --all-targets`：通过。
 
 ## Schema 生成与版本同步
