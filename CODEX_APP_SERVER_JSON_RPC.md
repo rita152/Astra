@@ -1,7 +1,7 @@
 # Codex CLI App Server JSON-RPC 协议清单
 
 > 基准版本：`codex-cli 0.150.1`
-> 生成日期：2026-08-28
+> 生成日期：2026-08-30
 > 接入状态更新：2026-08-30
 > 范围：`codex app-server generate-json-schema --experimental` 输出的全部方法，并与默认 schema 对比标注能力门槛。
 
@@ -46,18 +46,26 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 
 ## 已接入范围
 
-当前实现通过统一的 `AgentBackend::run_prompt(AgentRequest) -> Receiver<AgentEvent>` 接口隔离具体 coding agent。Codex 适配器位于 `src/agent/codex.rs`，UI 只依赖内部协议 `AgentEvent`，不直接依赖 Codex JSON-RPC。流式事件由 `ComposerView::apply_agent_event_batch` 批量消费。
+当前实现通过统一的 `AgentBackend` 接口隔离具体 coding agent：`load_model_catalog()` 返回 agent-neutral 的 `AgentModelCatalog`，`run_prompt(AgentRequest)` 返回 `AgentEvent` 流。Codex 适配器位于 `src/agent/codex.rs`；`model/list` 的分页、camelCase 字段、请求 id、通知 payload 和 JSON-RPC 错误都封装在该模块。UI 只依赖 `AgentModel`、`AgentRequest` 和 `AgentEvent`，不直接依赖 Codex JSON-RPC。流式事件由 `ComposerView::apply_agent_event_batch` 批量消费。
 
 | 已接入 JSON-RPC 方法 | 方向 | 内部协议 | 接入职责 |
 |---|---|---|---|
-| `initialize`、`initialized` | 客户端 → 服务端 | `drive_session` 连接生命周期（无 `AgentEvent`） | 建立一条 app-server 连接的初始化握手 |
-| `thread/start` | 客户端 → 服务端 | `drive_session` 请求/响应生命周期（无 `AgentEvent`） | 为本次 prompt 创建临时、只读线程 |
-| `turn/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 提交文本 prompt |
+| `initialize`、`initialized` | 客户端 → 服务端 | `initialize_connection` 连接生命周期（无 `AgentEvent`） | 为模型目录连接和 prompt 连接建立初始化握手 |
+| `model/list` | 客户端 → 服务端 | `CodexAppServerBackend::load_model_catalog` → `AgentModelCatalog` | 使用 `cursor`/`nextCursor` 拉取全部可见页；映射 model、`displayName`、默认模型、effort 与 service tier |
+| `thread/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 为本次 prompt 创建临时、只读线程，并传入所选 `model`、`serviceTier` |
+| `turn/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 提交文本 prompt，并传入所选 `model`、`effort`、`serviceTier` |
 | `item/started` | 服务端 → 客户端 | `AgentEvent::AssistantMessageStarted { item_id }` / `AgentEvent::CommandStarted(CommandExecution)` | 建立 assistant message 或 command activity |
 | `item/agentMessage/delta` | 服务端 → 客户端 | `AgentEvent::TextDelta(String)` | 追加流式 assistant 文本 |
 | `item/commandExecution/outputDelta` | 服务端 → 客户端 | `AgentEvent::CommandOutputDelta { item_id, delta }` | 按 `item_id` 将流式输出追加到对应 command activity |
 | `item/completed` | 服务端 → 客户端 | `AgentEvent::CommandCompleted(CommandExecution)` / `AgentEvent::TextDelta(String)` | 完成 command activity；未收到文本 delta 时用完整 agent message 兜底 |
+| `model/rerouted` | 服务端 → 客户端 | `AgentEvent::ModelRerouted` | 更新本轮实际模型，并在选择器触发器中显示 reroute 状态 |
+| `model/verification` | 服务端 → 客户端 | `AgentEvent::ModelVerificationRequired` | 将额外账户验证要求转换为可见的失败状态 |
+| `model/safetyBuffering/updated` | 服务端 → 客户端 | `AgentEvent::ModelSafetyBufferingUpdated` | 更新实际模型和暂态安全检查提示，结束 buffering 时清除提示 |
 | `turn/completed` | 服务端 → 客户端 | `AgentEvent::Completed` / `AgentEvent::Failed(String)` | 结束本轮流式状态并更新最终结果 |
+
+选择器不再维护模型硬编码目录。目录加载完成后优先选择 `isDefault: true` 的模型（缺失时退回首项），使用该模型的 `defaultReasoningEffort` 和 `defaultServiceTier`；切换模型时重新应用目标模型的默认项。高级菜单、键盘导航及简化 effort 滑杆都按当前目录长度动态生成。`ThreadStartParams` 的本机 schema 没有 `effort` 字段，因此 effort 按 schema 仅发送给 `turn/start`，没有通过未定义字段塞入 `thread/start`。
+
+Composer 的视觉层以本机 ChatGPT App（CDP `127.0.0.1:9222`）的实际计算样式为基准：展开触发器和主菜单宽 224 px，模型子菜单宽 280 px，推理强度子菜单宽 180 px，速度子菜单宽 233 px；行高、内边距、圆角、悬停/选中态、勾选图标、子菜单底部对齐和“重置为默认设置”行为均按实测值实现。模型子菜单只显示 `model/list` 返回的 `displayName`；推理强度和速度选项仍由目录动态决定，其中 ChatGPT UI 专属的 Ultra 副文案固定本地化为“更快消耗使用额度”，不使用协议中的英文 effort 描述替代该界面文案。
 
 未接入的服务端反向请求会收到 `-32601`，因此当前实现固定使用 `approvalPolicy: "never"`、`sandbox: "read-only"`。该策略下 app-server 自行执行的 `commandExecution` 可展示开始状态、增量输出和完成状态；需要用户审批或交互的操作仍未接入。
 
@@ -69,9 +77,9 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 
 | # | Method | 消息形式 | Params schema | 能力门槛 / 状态 | 内部方法 | 是否接入 |
 |---:|---|---|---|---|---|:---:|
-| 1 | `initialize` | 请求（有 `id`） | `InitializeParams` | 默认 | `CodexAppServerBackend::run_prompt` → `drive_session` | 是 |
+| 1 | `initialize` | 请求（有 `id`） | `InitializeParams` | 默认 | `initialize_connection`（`load_model_catalog` 与 `run_prompt` 共用） | 是 |
 | 2 | `server/diagnostics` | 请求（有 `id`） | `ServerDiagnosticsParams` | 实验性 | — | 否 |
-| 3 | `thread/start` | 请求（有 `id`） | `ThreadStartParams` | 默认 | `CodexAppServerBackend::run_prompt` → `drive_session` | 是 |
+| 3 | `thread/start` | 请求（有 `id`） | `ThreadStartParams` | 默认 | `AgentRequest` → `drive_session`（`model`、`serviceTier`） | 是 |
 | 4 | `thread/resume` | 请求（有 `id`） | `ThreadResumeParams` | 默认 | — | 否 |
 | 5 | `thread/fork` | 请求（有 `id`） | `ThreadForkParams` | 默认 | — | 否 |
 | 6 | `thread/archive` | 请求（有 `id`） | `ThreadArchiveParams` | 默认 | — | 否 |
@@ -153,7 +161,7 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 | 82 | `skills/config/write` | 请求（有 `id`） | `SkillsConfigWriteParams` | 默认 | — | 否 |
 | 83 | `plugin/install` | 请求（有 `id`） | `PluginInstallParams` | 默认 | — | 否 |
 | 84 | `plugin/uninstall` | 请求（有 `id`） | `PluginUninstallParams` | 默认 | — | 否 |
-| 85 | `turn/start` | 请求（有 `id`） | `TurnStartParams` | 默认 | `CodexAppServerBackend::run_prompt` → `drive_session` | 是 |
+| 85 | `turn/start` | 请求（有 `id`） | `TurnStartParams` | 默认 | `AgentRequest` → `drive_session`（`model`、`effort`、`serviceTier`） | 是 |
 | 86 | `turn/steer` | 请求（有 `id`） | `TurnSteerParams` | 默认 | — | 否 |
 | 87 | `turn/interrupt` | 请求（有 `id`） | `TurnInterruptParams` | 默认 | — | 否 |
 | 88 | `thread/realtime/start` | 请求（有 `id`） | `ThreadRealtimeStartParams` | 实验性 | — | 否 |
@@ -164,7 +172,7 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 | 93 | `thread/timeline/list` | 请求（有 `id`） | `ThreadTimelineListParams` | 实验性 | — | 否 |
 | 94 | `thread/realtime/listVoices` | 请求（有 `id`） | `ThreadRealtimeListVoicesParams` | 实验性 | — | 否 |
 | 95 | `review/start` | 请求（有 `id`） | `ReviewStartParams` | 默认 | — | 否 |
-| 96 | `model/list` | 请求（有 `id`） | `ModelListParams` | 默认 | — | 否 |
+| 96 | `model/list` | 请求（有 `id`） | `ModelListParams` | 默认 | `CodexAppServerBackend::load_model_catalog` → `drive_model_catalog` → `AgentModelCatalog` | 是 |
 | 97 | `modelProvider/capabilities/read` | 请求（有 `id`） | `ModelProviderCapabilitiesReadParams` | 默认 | — | 否 |
 | 98 | `experimentalFeature/list` | 请求（有 `id`） | `ExperimentalFeatureListParams` | 默认 | — | 否 |
 | 99 | `permissionProfile/list` | 请求（有 `id`） | `PermissionProfileListParams` | 默认 | — | 否 |
@@ -243,7 +251,7 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 
 | # | Method | 消息形式 | Params schema | 能力门槛 / 状态 | 内部方法 | 是否接入 |
 |---:|---|---|---|---|---|:---:|
-| 1 | `initialized` | 通知（无 `id`） | `无` | 默认 | `CodexAppServerBackend::run_prompt` → `drive_session` | 是 |
+| 1 | `initialized` | 通知（无 `id`） | `无` | 默认 | `initialize_connection`（目录与 prompt 连接共用） | 是 |
 
 ### 服务端 → 客户端通知（ServerNotification，79 个）
 
@@ -304,10 +312,10 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 | 53 | `item/reasoning/summaryPartAdded` | 通知（无 `id`） | `ReasoningSummaryPartAddedNotification` | 默认 | — | 否 |
 | 54 | `item/reasoning/textDelta` | 通知（无 `id`） | `ReasoningTextDeltaNotification` | 默认 | — | 否 |
 | 55 | `thread/compacted` | 通知（无 `id`） | `ContextCompactedNotification` | 默认；已弃用 | — | 否 |
-| 56 | `model/rerouted` | 通知（无 `id`） | `ModelReroutedNotification` | 默认 | — | 否 |
-| 57 | `model/verification` | 通知（无 `id`） | `ModelVerificationNotification` | 默认 | — | 否 |
+| 56 | `model/rerouted` | 通知（无 `id`） | `ModelReroutedNotification` | 默认 | `drive_session` → `AgentEvent::ModelRerouted` → `ComposerView::apply_agent_event_batch` | 是 |
+| 57 | `model/verification` | 通知（无 `id`） | `ModelVerificationNotification` | 默认 | `drive_session` → `AgentEvent::ModelVerificationRequired` → `ComposerView::apply_agent_event_batch` | 是 |
 | 58 | `turn/moderationMetadata` | 通知（无 `id`） | `TurnModerationMetadataNotification` | 默认 | — | 否 |
-| 59 | `model/safetyBuffering/updated` | 通知（无 `id`） | `ModelSafetyBufferingUpdatedNotification` | 默认 | — | 否 |
+| 59 | `model/safetyBuffering/updated` | 通知（无 `id`） | `ModelSafetyBufferingUpdatedNotification` | 默认 | `drive_session` → `AgentEvent::ModelSafetyBufferingUpdated` → `ComposerView::apply_agent_event_batch` | 是 |
 | 60 | `warning` | 通知（无 `id`） | `WarningNotification` | 默认 | — | 否 |
 | 61 | `guardianWarning` | 通知（无 `id`） | `GuardianWarningNotification` | 默认 | — | 否 |
 | 62 | `deprecationNotice` | 通知（无 `id`） | `DeprecationNoticeNotification` | 默认 | — | 否 |
@@ -328,6 +336,15 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 | 77 | `windows/worldWritableWarning` | 通知（无 `id`） | `WindowsWorldWritableWarningNotification` | 默认 | — | 否 |
 | 78 | `windowsSandbox/setupCompleted` | 通知（无 `id`） | `WindowsSandboxSetupCompletedNotification` | 默认 | — | 否 |
 | 79 | `account/login/completed` | 通知（无 `id`） | `AccountLoginCompletedNotification` | 默认 | — | 否 |
+
+## 本次验证结果
+
+- 本机版本：`codex-cli 0.150.1`。
+- 重新执行 `codex app-server generate-json-schema --experimental` 和默认 schema 生成；实验 schema 仍为 153 个 ClientRequest、11 个 ServerRequest、1 个 ClientNotification、79 个 ServerNotification（合计 244），默认 schema 合计 185。
+- 对真实 app-server 以 `limit: 2` 调用 `model/list`：通过 4 页及连续 `nextCursor` 拉取到 7 个可见模型；响应包含 `displayName`、`isDefault`、`supportedReasoningEfforts`、`defaultReasoningEffort`、`serviceTiers`、`defaultServiceTier`，与本机生成 schema 一致。
+- `cargo fmt -- --check`：通过。
+- `cargo test`：104 个测试全部通过，覆盖目录分页/解析、默认选择、模型切换、动态 effort、参数透传、三类模型通知的 adapter/UI 状态处理，以及 ChatGPT CDP 实测菜单几何与默认重置行为。
+- `cargo check --all-targets` 与 `cargo build --features screenshot`：通过；真实 GPUI 截图确认 7 个动态模型按 `displayName` 单行渲染，模型、推理强度和速度子菜单均按 ChatGPT 实测尺寸向上展开且未触底裁切，Ultra 副文案完整显示“更快消耗使用额度”。
 
 ## Schema 生成与版本同步
 

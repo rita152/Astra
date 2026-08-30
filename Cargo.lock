@@ -2063,6 +2063,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "objc",
+ "serde",
  "serde_json",
  "unicode-segmentation",
 ]

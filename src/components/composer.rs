@@ -9,8 +9,8 @@ use gpui::{
 
 use crate::{
     agent::{
-        AgentBackend, AgentEvent, AgentRequest, CodexAppServerBackend, CommandExecution,
-        CommandExecutionStatus,
+        AgentBackend, AgentEvent, AgentModel, AgentModelCatalog, AgentRequest,
+        CodexAppServerBackend, CommandExecution, CommandExecutionStatus,
     },
     components::{
         icons::icon,
@@ -23,7 +23,7 @@ use crate::{
 enum PickerSubmenu {
     Model,
     Effort,
-    Speed,
+    ServiceTier,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -68,8 +68,20 @@ pub enum ConversationActivity {
 
 const MODEL_PICKER_WIDTH: f32 = 224.0;
 const MODEL_PICKER_SUBMENU_GAP: f32 = 1.0;
-const MODEL_PICKER_RIGHT_INSET: f32 = 63.0;
+const MODEL_PICKER_TRIGGER_GAP: f32 = 4.0;
+// The open trigger reserves 224px and ends immediately before the 64px
+// dictation/send group inside the composer's 8px trailing inset.
+const MODEL_PICKER_RIGHT_INSET: f32 = 72.0;
 const MODEL_PICKER_MIN_SUBMENU_WIDTH: f32 = 180.0;
+const MODEL_PICKER_ROW_HEIGHT: f32 = 28.5625;
+const MODEL_PICKER_DETAIL_ROW_HEIGHT: f32 = 47.125;
+const MODEL_PICKER_SUBMENU_HEADER_HEIGHT: f32 = 26.0;
+const MODEL_PICKER_SUBMENU_VERTICAL_PADDING: f32 = 8.0;
+// Radix collision handling in the ChatGPT desktop app keeps each submenu's
+// lower edge at the same viewport inset. Relative to this composer's anchored
+// main menu, CDP resolves that edge to 184px below the main menu's top.
+const MODEL_PICKER_SUBMENU_BOTTOM_OFFSET: f32 = 184.0;
+const MODEL_PICKER_SUBMENU_MAX_HEIGHT: f32 = 420.0;
 const HOME_COMPOSER_MAX_WIDTH: f32 = 748.0;
 const APP_SIDEBAR_WIDTH: f32 = 256.125;
 const PARTICLE_TIMELINE_MS: f32 = 120_000.0;
@@ -222,11 +234,11 @@ fn max_particle_drift(progress: f32, index: usize, duration_ms: u64) -> (f32, f3
     ((x - 0.5) * 6.0, (y - 0.5) * 8.0)
 }
 
-fn particle_layers(slider_index: usize, fast_mode: bool) -> (bool, bool) {
-    let show_fast_particles = fast_mode;
+fn particle_layers(ultra_mode: bool, accelerated: bool) -> (bool, bool) {
+    let show_fast_particles = accelerated;
     // CDP: at data-max=true + data-fast-mode=true, MaxEffects retains only
     // its gradient canvas; the drifting TrackParticles layer is unmounted.
-    let show_max_particles = slider_index == 5 && !fast_mode;
+    let show_max_particles = ultra_mode && !accelerated;
     (show_max_particles, show_fast_particles)
 }
 
@@ -248,9 +260,15 @@ pub struct ComposerView {
     menu_open: bool,
     advanced_expanded: bool,
     submenu: Option<PickerSubmenu>,
-    selected_model: &'static str,
-    selected_effort: &'static str,
-    selected_speed: &'static str,
+    models: Vec<AgentModel>,
+    model_catalog_loading: bool,
+    model_catalog_error: Option<String>,
+    selected_model: String,
+    selected_effort: String,
+    selected_service_tier: Option<String>,
+    actual_model: Option<String>,
+    model_status: Option<String>,
+    safety_buffering: bool,
     slider_index: usize,
     slider_dragging: bool,
     dictation_state: DictationState,
@@ -270,7 +288,7 @@ impl ComposerView {
             this.submit_prompt(event.0.clone(), cx);
         })
         .detach();
-        Self {
+        let view = Self {
             mode,
             prompt_input,
             user_message: None,
@@ -288,16 +306,311 @@ impl ComposerView {
             menu_open: false,
             advanced_expanded: true,
             submenu: None,
-            selected_model: "5.6 Sol",
-            selected_effort: "中",
-            selected_speed: "快速",
-            slider_index: 2,
+            models: Vec::new(),
+            model_catalog_loading: true,
+            model_catalog_error: None,
+            selected_model: String::new(),
+            selected_effort: String::new(),
+            selected_service_tier: None,
+            actual_model: None,
+            model_status: None,
+            safety_buffering: false,
+            slider_index: 0,
             slider_dragging: false,
             dictation_state: DictationState::Idle,
             dictation_cycle: 0,
             permission_mode: PermissionMode::Full,
             permission_menu_open: false,
+        };
+        #[cfg(not(test))]
+        let mut view = view;
+        #[cfg(not(test))]
+        view.load_model_catalog(cx);
+        view
+    }
+
+    #[cfg(not(test))]
+    fn load_model_catalog(&mut self, cx: &mut Context<Self>) {
+        let receiver = CodexAppServerBackend::new().load_model_catalog();
+        cx.spawn(async move |this, cx| {
+            let result = receiver
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err("Codex 模型目录连接在返回结果前关闭".to_owned()));
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(catalog) => this.apply_model_catalog(catalog),
+                    Err(error) => this.set_model_catalog_error(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn apply_model_catalog(&mut self, catalog: AgentModelCatalog) {
+        let previous_model = self.selected_model.clone();
+        let previous_effort = self.selected_effort.clone();
+        let previous_service_tier = self.selected_service_tier.clone();
+
+        self.models = catalog.models;
+        self.model_catalog_loading = false;
+        self.model_catalog_error = None;
+        if self.models.is_empty() {
+            self.set_model_catalog_error("Codex 未返回可用模型".to_owned());
+            return;
         }
+
+        let selected_index = self
+            .models
+            .iter()
+            .position(|model| model.model == previous_model)
+            .or_else(|| self.models.iter().position(|model| model.is_default))
+            .unwrap_or(0);
+        let preserve_options = self.models[selected_index].model == previous_model;
+        self.apply_model_selection(
+            selected_index,
+            preserve_options.then_some(previous_effort),
+            preserve_options.then_some(previous_service_tier).flatten(),
+            preserve_options,
+        );
+    }
+
+    fn set_model_catalog_error(&mut self, error: String) {
+        self.models.clear();
+        self.model_catalog_loading = false;
+        self.model_catalog_error = Some(error);
+        self.selected_model.clear();
+        self.selected_effort.clear();
+        self.selected_service_tier = None;
+        self.actual_model = None;
+        self.model_status = None;
+        self.safety_buffering = false;
+        self.slider_index = 0;
+    }
+
+    fn apply_model_selection(
+        &mut self,
+        index: usize,
+        preferred_effort: Option<String>,
+        preferred_service_tier: Option<String>,
+        preserve_standard_tier: bool,
+    ) {
+        let Some(model) = self.models.get(index).cloned() else {
+            return;
+        };
+        self.selected_model = model.model;
+        self.selected_effort = preferred_effort
+            .filter(|effort| {
+                model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .any(|option| option.id == *effort)
+            })
+            .or_else(|| {
+                model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .any(|option| option.id == model.default_reasoning_effort)
+                    .then(|| model.default_reasoning_effort.clone())
+            })
+            .or_else(|| {
+                model
+                    .supported_reasoning_efforts
+                    .first()
+                    .map(|option| option.id.clone())
+            })
+            .unwrap_or_else(|| model.default_reasoning_effort.clone());
+
+        self.selected_service_tier = if preserve_standard_tier && preferred_service_tier.is_none() {
+            None
+        } else {
+            preferred_service_tier
+                .filter(|tier| model.service_tiers.iter().any(|option| option.id == *tier))
+                .or_else(|| {
+                    model
+                        .default_service_tier
+                        .filter(|tier| model.service_tiers.iter().any(|option| option.id == *tier))
+                })
+        };
+        self.slider_index = model
+            .supported_reasoning_efforts
+            .iter()
+            .position(|option| option.id == self.selected_effort)
+            .unwrap_or(0);
+        self.actual_model = None;
+        self.model_status = None;
+        self.safety_buffering = false;
+    }
+
+    fn select_model_at(&mut self, index: usize) {
+        self.apply_model_selection(index, None, None, false);
+    }
+
+    fn select_effort_at(&mut self, index: usize) {
+        let Some(effort) = self
+            .selected_model_entry()
+            .and_then(|model| model.supported_reasoning_efforts.get(index))
+            .map(|effort| effort.id.clone())
+        else {
+            return;
+        };
+        self.selected_effort = effort;
+        self.slider_index = index;
+        self.actual_model = None;
+        self.model_status = None;
+        self.safety_buffering = false;
+    }
+
+    fn select_service_tier_at(&mut self, index: usize) {
+        self.selected_service_tier = if index == 0 {
+            None
+        } else {
+            self.selected_model_entry()
+                .and_then(|model| model.service_tiers.get(index - 1))
+                .map(|tier| tier.id.clone())
+        };
+        self.actual_model = None;
+        self.model_status = None;
+        self.safety_buffering = false;
+    }
+
+    fn selected_model_entry(&self) -> Option<&AgentModel> {
+        self.models
+            .iter()
+            .find(|model| model.model == self.selected_model)
+    }
+
+    fn model_display_name<'a>(&'a self, model_name: &'a str) -> &'a str {
+        self.models
+            .iter()
+            .find(|model| model.model == model_name || model.id == model_name)
+            .map(|model| model.display_name.as_str())
+            .unwrap_or(model_name)
+    }
+
+    fn selected_model_label(&self) -> String {
+        if self.selected_model.is_empty() {
+            if self.model_catalog_loading {
+                "正在加载模型…".to_owned()
+            } else {
+                "模型不可用".to_owned()
+            }
+        } else {
+            self.model_display_name(&self.selected_model).to_owned()
+        }
+    }
+
+    fn effective_model_label(&self) -> String {
+        self.actual_model
+            .as_deref()
+            .map(|model| self.model_display_name(model).to_owned())
+            .unwrap_or_else(|| self.selected_model_label())
+    }
+
+    fn effort_label(effort: &str) -> &str {
+        match effort {
+            "none" => "无",
+            "minimal" => "最小",
+            "low" => "轻度",
+            "medium" => "中",
+            "high" => "高",
+            "xhigh" => "极高",
+            "max" => "最高",
+            "ultra" => "Ultra",
+            other => other,
+        }
+    }
+
+    fn effort_detail(effort: &str) -> Option<&'static str> {
+        (effort == "ultra").then_some("更快消耗使用额度")
+    }
+
+    fn selected_effort_label(&self) -> String {
+        if self.selected_effort.is_empty() {
+            "—".to_owned()
+        } else {
+            Self::effort_label(&self.selected_effort).to_owned()
+        }
+    }
+
+    fn selected_service_tier_label(&self) -> String {
+        let Some(selected) = self.selected_service_tier.as_deref() else {
+            return "标准".to_owned();
+        };
+        self.selected_model_entry()
+            .and_then(|model| model.service_tiers.iter().find(|tier| tier.id == selected))
+            .map(|tier| tier.name.clone())
+            .unwrap_or_else(|| selected.to_owned())
+    }
+
+    fn default_model_index(&self) -> Option<usize> {
+        self.models
+            .iter()
+            .position(|model| model.is_default)
+            .or((!self.models.is_empty()).then_some(0))
+    }
+
+    fn selection_is_default(&self) -> bool {
+        let Some(model) = self
+            .default_model_index()
+            .and_then(|index| self.models.get(index))
+        else {
+            return true;
+        };
+        let default_effort = model
+            .supported_reasoning_efforts
+            .iter()
+            .find(|option| option.id == model.default_reasoning_effort)
+            .or_else(|| model.supported_reasoning_efforts.first())
+            .map(|option| option.id.as_str())
+            .unwrap_or(model.default_reasoning_effort.as_str());
+        let default_service_tier = model
+            .default_service_tier
+            .as_deref()
+            .filter(|tier| model.service_tiers.iter().any(|option| option.id == *tier));
+
+        self.selected_model == model.model
+            && self.selected_effort == default_effort
+            && self.selected_service_tier.as_deref() == default_service_tier
+    }
+
+    fn reset_model_selection(&mut self) {
+        if let Some(index) = self.default_model_index() {
+            self.apply_model_selection(index, None, None, false);
+        }
+        self.advanced_expanded = false;
+        self.submenu = None;
+        self.submenu_keyboard_focus = false;
+        self.slider_dragging = false;
+    }
+
+    fn submenu_option_count(&self, submenu: PickerSubmenu) -> usize {
+        match submenu {
+            PickerSubmenu::Model => self.models.len(),
+            PickerSubmenu::Effort => self
+                .selected_model_entry()
+                .map(|model| model.supported_reasoning_efforts.len())
+                .unwrap_or(0),
+            PickerSubmenu::ServiceTier => self
+                .selected_model_entry()
+                .map(|model| model.service_tiers.len() + 1)
+                .unwrap_or(0),
+        }
+    }
+
+    fn toggle_accelerated_service_tier(&mut self) {
+        if self.selected_service_tier.is_some() {
+            self.selected_service_tier = None;
+        } else {
+            self.selected_service_tier = self
+                .selected_model_entry()
+                .and_then(|model| model.service_tiers.first())
+                .map(|tier| tier.id.clone());
+        }
+        self.actual_model = None;
+        self.model_status = None;
+        self.safety_buffering = false;
     }
 
     #[cfg(test)]
@@ -374,6 +687,22 @@ impl ComposerView {
             return;
         }
 
+        let selection = if self.selected_model.is_empty() || self.selected_effort.is_empty() {
+            Err(self.model_catalog_error.clone().unwrap_or_else(|| {
+                if self.model_catalog_loading {
+                    "Codex 模型目录仍在加载，请稍后重试".to_owned()
+                } else {
+                    "没有可用的 Codex 模型".to_owned()
+                }
+            }))
+        } else {
+            Ok((
+                self.selected_model.clone(),
+                self.selected_effort.clone(),
+                self.selected_service_tier.clone(),
+            ))
+        };
+
         self.user_message = Some(prompt.clone());
         self.user_message_time = Some(current_local_time_label());
         self.assistant_message.clear();
@@ -386,12 +715,32 @@ impl ComposerView {
         self.permission_menu_open = false;
         self.submenu = None;
         self.prompt_input.update(cx, |input, cx| input.clear(cx));
+
+        let (model, effort, service_tier) = match selection {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.assistant_message = error.clone();
+                self.conversation_activity
+                    .push(ConversationActivity::Error { message: error });
+                self.assistant_message_time = Some(current_local_time_label());
+                self.conversation_phase = ConversationPhase::Failed;
+                cx.emit(ConversationChanged);
+                cx.notify();
+                return;
+            }
+        };
+        self.actual_model = Some(model.clone());
+        self.model_status = None;
+        self.safety_buffering = false;
         cx.emit(ConversationChanged);
         cx.notify();
 
         let receiver = CodexAppServerBackend::new().run_prompt(AgentRequest {
             prompt,
             cwd: std::env::current_dir().unwrap_or_default(),
+            model,
+            effort,
+            service_tier,
         });
         self.consume_agent_events(receiver, cycle, cx);
     }
@@ -516,7 +865,70 @@ impl ComposerView {
                     upsert_command_activity(&mut self.conversation_activity, command);
                     self.conversation_phase = ConversationPhase::Streaming;
                 }
+                AgentEvent::ModelRerouted {
+                    from_model,
+                    to_model,
+                    reason,
+                } => {
+                    self.actual_model = Some(to_model.clone());
+                    self.model_status = Some(format!(
+                        "已从 {} 自动切换到 {}（{}）",
+                        self.model_display_name(&from_model),
+                        self.model_display_name(&to_model),
+                        reason
+                    ));
+                    self.safety_buffering = false;
+                }
+                AgentEvent::ModelVerificationRequired { verifications } => {
+                    let requirements = if verifications.is_empty() {
+                        "未知验证".to_owned()
+                    } else {
+                        verifications.join("、")
+                    };
+                    let error = format!("所选模型需要额外账户验证：{requirements}");
+                    self.assistant_message = error.clone();
+                    self.conversation_activity
+                        .push(ConversationActivity::Error { message: error });
+                    self.assistant_message_time = Some(current_local_time_label());
+                    self.conversation_phase = ConversationPhase::Failed;
+                    self.model_status = Some("需要账户验证".to_owned());
+                    self.safety_buffering = false;
+                    finished = true;
+                    break;
+                }
+                AgentEvent::ModelSafetyBufferingUpdated {
+                    model,
+                    use_cases,
+                    reasons,
+                    show_buffering_ui,
+                    faster_model,
+                } => {
+                    self.actual_model = Some(model);
+                    self.safety_buffering = show_buffering_ui;
+                    self.model_status = show_buffering_ui.then(|| {
+                        let mut message = "安全检查中".to_owned();
+                        if !use_cases.is_empty() || !reasons.is_empty() {
+                            let detail = use_cases
+                                .into_iter()
+                                .chain(reasons)
+                                .collect::<Vec<_>>()
+                                .join("、");
+                            message.push_str(&format!("：{detail}"));
+                        }
+                        if let Some(faster_model) = faster_model {
+                            message.push_str(&format!(
+                                "；可改用 {}",
+                                self.model_display_name(&faster_model)
+                            ));
+                        }
+                        message
+                    });
+                }
                 AgentEvent::Completed => {
+                    if self.safety_buffering {
+                        self.model_status = None;
+                        self.safety_buffering = false;
+                    }
                     self.assistant_message_time = Some(current_local_time_label());
                     self.conversation_phase = ConversationPhase::Complete;
                     finished = true;
@@ -528,6 +940,7 @@ impl ComposerView {
                         .push(ConversationActivity::Error { message: error });
                     self.assistant_message_time = Some(current_local_time_label());
                     self.conversation_phase = ConversationPhase::Failed;
+                    self.safety_buffering = false;
                     finished = true;
                     break;
                 }
@@ -562,11 +975,16 @@ impl ComposerView {
         }
         let key = event.keystroke.key.as_str();
         if let Some(submenu) = self.submenu {
-            let count = match submenu {
-                PickerSubmenu::Model => 7,
-                PickerSubmenu::Effort => 6,
-                PickerSubmenu::Speed => 2,
-            };
+            let count = self.submenu_option_count(submenu);
+            if count == 0 {
+                if matches!(key, "left" | "escape") {
+                    self.submenu = None;
+                    self.submenu_keyboard_focus = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+                return;
+            }
             match key {
                 "down" => {
                     self.submenu_focused_item = if self.submenu_keyboard_focus {
@@ -601,25 +1019,10 @@ impl ComposerView {
                         return;
                     }
                     match submenu {
-                        PickerSubmenu::Model => {
-                            const VALUES: [&str; 7] = [
-                                "5.6 Sol",
-                                "5.6 Terra",
-                                "5.6 Luna",
-                                "5.5",
-                                "5.4",
-                                "5.4 Mini",
-                                "5.3 Codex Spark",
-                            ];
-                            self.selected_model = VALUES[self.submenu_focused_item];
-                        }
-                        PickerSubmenu::Effort => {
-                            const VALUES: [&str; 6] = ["轻度", "中", "高", "极高", "最高", "Ultra"];
-                            self.selected_effort = VALUES[self.submenu_focused_item];
-                        }
-                        PickerSubmenu::Speed => {
-                            const VALUES: [&str; 2] = ["标准", "快速"];
-                            self.selected_speed = VALUES[self.submenu_focused_item];
+                        PickerSubmenu::Model => self.select_model_at(self.submenu_focused_item),
+                        PickerSubmenu::Effort => self.select_effort_at(self.submenu_focused_item),
+                        PickerSubmenu::ServiceTier => {
+                            self.select_service_tier_at(self.submenu_focused_item)
                         }
                     }
                     self.menu_open = false;
@@ -658,12 +1061,16 @@ impl ComposerView {
                     self.submenu = Some(match self.model_menu_focused_item {
                         0 => PickerSubmenu::Model,
                         1 => PickerSubmenu::Effort,
-                        _ => PickerSubmenu::Speed,
+                        _ => PickerSubmenu::ServiceTier,
                     });
                     self.submenu_keyboard_focus = false;
                 }
                 "enter" | "space" => {
-                    self.advanced_expanded = !self.advanced_expanded;
+                    if self.selection_is_default() {
+                        self.advanced_expanded = !self.advanced_expanded;
+                    } else {
+                        self.reset_model_selection();
+                    }
                 }
                 "escape" | "tab" => {
                     self.menu_open = false;
@@ -724,7 +1131,7 @@ impl ComposerView {
         self.submenu = match name {
             "model" => Some(PickerSubmenu::Model),
             "effort" => Some(PickerSubmenu::Effort),
-            "speed" => Some(PickerSubmenu::Speed),
+            "speed" | "service-tier" => Some(PickerSubmenu::ServiceTier),
             _ => None,
         };
         cx.notify();
@@ -734,7 +1141,13 @@ impl ComposerView {
         self.menu_open = true;
         self.advanced_expanded = false;
         self.submenu = None;
-        self.selected_speed = if fast { "快速" } else { "标准" };
+        self.selected_service_tier = if fast {
+            self.selected_model_entry()
+                .and_then(|model| model.service_tiers.first())
+                .map(|tier| tier.id.clone())
+        } else {
+            None
+        };
         self.set_slider_index(index);
         cx.notify();
     }
@@ -820,17 +1233,15 @@ impl ComposerView {
     }
 
     fn set_slider_index(&mut self, index: usize) {
-        self.slider_index = index.min(5);
-        let (model, effort) = match self.slider_index {
-            0 => ("5.6 Terra", "轻度"),
-            1 => ("5.6 Sol", "轻度"),
-            2 => ("5.6 Sol", "中"),
-            3 => ("5.6 Sol", "高"),
-            4 => ("5.6 Sol", "极高"),
-            _ => ("5.6 Sol", "Ultra"),
-        };
-        self.selected_model = model;
-        self.selected_effort = effort;
+        let effort_count = self
+            .selected_model_entry()
+            .map(|model| model.supported_reasoning_efforts.len())
+            .unwrap_or(0);
+        if effort_count == 0 {
+            self.slider_index = 0;
+            return;
+        }
+        self.select_effort_at(index.min(effort_count - 1));
     }
 
     fn start_dictation(&mut self, cx: &mut Context<Self>) {
@@ -1029,8 +1440,8 @@ impl ComposerView {
         &self,
         index: usize,
         id: &'static str,
-        label: &'static str,
-        value: &'static str,
+        label: &str,
+        value: &str,
         submenu: PickerSubmenu,
         theme: Theme,
         cx: &mut Context<Self>,
@@ -1066,8 +1477,12 @@ impl ComposerView {
                     cx.notify();
                 }
             }))
-            .child(div().flex_1().child(label))
-            .child(div().text_color(theme.text_tertiary).child(value))
+            .child(div().flex_1().child(label.to_owned()))
+            .child(
+                div()
+                    .text_color(theme.text_tertiary)
+                    .child(value.to_owned()),
+            )
             .child(
                 icon("chevron-down", theme.text_tertiary.into())
                     .size(px(16.0))
@@ -1081,15 +1496,20 @@ impl ComposerView {
     fn option_row(
         &self,
         id: (&'static str, usize),
-        title: &'static str,
-        detail: Option<&'static str>,
+        title: &str,
+        detail: Option<&str>,
+        truncate_detail: bool,
         selected: bool,
         focused: bool,
         theme: Theme,
     ) -> gpui::Stateful<Div> {
         div()
             .id(id)
-            .min_h(px(if detail.is_some() { 47.125 } else { 28.5625 }))
+            .min_h(px(if detail.is_some() {
+                MODEL_PICKER_DETAIL_ROW_HEIGHT
+            } else {
+                MODEL_PICKER_ROW_HEIGHT
+            }))
             .px(px(8.0))
             .py(px(5.0))
             .rounded(px(12.5))
@@ -1108,25 +1528,26 @@ impl ComposerView {
                     .text_size(px(13.0))
                     .line_height(px(18.5625))
                     .text_color(theme.text)
-                    .child(title)
+                    .child(title.to_owned())
                     .when_some(detail, |column, detail| {
                         column.child(
                             div()
+                                .min_w(px(0.0))
+                                .w_full()
                                 .text_size(px(12.0))
                                 .line_height(px(18.5625))
                                 .text_color(theme.text_tertiary)
-                                .child(detail),
+                                .when(truncate_detail, |detail| detail.truncate())
+                                .child(detail.to_owned()),
                         )
                     }),
             )
             .when(selected, |row| {
                 row.child(
-                    div()
+                    icon("check", theme.text.into())
+                        .size(px(17.0))
                         .flex_none()
-                        .w(px(16.0))
-                        .text_size(px(13.0))
-                        .text_color(theme.text)
-                        .child("✓"),
+                        .opacity(0.75),
                 )
             })
     }
@@ -1138,17 +1559,51 @@ impl ComposerView {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
-        let (width, top): (f32, f32) = match kind {
-            PickerSubmenu::Model => (280.0, -20.0),
-            PickerSubmenu::Effort => (180.0, -36.0),
-            PickerSubmenu::Speed => (233.0, 18.0),
+        let width = match kind {
+            PickerSubmenu::Model => 280.0,
+            PickerSubmenu::Effort => 180.0,
+            PickerSubmenu::ServiceTier => 233.0,
         };
+        let estimated_height = match kind {
+            PickerSubmenu::Model => {
+                self.models.len().max(1) as f32 * MODEL_PICKER_ROW_HEIGHT
+                    + MODEL_PICKER_SUBMENU_VERTICAL_PADDING
+            }
+            PickerSubmenu::Effort => {
+                self.selected_model_entry()
+                    .map(|model| {
+                        model
+                            .supported_reasoning_efforts
+                            .iter()
+                            .map(|option| {
+                                if option.id == "ultra" {
+                                    MODEL_PICKER_DETAIL_ROW_HEIGHT
+                                } else {
+                                    MODEL_PICKER_ROW_HEIGHT
+                                }
+                            })
+                            .sum::<f32>()
+                    })
+                    .unwrap_or(MODEL_PICKER_ROW_HEIGHT)
+                    + MODEL_PICKER_SUBMENU_HEADER_HEIGHT
+                    + MODEL_PICKER_SUBMENU_VERTICAL_PADDING
+            }
+            PickerSubmenu::ServiceTier => {
+                self.submenu_option_count(kind).max(1) as f32 * MODEL_PICKER_DETAIL_ROW_HEIGHT
+                    + MODEL_PICKER_SUBMENU_HEADER_HEIGHT
+                    + MODEL_PICKER_SUBMENU_VERTICAL_PADDING
+            }
+        }
+        .min(MODEL_PICKER_SUBMENU_MAX_HEIGHT);
+        let top = MODEL_PICKER_SUBMENU_BOTTOM_OFFSET - estimated_height;
         let layout = submenu_layout(viewport_width, width);
         let mut menu = div()
             .id("model-picker-submenu")
             .absolute()
             .top(px(top))
             .w(px(layout.width))
+            .max_h(px(MODEL_PICKER_SUBMENU_MAX_HEIGHT))
+            .overflow_y_scroll()
             .when(layout.open_left, |menu| {
                 menu.right(px(MODEL_PICKER_WIDTH + MODEL_PICKER_SUBMENU_GAP))
             })
@@ -1169,30 +1624,42 @@ impl ComposerView {
 
         match kind {
             PickerSubmenu::Model => {
-                const OPTIONS: [&str; 7] = [
-                    "5.6 Sol",
-                    "5.6 Terra",
-                    "5.6 Luna",
-                    "5.5",
-                    "5.4",
-                    "5.4 Mini",
-                    "5.3 Codex Spark",
-                ];
-                for (index, option) in OPTIONS.into_iter().enumerate() {
+                if self.models.is_empty() {
+                    let message = self.model_catalog_error.clone().unwrap_or_else(|| {
+                        if self.model_catalog_loading {
+                            "正在加载模型目录…".to_owned()
+                        } else {
+                            "没有可用模型".to_owned()
+                        }
+                    });
+                    menu = menu.child(self.option_row(
+                        ("model-option", 0),
+                        &message,
+                        None,
+                        false,
+                        false,
+                        false,
+                        theme,
+                    ));
+                }
+                for (index, model) in self.models.iter().cloned().enumerate() {
+                    let model_name = model.model.clone();
                     menu = menu.child(
                         self.option_row(
                             ("model-option", index),
-                            option,
+                            &model.display_name,
                             None,
-                            self.selected_model == option,
+                            false,
+                            self.selected_model == model_name,
                             self.submenu_keyboard_focus && self.submenu_focused_item == index,
                             theme,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            this.selected_model = option;
-                            if this.selected_effort == "轻度" {
-                                this.slider_index = if option == "5.6 Terra" { 0 } else { 1 };
+                            if let Some(index) = this.models.iter().position(|model| {
+                                model.model == model_name || model.id == model_name
+                            }) {
+                                this.select_model_at(index);
                             }
                             this.menu_open = false;
                             this.submenu = None;
@@ -1202,14 +1669,6 @@ impl ComposerView {
                 }
             }
             PickerSubmenu::Effort => {
-                const OPTIONS: [(&str, Option<&str>); 6] = [
-                    ("轻度", None),
-                    ("中", None),
-                    ("高", None),
-                    ("极高", None),
-                    ("最高", None),
-                    ("Ultra", Some("更快消耗使用额度")),
-                ];
                 menu = menu.child(
                     div()
                         .h(px(26.0))
@@ -1221,31 +1680,33 @@ impl ComposerView {
                         .text_color(theme.text_tertiary)
                         .child("推理强度"),
                 );
-                for (index, (option, detail)) in OPTIONS.into_iter().enumerate() {
+                let options = self
+                    .selected_model_entry()
+                    .map(|model| model.supported_reasoning_efforts.clone())
+                    .unwrap_or_default();
+                for (index, option) in options.into_iter().enumerate() {
+                    let effort_id = option.id.clone();
+                    let title = Self::effort_label(&effort_id).to_owned();
+                    let detail = Self::effort_detail(&effort_id);
                     menu = menu.child(
                         self.option_row(
                             ("effort-option", index),
-                            option,
+                            &title,
                             detail,
-                            self.selected_effort == option,
+                            true,
+                            self.selected_effort == effort_id,
                             self.submenu_keyboard_focus && self.submenu_focused_item == index,
                             theme,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            if option == "Ultra" {
-                                this.slider_index = 5;
-                                this.selected_effort = option;
-                            } else {
-                                let slider_index = match option {
-                                    "轻度" if this.selected_model == "5.6 Terra" => 0,
-                                    "轻度" => 1,
-                                    "中" => 2,
-                                    "高" => 3,
-                                    "极高" => 4,
-                                    _ => 5,
-                                };
-                                this.set_slider_index(slider_index);
+                            if let Some(index) = this.selected_model_entry().and_then(|model| {
+                                model
+                                    .supported_reasoning_efforts
+                                    .iter()
+                                    .position(|option| option.id == effort_id)
+                            }) {
+                                this.select_effort_at(index);
                             }
                             this.menu_open = false;
                             this.submenu = None;
@@ -1254,9 +1715,7 @@ impl ComposerView {
                     );
                 }
             }
-            PickerSubmenu::Speed => {
-                const OPTIONS: [(&str, &str); 2] =
-                    [("标准", "默认速度"), ("快速", "1.5 倍速度，用量更多")];
+            PickerSubmenu::ServiceTier => {
                 menu = menu.child(
                     div()
                         .h(px(26.0))
@@ -1268,19 +1727,51 @@ impl ComposerView {
                         .text_color(theme.text_tertiary)
                         .child("速度"),
                 );
-                for (index, (option, detail)) in OPTIONS.into_iter().enumerate() {
+                let service_tiers = self
+                    .selected_model_entry()
+                    .map(|model| model.service_tiers.clone())
+                    .unwrap_or_default();
+                menu = menu.child(
+                    self.option_row(
+                        ("service-tier-option", 0),
+                        "标准",
+                        Some("默认速度"),
+                        false,
+                        self.selected_service_tier.is_none(),
+                        self.submenu_keyboard_focus && self.submenu_focused_item == 0,
+                        theme,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.select_service_tier_at(0);
+                        this.menu_open = false;
+                        this.submenu = None;
+                        cx.notify();
+                    })),
+                );
+                for (offset, tier) in service_tiers.into_iter().enumerate() {
+                    let index = offset + 1;
+                    let tier_id = tier.id.clone();
                     menu = menu.child(
                         self.option_row(
-                            ("speed-option", index),
-                            option,
-                            Some(detail),
-                            self.selected_speed == option,
+                            ("service-tier-option", index),
+                            &tier.name,
+                            Some(&tier.description),
+                            false,
+                            self.selected_service_tier.as_deref() == Some(tier_id.as_str()),
                             self.submenu_keyboard_focus && self.submenu_focused_item == index,
                             theme,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            this.selected_speed = option;
+                            if let Some(index) = this.selected_model_entry().and_then(|model| {
+                                model
+                                    .service_tiers
+                                    .iter()
+                                    .position(|tier| tier.id == tier_id)
+                            }) {
+                                this.select_service_tier_at(index + 1);
+                            }
                             this.menu_open = false;
                             this.submenu = None;
                             cx.notify();
@@ -1293,58 +1784,82 @@ impl ComposerView {
     }
 
     fn view_controls(&self, show_fast_toggle: bool, theme: Theme, cx: &mut Context<Self>) -> Div {
-        let controls = div()
-            .h(px(32.0))
-            .flex()
-            .items_center()
-            .child(
+        let focused = self.model_menu_keyboard_focus && self.model_menu_focused_item == 3;
+        let mut controls = div().h(px(32.0)).flex().items_center();
+
+        if self.selection_is_default() {
+            controls = controls
+                .child(
+                    div()
+                        .id("model-picker-advanced")
+                        .h(px(32.0))
+                        .w(px(58.0))
+                        .p(px(4.0))
+                        .rounded(px(8.0))
+                        .flex()
+                        .items_center()
+                        .text_color(theme.text_tertiary)
+                        .cursor_pointer()
+                        .when(focused, |row| row.bg(theme.sidebar_hover))
+                        .hover(move |style| style.bg(theme.sidebar_hover))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.advanced_expanded = !this.advanced_expanded;
+                            this.submenu = None;
+                            this.slider_dragging = false;
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .w_full()
+                                .h_full()
+                                .px(px(4.0))
+                                .py(px(2.0))
+                                .rounded(px(6.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child("高级")
+                                .child(
+                                    icon("chevron-down", theme.text_tertiary.into())
+                                        .size(px(12.0))
+                                        .with_transformation(Transformation::rotate(radians(
+                                            if self.advanced_expanded {
+                                                std::f32::consts::PI
+                                            } else {
+                                                0.0
+                                            },
+                                        ))),
+                                ),
+                        ),
+                )
+                .child(div().flex_1());
+        } else {
+            controls = controls.child(
                 div()
-                    .id("model-picker-advanced")
-                    .h(px(32.0))
-                    .w(px(58.0))
-                    .p(px(4.0))
-                    .rounded(px(8.0))
+                    .id("model-picker-reset")
+                    .h(px(28.0))
+                    .when(show_fast_toggle, |row| row.flex_1())
+                    .when(!show_fast_toggle, |row| row.w_full())
+                    .px(px(8.0))
+                    .rounded(px(12.5))
                     .flex()
                     .items_center()
+                    .text_size(px(13.0))
+                    .line_height(px(18.5625))
                     .text_color(theme.text_tertiary)
                     .cursor_pointer()
-                    .when(
-                        self.model_menu_keyboard_focus && self.model_menu_focused_item == 3,
-                        |row| row.bg(theme.sidebar_hover),
-                    )
+                    .when(focused, |row| row.bg(theme.sidebar_hover))
                     .hover(move |style| style.bg(theme.sidebar_hover))
                     .on_click(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
-                        this.advanced_expanded = !this.advanced_expanded;
-                        this.submenu = None;
-                        this.slider_dragging = false;
+                        this.reset_model_selection();
                         cx.notify();
                     }))
-                    .child(
-                        div()
-                            .w_full()
-                            .h_full()
-                            .px(px(4.0))
-                            .py(px(2.0))
-                            .rounded(px(6.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(4.0))
-                            .child("高级")
-                            .child(
-                                icon("chevron-down", theme.text_tertiary.into())
-                                    .size(px(12.0))
-                                    .with_transformation(Transformation::rotate(radians(
-                                        if self.advanced_expanded {
-                                            std::f32::consts::PI
-                                        } else {
-                                            0.0
-                                        },
-                                    ))),
-                            ),
-                    ),
-            )
-            .child(div().flex_1());
+                    .child(div().flex_1().child("重置为默认设置"))
+                    .child(icon("model-reset", theme.text_tertiary.into()).size(px(14.0))),
+            );
+        }
 
         if show_fast_toggle {
             controls.child(
@@ -1359,18 +1874,14 @@ impl ComposerView {
                     .hover(move |style| style.bg(theme.sidebar_hover))
                     .on_click(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
-                        this.selected_speed = if this.selected_speed == "快速" {
-                            "标准"
-                        } else {
-                            "快速"
-                        };
+                        this.toggle_accelerated_service_tier();
                         cx.notify();
                     }))
                     .child(
                         icon(
                             "model-fast",
-                            if self.selected_speed == "快速" {
-                                if self.slider_index == 5 {
+                            if self.selected_service_tier.is_some() {
+                                if self.selected_effort == "ultra" {
                                     rgba(0xad7bf9ff).into()
                                 } else {
                                     rgba(0x339cffff).into()
@@ -1390,8 +1901,26 @@ impl ComposerView {
     fn power_slider(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         const TRACK_WIDTH: f32 = 200.0;
         const TRACK_INSET: f32 = 13.0;
-        const STEP: f32 = (TRACK_WIDTH - TRACK_INSET * 2.0) / 5.0;
-        let thumb_center = TRACK_INSET + STEP * self.slider_index as f32;
+        let effort_count = self
+            .selected_model_entry()
+            .map(|model| model.supported_reasoning_efforts.len())
+            .unwrap_or(0)
+            .max(1);
+        let step = if effort_count > 1 {
+            (TRACK_WIDTH - TRACK_INSET * 2.0) / (effort_count - 1) as f32
+        } else {
+            0.0
+        };
+        let step_center = |index: usize| {
+            if effort_count > 1 {
+                TRACK_INSET + step * index as f32
+            } else {
+                TRACK_WIDTH * 0.5
+            }
+        };
+        let slider_index = self.slider_index.min(effort_count - 1);
+        let thumb_center = step_center(slider_index);
+        let ultra_mode = self.selected_effort == "ultra";
         let thumb_size = if self.slider_dragging { 32.0 } else { 28.0 };
         let mut range = div()
             .absolute()
@@ -1403,7 +1932,7 @@ impl ComposerView {
             .overflow_hidden()
             .bg(rgba(0x339cffff));
 
-        if self.slider_index == 5 {
+        if ultra_mode {
             // Keep the first radius of the rounded range as solid blue. Starting the
             // rectangular gradient at the circle tangent prevents its square corners
             // from leaking through the rounded left cap.
@@ -1432,7 +1961,7 @@ impl ComposerView {
         }
 
         let (show_max_particles, show_fast_particles) =
-            particle_layers(self.slider_index, self.selected_speed == "快速");
+            particle_layers(ultra_mode, self.selected_service_tier.is_some());
         if show_max_particles || show_fast_particles {
             const MAX_PARTICLES: [(f32, f32, f32, f32, f32, u64); 14] = [
                 (0.50, 3.0, 17.0, 0.616, 0.405, 3102),
@@ -1567,10 +2096,10 @@ impl ComposerView {
             .border_color(theme.border)
             .child(range);
 
-        for index in 0..6 {
-            let center = TRACK_INSET + STEP * index as f32;
-            let selected = index <= self.slider_index;
-            let hidden = self.slider_index == 5 || (self.selected_speed == "快速" && selected);
+        for index in 0..effort_count {
+            let center = step_center(index);
+            let selected = index <= slider_index;
+            let hidden = ultra_mode || (self.selected_service_tier.is_some() && selected);
             track = track.child(
                 div()
                     .absolute()
@@ -1588,13 +2117,13 @@ impl ComposerView {
         }
 
         let mut hit_areas = div().absolute().inset_0();
-        for index in 0..6 {
-            let center = TRACK_INSET + STEP * index as f32;
-            let left = if index == 0 { 0.0 } else { center - STEP * 0.5 };
-            let right = if index == 5 {
+        for index in 0..effort_count {
+            let center = step_center(index);
+            let left = if index == 0 { 0.0 } else { center - step * 0.5 };
+            let right = if index + 1 == effort_count {
                 TRACK_WIDTH
             } else {
-                center + STEP * 0.5
+                center + step * 0.5
             };
             hit_areas = hit_areas.child(
                 div()
@@ -1675,6 +2204,10 @@ impl ComposerView {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
+        let selected_model_label = self.selected_model_label();
+        let selected_effort_label = self.selected_effort_label();
+        let selected_service_tier_label = self.selected_service_tier_label();
+        let selection_is_default = self.selection_is_default();
         let mut menu = div()
             .id("model-picker-menu")
             .track_focus(&self.model_menu_focus)
@@ -1705,7 +2238,7 @@ impl ComposerView {
                     0,
                     "model-picker-model-row",
                     "模型",
-                    self.selected_model,
+                    &selected_model_label,
                     PickerSubmenu::Model,
                     theme,
                     cx,
@@ -1714,27 +2247,29 @@ impl ComposerView {
                     1,
                     "model-picker-effort-row",
                     "推理强度",
-                    self.selected_effort,
+                    &selected_effort_label,
                     PickerSubmenu::Effort,
                     theme,
                     cx,
                 ))
                 .child(self.picker_row(
                     2,
-                    "model-picker-speed-row",
+                    "model-picker-service-tier-row",
                     "速度",
-                    self.selected_speed,
-                    PickerSubmenu::Speed,
+                    &selected_service_tier_label,
+                    PickerSubmenu::ServiceTier,
                     theme,
                     cx,
                 ))
-                .child(
+                .child(if selection_is_default {
                     div()
                         .h(px(8.0))
                         .px(px(8.0))
                         .py(px(3.5))
-                        .child(div().h(px(1.0)).w_full().bg(theme.border)),
-                )
+                        .child(div().h(px(1.0)).w_full().bg(theme.border))
+                } else {
+                    div().h(px(4.0))
+                })
                 .child(self.view_controls(false, theme, cx));
         } else {
             menu = menu
@@ -2060,6 +2595,54 @@ impl ComposerView {
 
     fn render_composer(&self, viewport_width: f32, theme: Theme, cx: &mut Context<Self>) -> Div {
         let (permission_label, permission_icon, permission_color) = self.permission_label();
+        let effective_model_label = self.effective_model_label();
+        let model_status_active = self.model_status.is_some();
+        let effort_or_status_label = self
+            .model_status
+            .clone()
+            .unwrap_or_else(|| self.selected_effort_label());
+        let fast_tier_selected = self.selected_service_tier.is_some();
+        let trigger_label = div()
+            .min_w(px(0.0))
+            .flex()
+            .items_center()
+            .gap(px(MODEL_PICKER_TRIGGER_GAP))
+            .when(self.menu_open, |label| label.flex_1().justify_center())
+            .child(div().text_color(theme.text).child(effective_model_label))
+            .child(
+                div()
+                    .text_color(if model_status_active {
+                        theme.effort
+                    } else {
+                        theme.text_tertiary
+                    })
+                    .child(effort_or_status_label),
+            );
+        let trigger_value = div()
+            .min_w(px(0.0))
+            .flex()
+            .items_center()
+            .when(self.menu_open, |value| {
+                value.flex_1().child(
+                    div()
+                        .w(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(fast_tier_selected, |indicator| {
+                            indicator.child(icon("model-fast", theme.text.into()).size(px(14.0)))
+                        }),
+                )
+            })
+            .when(!self.menu_open && fast_tier_selected, |value| {
+                // ChatGPT CDP: the closed trigger uses a 14px fast glyph with
+                // exactly 4px between its right edge and the model label.
+                value
+                    .gap(px(MODEL_PICKER_TRIGGER_GAP))
+                    .child(icon("model-fast", theme.text.into()).size(px(14.0)))
+            })
+            .child(trigger_label);
         let prompt_is_empty = self.prompt_input.read(cx).text().is_empty();
         let conversation_started = self.conversation_phase != ConversationPhase::Empty;
         let generation_active = matches!(
@@ -2186,6 +2769,9 @@ impl ComposerView {
                                                 .h(px(28.0))
                                                 .px(px(8.0))
                                                 .rounded_full()
+                                                .when(self.menu_open, |button| {
+                                                    button.w(px(MODEL_PICKER_WIDTH)).flex_none()
+                                                })
                                                 .flex()
                                                 .items_center()
                                                 .gap(px(4.0))
@@ -2209,22 +2795,7 @@ impl ComposerView {
                                                     }
                                                     cx.notify();
                                                 }))
-                                                .when(self.selected_speed == "快速", |button| {
-                                                    button.child(
-                                                        icon("model-fast", theme.text.into())
-                                                            .size(px(14.0)),
-                                                    )
-                                                })
-                                                .child(
-                                                    div()
-                                                        .text_color(theme.text)
-                                                        .child(self.selected_model),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_color(theme.effort)
-                                                        .child(self.selected_effort),
-                                                )
+                                                .child(trigger_value)
                                                 .child(
                                                     icon(
                                                         "chevron-down",
@@ -2355,12 +2926,18 @@ impl Render for ComposerView {
 mod tests {
     use super::{
         ComposerView, ConversationActivity, ConversationChanged, ConversationPhase,
-        STREAM_EVENTS_PER_UPDATE, STREAM_UPDATE_INTERVAL, SubmenuLayout,
-        collect_ready_agent_events, current_local_time_label, ensure_closed_batch_is_terminal,
-        find_command_activity_mut, max_particle_drift, particle_layers, particle_transition_ease,
-        push_coalesced_agent_event, submenu_layout, upsert_command_activity,
+        MODEL_PICKER_DETAIL_ROW_HEIGHT, MODEL_PICKER_ROW_HEIGHT,
+        MODEL_PICKER_SUBMENU_BOTTOM_OFFSET, MODEL_PICKER_SUBMENU_HEADER_HEIGHT,
+        MODEL_PICKER_SUBMENU_VERTICAL_PADDING, MODEL_PICKER_TRIGGER_GAP, STREAM_EVENTS_PER_UPDATE,
+        STREAM_UPDATE_INTERVAL, SubmenuLayout, collect_ready_agent_events,
+        current_local_time_label, ensure_closed_batch_is_terminal, find_command_activity_mut,
+        max_particle_drift, particle_layers, particle_transition_ease, push_coalesced_agent_event,
+        submenu_layout, upsert_command_activity,
     };
-    use crate::agent::{AgentEvent, CommandExecution, CommandExecutionStatus};
+    use crate::agent::{
+        AgentEvent, AgentModel, AgentModelCatalog, AgentReasoningEffort, AgentServiceTier,
+        CommandExecution, CommandExecutionStatus,
+    };
     use crate::theme::ThemeMode;
     use gpui::{
         Bounds, Focusable, MouseButton, TestApp, WindowBounds, WindowOptions, point, px, size,
@@ -2372,6 +2949,51 @@ mod tests {
         },
         time::Duration,
     };
+
+    fn test_model_catalog() -> AgentModelCatalog {
+        AgentModelCatalog {
+            models: vec![
+                AgentModel {
+                    id: "model-a-id".into(),
+                    model: "model-a".into(),
+                    display_name: "Model A".into(),
+                    description: "First model".into(),
+                    supported_reasoning_efforts: vec![AgentReasoningEffort {
+                        id: "low".into(),
+                        description: "Light reasoning".into(),
+                    }],
+                    default_reasoning_effort: "low".into(),
+                    service_tiers: Vec::new(),
+                    default_service_tier: None,
+                    is_default: false,
+                },
+                AgentModel {
+                    id: "model-b-id".into(),
+                    model: "model-b".into(),
+                    display_name: "Model B".into(),
+                    description: "Default model".into(),
+                    supported_reasoning_efforts: vec![
+                        AgentReasoningEffort {
+                            id: "medium".into(),
+                            description: "Balanced".into(),
+                        },
+                        AgentReasoningEffort {
+                            id: "high".into(),
+                            description: "Deep".into(),
+                        },
+                    ],
+                    default_reasoning_effort: "high".into(),
+                    service_tiers: vec![AgentServiceTier {
+                        id: "priority".into(),
+                        name: "Fast".into(),
+                        description: "Lower latency".into(),
+                    }],
+                    default_service_tier: Some("priority".into()),
+                    is_default: true,
+                },
+            ],
+        }
+    }
 
     #[test]
     fn command_output_deltas_are_reconciled_with_completion() {
@@ -2708,7 +3330,7 @@ mod tests {
     fn submenu_clamps_to_the_trailing_edge_at_reference_width() {
         let layout = submenu_layout(1440.0, 280.0);
         assert!(!layout.open_left);
-        assert!((layout.width - 279.9375).abs() < 0.001);
+        assert_eq!(layout.width, 280.0);
 
         assert_eq!(
             submenu_layout(1440.0, 180.0),
@@ -2731,29 +3353,186 @@ mod tests {
     }
 
     #[test]
-    fn slider_positions_match_the_cdp_observed_model_and_effort_labels() {
+    fn model_picker_geometry_matches_the_chatgpt_cdp_measurements() {
+        let model_height = 7.0 * MODEL_PICKER_ROW_HEIGHT + MODEL_PICKER_SUBMENU_VERTICAL_PADDING;
+        let effort_height = 5.0 * MODEL_PICKER_ROW_HEIGHT
+            + MODEL_PICKER_DETAIL_ROW_HEIGHT
+            + MODEL_PICKER_SUBMENU_HEADER_HEIGHT
+            + MODEL_PICKER_SUBMENU_VERTICAL_PADDING;
+        let speed_height = 2.0 * MODEL_PICKER_DETAIL_ROW_HEIGHT
+            + MODEL_PICKER_SUBMENU_HEADER_HEIGHT
+            + MODEL_PICKER_SUBMENU_VERTICAL_PADDING;
+
+        assert!((model_height - 207.9375).abs() < 0.001);
+        assert!((effort_height - 223.9375).abs() < 0.001);
+        assert!((speed_height - 128.25).abs() < 0.001);
+        assert!((MODEL_PICKER_SUBMENU_BOTTOM_OFFSET - model_height + 23.9375).abs() < 0.001);
+        assert!((MODEL_PICKER_SUBMENU_BOTTOM_OFFSET - effort_height + 39.9375).abs() < 0.001);
+        assert!((MODEL_PICKER_SUBMENU_BOTTOM_OFFSET - speed_height - 55.75).abs() < 0.001);
+        assert_eq!(MODEL_PICKER_TRIGGER_GAP, 4.0);
+        assert_eq!(ComposerView::effort_label("low"), "轻度");
+        assert_eq!(
+            ComposerView::effort_detail("ultra"),
+            Some("更快消耗使用额度")
+        );
+        assert_eq!(ComposerView::effort_detail("high"), None);
+    }
+
+    #[test]
+    fn catalog_default_selection_and_model_switch_use_advertised_defaults() {
         let mut app = TestApp::new();
         let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
-        let expected = [
-            ("5.6 Terra", "轻度"),
-            ("5.6 Sol", "轻度"),
-            ("5.6 Sol", "中"),
-            ("5.6 Sol", "高"),
-            ("5.6 Sol", "极高"),
-            ("5.6 Sol", "Ultra"),
-        ];
+        app.update_entity(&composer, |composer, _| {
+            composer.apply_model_catalog(test_model_catalog())
+        });
 
-        for (index, (model, effort)) in expected.into_iter().enumerate() {
-            app.update_entity(&composer, |composer, _| composer.set_slider_index(index));
-            assert_eq!(
-                app.read_entity(&composer, |composer, _| composer.selected_model),
-                model
+        let selected = app.read_entity(&composer, |composer, _| {
+            (
+                composer.selected_model.clone(),
+                composer.selected_effort.clone(),
+                composer.selected_service_tier.clone(),
+                composer.selected_model_label(),
+            )
+        });
+        assert_eq!(
+            selected,
+            (
+                "model-b".into(),
+                "high".into(),
+                Some("priority".into()),
+                "Model B".into()
+            )
+        );
+
+        app.update_entity(&composer, |composer, _| composer.select_model_at(0));
+        let switched = app.read_entity(&composer, |composer, _| {
+            (
+                composer.selected_model.clone(),
+                composer.selected_effort.clone(),
+                composer.selected_service_tier.clone(),
+            )
+        });
+        assert_eq!(switched, ("model-a".into(), "low".into(), None));
+    }
+
+    #[test]
+    fn changed_picker_values_can_reset_to_the_advertised_defaults() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        app.update_entity(&composer, |composer, _| {
+            composer.apply_model_catalog(test_model_catalog());
+            assert!(composer.selection_is_default());
+            composer.select_effort_at(0);
+            assert!(!composer.selection_is_default());
+            composer.reset_model_selection();
+        });
+
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| (
+                composer.selected_model.clone(),
+                composer.selected_effort.clone(),
+                composer.selected_service_tier.clone(),
+                composer.advanced_expanded,
+                composer.selection_is_default(),
+            )),
+            (
+                "model-b".into(),
+                "high".into(),
+                Some("priority".into()),
+                false,
+                true,
+            )
+        );
+    }
+
+    #[test]
+    fn slider_uses_the_selected_models_dynamic_effort_options() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        app.update_entity(&composer, |composer, _| {
+            composer.apply_model_catalog(test_model_catalog());
+            composer.set_slider_index(0);
+        });
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer.selected_effort.clone()),
+            "medium"
+        );
+        app.update_entity(&composer, |composer, _| composer.set_slider_index(99));
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer.selected_effort.clone()),
+            "high"
+        );
+    }
+
+    #[test]
+    fn model_notifications_update_the_effective_model_buffering_and_error_state() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        app.update_entity(&composer, |composer, _| {
+            composer.apply_model_catalog(test_model_catalog());
+            assert!(
+                !composer.apply_agent_event_batch(vec![AgentEvent::ModelRerouted {
+                    from_model: "model-b".into(),
+                    to_model: "model-a".into(),
+                    reason: "highRiskCyberActivity".into(),
+                }])
             );
-            assert_eq!(
-                app.read_entity(&composer, |composer, _| composer.selected_effort),
-                effort
-            );
-        }
+        });
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer.effective_model_label()),
+            "Model A"
+        );
+        assert!(app.read_entity(&composer, |composer, _| {
+            composer
+                .model_status
+                .as_deref()
+                .is_some_and(|status| status.contains("自动切换"))
+        }));
+
+        app.update_entity(&composer, |composer, _| {
+            assert!(!composer.apply_agent_event_batch(vec![
+                AgentEvent::ModelSafetyBufferingUpdated {
+                    model: "model-a".into(),
+                    use_cases: vec!["cyber".into()],
+                    reasons: vec!["review".into()],
+                    show_buffering_ui: true,
+                    faster_model: Some("model-b".into()),
+                },
+            ]));
+        });
+        assert!(app.read_entity(&composer, |composer, _| composer.safety_buffering));
+        assert!(app.read_entity(&composer, |composer, _| {
+            composer
+                .model_status
+                .as_deref()
+                .is_some_and(|status| status.contains("安全检查中"))
+        }));
+
+        app.update_entity(&composer, |composer, _| {
+            assert!(!composer.apply_agent_event_batch(vec![
+                AgentEvent::ModelSafetyBufferingUpdated {
+                    model: "model-a".into(),
+                    use_cases: Vec::new(),
+                    reasons: Vec::new(),
+                    show_buffering_ui: false,
+                    faster_model: None,
+                },
+            ]));
+        });
+        assert!(!app.read_entity(&composer, |composer, _| composer.safety_buffering));
+        assert!(app.read_entity(&composer, |composer, _| composer.model_status.is_none()));
+
+        app.update_entity(&composer, |composer, _| {
+            assert!(composer.apply_agent_event_batch(vec![
+                AgentEvent::ModelVerificationRequired {
+                    verifications: vec!["trustedAccessForCyber".into()],
+                },
+            ]));
+        });
+        let (phase, _, _, message, _) =
+            app.read_entity(&composer, |composer, _| composer.conversation_snapshot());
+        assert_eq!(phase, ConversationPhase::Failed);
+        assert!(message.contains("trustedAccessForCyber"));
     }
 
     #[test]
@@ -2795,9 +3574,9 @@ mod tests {
 
     #[test]
     fn ultra_fast_uses_only_the_fast_particle_layer_observed_over_cdp() {
-        assert_eq!(particle_layers(5, false), (true, false));
-        assert_eq!(particle_layers(5, true), (false, true));
-        assert_eq!(particle_layers(4, true), (false, true));
+        assert_eq!(particle_layers(true, false), (true, false));
+        assert_eq!(particle_layers(true, true), (false, true));
+        assert_eq!(particle_layers(false, true), (false, true));
     }
 
     #[test]
@@ -2956,14 +3735,15 @@ mod tests {
             |_, cx| ComposerView::new(ThemeMode::Dark, cx),
         );
         window.update(|composer, window, cx| {
+            composer.apply_model_catalog(test_model_catalog());
             composer.open_picker(cx);
             window.focus(&composer.model_menu_focus, cx);
         });
         window.draw();
-        window.simulate_keystrokes("down right down down enter");
+        window.simulate_keystrokes("down right down enter");
         assert_eq!(
-            window.read(|composer, _| composer.selected_model),
-            "5.6 Terra"
+            window.read(|composer, _| composer.selected_model.clone()),
+            "model-a"
         );
         assert!(!window.read(|composer, _| composer.menu_open));
 

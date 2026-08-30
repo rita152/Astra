@@ -5,13 +5,19 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_channel::{Receiver, Sender};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{AgentBackend, AgentEvent, AgentRequest, CommandExecution, CommandExecutionStatus};
+use super::{
+    AgentBackend, AgentEvent, AgentModel, AgentModelCatalog, AgentReasoningEffort, AgentRequest,
+    AgentServiceTier, CommandExecution, CommandExecutionStatus,
+};
 
 const INITIALIZE_ID: u64 = 1;
 const THREAD_START_ID: u64 = 2;
 const TURN_START_ID: u64 = 3;
+const MODEL_LIST_FIRST_ID: u64 = 2;
+const MODEL_LIST_PAGE_SIZE: u32 = 50;
 const UNDEFINED_METHOD_PARAMS_LIMIT: usize = 2_000;
 
 // These protocol methods are intentionally recognized even though this view
@@ -28,6 +34,76 @@ const PASSIVE_SERVER_METHODS: &[&str] = &[
     "account/rateLimits/updated",
 ];
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelListResponse {
+    data: Vec<ModelListEntry>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelListEntry {
+    id: String,
+    model: String,
+    display_name: String,
+    description: String,
+    hidden: bool,
+    supported_reasoning_efforts: Vec<ModelReasoningEffort>,
+    default_reasoning_effort: String,
+    #[serde(default)]
+    service_tiers: Vec<ModelServiceTier>,
+    #[serde(default)]
+    default_service_tier: Option<String>,
+    is_default: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelReasoningEffort {
+    reasoning_effort: String,
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelServiceTier {
+    id: String,
+    name: String,
+    description: String,
+}
+
+impl From<ModelListEntry> for AgentModel {
+    fn from(entry: ModelListEntry) -> Self {
+        Self {
+            id: entry.id,
+            model: entry.model,
+            display_name: entry.display_name,
+            description: entry.description,
+            supported_reasoning_efforts: entry
+                .supported_reasoning_efforts
+                .into_iter()
+                .map(|effort| AgentReasoningEffort {
+                    id: effort.reasoning_effort,
+                    description: effort.description,
+                })
+                .collect(),
+            default_reasoning_effort: entry.default_reasoning_effort,
+            service_tiers: entry
+                .service_tiers
+                .into_iter()
+                .map(|tier| AgentServiceTier {
+                    id: tier.id,
+                    name: tier.name,
+                    description: tier.description,
+                })
+                .collect(),
+            default_service_tier: entry.default_service_tier,
+            is_default: entry.is_default,
+        }
+    }
+}
+
 /// Codex CLI adapter. JSON-RPC details intentionally stay inside this module.
 #[derive(Default)]
 pub struct CodexAppServerBackend;
@@ -39,6 +115,15 @@ impl CodexAppServerBackend {
 }
 
 impl AgentBackend for CodexAppServerBackend {
+    fn load_model_catalog(&self) -> Receiver<Result<AgentModelCatalog, String>> {
+        let (catalog_tx, catalog_rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = run_model_catalog_process().map_err(|error| format!("{error:#}"));
+            let _ = catalog_tx.send_blocking(result);
+        });
+        catalog_rx
+    }
+
     fn run_prompt(&self, request: AgentRequest) -> Receiver<AgentEvent> {
         let (events_tx, events_rx) = async_channel::unbounded();
         std::thread::spawn(move || {
@@ -48,6 +133,33 @@ impl AgentBackend for CodexAppServerBackend {
         });
         events_rx
     }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn run_model_catalog_process() -> Result<AgentModelCatalog> {
+    let mut child = Command::new("codex")
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("无法启动 `codex app-server --stdio`；请确认 Codex CLI 已安装并完成登录")?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("无法读取 Codex app-server stdout")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("无法写入 Codex app-server stdin")?;
+    let mut reader = BufReader::new(stdout);
+    let result = drive_model_catalog(&mut reader, &mut stdin);
+
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
 fn run_prompt_process(request: &AgentRequest, events: &Sender<AgentEvent>) -> Result<()> {
@@ -76,11 +188,10 @@ fn run_prompt_process(request: &AgentRequest, events: &Sender<AgentEvent>) -> Re
     result
 }
 
-fn drive_session<R: BufRead, W: Write>(
+fn initialize_connection<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    request: &AgentRequest,
-    events: &Sender<AgentEvent>,
+    events: Option<&Sender<AgentEvent>>,
 ) -> Result<()> {
     send(
         writer,
@@ -96,9 +207,72 @@ fn drive_session<R: BufRead, W: Write>(
             }
         }),
     )?;
-    wait_for_response(reader, writer, INITIALIZE_ID)?;
+    wait_for_response(reader, writer, INITIALIZE_ID, events)?;
+    send(writer, json!({ "method": "initialized", "params": {} }))
+}
 
-    send(writer, json!({ "method": "initialized", "params": {} }))?;
+fn drive_model_catalog<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<AgentModelCatalog> {
+    initialize_connection(reader, writer, None)?;
+
+    let mut models = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut request_id = MODEL_LIST_FIRST_ID;
+    let mut seen_cursors = std::collections::HashSet::new();
+    loop {
+        send(
+            writer,
+            json!({
+                "method": "model/list",
+                "id": request_id,
+                "params": {
+                    "cursor": cursor,
+                    "limit": MODEL_LIST_PAGE_SIZE,
+                    "includeHidden": false
+                }
+            }),
+        )?;
+        let response = wait_for_response(reader, writer, request_id, None)?;
+        let result = response
+            .get("result")
+            .cloned()
+            .context("model/list 响应缺少 result")?;
+        let page: ModelListResponse = serde_json::from_value(result)
+            .context("无法解析 model/list 响应；本机 Codex CLI schema 可能已变化")?;
+        models.extend(
+            page.data
+                .into_iter()
+                .filter(|entry| !entry.hidden)
+                .map(AgentModel::from),
+        );
+
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            bail!("model/list 返回了重复分页 cursor `{next_cursor}`");
+        }
+        cursor = Some(next_cursor);
+        request_id = request_id
+            .checked_add(1)
+            .context("model/list 分页请求 id 溢出")?;
+    }
+
+    if models.is_empty() {
+        bail!("model/list 未返回可显示的模型");
+    }
+    Ok(AgentModelCatalog { models })
+}
+
+fn drive_session<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    request: &AgentRequest,
+    events: &Sender<AgentEvent>,
+) -> Result<()> {
+    initialize_connection(reader, writer, Some(events))?;
     send(
         writer,
         json!({
@@ -109,11 +283,13 @@ fn drive_session<R: BufRead, W: Write>(
                 "approvalPolicy": "never",
                 "sandbox": "read-only",
                 "ephemeral": true,
-                "serviceName": "gpui-chat-clone"
+                "serviceName": "gpui-chat-clone",
+                "model": request.model,
+                "serviceTier": request.service_tier
             }
         }),
     )?;
-    let thread_response = wait_for_response(reader, writer, THREAD_START_ID)?;
+    let thread_response = wait_for_response(reader, writer, THREAD_START_ID, Some(events))?;
     let thread_id = thread_response
         .pointer("/result/thread/id")
         .and_then(Value::as_str)
@@ -126,17 +302,21 @@ fn drive_session<R: BufRead, W: Write>(
             "id": TURN_START_ID,
             "params": {
                 "threadId": thread_id,
-                "input": [{ "type": "text", "text": request.prompt }]
+                "input": [{ "type": "text", "text": request.prompt }],
+                "model": request.model,
+                "effort": request.effort,
+                "serviceTier": request.service_tier
             }
         }),
     )?;
-    wait_for_response(reader, writer, TURN_START_ID)?;
+    wait_for_response(reader, writer, TURN_START_ID, Some(events))?;
     let _ = events.send_blocking(AgentEvent::Started);
 
     let mut streamed_text = false;
     loop {
         let message = read_message(reader)?;
         respond_to_server_request(writer, &message)?;
+        forward_model_notification(&message, events)?;
         ensure_server_method_is_defined(&message)?;
 
         match message.get("method").and_then(Value::as_str) {
@@ -208,6 +388,7 @@ fn drive_session<R: BufRead, W: Write>(
                 }
                 bail!("Codex turn 结束，状态为 {status}");
             }
+            Some("model/rerouted" | "model/verification" | "model/safetyBuffering/updated") => {}
             Some(method) if PASSIVE_SERVER_METHODS.contains(&method) => {}
             Some(method) => return Err(undefined_server_method_error(method, &message)),
             None => {}
@@ -223,7 +404,105 @@ fn is_defined_server_method(method: &str) -> bool {
             | "item/commandExecution/outputDelta"
             | "item/completed"
             | "turn/completed"
+            | "model/rerouted"
+            | "model/verification"
+            | "model/safetyBuffering/updated"
     ) || PASSIVE_SERVER_METHODS.contains(&method)
+}
+
+fn required_notification_string(message: &Value, field: &str) -> Result<String> {
+    message
+        .pointer(&format!("/params/{field}"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| {
+            let method = message
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("未知方法");
+            format!("{method} 通知缺少字符串字段 params.{field}")
+        })
+}
+
+fn required_notification_strings(message: &Value, field: &str) -> Result<Vec<String>> {
+    message
+        .pointer(&format!("/params/{field}"))
+        .and_then(Value::as_array)
+        .with_context(|| {
+            let method = message
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("未知方法");
+            format!("{method} 通知缺少数组字段 params.{field}")
+        })?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .with_context(|| format!("通知字段 params.{field} 必须是字符串数组"))
+        })
+        .collect()
+}
+
+fn required_nullable_notification_string(message: &Value, field: &str) -> Result<Option<String>> {
+    match message.pointer(&format!("/params/{field}")) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        _ => {
+            let method = message
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("未知方法");
+            bail!("{method} 通知缺少字符串或 null 字段 params.{field}")
+        }
+    }
+}
+
+fn parse_model_notification(message: &Value) -> Result<Option<AgentEvent>> {
+    let event = match message.get("method").and_then(Value::as_str) {
+        Some("model/rerouted") => {
+            let _ = required_notification_string(message, "threadId")?;
+            let _ = required_notification_string(message, "turnId")?;
+            AgentEvent::ModelRerouted {
+                from_model: required_notification_string(message, "fromModel")?,
+                to_model: required_notification_string(message, "toModel")?,
+                reason: required_notification_string(message, "reason")?,
+            }
+        }
+        Some("model/verification") => {
+            let _ = required_notification_string(message, "threadId")?;
+            let _ = required_notification_string(message, "turnId")?;
+            AgentEvent::ModelVerificationRequired {
+                verifications: required_notification_strings(message, "verifications")?,
+            }
+        }
+        Some("model/safetyBuffering/updated") => {
+            let _ = required_notification_string(message, "threadId")?;
+            let _ = required_notification_string(message, "turnId")?;
+            AgentEvent::ModelSafetyBufferingUpdated {
+                model: required_notification_string(message, "model")?,
+                use_cases: required_notification_strings(message, "useCases")?,
+                reasons: required_notification_strings(message, "reasons")?,
+                show_buffering_ui: message
+                    .pointer("/params/showBufferingUi")
+                    .and_then(Value::as_bool)
+                    .context(
+                        "model/safetyBuffering/updated 通知缺少布尔字段 params.showBufferingUi",
+                    )?,
+                faster_model: required_nullable_notification_string(message, "fasterModel")?,
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(event))
+}
+
+fn forward_model_notification(message: &Value, events: &Sender<AgentEvent>) -> Result<()> {
+    if let Some(event) = parse_model_notification(message)? {
+        let _ = events.send_blocking(event);
+    }
+    Ok(())
 }
 
 fn ensure_server_method_is_defined(message: &Value) -> Result<()> {
@@ -325,10 +604,18 @@ fn wait_for_response(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
     expected_id: u64,
+    events: Option<&Sender<AgentEvent>>,
 ) -> Result<Value> {
     loop {
         let message = read_message(reader)?;
         respond_to_server_request(writer, &message)?;
+        if let Some(events) = events {
+            forward_model_notification(&message, events)?;
+        } else {
+            // Validate model notifications even on non-turn connections so a
+            // changed wire shape fails at the adapter boundary.
+            let _ = parse_model_notification(&message)?;
+        }
         ensure_server_method_is_defined(&message)?;
         if message.get("id").and_then(Value::as_u64) != Some(expected_id) {
             continue;
@@ -366,9 +653,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AgentEvent, AgentRequest, INITIALIZE_ID, PASSIVE_SERVER_METHODS,
-        UNDEFINED_METHOD_PARAMS_LIMIT, drive_session, ensure_server_method_is_defined,
-        wait_for_response,
+        AgentEvent, AgentRequest, INITIALIZE_ID, MODEL_LIST_PAGE_SIZE, PASSIVE_SERVER_METHODS,
+        UNDEFINED_METHOD_PARAMS_LIMIT, drive_model_catalog, drive_session,
+        ensure_server_method_is_defined, wait_for_response,
     };
 
     #[test]
@@ -395,6 +682,9 @@ mod tests {
             &AgentRequest {
                 prompt: "打个招呼".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                model: "gpt-test".into(),
+                effort: "high".into(),
+                service_tier: Some("priority".into()),
             },
             &tx,
         )
@@ -444,6 +734,102 @@ mod tests {
         assert!(sent.contains("\"method\":\"thread/start\""));
         assert!(sent.contains("\"method\":\"turn/start\""));
         assert!(sent.contains("\"threadId\":\"thr_1\""));
+
+        let sent_messages: Vec<serde_json::Value> = sent
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let thread_start = sent_messages
+            .iter()
+            .find(|message| {
+                message.get("method").and_then(|value| value.as_str()) == Some("thread/start")
+            })
+            .unwrap();
+        assert_eq!(
+            thread_start
+                .pointer("/params/model")
+                .and_then(|value| value.as_str()),
+            Some("gpt-test")
+        );
+        assert_eq!(
+            thread_start
+                .pointer("/params/serviceTier")
+                .and_then(|value| value.as_str()),
+            Some("priority")
+        );
+        let turn_start = sent_messages
+            .iter()
+            .find(|message| {
+                message.get("method").and_then(|value| value.as_str()) == Some("turn/start")
+            })
+            .unwrap();
+        assert_eq!(
+            turn_start
+                .pointer("/params/model")
+                .and_then(|value| value.as_str()),
+            Some("gpt-test")
+        );
+        assert_eq!(
+            turn_start
+                .pointer("/params/effort")
+                .and_then(|value| value.as_str()),
+            Some("high")
+        );
+        assert_eq!(
+            turn_start
+                .pointer("/params/serviceTier")
+                .and_then(|value| value.as_str()),
+            Some("priority")
+        );
+    }
+
+    #[test]
+    fn model_catalog_accumulates_pages_and_maps_defaults_and_options() {
+        let input = concat!(
+            "{\"id\":1,\"result\":{}}\n",
+            "{\"id\":2,\"result\":{\"data\":[",
+            "{\"id\":\"hidden\",\"model\":\"hidden\",\"displayName\":\"Hidden\",\"description\":\"hidden\",\"hidden\":true,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\",\"description\":\"Low\"}],\"defaultReasoningEffort\":\"low\",\"isDefault\":false},",
+            "{\"id\":\"model-a\",\"model\":\"model-a-wire\",\"displayName\":\"Model A\",\"description\":\"First page\",\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\",\"description\":\"Low\"}],\"defaultReasoningEffort\":\"low\",\"serviceTiers\":[],\"defaultServiceTier\":null,\"isDefault\":false}],\"nextCursor\":\"page-2\"}}\n",
+            "{\"id\":3,\"result\":{\"data\":[{\"id\":\"model-b\",\"model\":\"model-b-wire\",\"displayName\":\"Model B\",\"description\":\"Second page\",\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"medium\",\"description\":\"Balanced\"},{\"reasoningEffort\":\"high\",\"description\":\"Deep\"}],\"defaultReasoningEffort\":\"medium\",\"serviceTiers\":[{\"id\":\"priority\",\"name\":\"Fast\",\"description\":\"Lower latency\"}],\"defaultServiceTier\":\"priority\",\"isDefault\":true}],\"nextCursor\":null}}\n"
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+
+        let catalog = drive_model_catalog(&mut reader, &mut output).unwrap();
+        assert_eq!(catalog.models.len(), 2);
+        assert_eq!(catalog.models[0].id, "model-a");
+        assert_eq!(catalog.models[0].model, "model-a-wire");
+        assert_eq!(catalog.models[1].display_name, "Model B");
+        assert!(catalog.models[1].is_default);
+        assert_eq!(catalog.models[1].default_reasoning_effort, "medium");
+        assert_eq!(catalog.models[1].service_tiers[0].id, "priority");
+        assert_eq!(
+            catalog.models[1].default_service_tier.as_deref(),
+            Some("priority")
+        );
+
+        let sent = String::from_utf8(output).unwrap();
+        let requests: Vec<serde_json::Value> = sent
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|message: &serde_json::Value| {
+                message.get("method").and_then(|value| value.as_str()) == Some("model/list")
+            })
+            .collect();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].pointer("/params/cursor"), Some(&json!(null)));
+        assert_eq!(
+            requests[0]
+                .pointer("/params/limit")
+                .and_then(|value| value.as_u64()),
+            Some(u64::from(MODEL_LIST_PAGE_SIZE))
+        );
+        assert_eq!(
+            requests[1]
+                .pointer("/params/cursor")
+                .and_then(|value| value.as_str()),
+            Some("page-2")
+        );
     }
 
     #[test]
@@ -497,7 +883,7 @@ mod tests {
         );
         let mut output = Vec::new();
 
-        let error = wait_for_response(&mut reader, &mut output, INITIALIZE_ID)
+        let error = wait_for_response(&mut reader, &mut output, INITIALIZE_ID, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("protocol/futureHandshake"));
@@ -511,7 +897,7 @@ mod tests {
         );
         let mut output = Vec::new();
 
-        let error = wait_for_response(&mut reader, &mut output, INITIALIZE_ID)
+        let error = wait_for_response(&mut reader, &mut output, INITIALIZE_ID, None)
             .unwrap_err()
             .to_string();
         let response = String::from_utf8(output).unwrap();
@@ -541,6 +927,9 @@ mod tests {
             &AgentRequest {
                 prompt: "probe".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                model: "gpt-test".into(),
+                effort: "medium".into(),
+                service_tier: None,
             },
             &tx,
         )
@@ -583,6 +972,9 @@ mod tests {
             &AgentRequest {
                 prompt: "深入分析当前项目".into(),
                 cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                model: "gpt-test".into(),
+                effort: "medium".into(),
+                service_tier: None,
             },
             &tx,
         )
@@ -596,6 +988,68 @@ mod tests {
             events
                 .iter()
                 .any(|event| matches!(event, AgentEvent::CommandOutputDelta { .. }))
+        );
+    }
+
+    #[test]
+    fn model_notifications_are_normalized_into_agent_events() {
+        let input = concat!(
+            "{\"id\":1,\"result\":{}}\n",
+            "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n",
+            "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_1\"}}}\n",
+            "{\"method\":\"model/rerouted\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"fromModel\":\"model-a\",\"toModel\":\"model-b\",\"reason\":\"highRiskCyberActivity\"}}\n",
+            "{\"method\":\"model/safetyBuffering/updated\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"model\":\"model-b\",\"useCases\":[\"cyber\"],\"reasons\":[\"review\"],\"showBufferingUi\":true,\"fasterModel\":\"model-c\"}}\n",
+            "{\"method\":\"model/safetyBuffering/updated\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"model\":\"model-b\",\"useCases\":[],\"reasons\":[],\"showBufferingUi\":false,\"fasterModel\":null}}\n",
+            "{\"method\":\"model/verification\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"verifications\":[\"trustedAccessForCyber\"]}}\n",
+            "{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"status\":\"completed\"}}}\n"
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+        let (tx, rx) = async_channel::unbounded();
+        drive_session(
+            &mut reader,
+            &mut output,
+            &AgentRequest {
+                prompt: "probe".into(),
+                cwd: PathBuf::from("/tmp/project"),
+                model: "model-a".into(),
+                effort: "high".into(),
+                service_tier: None,
+            },
+            &tx,
+        )
+        .unwrap();
+        drop(tx);
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::Started,
+                AgentEvent::ModelRerouted {
+                    from_model: "model-a".into(),
+                    to_model: "model-b".into(),
+                    reason: "highRiskCyberActivity".into(),
+                },
+                AgentEvent::ModelSafetyBufferingUpdated {
+                    model: "model-b".into(),
+                    use_cases: vec!["cyber".into()],
+                    reasons: vec!["review".into()],
+                    show_buffering_ui: true,
+                    faster_model: Some("model-c".into()),
+                },
+                AgentEvent::ModelSafetyBufferingUpdated {
+                    model: "model-b".into(),
+                    use_cases: Vec::new(),
+                    reasons: Vec::new(),
+                    show_buffering_ui: false,
+                    faster_model: None,
+                },
+                AgentEvent::ModelVerificationRequired {
+                    verifications: vec!["trustedAccessForCyber".into()],
+                },
+                AgentEvent::Completed,
+            ]
         );
     }
 }

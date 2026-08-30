@@ -11,6 +11,7 @@ screenshot = ["gpui/test-support", "gpui_platform/test-support"]
 anyhow = "1"
 async-channel = "2.5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 unicode-segmentation = "1"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2" }
