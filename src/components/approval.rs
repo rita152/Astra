@@ -188,6 +188,10 @@ pub struct ApprovalCardViewModel {
     pub request_id: String,
     pub request: ApprovalRequestPresentation,
     pub status: ApprovalCardStatus,
+    /// Whether the server listed `accept` in `availableDecisions`.
+    pub allow_once: bool,
+    /// Whether the server listed `decline` in `availableDecisions`.
+    pub decline: bool,
     /// `None` renders a single Allow button. A value renders ChatGPT's split
     /// button and its two-row menu.
     pub scoped_approval: Option<ApprovalScope>,
@@ -207,6 +211,8 @@ impl ApprovalCardViewModel {
             request_id: request_id.into(),
             request,
             status: ApprovalCardStatus::Pending,
+            allow_once: true,
+            decline: true,
             scoped_approval,
             visual_state: ApprovalVisualState::Default,
             keyboard_focus: None,
@@ -215,6 +221,17 @@ impl ApprovalCardViewModel {
 
     pub fn should_render(&self) -> bool {
         self.status == ApprovalCardStatus::Pending
+    }
+
+    pub fn set_available_decisions(
+        &mut self,
+        allow_once: bool,
+        decline: bool,
+        scoped_approval: Option<ApprovalScope>,
+    ) {
+        self.allow_once = allow_once;
+        self.decline = decline;
+        self.scoped_approval = scoped_approval;
     }
 
     pub fn geometry(&self) -> ApprovalCardGeometry {
@@ -247,42 +264,38 @@ impl ApprovalCardViewModel {
                         _ => ApprovalKeyboardFocus::MenuAllowOnce,
                     }
                 } else {
-                    match (self.keyboard_focus, shift, self.scoped_approval.is_some()) {
-                        (Some(ApprovalKeyboardFocus::Decline), false, _) => {
-                            ApprovalKeyboardFocus::AllowOnce
-                        }
-                        (Some(ApprovalKeyboardFocus::AllowOnce), false, true) => {
-                            ApprovalKeyboardFocus::MenuToggle
-                        }
-                        (Some(ApprovalKeyboardFocus::AllowOnce), false, false) => {
-                            ApprovalKeyboardFocus::Decline
-                        }
-                        (Some(ApprovalKeyboardFocus::MenuToggle), false, _) => {
-                            ApprovalKeyboardFocus::Decline
-                        }
-                        (Some(ApprovalKeyboardFocus::Decline), true, true) => {
-                            ApprovalKeyboardFocus::MenuToggle
-                        }
-                        (Some(ApprovalKeyboardFocus::Decline), true, false) => {
-                            ApprovalKeyboardFocus::AllowOnce
-                        }
-                        (Some(ApprovalKeyboardFocus::AllowOnce), true, _) => {
-                            ApprovalKeyboardFocus::Decline
-                        }
-                        (Some(ApprovalKeyboardFocus::MenuToggle), true, _) => {
-                            ApprovalKeyboardFocus::AllowOnce
-                        }
-                        (_, true, true) => ApprovalKeyboardFocus::MenuToggle,
-                        (_, true, false) => ApprovalKeyboardFocus::AllowOnce,
-                        _ => ApprovalKeyboardFocus::Decline,
+                    let mut focus_order = Vec::with_capacity(3);
+                    if self.decline {
+                        focus_order.push(ApprovalKeyboardFocus::Decline);
                     }
+                    if self.allow_once || self.scoped_approval.is_some() {
+                        focus_order.push(ApprovalKeyboardFocus::AllowOnce);
+                    }
+                    if self.allow_once && self.scoped_approval.is_some() {
+                        focus_order.push(ApprovalKeyboardFocus::MenuToggle);
+                    }
+                    if focus_order.is_empty() {
+                        return None;
+                    }
+                    let current = self.keyboard_focus.and_then(|focus| {
+                        focus_order.iter().position(|candidate| *candidate == focus)
+                    });
+                    let next = match (current, shift) {
+                        (Some(index), false) => (index + 1) % focus_order.len(),
+                        (Some(0), true) | (None, true) => focus_order.len() - 1,
+                        (Some(index), true) => index - 1,
+                        (None, false) => 0,
+                    };
+                    focus_order[next]
                 };
                 Some(ApprovalCardEvent::KeyboardFocusChanged(Some(next)))
             }
             "escape" if self.visual_state.menu_open() => Some(ApprovalCardEvent::ToggleMenu),
-            "escape" => Some(ApprovalCardEvent::Decision(ApprovalDecision::Decline)),
+            "escape" if self.decline => {
+                Some(ApprovalCardEvent::Decision(ApprovalDecision::Decline))
+            }
             "enter" | "space" => match self.keyboard_focus {
-                Some(ApprovalKeyboardFocus::Decline) => {
+                Some(ApprovalKeyboardFocus::Decline) if self.decline => {
                     Some(ApprovalCardEvent::Decision(ApprovalDecision::Decline))
                 }
                 Some(ApprovalKeyboardFocus::MenuToggle) => Some(ApprovalCardEvent::ToggleMenu),
@@ -292,8 +305,15 @@ impl ApprovalCardViewModel {
                 Some(ApprovalKeyboardFocus::MenuScoped(scope)) => Some(
                     ApprovalCardEvent::Decision(ApprovalDecision::AllowScoped(scope)),
                 ),
-                Some(ApprovalKeyboardFocus::AllowOnce) | None if !self.visual_state.menu_open() => {
+                Some(ApprovalKeyboardFocus::AllowOnce) | None
+                    if !self.visual_state.menu_open() && self.allow_once =>
+                {
                     Some(ApprovalCardEvent::Decision(ApprovalDecision::AllowOnce))
+                }
+                Some(ApprovalKeyboardFocus::AllowOnce) | None if !self.visual_state.menu_open() => {
+                    self.scoped_approval.map(|scope| {
+                        ApprovalCardEvent::Decision(ApprovalDecision::AllowScoped(scope))
+                    })
                 }
                 _ => None,
             },
@@ -577,6 +597,13 @@ pub fn render_approval_card(
         .child(keycap("Esc", palette.decline_text));
 
     let approve_callback = callback.clone();
+    let split_approval = model.allow_once && model.scoped_approval.is_some();
+    let primary_scope = (!model.allow_once)
+        .then_some(model.scoped_approval)
+        .flatten();
+    let primary_label = primary_scope
+        .map(ApprovalScope::label)
+        .unwrap_or("允许一次");
     let approve_fill = if matches!(
         model.visual_state,
         ApprovalVisualState::ApproveHovered | ApprovalVisualState::SplitMenu { .. }
@@ -588,14 +615,10 @@ pub fn render_approval_card(
     let mut approve = div()
         .id(approval_element_id("approval-once", &model.request_id))
         .role(Role::Button)
-        .aria_label("允许一次")
+        .aria_label(primary_label)
         .h(px(APPROVAL_BUTTON_HEIGHT))
         .pl(px(8.0))
-        .pr(if model.scoped_approval.is_some() {
-            px(1.0)
-        } else {
-            px(8.0)
-        })
+        .pr(if split_approval { px(1.0) } else { px(8.0) })
         .flex()
         .items_center()
         .gap(px(4.0))
@@ -610,15 +633,14 @@ pub fn render_approval_card(
         .cursor_pointer()
         .hover(move |button| button.bg(palette.approve_hover))
         .on_click(move |_, window, cx| {
-            approve_callback.emit(
-                ApprovalCardEvent::Decision(ApprovalDecision::AllowOnce),
-                window,
-                cx,
-            );
+            let decision = primary_scope
+                .map(ApprovalDecision::AllowScoped)
+                .unwrap_or(ApprovalDecision::AllowOnce);
+            approve_callback.emit(ApprovalCardEvent::Decision(decision), window, cx);
         })
-        .child("允许一次")
+        .child(primary_label)
         .child(keycap("⏎", palette.approve_text));
-    approve = if model.scoped_approval.is_some() {
+    approve = if split_approval {
         approve.rounded_l(px(9999.0))
     } else {
         approve
@@ -635,7 +657,7 @@ pub fn render_approval_card(
         .overflow_hidden()
         .child(approve);
 
-    if model.scoped_approval.is_some() {
+    if split_approval {
         let menu_callback = callback.clone();
         approve_group = approve_group.child(
             div()
@@ -677,8 +699,11 @@ pub fn render_approval_card(
         .items_center()
         .gap(px(8.0))
         .child(div().flex_1())
-        .child(decline)
-        .child(approve_group);
+        .when(model.decline, |actions| actions.child(decline))
+        .when(
+            model.allow_once || model.scoped_approval.is_some(),
+            |actions| actions.child(approve_group),
+        );
 
     let card = div()
         .h(px(geometry.card_height))
@@ -726,6 +751,7 @@ pub fn render_approval_card(
 
     if let (ApprovalVisualState::SplitMenu { focused }, Some(scope)) =
         (model.visual_state, model.scoped_approval)
+        && model.allow_once
     {
         result = result.child(approval_menu(
             request_id, scope, focused, geometry, palette, callback,

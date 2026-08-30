@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use chrono::Local;
 use gpui::{
@@ -9,15 +9,16 @@ use gpui::{
 
 use crate::{
     agent::{
-        AgentBackend, AgentConfigWarning, AgentEffectivePermissions, AgentEvent,
-        AgentInterruptHandle, AgentInterruptOutcome, AgentModel, AgentModelCatalog,
-        AgentPermissionMode, AgentRequest, CodexAppServerBackend, CommandExecution,
-        CommandExecutionStatus,
+        AgentApprovalHandle, AgentBackend, AgentCommandApprovalChoice, AgentConfigWarning,
+        AgentEffectivePermissions, AgentEvent, AgentInterruptHandle, AgentInterruptOutcome,
+        AgentModel, AgentModelCatalog, AgentPermissionMode, AgentRequest, CodexAppServerBackend,
+        CommandExecution, CommandExecutionStatus,
     },
     components::{
         approval::{
-            ApprovalCardEvent, ApprovalCardStatus, ApprovalCardViewModel, ApprovalKeyboardFocus,
-            ApprovalMenuItem, ApprovalRequestPresentation, ApprovalVisualState,
+            ApprovalCardEvent, ApprovalCardStatus, ApprovalCardViewModel, ApprovalDecision,
+            ApprovalKeyboardFocus, ApprovalMenuItem, ApprovalRequestPresentation, ApprovalScope,
+            ApprovalVisualState,
         },
         file_change::{
             FileApprovalEvent, FileApprovalKeyboardFocus, FileApprovalMenuItem,
@@ -327,6 +328,7 @@ pub struct ComposerView {
     conversation_phase: ConversationPhase,
     conversation_cycle: u64,
     active_turn: Option<AgentInterruptHandle>,
+    approval_responders: HashMap<String, AgentApprovalHandle>,
     thread_id: Option<String>,
     model_menu_focus: FocusHandle,
     model_menu_focused_item: usize,
@@ -437,6 +439,7 @@ impl ComposerView {
             conversation_phase: ConversationPhase::Empty,
             conversation_cycle: 0,
             active_turn: None,
+            approval_responders: HashMap::new(),
             thread_id: None,
             model_menu_focus: cx.focus_handle(),
             model_menu_focused_item: 0,
@@ -849,6 +852,7 @@ impl ComposerView {
         self.user_message_time = Some(current_local_time_label());
         self.assistant_message.clear();
         self.conversation_activity.clear();
+        self.approval_responders.clear();
         self.assistant_message_time = None;
         self.conversation_phase = ConversationPhase::Starting;
         self.conversation_cycle = self.conversation_cycle.wrapping_add(1);
@@ -1067,6 +1071,41 @@ impl ComposerView {
                     if self.conversation_phase != ConversationPhase::Stopping {
                         self.conversation_phase = ConversationPhase::Streaming;
                     }
+                }
+                AgentEvent::CommandApprovalRequested { request, responder } => {
+                    let request_id = request.request_id.ui_key();
+                    let presentation = if let Some(host) = request.network_host {
+                        ApprovalRequestPresentation::network(
+                            host,
+                            (!request.command.is_empty()).then_some(request.command),
+                            request.reason,
+                        )
+                    } else {
+                        ApprovalRequestPresentation::command(request.command, request.reason)
+                    };
+                    let mut model = ApprovalCardViewModel::pending(&request_id, presentation);
+                    model.set_available_decisions(
+                        request.allow_once,
+                        request.decline,
+                        request
+                            .accept_with_execpolicy_amendment
+                            .is_some()
+                            .then_some(ApprovalScope::SimilarCommands),
+                    );
+                    self.approval_responders
+                        .insert(request_id.clone(), responder);
+                    self.conversation_activity
+                        .push(ConversationActivity::Approval(model));
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Streaming;
+                    }
+                }
+                AgentEvent::CommandApprovalResolved { request_id } => {
+                    let request_id = request_id.ui_key();
+                    self.approval_responders.remove(&request_id);
+                    self.conversation_activity.retain(|activity| {
+                        !matches!(activity, ConversationActivity::Approval(model) if model.request_id == request_id)
+                    });
                 }
                 AgentEvent::ModelRerouted {
                     from_model,
@@ -2032,16 +2071,46 @@ impl ComposerView {
         }) else {
             return;
         };
+        if matches!(
+            &self.conversation_activity[index],
+            ConversationActivity::Approval(model) if !model.should_render()
+        ) {
+            return;
+        }
 
         match event {
-            ApprovalCardEvent::Decision(_) => {
-                // Capture fixtures exercise the native card's closed state,
-                // but no live protocol response is wired until the request-id
-                // registry and decision reply path are connected.
-                if let ConversationActivity::Approval(model) =
-                    &mut self.conversation_activity[index]
-                {
-                    model.status = ApprovalCardStatus::Resolved;
+            ApprovalCardEvent::Decision(decision) => {
+                let choice = match decision {
+                    ApprovalDecision::AllowOnce => AgentCommandApprovalChoice::Accept,
+                    ApprovalDecision::Decline => AgentCommandApprovalChoice::Decline,
+                    ApprovalDecision::AllowScoped(ApprovalScope::SimilarCommands) => {
+                        AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment
+                    }
+                    ApprovalDecision::AllowScoped(_) => return,
+                };
+                let response = self
+                    .approval_responders
+                    .get(request_id)
+                    .map(|responder| responder.respond(choice));
+                match response {
+                    Some(Ok(())) | None => {
+                        // Keep the activity until serverRequest/resolved so the
+                        // server remains authoritative, while immediately
+                        // unmounting the card and blocking duplicate clicks.
+                        if let ConversationActivity::Approval(model) =
+                            &mut self.conversation_activity[index]
+                        {
+                            model.status = ApprovalCardStatus::Resolved;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        self.conversation_activity
+                            .push(ConversationActivity::ProtocolError {
+                                message: "无法回复命令审批".to_owned(),
+                                details: Some(error),
+                                will_retry: false,
+                            });
+                    }
                 }
             }
             ApprovalCardEvent::ToggleMenu => {
@@ -4305,11 +4374,14 @@ mod tests {
         push_coalesced_agent_event, submenu_layout, upsert_command_activity,
     };
     use crate::agent::{
-        AgentActivePermissionProfile, AgentConfigWarning, AgentEffectivePermissions, AgentEvent,
-        AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome, AgentModel,
-        AgentModelCatalog, AgentReasoningEffort, AgentServiceTier, AgentThreadSettings,
-        CommandExecution, CommandExecutionStatus,
+        AgentActivePermissionProfile, AgentApprovalControl, AgentApprovalHandle,
+        AgentCommandApprovalChoice, AgentCommandApprovalRequest, AgentConfigWarning,
+        AgentEffectivePermissions, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
+        AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentReasoningEffort,
+        AgentServerRequestId, AgentServiceTier, AgentThreadSettings, CommandExecution,
+        CommandExecutionStatus,
     };
+    use crate::components::approval::{ApprovalCardEvent, ApprovalDecision, ApprovalScope};
     use crate::components::user_input_request::{
         UserInputKeyboardFocus, UserInputKeyboardOutcome, UserInputOptionPresentation,
         UserInputQuestionPresentation, UserInputRequestEvent, UserInputRequestPresentation,
@@ -4318,13 +4390,33 @@ mod tests {
     use gpui::{
         Bounds, Focusable, MouseButton, TestApp, WindowBounds, WindowOptions, point, px, size,
     };
+    use serde_json::json;
     use std::{
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
+
+    #[derive(Default)]
+    struct RecordingApprovalControl {
+        responses: Mutex<Vec<(AgentServerRequestId, AgentCommandApprovalChoice)>>,
+    }
+
+    impl AgentApprovalControl for RecordingApprovalControl {
+        fn respond(
+            &self,
+            request_id: &AgentServerRequestId,
+            choice: AgentCommandApprovalChoice,
+        ) -> Result<(), String> {
+            self.responses
+                .lock()
+                .unwrap()
+                .push((request_id.clone(), choice));
+            Ok(())
+        }
+    }
 
     fn test_model_catalog() -> AgentModelCatalog {
         AgentModelCatalog {
@@ -4414,6 +4506,81 @@ mod tests {
         fn abandon(&self) {
             self.abandoned.store(true, Ordering::Release);
         }
+    }
+
+    #[test]
+    fn live_command_approval_uses_existing_card_and_unmounts_on_resolved() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        let request_id = AgentServerRequestId::String("approval-1".into());
+        let control = Arc::new(RecordingApprovalControl::default());
+        let responder = AgentApprovalHandle::new(request_id.clone(), control.clone());
+
+        app.update_entity(&composer, |composer, _| {
+            assert!(!composer.apply_agent_event_batch(vec![
+                AgentEvent::CommandApprovalRequested {
+                    request: AgentCommandApprovalRequest {
+                        request_id: request_id.clone(),
+                        command: "git --version".into(),
+                        reason: Some("需要读取版本".into()),
+                        network_host: None,
+                        allow_once: false,
+                        decline: true,
+                        accept_with_execpolicy_amendment: Some(json!({
+                            "acceptWithExecpolicyAmendment": {
+                                "execpolicy_amendment": ["git", "--version"]
+                            }
+                        })),
+                    },
+                    responder,
+                },
+            ]));
+            let model = composer
+                .conversation_activity
+                .iter()
+                .find_map(|activity| match activity {
+                    ConversationActivity::Approval(model) => Some(model),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(!model.allow_once);
+            assert!(model.decline);
+            assert_eq!(model.scoped_approval, Some(ApprovalScope::SimilarCommands));
+        });
+
+        let ui_key = request_id.ui_key();
+        app.update_entity(&composer, |composer, cx| {
+            composer.handle_approval_card_event(
+                &ui_key,
+                ApprovalCardEvent::Decision(ApprovalDecision::AllowScoped(
+                    ApprovalScope::SimilarCommands,
+                )),
+                cx,
+            );
+            // A stale second click is ignored after the card resolves locally.
+            composer.handle_approval_card_event(
+                &ui_key,
+                ApprovalCardEvent::Decision(ApprovalDecision::Decline),
+                cx,
+            );
+        });
+        assert_eq!(
+            *control.responses.lock().unwrap(),
+            vec![(
+                request_id.clone(),
+                AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment
+            )]
+        );
+
+        app.update_entity(&composer, |composer, _| {
+            composer.apply_agent_event_batch(vec![AgentEvent::CommandApprovalResolved {
+                request_id: request_id.clone(),
+            }]);
+            assert!(!composer.conversation_activity.iter().any(
+                |activity| matches!(activity, ConversationActivity::Approval(model) if model.request_id == ui_key)
+            ));
+            assert!(!composer.approval_responders.contains_key(&ui_key));
+        });
     }
 
     #[test]

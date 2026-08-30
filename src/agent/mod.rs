@@ -1,6 +1,6 @@
 mod codex;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{fmt, path::PathBuf, sync::Arc};
 
 use async_channel::Receiver;
 use serde_json::Value;
@@ -165,6 +165,90 @@ pub struct AgentConfigWarning {
     pub column: Option<u64>,
 }
 
+/// JSON-RPC request ids are deliberately not normalized: a numeric `7` and a
+/// string `"7"` identify different server requests and must be echoed with
+/// their original type.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum AgentServerRequestId {
+    Number(i64),
+    String(String),
+}
+
+impl AgentServerRequestId {
+    pub fn ui_key(&self) -> String {
+        match self {
+            Self::Number(id) => format!("number:{id}"),
+            Self::String(id) => format!("string:{id}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentCommandApprovalRequest {
+    pub request_id: AgentServerRequestId,
+    pub command: String,
+    pub reason: Option<String>,
+    pub network_host: Option<String>,
+    pub allow_once: bool,
+    pub decline: bool,
+    /// The exact decision object supplied by `availableDecisions`.
+    pub accept_with_execpolicy_amendment: Option<Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentCommandApprovalChoice {
+    Accept,
+    Decline,
+    AcceptWithExecpolicyAmendment,
+}
+
+pub(crate) trait AgentApprovalControl: Send + Sync {
+    fn respond(
+        &self,
+        request_id: &AgentServerRequestId,
+        choice: AgentCommandApprovalChoice,
+    ) -> Result<(), String>;
+}
+
+#[derive(Clone)]
+pub struct AgentApprovalHandle {
+    request_id: AgentServerRequestId,
+    control: Arc<dyn AgentApprovalControl>,
+}
+
+impl AgentApprovalHandle {
+    pub(crate) fn new(
+        request_id: AgentServerRequestId,
+        control: Arc<dyn AgentApprovalControl>,
+    ) -> Self {
+        Self {
+            request_id,
+            control,
+        }
+    }
+
+    pub fn respond(&self, choice: AgentCommandApprovalChoice) -> Result<(), String> {
+        self.control.respond(&self.request_id, choice)
+    }
+}
+
+impl fmt::Debug for AgentApprovalHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentApprovalHandle")
+            .field("request_id", &self.request_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for AgentApprovalHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.request_id == other.request_id && Arc::ptr_eq(&self.control, &other.control)
+    }
+}
+
+impl Eq for AgentApprovalHandle {}
+
 /// Agent-neutral output consumed by the UI.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
@@ -192,6 +276,13 @@ pub enum AgentEvent {
         delta: String,
     },
     CommandCompleted(CommandExecution),
+    CommandApprovalRequested {
+        request: AgentCommandApprovalRequest,
+        responder: AgentApprovalHandle,
+    },
+    CommandApprovalResolved {
+        request_id: AgentServerRequestId,
+    },
     ModelRerouted {
         from_model: String,
         to_model: String,

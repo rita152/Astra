@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
@@ -14,11 +15,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    AgentActivePermissionProfile, AgentBackend, AgentConfigWarning, AgentEffectivePermissions,
-    AgentEvent, AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome, AgentModel,
-    AgentModelCatalog, AgentPermissionMode, AgentPermissionProfile, AgentReasoningEffort,
-    AgentRequest, AgentRun, AgentServiceTier, AgentThreadSettings, CommandExecution,
-    CommandExecutionStatus,
+    AgentActivePermissionProfile, AgentApprovalControl, AgentApprovalHandle, AgentBackend,
+    AgentCommandApprovalChoice, AgentCommandApprovalRequest, AgentConfigWarning,
+    AgentEffectivePermissions, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
+    AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentPermissionMode,
+    AgentPermissionProfile, AgentReasoningEffort, AgentRequest, AgentRun, AgentServerRequestId,
+    AgentServiceTier, AgentThreadSettings, CommandExecution, CommandExecutionStatus,
 };
 
 const INITIALIZE_ID: u64 = 1;
@@ -113,6 +115,14 @@ struct TurnSessionState {
     terminal: bool,
 }
 
+#[derive(Debug)]
+struct PendingCommandApproval {
+    #[allow(dead_code)] // Retained verbatim for protocol auditing; exercised by registry tests.
+    params: Value,
+    available_decisions: Vec<Value>,
+    responded: bool,
+}
+
 struct AppServerProcess {
     child: Mutex<Option<Child>>,
     reaped: AtomicBool,
@@ -179,6 +189,7 @@ impl Drop for AppServerProcess {
 struct CodexTurnSession<W> {
     writer: Mutex<Option<W>>,
     state: Mutex<TurnSessionState>,
+    pending_command_approvals: Mutex<HashMap<AgentServerRequestId, PendingCommandApproval>>,
     process: Option<Arc<AppServerProcess>>,
 }
 
@@ -187,8 +198,82 @@ impl<W: Write + Send> CodexTurnSession<W> {
         Self {
             writer: Mutex::new(Some(writer)),
             state: Mutex::new(TurnSessionState::default()),
+            pending_command_approvals: Mutex::new(HashMap::new()),
             process,
         }
+    }
+
+    fn register_command_approval(
+        &self,
+        request_id: AgentServerRequestId,
+        params: Value,
+        available_decisions: Vec<Value>,
+    ) -> Result<()> {
+        let mut pending = self
+            .pending_command_approvals
+            .lock()
+            .map_err(|_| anyhow!("Codex command approval registry 锁已损坏"))?;
+        if pending.contains_key(&request_id) {
+            bail!("收到重复的 command approval request id {request_id:?}");
+        }
+        pending.insert(
+            request_id,
+            PendingCommandApproval {
+                params,
+                available_decisions,
+                responded: false,
+            },
+        );
+        Ok(())
+    }
+
+    fn resolve_command_approval(&self, request_id: &AgentServerRequestId) -> Result<bool> {
+        Ok(self
+            .pending_command_approvals
+            .lock()
+            .map_err(|_| anyhow!("Codex command approval registry 锁已损坏"))?
+            .remove(request_id)
+            .is_some())
+    }
+
+    fn respond_to_command_approval(
+        &self,
+        request_id: &AgentServerRequestId,
+        choice: AgentCommandApprovalChoice,
+    ) -> Result<()> {
+        let decision = {
+            let mut pending = self
+                .pending_command_approvals
+                .lock()
+                .map_err(|_| anyhow!("Codex command approval registry 锁已损坏"))?;
+            let request = pending.get_mut(request_id).with_context(|| {
+                format!("command approval {request_id:?} 已经 resolved 或不存在")
+            })?;
+            if request.responded {
+                bail!("command approval {request_id:?} 已经回复，拒绝重复 decision");
+            }
+            let decision = match choice {
+                AgentCommandApprovalChoice::Accept => request
+                    .available_decisions
+                    .iter()
+                    .find(|decision| decision.as_str() == Some("accept")),
+                AgentCommandApprovalChoice::Decline => request
+                    .available_decisions
+                    .iter()
+                    .find(|decision| decision.as_str() == Some("decline")),
+                AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment => request
+                    .available_decisions
+                    .iter()
+                    .find(|decision| decision.get("acceptWithExecpolicyAmendment").is_some()),
+            }
+            .cloned()
+            .with_context(|| {
+                format!("command approval {request_id:?} 未提供所选 decision，拒绝越权回复")
+            })?;
+            request.responded = true;
+            decision
+        };
+        self.send(json!({ "id": request_id_value(request_id), "result": { "decision": decision } }))
     }
 
     fn send(&self, message: Value) -> Result<()> {
@@ -320,6 +405,16 @@ impl<W: Write + Send> CodexTurnSession<W> {
             state.terminal,
         )
     }
+
+    #[cfg(test)]
+    fn pending_approval_snapshot(&self) -> Vec<(AgentServerRequestId, Value, bool)> {
+        self.pending_command_approvals
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, approval)| (id.clone(), approval.params.clone(), approval.responded))
+            .collect()
+    }
 }
 
 impl<W: Write + Send + 'static> AgentInterruptControl for CodexTurnSession<W> {
@@ -330,6 +425,35 @@ impl<W: Write + Send + 'static> AgentInterruptControl for CodexTurnSession<W> {
 
     fn abandon(&self) {
         self.abandon_inner();
+    }
+}
+
+impl<W: Write + Send + 'static> AgentApprovalControl for CodexTurnSession<W> {
+    fn respond(
+        &self,
+        request_id: &AgentServerRequestId,
+        choice: AgentCommandApprovalChoice,
+    ) -> Result<(), String> {
+        self.respond_to_command_approval(request_id, choice)
+            .map_err(|error| format!("{error:#}"))
+    }
+}
+
+fn request_id_from_value(value: &Value) -> Result<AgentServerRequestId> {
+    match value {
+        Value::String(id) => Ok(AgentServerRequestId::String(id.clone())),
+        Value::Number(id) => id
+            .as_i64()
+            .map(AgentServerRequestId::Number)
+            .context("Codex JSON-RPC request id 数字超出 int64 范围"),
+        _ => bail!("Codex JSON-RPC request id 必须是字符串或 int64 数字"),
+    }
+}
+
+fn request_id_value(request_id: &AgentServerRequestId) -> Value {
+    match request_id {
+        AgentServerRequestId::Number(id) => json!(id),
+        AgentServerRequestId::String(id) => json!(id),
     }
 }
 
@@ -596,9 +720,9 @@ fn initialize_connection<R: BufRead, W: Write>(
     send(writer, json!({ "method": "initialized", "params": {} }))
 }
 
-fn initialize_turn_connection<R: BufRead, W: Write + Send>(
+fn initialize_turn_connection<R: BufRead, W: Write + Send + 'static>(
     reader: &mut R,
-    session: &CodexTurnSession<W>,
+    session: &Arc<CodexTurnSession<W>>,
     events: &Sender<AgentEvent>,
 ) -> Result<()> {
     session.send(json!({
@@ -899,9 +1023,9 @@ fn drive_thread_settings_update<R: BufRead, W: Write>(
     }
 }
 
-fn drive_session<R: BufRead, W: Write + Send>(
+fn drive_session<R: BufRead, W: Write + Send + 'static>(
     reader: &mut R,
-    session: &CodexTurnSession<W>,
+    session: &Arc<CodexTurnSession<W>>,
     request: &AgentRequest,
     events: &Sender<AgentEvent>,
 ) -> Result<TurnOutcome> {
@@ -963,7 +1087,8 @@ fn drive_session<R: BufRead, W: Write + Send>(
     let mut streamed_text = false;
     loop {
         let message = read_message(reader)?;
-        respond_to_server_request_on_session(session, &message)?;
+        respond_to_server_request_on_session(session, &message, events)?;
+        handle_server_request_resolved(session, &message, events)?;
         forward_agent_notification(&message, events)?;
         ensure_server_method_is_defined(&message)?;
 
@@ -1049,7 +1174,9 @@ fn drive_session<R: BufRead, W: Write + Send>(
                 return Ok(outcome);
             }
             Some(
-                "turn/started"
+                "item/commandExecution/requestApproval"
+                | "serverRequest/resolved"
+                | "turn/started"
                 | "error"
                 | "thread/settings/updated"
                 | "warning"
@@ -1068,7 +1195,9 @@ fn drive_session<R: BufRead, W: Write + Send>(
 fn is_defined_server_method(method: &str) -> bool {
     matches!(
         method,
-        "item/started"
+        "item/commandExecution/requestApproval"
+            | "serverRequest/resolved"
+            | "item/started"
             | "item/agentMessage/delta"
             | "item/commandExecution/outputDelta"
             | "item/completed"
@@ -1478,15 +1607,16 @@ fn wait_for_response(
     }
 }
 
-fn wait_for_session_response<R: BufRead, W: Write + Send>(
+fn wait_for_session_response<R: BufRead, W: Write + Send + 'static>(
     reader: &mut R,
-    session: &CodexTurnSession<W>,
+    session: &Arc<CodexTurnSession<W>>,
     expected_id: u64,
     events: &Sender<AgentEvent>,
 ) -> Result<Value> {
     loop {
         let message = read_message(reader)?;
-        respond_to_server_request_on_session(session, &message)?;
+        respond_to_server_request_on_session(session, &message, events)?;
+        handle_server_request_resolved(session, &message, events)?;
         forward_agent_notification(&message, events)?;
         ensure_server_method_is_defined(&message)?;
         if message.get("id").and_then(Value::as_u64) != Some(expected_id) {
@@ -1518,14 +1648,26 @@ fn respond_to_server_request(writer: &mut impl Write, message: &Value) -> Result
     )
 }
 
-fn respond_to_server_request_on_session<W: Write + Send>(
-    session: &CodexTurnSession<W>,
+fn respond_to_server_request_on_session<W: Write + Send + 'static>(
+    session: &Arc<CodexTurnSession<W>>,
     message: &Value,
+    events: &Sender<AgentEvent>,
 ) -> Result<()> {
     let Some(id) = message.get("id") else {
         return Ok(());
     };
-    if message.get("method").is_none() {
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if method == "item/commandExecution/requestApproval" {
+        let (request_id, request, params, available_decisions) =
+            parse_command_approval_request(message)?;
+        session.register_command_approval(request_id.clone(), params, available_decisions)?;
+        let control: Arc<dyn AgentApprovalControl> = session.clone();
+        let responder = AgentApprovalHandle::new(request_id, control);
+        events
+            .send_blocking(AgentEvent::CommandApprovalRequested { request, responder })
+            .map_err(|_| anyhow!("Composer 审批事件通道已经关闭"))?;
         return Ok(());
     }
     session.send(json!({
@@ -1537,6 +1679,123 @@ fn respond_to_server_request_on_session<W: Write + Send>(
     }))
 }
 
+fn parse_command_approval_request(
+    message: &Value,
+) -> Result<(
+    AgentServerRequestId,
+    AgentCommandApprovalRequest,
+    Value,
+    Vec<Value>,
+)> {
+    let request_id = request_id_from_value(
+        message
+            .get("id")
+            .context("command approval request 缺少 JSON-RPC id")?,
+    )?;
+    let params = message
+        .get("params")
+        .and_then(Value::as_object)
+        .context("command approval request 缺少对象 params")?;
+    for field in ["kind", "threadId", "turnId", "itemId"] {
+        params
+            .get(field)
+            .and_then(Value::as_str)
+            .with_context(|| format!("command approval params.{field} 必须是字符串"))?;
+    }
+    params
+        .get("startedAtMs")
+        .and_then(Value::as_i64)
+        .context("command approval params.startedAtMs 必须是 int64")?;
+    match params.get("environmentId") {
+        Some(Value::String(_) | Value::Null) => {}
+        _ => bail!("command approval params.environmentId 必须是字符串或 null"),
+    }
+
+    let available_decisions = match params.get("availableDecisions") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(decisions)) => decisions.clone(),
+        Some(_) => bail!("command approval params.availableDecisions 必须是数组或 null"),
+    };
+    let allow_once = available_decisions
+        .iter()
+        .any(|decision| decision.as_str() == Some("accept"));
+    let decline = available_decisions
+        .iter()
+        .any(|decision| decision.as_str() == Some("decline"));
+    let accept_with_execpolicy_amendment = available_decisions
+        .iter()
+        .find(|decision| decision.get("acceptWithExecpolicyAmendment").is_some())
+        .cloned();
+
+    let optional_string = |field: &str| -> Result<Option<String>> {
+        match params.get(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.clone())),
+            Some(_) => bail!("command approval params.{field} 必须是字符串或 null"),
+        }
+    };
+    let command = optional_string("command")?
+        .or_else(|| {
+            params
+                .get("commandActions")
+                .and_then(Value::as_array)
+                .and_then(|actions| actions.first())
+                .and_then(|action| action.get("command"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    let network_host = match params.get("networkApprovalContext") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(context)) => Some(
+            context
+                .get("host")
+                .and_then(Value::as_str)
+                .context("command approval params.networkApprovalContext.host 必须是字符串")?
+                .to_owned(),
+        ),
+        Some(_) => bail!("command approval params.networkApprovalContext 必须是对象或 null"),
+    };
+    let request = AgentCommandApprovalRequest {
+        request_id: request_id.clone(),
+        command,
+        reason: optional_string("reason")?,
+        network_host,
+        allow_once,
+        decline,
+        accept_with_execpolicy_amendment,
+    };
+    Ok((
+        request_id,
+        request,
+        Value::Object(params.clone()),
+        available_decisions,
+    ))
+}
+
+fn handle_server_request_resolved<W: Write + Send>(
+    session: &CodexTurnSession<W>,
+    message: &Value,
+    events: &Sender<AgentEvent>,
+) -> Result<()> {
+    if message.get("method").and_then(Value::as_str) != Some("serverRequest/resolved") {
+        return Ok(());
+    }
+    message
+        .pointer("/params/threadId")
+        .and_then(Value::as_str)
+        .context("serverRequest/resolved 缺少字符串 params.threadId")?;
+    let request_id = request_id_from_value(
+        message
+            .pointer("/params/requestId")
+            .context("serverRequest/resolved 缺少 params.requestId")?,
+    )?;
+    session.resolve_command_approval(&request_id)?;
+    events
+        .send_blocking(AgentEvent::CommandApprovalResolved { request_id })
+        .map_err(|_| anyhow!("Composer 审批事件通道已经关闭"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1544,22 +1803,51 @@ mod tests {
         path::{Path, PathBuf},
         process::Command,
         sync::Arc,
+        time::{Duration, Instant},
     };
 
     use serde_json::{Value, json};
 
     use super::{
-        AgentConfigWarning, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
-        AgentInterruptOutcome, AgentPermissionMode, AgentRequest, AgentThreadSettings,
-        AppServerProcess, CodexTurnSession, INITIALIZE_ID, MODEL_LIST_PAGE_SIZE,
+        AgentBackend, AgentCommandApprovalChoice, AgentConfigWarning, AgentEvent,
+        AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome, AgentPermissionMode,
+        AgentRequest, AgentServerRequestId, AgentThreadSettings, AppServerProcess,
+        CodexAppServerBackend, CodexTurnSession, INITIALIZE_ID, MODEL_LIST_PAGE_SIZE,
         PASSIVE_SERVER_METHODS, TurnOutcome, UNDEFINED_METHOD_PARAMS_LIMIT, drive_model_catalog,
         drive_permission_profiles, drive_session, drive_thread_settings_update,
-        ensure_server_method_is_defined, parse_agent_notification, thread_settings_update_request,
-        wait_for_response,
+        ensure_server_method_is_defined, handle_server_request_resolved, parse_agent_notification,
+        respond_to_server_request_on_session, run_model_catalog_process,
+        thread_settings_update_request, wait_for_response,
     };
 
+    fn command_approval_request(id: Value) -> Value {
+        json!({
+            "id": id,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "kind": "command",
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "itemId": "item_1",
+                "startedAtMs": 1_777_777_777_000_i64,
+                "environmentId": null,
+                "reason": "需要读取版本",
+                "command": "git --version",
+                "cwd": "/tmp",
+                "commandActions": [{"type":"unknown","command":"git --version"}],
+                "proposedExecpolicyAmendment": ["git", "--version"],
+                "availableDecisions": [
+                    "accept",
+                    {"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["git","--version"]}},
+                    "decline"
+                ]
+            }
+        })
+    }
+
     fn take_session_output(session: &CodexTurnSession<Vec<u8>>) -> Vec<u8> {
-        session.writer.lock().unwrap().take().unwrap()
+        let mut writer = session.writer.lock().unwrap();
+        std::mem::take(writer.as_mut().unwrap())
     }
 
     fn turn_start_for_mode(mode: AgentPermissionMode, cwd: PathBuf) -> Value {
@@ -1570,7 +1858,7 @@ mod tests {
             "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_permissions\",\"turn\":{\"id\":\"turn_permissions\",\"status\":\"completed\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
-        let session = CodexTurnSession::new(Vec::new(), None);
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
         let (tx, _rx) = async_channel::unbounded();
         drive_session(
             &mut reader,
@@ -1851,7 +2139,7 @@ mod tests {
             "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
-        let session = CodexTurnSession::new(Vec::new(), None);
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
         let (tx, rx) = async_channel::unbounded();
         let outcome = drive_session(
             &mut reader,
@@ -2015,7 +2303,7 @@ mod tests {
             "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_interrupt\",\"turn\":{\"id\":\"turn_interrupt\",\"status\":\"interrupted\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
-        let session = CodexTurnSession::new(Vec::new(), None);
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
         let (tx, rx) = async_channel::unbounded();
 
         assert_eq!(
@@ -2092,7 +2380,7 @@ mod tests {
 
     #[test]
     fn duplicate_and_finished_interrupts_do_not_write_again() {
-        let session = CodexTurnSession::new(Vec::new(), None);
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
         session
             .activate_turn("thr_1".into(), "turn_1".into())
             .unwrap();
@@ -2226,7 +2514,7 @@ mod tests {
             "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_notices\",\"turn\":{\"id\":\"turn_notices\",\"status\":\"completed\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
-        let session = CodexTurnSession::new(Vec::new(), None);
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
         let (tx, rx) = async_channel::unbounded();
 
         let outcome = drive_session(
@@ -2294,7 +2582,7 @@ mod tests {
             "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_failed\",\"turn\":{\"id\":\"turn_failed\",\"status\":\"failed\",\"error\":{\"message\":\"模型请求失败\",\"additionalDetails\":\"上游返回 503\"}}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
-        let session = CodexTurnSession::new(Vec::new(), None);
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
         let (tx, rx) = async_channel::unbounded();
 
         let outcome = drive_session(
@@ -2417,20 +2705,79 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_command_approval_is_rejected_instead_of_entering_live_ui() {
-        let mut reader = Cursor::new(
-            b"{\"id\":77,\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"itemId\":\"item_1\"}}\n",
+    fn command_approval_enters_live_ui_and_replies_exactly_once() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let message = command_approval_request(json!(77));
+
+        respond_to_server_request_on_session(&session, &message, &tx).unwrap();
+        assert!(take_session_output(&session).is_empty());
+        let pending = session.pending_approval_snapshot();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, AgentServerRequestId::Number(77));
+        assert_eq!(pending[0].1, message["params"]);
+        assert!(!pending[0].2);
+
+        let event = rx.try_recv().unwrap();
+        let AgentEvent::CommandApprovalRequested { request, responder } = event else {
+            panic!("expected command approval event");
+        };
+        assert_eq!(request.request_id, AgentServerRequestId::Number(77));
+        assert_eq!(request.command, "git --version");
+        assert!(request.allow_once);
+        assert!(request.decline);
+        assert!(request.accept_with_execpolicy_amendment.is_some());
+
+        responder
+            .respond(AgentCommandApprovalChoice::Accept)
+            .unwrap();
+        let response: Value = serde_json::from_slice(&take_session_output(&session)).unwrap();
+        assert_eq!(response, json!({"id":77,"result":{"decision":"accept"}}));
+        let duplicate = responder
+            .respond(AgentCommandApprovalChoice::Decline)
+            .unwrap_err();
+        assert!(duplicate.contains("拒绝重复 decision"));
+        assert!(take_session_output(&session).is_empty());
+    }
+
+    #[test]
+    fn command_approval_preserves_string_ids_and_raw_execpolicy_decision() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        respond_to_server_request_on_session(&session, &command_approval_request(json!("77")), &tx)
+            .unwrap();
+        respond_to_server_request_on_session(&session, &command_approval_request(json!(77)), &tx)
+            .unwrap();
+        assert_eq!(session.pending_approval_snapshot().len(), 2);
+
+        let first = rx.try_recv().unwrap();
+        let AgentEvent::CommandApprovalRequested { request, responder } = first else {
+            panic!("expected command approval event");
+        };
+        assert_eq!(
+            request.request_id,
+            AgentServerRequestId::String("77".into())
         );
-        let mut output = Vec::new();
+        responder
+            .respond(AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment)
+            .unwrap();
+        let response: Value = serde_json::from_slice(&take_session_output(&session)).unwrap();
+        assert_eq!(response["id"], json!("77"));
+        assert_eq!(
+            response["result"]["decision"],
+            json!({"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["git","--version"]}})
+        );
 
-        let error = wait_for_response(&mut reader, &mut output, INITIALIZE_ID, None)
-            .unwrap_err()
-            .to_string();
-        let response = String::from_utf8(output).unwrap();
-
-        assert!(error.contains("item/commandExecution/requestApproval"));
-        assert!(response.contains("\"id\":77"));
-        assert!(response.contains("\"code\":-32601"));
+        let second = rx.try_recv().unwrap();
+        let AgentEvent::CommandApprovalRequested { request, responder } = second else {
+            panic!("expected second command approval event");
+        };
+        assert_eq!(request.request_id, AgentServerRequestId::Number(77));
+        responder
+            .respond(AgentCommandApprovalChoice::Decline)
+            .unwrap();
+        let response: Value = serde_json::from_slice(&take_session_output(&session)).unwrap();
+        assert_eq!(response, json!({"id":77,"result":{"decision":"decline"}}));
     }
 
     #[test]
@@ -2467,19 +2814,85 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_server_request_resolved_notification_is_undefined() {
-        let mut reader = Cursor::new(
-            b"{\"method\":\"serverRequest/resolved\",\"params\":{\"threadId\":\"thr_1\",\"requestId\":77}}\n",
+    fn server_request_resolved_clears_only_the_matching_pending_request() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        for id in [json!(77), json!("77")] {
+            respond_to_server_request_on_session(&session, &command_approval_request(id), &tx)
+                .unwrap();
+            rx.try_recv().unwrap();
+        }
+
+        let resolved = json!({
+            "method":"serverRequest/resolved",
+            "params":{"threadId":"thr_1","requestId":77}
+        });
+        handle_server_request_resolved(&session, &resolved, &tx).unwrap();
+        assert_eq!(session.pending_approval_snapshot().len(), 1);
+        assert_eq!(
+            session.pending_approval_snapshot()[0].0,
+            AgentServerRequestId::String("77".into())
         );
-        let mut output = Vec::new();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AgentEvent::CommandApprovalResolved {
+                request_id: AgentServerRequestId::Number(77)
+            }
+        );
+        ensure_server_method_is_defined(&resolved).unwrap();
+    }
 
-        let error = wait_for_response(&mut reader, &mut output, INITIALIZE_ID, None)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("serverRequest/resolved"));
-        assert!(error.contains("通知"));
-        assert!(output.is_empty());
+    #[test]
+    #[ignore = "requires a logged-in local Codex CLI and makes one model request"]
+    fn real_cli_safe_network_command_accept_once_round_trip() {
+        let catalog = run_model_catalog_process().unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.is_default)
+            .unwrap_or(&catalog.models[0]);
+        let run = CodexAppServerBackend::new().run_prompt(AgentRequest {
+            prompt: "Use the shell to run exactly `curl -I https://example.com` and no other command. Request approval for network access, then wait for my decision.".into(),
+            cwd: std::env::current_dir().unwrap(),
+            thread_id: None,
+            model: model.model.clone(),
+            effort: model.default_reasoning_effort.clone(),
+            service_tier: model.default_service_tier.clone(),
+            permission_mode: AgentPermissionMode::Request,
+        });
+        let (events, _interrupt) = run.into_parts();
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let mut approval_id = None;
+        let mut resolved = false;
+        let mut completed = false;
+        while Instant::now() < deadline && !completed {
+            match events.try_recv() {
+                Ok(AgentEvent::CommandApprovalRequested { request, responder }) => {
+                    eprintln!("real command approval: {request:#?}");
+                    assert!(request.allow_once);
+                    approval_id = Some(request.request_id);
+                    responder
+                        .respond(AgentCommandApprovalChoice::Accept)
+                        .unwrap();
+                }
+                Ok(AgentEvent::CommandApprovalResolved { request_id }) => {
+                    assert_eq!(Some(&request_id), approval_id.as_ref());
+                    resolved = true;
+                }
+                Ok(AgentEvent::Completed) => completed = true,
+                Ok(AgentEvent::Failed(error)) => panic!("real CLI turn failed: {error}"),
+                Ok(_) | Err(async_channel::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(async_channel::TryRecvError::Closed) => break,
+            }
+        }
+        assert!(
+            approval_id.is_some(),
+            "real CLI did not request command approval"
+        );
+        assert!(resolved, "real CLI did not emit serverRequest/resolved");
+        assert!(completed, "real CLI turn did not complete after accept");
     }
 
     #[test]
@@ -2510,7 +2923,7 @@ mod tests {
             "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
-        let session = CodexTurnSession::new(Vec::new(), None);
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
         let (tx, rx) = async_channel::unbounded();
 
         let outcome = drive_session(
@@ -2552,7 +2965,7 @@ mod tests {
             "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
-        let session = CodexTurnSession::new(Vec::new(), None);
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
         let (tx, rx) = async_channel::unbounded();
 
         let error = drive_session(
@@ -2606,7 +3019,7 @@ mod tests {
         );
 
         let mut reader = Cursor::new(input.as_bytes());
-        let session = CodexTurnSession::new(Vec::new(), None);
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
         let (tx, rx) = async_channel::unbounded();
         let outcome = drive_session(
             &mut reader,
@@ -2656,7 +3069,7 @@ mod tests {
             "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
-        let session = CodexTurnSession::new(Vec::new(), None);
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
         let (tx, rx) = async_channel::unbounded();
         let outcome = drive_session(
             &mut reader,

@@ -2,7 +2,7 @@
 
 > 基准版本：`codex-cli 0.150.1`
 > 生成日期：2026-08-30
-> 接入状态更新：2026-08-30
+> 接入状态更新：2026-08-31
 > 范围：`codex app-server generate-ts --experimental` 输出的全部方法联合类型，并与默认 TypeScript schema 对比标注能力门槛；同时用 JSON Schema 交叉校验字段定义。
 
 ## 结论
@@ -53,11 +53,13 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 
 | 已接入 JSON-RPC 方法 | 方向 | 内部协议 | 接入职责 |
 |---|---|---|---|
-| `initialize`、`initialized` | 客户端 → 服务端 | `initialize_connection` 连接生命周期（无 `AgentEvent`） | 为模型目录连接和 prompt 连接建立初始化握手；按本机 0.150.1 schema 显式声明 `capabilities.experimentalApi: false`、`requestAttestation: false` |
+| `initialize`、`initialized` | 客户端 → 服务端 | `initialize_connection` 连接生命周期（无 `AgentEvent`） | 为模型目录连接和 prompt 连接建立初始化握手；按本机 0.150.1 schema 显式声明 `capabilities.experimentalApi: true`、`requestAttestation: false` |
 | `model/list` | 客户端 → 服务端 | `CodexAppServerBackend::load_model_catalog` → `AgentModelCatalog` | 使用 `cursor`/`nextCursor` 拉取全部可见页；映射 model、`displayName`、默认模型、effort 与 service tier |
 | `thread/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session` → `AgentEvent::ThreadCreated` | 首回合创建可复用 thread，传入所选 `model`、`serviceTier`；不再发送固定权限字段 |
 | `turn/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 提交文本 prompt；新 thread 首回合同时携带 Composer 模式对应的完整权限字段，后续回合复用已生效的 thread 设置 |
 | `turn/interrupt` | 客户端 → 服务端 | `AgentInterruptHandle::interrupt` → `CodexTurnSession` | 在原 stdio 连接上使用已保存的 `threadId`、`turnId` 发送一次中断；开始阶段的停止请求会排队，重复请求及已结束 turn 不会重复写入 |
+| `item/commandExecution/requestApproval` | 服务端 → 客户端反向请求 | `AgentEvent::CommandApprovalRequested` + `AgentApprovalHandle` | 保存原始 string/int64 request id、完整 params 与每请求的 `availableDecisions`；Composer 复用 `ApprovalCardViewModel`/`render_approval_card`。允许一次回 `accept`，拒绝回 `decline`，“允许类似命令”原样回传服务端的 `acceptWithExecpolicyAmendment`；未提供的选项不显示也不能回传 |
+| `serverRequest/resolved` | 服务端 → 客户端 | `AgentEvent::CommandApprovalResolved` | 按保留原始类型的 request id 清理 pending registry、responder 和对应审批卡片；数字 `7` 与字符串 `"7"` 独立管理 |
 | `turn/started` | 服务端 → 客户端 | `AgentEvent::Started` | 将 `Starting` 推进到可见的 `Thinking` 运行态；保留停止按钮与活动状态，不结束事件流 |
 | `error` | 服务端 → 客户端 | `AgentEvent::Error { message, details, will_retry }` | `willRetry: true` 显示低强调重试活动行，`false` 显示错误 Notice；两者都保持非终止，等待 `turn/completed` 决定最终状态 |
 | `thread/settings/updated` | 服务端 → 客户端 | `AgentEvent::ThreadSettingsUpdated` | 静默同步模型、effort、service tier 与 effective 权限；当前状态由 Composer 控件直接呈现，不额外显示状态行 |
@@ -72,7 +74,9 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 | `model/safetyBuffering/updated` | 服务端 → 客户端 | `AgentEvent::ModelSafetyBufferingUpdated` | 更新实际模型和暂态安全检查提示，结束 buffering 时清除提示 |
 | `turn/completed` | 服务端 → 客户端 | `AgentEvent::Completed` / `AgentEvent::Interrupted` / `AgentEvent::Failed(String)` | 校验匹配的 `threadId`、`turnId`，按 `completed`、`interrupted`、`failed` 终态结束本轮；失败会合并 `error.message` 与 `additionalDetails`，终态后回收 stdin 与 app-server 子进程 |
 
-Prompt 会话的 stdin 由可并发写入的 `CodexTurnSession` 持续持有，当前 `threadId` 与 `turnId` 会保留到终态。点击停止后 Composer 只进入 `Stopping`，不会截断事件流或伪造本地完成；只有收到匹配 turn 的 `turn/completed` 且状态为 `interrupted` 后才转为 `Stopped`。若任务先自然完成，则保留 `Complete`；若中断写入或连接失败，则进入 `Failed`。控制句柄丢弃、协议异常和正常终态都走幂等的关闭、kill、wait 路径，避免重复停止与退出竞态留下子进程。
+Prompt 会话的 stdin 由可并发写入的 `CodexTurnSession` 持续持有，当前 `threadId` 与 `turnId` 会保留到终态。同一个 session 还维护线程安全的多请求 command approval registry；decision 在写 stdin 前会再次校验该请求的 `availableDecisions` 并原子标记已回复，因此重复点击、resolved 后点击和跨请求 decision 都不会产生第二次写入。点击停止后 Composer 只进入 `Stopping`，不会截断事件流或伪造本地完成；只有收到匹配 turn 的 `turn/completed` 且状态为 `interrupted` 后才转为 `Stopped`。若任务先自然完成，则保留 `Complete`；若中断写入或连接失败，则进入 `Failed`。控制句柄丢弃、协议异常和正常终态都走幂等的关闭、kill、wait 路径，避免重复停止与退出竞态留下子进程。
+
+真实 CLI smoke test 使用当前默认模型申请执行只读网络命令 `curl -I https://example.com`：app-server 发出数字 request id `0`，该次 `availableDecisions` 仅包含 `accept` 与 `acceptWithExecpolicyAmendment`（没有 `decline`）；客户端因此只暴露允许项，选择“允许一次”后精确回传 `{"decision":"accept"}`，随后收到同 id 的 `serverRequest/resolved` 并正常完成 turn。测试没有持久化 execpolicy amendment，也没有修改本地文件。
 
 选择器不再维护模型硬编码目录。目录加载完成后优先选择 `isDefault: true` 的模型（缺失时退回首项），使用该模型的 `defaultReasoningEffort` 和 `defaultServiceTier`；切换模型时重新应用目标模型的默认项。高级菜单、键盘导航及简化 effort 滑杆都按当前目录长度动态生成。`ThreadStartParams` 的本机 schema 没有 `effort` 字段，因此 effort 按 schema 仅发送给 `turn/start`，没有通过未定义字段塞入 `thread/start`。
 
@@ -82,7 +86,7 @@ Composer 的视觉层以本机 ChatGPT App（CDP `127.0.0.1:9222`）的实际计
 
 ### Composer 权限模式：真实 wire 取证、UI 恢复与协议边界
 
-2026-08-31 Composer 四种权限模式已接入 JSON-RPC。首回合创建可复用 thread 并在 `turn/start` 发送权限字段；已有 thread 切换通过 `thread/settings/update`，且只以 `thread/settings/updated` 保存服务端 effective 权限。RPC 失败保留原 effective 设置并显示错误。审批交互类 `item/*/requestApproval` 仍不在本次范围内。
+2026-08-31 Composer 四种权限模式已接入 JSON-RPC。首回合创建可复用 thread 并在 `turn/start` 发送权限字段；已有 thread 切换通过 `thread/settings/update`，且只以 `thread/settings/updated` 保存服务端 effective 权限。RPC 失败保留原 effective 设置并显示错误。审批交互中仅 `item/commandExecution/requestApproval` 与其 `serverRequest/resolved` 生命周期已接入；`item/fileChange/requestApproval`、`item/permissions/requestApproval` 等其他反向请求仍未接入并返回 `-32601`。
 
 2026-08-30 已在真实 ChatGPT App 上对已有 thread `01a05195-1b99-7012-ac56-d651e2fada02` 分别选择四种模式。下表 request 列是 `thread/settings/update.params` 除 `threadId` 外的全部字段；四次 response 均为精确的 `result: {}`，不包含有效设置；最后一列只摘录随后 `thread/settings/updated.params.threadSettings` 中的权限相关服务端有效值。`V` 是该 thread 的 `/Users/zp/.codex/visualizations/2026/08/30/01a05195-1b99-7012-ac56-d651e2fada02`。
 
@@ -128,7 +132,7 @@ Assist 的三个值必须分层保存：菜单选择 request 发送 `guardian_su
 
 | 表面 | 严格逐状态结果 | 诊断与协议状态 |
 |---|---|---|
-| 命令/网络审批 pending | dark default/approve-hover/decline-hover/options/options-focus：`99.377621 / 99.324033 / 99.380064 / 98.971475 / 98.958139%`；light：`99.276492 / 99.218457 / 99.279315 / 98.738763 / 98.720820%` | blocked；`item/commandExecution/requestApproval` 仍返回 `-32601` |
+| 命令/网络审批 pending | dark default/approve-hover/decline-hover/options/options-focus：`99.377621 / 99.324033 / 99.380064 / 98.971475 / 98.958139%`；light：`99.276492 / 99.218457 / 99.279315 / 98.738763 / 98.720820%` | 视觉诊断仍 blocked；真实 `item/commandExecution/requestApproval` 已接入，按钮严格由 `availableDecisions` 裁剪 |
 | 命令审批关闭态 | 真实 renderer 在 approved/declined/resolved 后卸载卡片；旧 `2200×194` 比较主要是背景和 Composer，不是状态局部 UI，已全部撤销；light approved 与 timeout 也没有可用真实参考 | 全部 blocked；不能用卸载后的大背景声明关闭态通过 |
 | 文件修改审批 | 旧单文件 light default/approve-hover/decline-hover/options/options-focus：`99.409058 / 99.352807 / 99.410098 / 98.935915 / 98.920439%`；dark：`99.499727 / 99.447893 / 99.500764 / 99.108220 / 99.099238%`，其中 dark decline-hover 单项 `99.500764%` 独立 ready。自然两文件 default 完整 `736×210`：dark/light `99.004312473782 / 98.817138087119%`；自然八文件完整 `736×344` top：`98.353087495952 / 98.031921396803%`，bottom：`98.349940129827 / 98.028268056464%`；timeout 未触发 | surface gate 仍 blocked；top/bottom 是各自独立 GPUI 滚动状态，不能用 header/action 或旧单文件局部替代，`item/fileChange/requestApproval` 未接入 |
 | `fileChange` activity | 旧单文件 completed light/dark strict `736×65`：`97.735994 / 98.017034%`；与 request 2106 对应的自然两文件 completed 完整 `736×138` dark/light：`98.069895412481 / 98.067142499722%`；started/failed 没有独立真实参考 | blocked；两个真实文件行均已渲染，Undo 因缺少真实反转领域操作继续移除，没有扩展生产 `item/started` / `item/completed` |
@@ -139,7 +143,7 @@ Assist 的三个值必须分层保存：菜单选择 request 发送 `guardian_su
 
 候选组件仍有完整性或证据缺口：长/多行命令预览仍只有已实采的单行几何；审批控件使用 surface-owned 逻辑焦点，Diff 尚无完整键盘操作。文件审批、完成态重复文件行和完整多行 Diff 的首项/首行限制已经移除，Review/Copy/Open 已改用真实领域 presentation/path；多题已实现 header 内 previous/`N of M`/next、真实 DOM 顺序的 Tab/Enter、答案保持、最终提交、逐题跳过、dismiss/resolved。Other 已改为 `EntityInputHandler` 原生输入并覆盖 IME、光标、选区、剪贴板、删除、方向键、Enter 与 secret mask。数值相似度现在用于指导继续对齐，不再隐藏已实现的 UI；缺少真实参考的 started/failed/timeout/error 状态仍不会凭空设计。
 
-`serverRequest/resolved` 仍保持未定义，因为按 request id 管理的 pending registry、回复和卸载闭环尚未接入，而不是因为像素分数。协议回归测试仍锁定四类反向请求返回 `-32601`，`serverRequest/resolved` 与 `turn/diff/updated` 进入 undefined-method 错误，`fileChange` item 不提前生成领域事件；不会静默自动批准或伪造本地完成。
+`serverRequest/resolved` 已接入 command approval 的 pending registry、回复和卸载闭环。协议回归测试锁定 command approval 的解析、原始 string/int64 id、准确 response、原样 execpolicy amendment、重复点击、多 pending、resolved 和 Composer UI 集成；其余反向请求仍返回 `-32601`，`turn/diff/updated` 仍进入 undefined-method 错误，`fileChange` item 不提前生成领域事件；不会静默自动批准或伪造本地完成。
 
 下方总表中，“是”表示消息已转换为内部协议并由应用消费；“已知（no-op）”表示适配器会显式接受该通知，但不生成 `AgentEvent`；“否”表示尚未定义或接入，实际收到时会进入未定义方法错误处理。
 
@@ -310,7 +314,7 @@ Assist 的三个值必须分层保存：菜单选择 request 发送 `guardian_su
 
 | # | Method | 消息形式 | Params schema | 能力门槛 / 状态 | 内部方法 | 是否接入 |
 |---:|---|---|---|---|---|:---:|
-| 1 | `item/commandExecution/requestApproval` | 反向请求（有 `id`） | `CommandExecutionRequestApprovalParams` | 默认 | — | 否 |
+| 1 | `item/commandExecution/requestApproval` | 反向请求（有 `id`） | `CommandExecutionRequestApprovalParams` | 默认；`availableDecisions` 为 experimental 字段 | `CodexTurnSession` registry → `AgentEvent::CommandApprovalRequested` → Composer 现有审批卡片 → `AgentApprovalHandle` response | 是 |
 | 2 | `item/fileChange/requestApproval` | 反向请求（有 `id`） | `FileChangeRequestApprovalParams` | 默认 | — | 否 |
 | 3 | `item/tool/requestUserInput` | 反向请求（有 `id`） | `ToolRequestUserInputParams` | 默认 | — | 否 |
 | 4 | `mcpServer/elicitation/request` | 反向请求（有 `id`） | `McpServerElicitationRequestParams` | 默认 | — | 否 |
@@ -373,7 +377,7 @@ Assist 的三个值必须分层保存：菜单选择 request 发送 `guardian_su
 | 39 | `item/commandExecution/terminalInteraction` | 通知（无 `id`） | `TerminalInteractionNotification` | 默认 | — | 否 |
 | 40 | `item/fileChange/outputDelta` | 通知（无 `id`） | `FileChangeOutputDeltaNotification` | 默认；已弃用 | — | 否 |
 | 41 | `item/fileChange/patchUpdated` | 通知（无 `id`） | `FileChangePatchUpdatedNotification` | 默认 | — | 否 |
-| 42 | `serverRequest/resolved` | 通知（无 `id`） | `ServerRequestResolvedNotification` | 默认 | — | 否 |
+| 42 | `serverRequest/resolved` | 通知（无 `id`） | `ServerRequestResolvedNotification` | 默认 | `CodexTurnSession` registry → `AgentEvent::CommandApprovalResolved` → Composer 定点卸载 | 是 |
 | 43 | `item/mcpToolCall/progress` | 通知（无 `id`） | `McpToolCallProgressNotification` | 默认 | — | 否 |
 | 44 | `mcpServer/oauthLogin/completed` | 通知（无 `id`） | `McpServerOauthLoginCompletedNotification` | 默认 | — | 否 |
 | 45 | `mcpServer/startupStatus/updated` | 通知（无 `id`） | `McpServerStatusUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
