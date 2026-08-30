@@ -1,5 +1,6 @@
 use std::{
     io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -13,15 +14,20 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    AgentBackend, AgentConfigWarning, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
-    AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentReasoningEffort, AgentRequest,
-    AgentRun, AgentServiceTier, AgentThreadSettings, CommandExecution, CommandExecutionStatus,
+    AgentActivePermissionProfile, AgentBackend, AgentConfigWarning, AgentEffectivePermissions,
+    AgentEvent, AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome, AgentModel,
+    AgentModelCatalog, AgentPermissionMode, AgentPermissionProfile, AgentReasoningEffort,
+    AgentRequest, AgentRun, AgentServiceTier, AgentThreadSettings, CommandExecution,
+    CommandExecutionStatus,
 };
 
 const INITIALIZE_ID: u64 = 1;
 const THREAD_START_ID: u64 = 2;
 const TURN_START_ID: u64 = 3;
 const TURN_INTERRUPT_ID: u64 = 4;
+const THREAD_SETTINGS_UPDATE_ID: u64 = 2;
+#[allow(dead_code)]
+const PERMISSION_PROFILE_LIST_ID: u64 = 2;
 const MODEL_LIST_FIRST_ID: u64 = 2;
 const MODEL_LIST_PAGE_SIZE: u32 = 50;
 const UNDEFINED_METHOD_PARAMS_LIMIT: usize = 2_000;
@@ -46,6 +52,25 @@ struct ModelListResponse {
     data: Vec<ModelListEntry>,
     #[serde(default)]
     next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct PermissionProfileListResponse {
+    data: Vec<PermissionProfileListEntry>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct PermissionProfileListEntry {
+    id: String,
+    allowed: bool,
+    #[serde(default)]
+    extends: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -387,6 +412,33 @@ impl AgentBackend for CodexAppServerBackend {
         catalog_rx
     }
 
+    fn load_permission_profiles(
+        &self,
+        cwd: PathBuf,
+    ) -> Receiver<Result<Vec<AgentPermissionProfile>, String>> {
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = run_permission_profile_process(&cwd).map_err(|error| format!("{error:#}"));
+            let _ = tx.send_blocking(result);
+        });
+        rx
+    }
+
+    fn update_thread_permissions(
+        &self,
+        thread_id: String,
+        cwd: PathBuf,
+        mode: AgentPermissionMode,
+    ) -> Receiver<Result<AgentThreadSettings, String>> {
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = run_thread_settings_update_process(&thread_id, &cwd, mode)
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send_blocking(result);
+        });
+        rx
+    }
+
     fn run_prompt(&self, request: AgentRequest) -> AgentRun {
         let (events_tx, events_rx) = async_channel::unbounded();
         let interrupt = match spawn_prompt_session() {
@@ -423,6 +475,47 @@ impl AgentBackend for CodexAppServerBackend {
         };
         AgentRun::new(events_rx, interrupt)
     }
+}
+
+fn with_app_server<T>(
+    drive: impl FnOnce(&mut BufReader<ChildStdout>, &mut ChildStdin) -> Result<T>,
+) -> Result<T> {
+    let mut child = Command::new("codex")
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("无法启动 `codex app-server --stdio`；请确认 Codex CLI 已安装并完成登录")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("无法读取 Codex app-server stdout")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("无法写入 Codex app-server stdin")?;
+    let mut reader = BufReader::new(stdout);
+    let result = drive(&mut reader, &mut stdin);
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+#[allow(dead_code)]
+fn run_permission_profile_process(cwd: &Path) -> Result<Vec<AgentPermissionProfile>> {
+    with_app_server(|reader, writer| drive_permission_profiles(reader, writer, cwd))
+}
+
+fn run_thread_settings_update_process(
+    thread_id: &str,
+    cwd: &Path,
+    mode: AgentPermissionMode,
+) -> Result<AgentThreadSettings> {
+    with_app_server(|reader, writer| {
+        drive_thread_settings_update(reader, writer, thread_id, cwd, mode)
+    })
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -493,7 +586,7 @@ fn initialize_connection<R: BufRead, W: Write>(
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "capabilities": {
-                    "experimentalApi": false,
+                    "experimentalApi": true,
                     "requestAttestation": false
                 }
             }
@@ -518,7 +611,7 @@ fn initialize_turn_connection<R: BufRead, W: Write + Send>(
                 "version": env!("CARGO_PKG_VERSION")
             },
             "capabilities": {
-                "experimentalApi": false,
+                "experimentalApi": true,
                 "requestAttestation": false
             }
         }
@@ -582,6 +675,230 @@ fn drive_model_catalog<R: BufRead, W: Write>(
     Ok(AgentModelCatalog { models })
 }
 
+#[allow(dead_code)]
+fn drive_permission_profiles<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    cwd: &Path,
+) -> Result<Vec<AgentPermissionProfile>> {
+    initialize_connection(reader, writer, None)?;
+    send(
+        writer,
+        json!({
+            "method": "permissionProfile/list",
+            "id": PERMISSION_PROFILE_LIST_ID,
+            "params": { "cursor": null, "limit": 100, "cwd": cwd }
+        }),
+    )?;
+    let response = wait_for_response(reader, writer, PERMISSION_PROFILE_LIST_ID, None)?;
+    let page: PermissionProfileListResponse = serde_json::from_value(
+        response
+            .get("result")
+            .cloned()
+            .context("permissionProfile/list 响应缺少 result")?,
+    )
+    .context("无法解析 permissionProfile/list 响应")?;
+    if page.next_cursor.is_some() {
+        bail!("permissionProfile/list 返回了超出 100 项的 profile；当前客户端不应静默截断");
+    }
+    Ok(page
+        .data
+        .into_iter()
+        .map(|profile| AgentPermissionProfile {
+            id: profile.id,
+            allowed: profile.allowed,
+            extends: profile.extends,
+        })
+        .collect())
+}
+
+fn workspace_roots(cwd: &Path, thread_id: &str) -> Vec<String> {
+    let mut roots = vec![cwd.to_string_lossy().into_owned()];
+    if let Some(home) = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+    {
+        let dated = chrono::Local::now().format("%Y/%m/%d").to_string();
+        roots.push(
+            home.join("visualizations")
+                .join(dated)
+                .join(thread_id)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    roots
+}
+
+fn workspace_write_policy(roots: &[String], network_access: bool) -> Value {
+    json!({
+        "type": "workspaceWrite",
+        "writableRoots": roots,
+        "networkAccess": network_access,
+        "excludeTmpdirEnvVar": false,
+        "excludeSlashTmp": false
+    })
+}
+
+fn custom_sandbox_policy(cwd: &Path, roots: &[String]) -> Result<Value> {
+    let config_paths = [
+        std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+            .map(|path| path.join("config.toml")),
+        Some(cwd.join(".codex/config.toml")),
+    ];
+    let mut merged = toml::Value::Table(toml::map::Map::new());
+    for path in config_paths
+        .into_iter()
+        .flatten()
+        .filter(|path| path.is_file())
+    {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("无法读取 {}", path.display()))?;
+        let parsed: toml::Value =
+            toml::from_str(&text).with_context(|| format!("无法解析 {}", path.display()))?;
+        if let (Some(target), Some(source)) = (merged.as_table_mut(), parsed.as_table()) {
+            target.extend(source.clone());
+        }
+    }
+    let mode = merged
+        .get("sandbox_mode")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("workspace-write");
+    match mode {
+        "danger-full-access" => Ok(json!({ "type": "dangerFullAccess" })),
+        "read-only" => Ok(json!({ "type": "readOnly" })),
+        "workspace-write" => {
+            let network = merged
+                .get("sandbox_workspace_write")
+                .and_then(|value| value.get("network_access"))
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false);
+            Ok(workspace_write_policy(roots, network))
+        }
+        other => bail!("config.toml 中的 sandbox_mode `{other}` 不受支持"),
+    }
+}
+
+fn permission_fields(
+    mode: AgentPermissionMode,
+    cwd: &Path,
+    thread_id: &str,
+    existing_thread_update: bool,
+) -> Result<(
+    String,
+    String,
+    Option<Value>,
+    Option<String>,
+    Option<Vec<String>>,
+)> {
+    let roots = workspace_roots(cwd, thread_id);
+    let fields = match mode {
+        AgentPermissionMode::Request => (
+            "on-request".into(),
+            "user".into(),
+            Some(workspace_write_policy(&roots, false)),
+            existing_thread_update.then(|| ":workspace".into()),
+            None,
+        ),
+        AgentPermissionMode::Assist => (
+            "on-request".into(),
+            if existing_thread_update {
+                "guardian_subagent"
+            } else {
+                "auto_review"
+            }
+            .into(),
+            Some(workspace_write_policy(&roots, false)),
+            existing_thread_update.then(|| ":workspace".into()),
+            None,
+        ),
+        AgentPermissionMode::Full => (
+            "never".into(),
+            "user".into(),
+            None,
+            Some(":danger-full-access".into()),
+            (!existing_thread_update).then_some(roots),
+        ),
+        AgentPermissionMode::Custom => (
+            "on-request".into(),
+            "user".into(),
+            Some(custom_sandbox_policy(cwd, &roots)?),
+            None,
+            (!existing_thread_update).then_some(roots),
+        ),
+    };
+    Ok(fields)
+}
+
+fn thread_settings_update_request(
+    id: u64,
+    thread_id: &str,
+    cwd: &Path,
+    mode: AgentPermissionMode,
+) -> Result<Value> {
+    let (approval_policy, approvals_reviewer, sandbox_policy, permissions, _) =
+        permission_fields(mode, cwd, thread_id, true)?;
+    let mut params = serde_json::Map::new();
+    params.insert("threadId".into(), json!(thread_id));
+    params.insert("approvalPolicy".into(), json!(approval_policy));
+    params.insert("approvalsReviewer".into(), json!(approvals_reviewer));
+    if mode == AgentPermissionMode::Custom {
+        params.insert(
+            "sandboxPolicy".into(),
+            sandbox_policy.context("Custom 缺少 sandboxPolicy")?,
+        );
+    } else {
+        params.insert(
+            "permissions".into(),
+            json!(permissions.context("权限模式缺少 profile")?),
+        );
+    }
+    Ok(json!({ "method": "thread/settings/update", "id": id, "params": params }))
+}
+
+fn drive_thread_settings_update<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    thread_id: &str,
+    cwd: &Path,
+    mode: AgentPermissionMode,
+) -> Result<AgentThreadSettings> {
+    initialize_connection(reader, writer, None)?;
+    send(
+        writer,
+        thread_settings_update_request(THREAD_SETTINGS_UPDATE_ID, thread_id, cwd, mode)?,
+    )?;
+    let mut response_ok = false;
+    let mut effective = None;
+    loop {
+        let message = read_message(reader)?;
+        respond_to_server_request(writer, &message)?;
+        ensure_server_method_is_defined(&message)?;
+        if message.get("id").and_then(Value::as_u64) == Some(THREAD_SETTINGS_UPDATE_ID) {
+            if let Some(error) = message.get("error") {
+                bail!("thread/settings/update 失败：{error}");
+            }
+            response_ok = true;
+        }
+        if message.get("method").and_then(Value::as_str) == Some("thread/settings/updated") {
+            if message.pointer("/params/threadId").and_then(Value::as_str) != Some(thread_id) {
+                continue;
+            }
+            let event = parse_agent_notification(&message)?;
+            if let Some(AgentEvent::ThreadSettingsUpdated(settings)) = event
+                && settings.permissions.is_some()
+            {
+                effective = Some(settings);
+            }
+        }
+        if response_ok && effective.is_some() {
+            return Ok(effective.expect("checked above"));
+        }
+    }
+}
+
 fn drive_session<R: BufRead, W: Write + Send>(
     reader: &mut R,
     session: &CodexTurnSession<W>,
@@ -589,37 +906,52 @@ fn drive_session<R: BufRead, W: Write + Send>(
     events: &Sender<AgentEvent>,
 ) -> Result<TurnOutcome> {
     initialize_turn_connection(reader, session, events)?;
-    session.send(json!({
-        "method": "thread/start",
-        "id": THREAD_START_ID,
-        "params": {
-            "cwd": request.cwd,
-            "approvalPolicy": "never",
-            "sandbox": "read-only",
-            "ephemeral": true,
-            "serviceName": "gpui-chat-clone",
-            "model": request.model,
-            "serviceTier": request.service_tier
-        }
-    }))?;
-    let thread_response = wait_for_session_response(reader, session, THREAD_START_ID, events)?;
-    let thread_id = thread_response
-        .pointer("/result/thread/id")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .context("thread/start 响应缺少 result.thread.id")?;
+    let is_new_thread = request.thread_id.is_none();
+    let thread_id = if let Some(thread_id) = &request.thread_id {
+        thread_id.clone()
+    } else {
+        session.send(json!({
+            "method": "thread/start",
+            "id": THREAD_START_ID,
+            "params": {
+                "cwd": request.cwd,
+                "ephemeral": false,
+                "serviceName": "gpui-chat-clone",
+                "model": request.model,
+                "serviceTier": request.service_tier
+            }
+        }))?;
+        let thread_response = wait_for_session_response(reader, session, THREAD_START_ID, events)?;
+        let thread_id = thread_response
+            .pointer("/result/thread/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .context("thread/start 响应缺少 result.thread.id")?;
+        let _ = events.send_blocking(AgentEvent::ThreadCreated {
+            thread_id: thread_id.clone(),
+        });
+        thread_id
+    };
 
-    session.send(json!({
-        "method": "turn/start",
-        "id": TURN_START_ID,
-        "params": {
-            "threadId": thread_id,
-            "input": [{ "type": "text", "text": request.prompt }],
-            "model": request.model,
-            "effort": request.effort,
-            "serviceTier": request.service_tier
-        }
-    }))?;
+    let mut turn_params = serde_json::Map::new();
+    turn_params.insert("threadId".into(), json!(thread_id));
+    turn_params.insert(
+        "input".into(),
+        json!([{ "type": "text", "text": request.prompt }]),
+    );
+    turn_params.insert("model".into(), json!(request.model));
+    turn_params.insert("effort".into(), json!(request.effort));
+    turn_params.insert("serviceTier".into(), json!(request.service_tier));
+    if is_new_thread {
+        let (approval_policy, approvals_reviewer, sandbox_policy, permissions, runtime_roots) =
+            permission_fields(request.permission_mode, &request.cwd, &thread_id, false)?;
+        turn_params.insert("approvalPolicy".into(), json!(approval_policy));
+        turn_params.insert("approvalsReviewer".into(), json!(approvals_reviewer));
+        turn_params.insert("sandboxPolicy".into(), json!(sandbox_policy));
+        turn_params.insert("permissions".into(), json!(permissions));
+        turn_params.insert("runtimeWorkspaceRoots".into(), json!(runtime_roots));
+    }
+    session.send(json!({ "method": "turn/start", "id": TURN_START_ID, "params": turn_params }))?;
     let turn_response = wait_for_session_response(reader, session, TURN_START_ID, events)?;
     let turn_id = turn_response
         .pointer("/result/turn/id")
@@ -864,6 +1196,43 @@ fn parse_agent_notification(message: &Value) -> Result<Option<AgentEvent>> {
         }
         Some("thread/settings/updated") => {
             let _ = required_notification_string(message, "threadId")?;
+            let permissions = match message.pointer("/params/threadSettings/approvalPolicy") {
+                None => None,
+                Some(_) => {
+                    let active_permission_profile =
+                        match message.pointer("/params/threadSettings/activePermissionProfile") {
+                            None | Some(Value::Null) => None,
+                            Some(profile) => Some(AgentActivePermissionProfile {
+                                id: profile
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .context("activePermissionProfile.id 必须是字符串")?
+                                    .to_owned(),
+                                extends: profile
+                                    .get("extends")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                            }),
+                        };
+                    Some(AgentEffectivePermissions {
+                        approval_policy: required_string_at(
+                            message,
+                            "/params/threadSettings/approvalPolicy",
+                            "params.threadSettings.approvalPolicy",
+                        )?,
+                        approvals_reviewer: required_string_at(
+                            message,
+                            "/params/threadSettings/approvalsReviewer",
+                            "params.threadSettings.approvalsReviewer",
+                        )?,
+                        sandbox_policy: message
+                            .pointer("/params/threadSettings/sandboxPolicy")
+                            .filter(|value| !value.is_null())
+                            .cloned(),
+                        active_permission_profile,
+                    })
+                }
+            };
             AgentEvent::ThreadSettingsUpdated(AgentThreadSettings {
                 model: required_string_at(
                     message,
@@ -885,6 +1254,7 @@ fn parse_agent_notification(message: &Value) -> Result<Option<AgentEvent>> {
                     "/params/threadSettings/cwd",
                     "params.threadSettings.cwd",
                 )?,
+                permissions,
             })
         }
         Some("warning") => {
@@ -1169,20 +1539,299 @@ fn respond_to_server_request_on_session<W: Write + Send>(
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, path::PathBuf, process::Command, sync::Arc};
+    use std::{
+        io::Cursor,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::Arc,
+    };
 
     use serde_json::{Value, json};
 
     use super::{
         AgentConfigWarning, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
-        AgentInterruptOutcome, AgentRequest, AgentThreadSettings, AppServerProcess,
-        CodexTurnSession, INITIALIZE_ID, MODEL_LIST_PAGE_SIZE, PASSIVE_SERVER_METHODS, TurnOutcome,
-        UNDEFINED_METHOD_PARAMS_LIMIT, drive_model_catalog, drive_session,
-        ensure_server_method_is_defined, wait_for_response,
+        AgentInterruptOutcome, AgentPermissionMode, AgentRequest, AgentThreadSettings,
+        AppServerProcess, CodexTurnSession, INITIALIZE_ID, MODEL_LIST_PAGE_SIZE,
+        PASSIVE_SERVER_METHODS, TurnOutcome, UNDEFINED_METHOD_PARAMS_LIMIT, drive_model_catalog,
+        drive_permission_profiles, drive_session, drive_thread_settings_update,
+        ensure_server_method_is_defined, parse_agent_notification, thread_settings_update_request,
+        wait_for_response,
     };
 
     fn take_session_output(session: &CodexTurnSession<Vec<u8>>) -> Vec<u8> {
         session.writer.lock().unwrap().take().unwrap()
+    }
+
+    fn turn_start_for_mode(mode: AgentPermissionMode, cwd: PathBuf) -> Value {
+        let input = concat!(
+            "{\"id\":1,\"result\":{}}\n",
+            "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_permissions\"}}}\n",
+            "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_permissions\"}}}\n",
+            "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_permissions\",\"turn\":{\"id\":\"turn_permissions\",\"status\":\"completed\"}}}\n"
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let session = CodexTurnSession::new(Vec::new(), None);
+        let (tx, _rx) = async_channel::unbounded();
+        drive_session(
+            &mut reader,
+            &session,
+            &AgentRequest {
+                prompt: "permission probe".into(),
+                cwd,
+                thread_id: None,
+                model: "gpt-test".into(),
+                effort: "medium".into(),
+                service_tier: None,
+                permission_mode: mode,
+            },
+            &tx,
+        )
+        .unwrap();
+        String::from_utf8(take_session_output(&session))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|message| message.get("method").and_then(Value::as_str) == Some("turn/start"))
+            .unwrap()
+    }
+
+    #[test]
+    fn permission_mode_requests_match_the_four_protocol_shapes() {
+        let cwd = PathBuf::from("/tmp/project");
+        let request =
+            thread_settings_update_request(7, "thr_1", &cwd, AgentPermissionMode::Request).unwrap();
+        assert_eq!(
+            request.pointer("/params/approvalPolicy"),
+            Some(&json!("on-request"))
+        );
+        assert_eq!(
+            request.pointer("/params/approvalsReviewer"),
+            Some(&json!("user"))
+        );
+        assert_eq!(
+            request.pointer("/params/permissions"),
+            Some(&json!(":workspace"))
+        );
+        assert!(request.pointer("/params/sandboxPolicy").is_none());
+
+        let assist =
+            thread_settings_update_request(7, "thr_1", &cwd, AgentPermissionMode::Assist).unwrap();
+        assert_eq!(
+            assist.pointer("/params/approvalsReviewer"),
+            Some(&json!("guardian_subagent"))
+        );
+        assert_eq!(
+            assist.pointer("/params/permissions"),
+            Some(&json!(":workspace"))
+        );
+
+        let full =
+            thread_settings_update_request(7, "thr_1", &cwd, AgentPermissionMode::Full).unwrap();
+        assert_eq!(
+            full.pointer("/params/approvalPolicy"),
+            Some(&json!("never"))
+        );
+        assert_eq!(
+            full.pointer("/params/approvalsReviewer"),
+            Some(&json!("user"))
+        );
+        assert_eq!(
+            full.pointer("/params/permissions"),
+            Some(&json!(":danger-full-access"))
+        );
+
+        let temp =
+            std::env::temp_dir().join(format!("gpui-permission-custom-{}", std::process::id()));
+        std::fs::create_dir_all(temp.join(".codex")).unwrap();
+        std::fs::write(
+            temp.join(".codex/config.toml"),
+            "sandbox_mode = \"danger-full-access\"\n",
+        )
+        .unwrap();
+        let custom =
+            thread_settings_update_request(7, "thr_1", &temp, AgentPermissionMode::Custom).unwrap();
+        assert_eq!(
+            custom.pointer("/params/approvalPolicy"),
+            Some(&json!("on-request"))
+        );
+        assert_eq!(
+            custom.pointer("/params/approvalsReviewer"),
+            Some(&json!("user"))
+        );
+        assert_eq!(
+            custom.pointer("/params/sandboxPolicy/type"),
+            Some(&json!("dangerFullAccess"))
+        );
+        assert!(custom.pointer("/params/permissions").is_none());
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn first_turn_carries_each_permission_mode_and_assist_uses_effective_reviewer() {
+        let request =
+            turn_start_for_mode(AgentPermissionMode::Request, PathBuf::from("/tmp/project"));
+        assert_eq!(
+            request.pointer("/params/approvalPolicy"),
+            Some(&json!("on-request"))
+        );
+        assert_eq!(
+            request.pointer("/params/approvalsReviewer"),
+            Some(&json!("user"))
+        );
+        assert_eq!(
+            request.pointer("/params/sandboxPolicy/type"),
+            Some(&json!("workspaceWrite"))
+        );
+        assert_eq!(request.pointer("/params/permissions"), Some(&Value::Null));
+        assert_eq!(
+            request.pointer("/params/runtimeWorkspaceRoots"),
+            Some(&Value::Null)
+        );
+
+        let assist =
+            turn_start_for_mode(AgentPermissionMode::Assist, PathBuf::from("/tmp/project"));
+        assert_eq!(
+            assist.pointer("/params/approvalsReviewer"),
+            Some(&json!("auto_review"))
+        );
+
+        let full = turn_start_for_mode(AgentPermissionMode::Full, PathBuf::from("/tmp/project"));
+        assert_eq!(
+            full.pointer("/params/permissions"),
+            Some(&json!(":danger-full-access"))
+        );
+        assert_eq!(full.pointer("/params/sandboxPolicy"), Some(&Value::Null));
+        assert!(
+            full.pointer("/params/runtimeWorkspaceRoots")
+                .is_some_and(Value::is_array)
+        );
+
+        let temp = std::env::temp_dir().join(format!(
+            "gpui-permission-turn-custom-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(temp.join(".codex")).unwrap();
+        std::fs::write(
+            temp.join(".codex/config.toml"),
+            "sandbox_mode = \"danger-full-access\"\n",
+        )
+        .unwrap();
+        let custom = turn_start_for_mode(AgentPermissionMode::Custom, temp.clone());
+        assert_eq!(
+            custom.pointer("/params/sandboxPolicy/type"),
+            Some(&json!("dangerFullAccess"))
+        );
+        assert_eq!(custom.pointer("/params/permissions"), Some(&Value::Null));
+        assert!(
+            custom
+                .pointer("/params/runtimeWorkspaceRoots")
+                .is_some_and(Value::is_array)
+        );
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn effective_permission_notification_preserves_auto_review_and_profile() {
+        let message = json!({
+            "method": "thread/settings/updated",
+            "params": { "threadId": "thr_1", "threadSettings": {
+                "model": "gpt-test", "effort": "medium", "serviceTier": null, "cwd": "/tmp/project",
+                "approvalPolicy": "on-request", "approvalsReviewer": "auto_review",
+                "sandboxPolicy": { "type": "workspaceWrite", "writableRoots": ["/tmp/project"] },
+                "activePermissionProfile": { "id": ":workspace", "extends": null }
+            }}
+        });
+        let Some(AgentEvent::ThreadSettingsUpdated(settings)) =
+            parse_agent_notification(&message).unwrap()
+        else {
+            panic!("expected settings event");
+        };
+        let permissions = settings.permissions.unwrap();
+        assert_eq!(permissions.approvals_reviewer, "auto_review");
+        assert_eq!(permissions.approval_policy, "on-request");
+        assert_eq!(
+            permissions.active_permission_profile.unwrap().id,
+            ":workspace"
+        );
+        assert_eq!(
+            permissions.sandbox_policy.unwrap()["type"],
+            "workspaceWrite"
+        );
+    }
+
+    #[test]
+    fn settings_rpc_failure_returns_error_without_an_effective_update() {
+        let input = concat!(
+            "{\"id\":1,\"result\":{}}\n",
+            "{\"id\":2,\"error\":{\"code\":-32602,\"message\":\"invalid permissions\"}}\n"
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let mut writer = Vec::new();
+        let error = drive_thread_settings_update(
+            &mut reader,
+            &mut writer,
+            "thr_1",
+            Path::new("/tmp/project"),
+            AgentPermissionMode::Assist,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("invalid permissions"));
+    }
+
+    #[test]
+    fn existing_thread_switch_waits_for_and_returns_effective_settings() {
+        let input = concat!(
+            "{\"id\":1,\"result\":{}}\n",
+            "{\"id\":2,\"result\":{}}\n",
+            "{\"method\":\"thread/settings/updated\",\"params\":{\"threadId\":\"thr_1\",\"threadSettings\":{\"model\":\"gpt-test\",\"effort\":\"medium\",\"serviceTier\":null,\"cwd\":\"/tmp/project\",\"approvalPolicy\":\"on-request\",\"approvalsReviewer\":\"auto_review\",\"sandboxPolicy\":{\"type\":\"workspaceWrite\"},\"activePermissionProfile\":{\"id\":\":workspace\",\"extends\":null}}}}\n"
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let mut writer = Vec::new();
+        let settings = drive_thread_settings_update(
+            &mut reader,
+            &mut writer,
+            "thr_1",
+            Path::new("/tmp/project"),
+            AgentPermissionMode::Assist,
+        )
+        .unwrap();
+        let effective = settings.permissions.unwrap();
+        assert_eq!(effective.approvals_reviewer, "auto_review");
+        let sent = String::from_utf8(writer).unwrap();
+        let update: Value = sent
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .find(|message: &Value| {
+                message.get("method").and_then(Value::as_str) == Some("thread/settings/update")
+            })
+            .unwrap();
+        assert_eq!(
+            update.pointer("/params/approvalsReviewer"),
+            Some(&json!("guardian_subagent"))
+        );
+    }
+
+    #[test]
+    fn permission_profile_list_maps_available_profiles() {
+        let input = concat!(
+            "{\"id\":1,\"result\":{}}\n",
+            "{\"id\":2,\"result\":{\"data\":[{\"id\":\":workspace\",\"allowed\":true,\"extends\":null}],\"nextCursor\":null}}\n"
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let mut writer = Vec::new();
+        let profiles =
+            drive_permission_profiles(&mut reader, &mut writer, Path::new("/tmp/project")).unwrap();
+        assert_eq!(
+            profiles,
+            vec![super::AgentPermissionProfile {
+                id: ":workspace".into(),
+                allowed: true,
+                extends: None
+            }]
+        );
+        let sent = String::from_utf8(writer).unwrap();
+        assert!(sent.contains("\"method\":\"permissionProfile/list\""));
     }
 
     #[test]
@@ -1210,9 +1859,11 @@ mod tests {
             &AgentRequest {
                 prompt: "打个招呼".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                thread_id: None,
                 model: "gpt-test".into(),
                 effort: "high".into(),
                 service_tier: Some("priority".into()),
+                permission_mode: AgentPermissionMode::Full,
             },
             &tx,
         )
@@ -1228,6 +1879,9 @@ mod tests {
         assert_eq!(
             received,
             vec![
+                AgentEvent::ThreadCreated {
+                    thread_id: "thr_1".into()
+                },
                 AgentEvent::Started,
                 AgentEvent::AssistantMessageStarted {
                     item_id: "msg_1".into(),
@@ -1277,7 +1931,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             initialize.pointer("/params/capabilities/experimentalApi"),
-            Some(&json!(false))
+            Some(&json!(true))
         );
         assert_eq!(
             initialize.pointer("/params/capabilities/requestAttestation"),
@@ -1301,18 +1955,8 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("priority")
         );
-        assert_eq!(
-            thread_start
-                .pointer("/params/approvalPolicy")
-                .and_then(Value::as_str),
-            Some("never")
-        );
-        assert_eq!(
-            thread_start
-                .pointer("/params/sandbox")
-                .and_then(Value::as_str),
-            Some("read-only")
-        );
+        assert!(thread_start.pointer("/params/approvalPolicy").is_none());
+        assert!(thread_start.pointer("/params/sandbox").is_none());
         let turn_start = sent_messages
             .iter()
             .find(|message| {
@@ -1336,6 +1980,27 @@ mod tests {
                 .pointer("/params/serviceTier")
                 .and_then(|value| value.as_str()),
             Some("priority")
+        );
+        assert_eq!(
+            turn_start.pointer("/params/approvalPolicy"),
+            Some(&json!("never"))
+        );
+        assert_eq!(
+            turn_start.pointer("/params/approvalsReviewer"),
+            Some(&json!("user"))
+        );
+        assert_eq!(
+            turn_start.pointer("/params/sandboxPolicy"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            turn_start.pointer("/params/permissions"),
+            Some(&json!(":danger-full-access"))
+        );
+        assert!(
+            turn_start
+                .pointer("/params/runtimeWorkspaceRoots")
+                .is_some_and(Value::is_array)
         );
     }
 
@@ -1365,9 +2030,11 @@ mod tests {
             &AgentRequest {
                 prompt: "interrupt me".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                thread_id: None,
                 model: "gpt-test".into(),
                 effort: "medium".into(),
                 service_tier: None,
+                permission_mode: AgentPermissionMode::Full,
             },
             &tx,
         )
@@ -1386,6 +2053,12 @@ mod tests {
 
         tx.send_blocking(outcome.into_event()).unwrap();
         drop(tx);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AgentEvent::ThreadCreated {
+                thread_id: "thr_interrupt".into()
+            }
+        );
         assert_eq!(rx.try_recv().unwrap(), AgentEvent::Started);
         assert_eq!(rx.try_recv().unwrap(), AgentEvent::Interrupted);
         assert!(rx.try_recv().is_err());
@@ -1562,9 +2235,11 @@ mod tests {
             &AgentRequest {
                 prompt: "probe notices".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                thread_id: None,
                 model: "model-a".into(),
                 effort: "medium".into(),
                 service_tier: None,
+                permission_mode: AgentPermissionMode::Full,
             },
             &tx,
         )
@@ -1584,12 +2259,16 @@ mod tests {
                     line: Some(8),
                     column: Some(4),
                 }),
+                AgentEvent::ThreadCreated {
+                    thread_id: "thr_notices".into()
+                },
                 AgentEvent::Started,
                 AgentEvent::ThreadSettingsUpdated(AgentThreadSettings {
                     model: "model-b".into(),
                     effort: Some("high".into()),
                     service_tier: Some("priority".into()),
                     cwd: "/tmp/project/updated".into(),
+                    permissions: None,
                 }),
                 AgentEvent::Warning {
                     message: "上下文窗口即将用尽".into(),
@@ -1624,9 +2303,11 @@ mod tests {
             &AgentRequest {
                 prompt: "fail".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                thread_id: None,
                 model: "model-a".into(),
                 effort: "medium".into(),
                 service_tier: None,
+                permission_mode: AgentPermissionMode::Full,
             },
             &tx,
         )
@@ -1642,6 +2323,9 @@ mod tests {
         assert_eq!(
             events,
             vec![
+                AgentEvent::ThreadCreated {
+                    thread_id: "thr_failed".into()
+                },
                 AgentEvent::Started,
                 AgentEvent::Error {
                     message: "模型请求失败".into(),
@@ -1835,9 +2519,11 @@ mod tests {
             &AgentRequest {
                 prompt: "test".into(),
                 cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                thread_id: None,
                 model: "gpt-test".into(),
                 effort: "medium".into(),
                 service_tier: None,
+                permission_mode: AgentPermissionMode::Full,
             },
             &tx,
         )
@@ -1845,6 +2531,12 @@ mod tests {
         assert_eq!(outcome, TurnOutcome::Completed);
         drop(tx);
 
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AgentEvent::ThreadCreated {
+                thread_id: "thr_1".into()
+            }
+        );
         assert_eq!(rx.try_recv().unwrap(), AgentEvent::Started);
         assert!(rx.try_recv().is_err());
     }
@@ -1869,9 +2561,11 @@ mod tests {
             &AgentRequest {
                 prompt: "probe".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                thread_id: None,
                 model: "gpt-test".into(),
                 effort: "medium".into(),
                 service_tier: None,
+                permission_mode: AgentPermissionMode::Full,
             },
             &tx,
         )
@@ -1881,6 +2575,12 @@ mod tests {
 
         assert!(error.contains("item/brandNew/delta"));
         assert!(error.contains("diagnostic payload"));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AgentEvent::ThreadCreated {
+                thread_id: "thr_1".into()
+            }
+        );
         assert_eq!(rx.try_recv().unwrap(), AgentEvent::Started);
         assert!(rx.try_recv().is_err());
     }
@@ -1914,9 +2614,11 @@ mod tests {
             &AgentRequest {
                 prompt: "深入分析当前项目".into(),
                 cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                thread_id: None,
                 model: "gpt-test".into(),
                 effort: "medium".into(),
                 service_tier: None,
+                permission_mode: AgentPermissionMode::Full,
             },
             &tx,
         )
@@ -1926,7 +2628,12 @@ mod tests {
         drop(tx);
 
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert_eq!(events.first(), Some(&AgentEvent::Started));
+        assert_eq!(
+            events.first(),
+            Some(&AgentEvent::ThreadCreated {
+                thread_id: "thr_1".into()
+            })
+        );
         assert_eq!(events.last(), Some(&AgentEvent::Completed));
         assert!(
             events
@@ -1957,9 +2664,11 @@ mod tests {
             &AgentRequest {
                 prompt: "probe".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                thread_id: None,
                 model: "model-a".into(),
                 effort: "high".into(),
                 service_tier: None,
+                permission_mode: AgentPermissionMode::Full,
             },
             &tx,
         )
@@ -1972,6 +2681,9 @@ mod tests {
         assert_eq!(
             events,
             vec![
+                AgentEvent::ThreadCreated {
+                    thread_id: "thr_1".into()
+                },
                 AgentEvent::Started,
                 AgentEvent::ModelRerouted {
                     from_model: "model-a".into(),

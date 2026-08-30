@@ -1244,9 +1244,6 @@ fn activity_stream(
                 index,
                 theme,
             )),
-            ConversationActivity::SettingsUpdated { summary, cwd } => {
-                stream.child(settings_updated_activity(index, summary, cwd, theme))
-            }
             ConversationActivity::Warning { message } => stream.child(notice_activity(
                 message,
                 None,
@@ -1395,45 +1392,6 @@ fn retrying_error_activity(
                 )
             },
         ))
-}
-
-fn settings_updated_activity(
-    index: usize,
-    summary: String,
-    cwd: String,
-    theme: Theme,
-) -> impl IntoElement {
-    let accessible_label = format!("{summary}；工作目录：{cwd}");
-    div()
-        .id(("conversation-settings-updated", index))
-        .role(Role::Status)
-        .aria_label(accessible_label)
-        .w_full()
-        .flex()
-        .items_start()
-        .gap(px(6.0))
-        .text_color(theme.text_tertiary)
-        .child(
-            icon("check", theme.command_muted.into())
-                .size(px(16.0))
-                .mt(px(2.0))
-                .flex_none(),
-        )
-        .child(
-            div()
-                .min_w(px(0.0))
-                .flex_1()
-                .text_size(px(14.0))
-                .line_height(px(21.0))
-                .child(summary)
-                .child(
-                    div()
-                        .text_size(px(NOTICE_TEXT_SIZE))
-                        .line_height(px(NOTICE_LINE_HEIGHT))
-                        .text_color(theme.text_tertiary)
-                        .child(cwd),
-                ),
-        )
 }
 
 fn notice_activity(

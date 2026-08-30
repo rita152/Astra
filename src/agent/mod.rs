@@ -3,6 +3,7 @@ mod codex;
 use std::{path::PathBuf, sync::Arc};
 
 use async_channel::Receiver;
+use serde_json::Value;
 
 pub use codex::CodexAppServerBackend;
 
@@ -42,9 +43,41 @@ pub struct AgentModelCatalog {
 pub struct AgentRequest {
     pub prompt: String,
     pub cwd: PathBuf,
+    pub thread_id: Option<String>,
     pub model: String,
     pub effort: String,
     pub service_tier: Option<String>,
+    pub permission_mode: AgentPermissionMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentPermissionMode {
+    Request,
+    Assist,
+    Full,
+    Custom,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentActivePermissionProfile {
+    pub id: String,
+    pub extends: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEffectivePermissions {
+    pub approval_policy: String,
+    pub approvals_reviewer: String,
+    pub sandbox_policy: Option<Value>,
+    pub active_permission_profile: Option<AgentActivePermissionProfile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct AgentPermissionProfile {
+    pub id: String,
+    pub allowed: bool,
+    pub extends: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +153,7 @@ pub struct AgentThreadSettings {
     pub effort: Option<String>,
     pub service_tier: Option<String>,
     pub cwd: String,
+    pub permissions: Option<AgentEffectivePermissions>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,6 +168,9 @@ pub struct AgentConfigWarning {
 /// Agent-neutral output consumed by the UI.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
+    ThreadCreated {
+        thread_id: String,
+    },
     Started,
     Error {
         message: String,
@@ -179,5 +216,16 @@ pub enum AgentEvent {
 pub trait AgentBackend: Send + Sync {
     #[cfg_attr(test, allow(dead_code))]
     fn load_model_catalog(&self) -> Receiver<Result<AgentModelCatalog, String>>;
+    #[allow(dead_code)]
+    fn load_permission_profiles(
+        &self,
+        cwd: PathBuf,
+    ) -> Receiver<Result<Vec<AgentPermissionProfile>, String>>;
+    fn update_thread_permissions(
+        &self,
+        thread_id: String,
+        cwd: PathBuf,
+        mode: AgentPermissionMode,
+    ) -> Receiver<Result<AgentThreadSettings, String>>;
     fn run_prompt(&self, request: AgentRequest) -> AgentRun;
 }

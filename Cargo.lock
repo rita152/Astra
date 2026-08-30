@@ -2065,6 +2065,7 @@ dependencies = [
  "objc",
  "serde",
  "serde_json",
+ "toml 0.8.23",
  "unicode-segmentation",
 ]
 

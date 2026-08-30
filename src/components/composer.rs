@@ -9,8 +9,9 @@ use gpui::{
 
 use crate::{
     agent::{
-        AgentBackend, AgentConfigWarning, AgentEvent, AgentInterruptHandle, AgentInterruptOutcome,
-        AgentModel, AgentModelCatalog, AgentRequest, CodexAppServerBackend, CommandExecution,
+        AgentBackend, AgentConfigWarning, AgentEffectivePermissions, AgentEvent,
+        AgentInterruptHandle, AgentInterruptOutcome, AgentModel, AgentModelCatalog,
+        AgentPermissionMode, AgentRequest, CodexAppServerBackend, CommandExecution,
         CommandExecutionStatus,
     },
     components::{
@@ -73,6 +74,15 @@ impl PermissionMode {
             _ => Self::Custom,
         }
     }
+
+    const fn agent_mode(self) -> AgentPermissionMode {
+        match self {
+            Self::Request => AgentPermissionMode::Request,
+            Self::Assist => AgentPermissionMode::Assist,
+            Self::Full => AgentPermissionMode::Full,
+            Self::Custom => AgentPermissionMode::Custom,
+        }
+    }
 }
 
 /// Opens the native full-access confirmation dialog.
@@ -117,10 +127,6 @@ pub enum ConversationActivity {
         message: String,
         details: Option<String>,
         will_retry: bool,
-    },
-    SettingsUpdated {
-        summary: String,
-        cwd: String,
     },
     Warning {
         message: String,
@@ -321,6 +327,7 @@ pub struct ComposerView {
     conversation_phase: ConversationPhase,
     conversation_cycle: u64,
     active_turn: Option<AgentInterruptHandle>,
+    thread_id: Option<String>,
     model_menu_focus: FocusHandle,
     model_menu_focused_item: usize,
     model_menu_keyboard_focus: bool,
@@ -347,6 +354,9 @@ pub struct ComposerView {
     /// visibility gate.
     permission_ui_enabled: bool,
     permission_mode: PermissionMode,
+    effective_permissions: Option<AgentEffectivePermissions>,
+    permission_error: Option<String>,
+    permission_update_cycle: u64,
     permission_menu_focus: FocusHandle,
     permission_menu_focused_item: usize,
     permission_menu_keyboard_focus: bool,
@@ -427,6 +437,7 @@ impl ComposerView {
             conversation_phase: ConversationPhase::Empty,
             conversation_cycle: 0,
             active_turn: None,
+            thread_id: None,
             model_menu_focus: cx.focus_handle(),
             model_menu_focused_item: 0,
             model_menu_keyboard_focus: false,
@@ -449,6 +460,9 @@ impl ComposerView {
             dictation_cycle: 0,
             permission_ui_enabled: true,
             permission_mode: PermissionMode::Full,
+            effective_permissions: None,
+            permission_error: None,
+            permission_update_cycle: 0,
             permission_menu_focus: cx.focus_handle().tab_stop(true),
             permission_menu_focused_item: 0,
             permission_menu_keyboard_focus: false,
@@ -867,9 +881,11 @@ impl ComposerView {
         let run = CodexAppServerBackend::new().run_prompt(AgentRequest {
             prompt,
             cwd: std::env::current_dir().unwrap_or_default(),
+            thread_id: self.thread_id.clone(),
             model,
             effort,
             service_tier,
+            permission_mode: self.permission_mode.agent_mode(),
         });
         let (receiver, interrupt) = run.into_parts();
         self.active_turn = interrupt;
@@ -936,6 +952,9 @@ impl ComposerView {
         let mut finished = false;
         for event in events {
             match event {
+                AgentEvent::ThreadCreated { thread_id } => {
+                    self.thread_id = Some(thread_id);
+                }
                 AgentEvent::Started => {
                     if self.conversation_phase != ConversationPhase::Stopping {
                         self.conversation_phase = ConversationPhase::Thinking;
@@ -954,15 +973,10 @@ impl ComposerView {
                         });
                 }
                 AgentEvent::ThreadSettingsUpdated(settings) => {
-                    let model_label = self.model_display_name(&settings.model).to_owned();
-                    let mut summary_parts = vec![model_label];
-                    if let Some(effort) = settings.effort.as_deref() {
-                        summary_parts.push(format!("{}推理", Self::effort_label(effort)));
+                    if let Some(permissions) = &settings.permissions {
+                        self.effective_permissions = Some(permissions.clone());
+                        self.permission_error = None;
                     }
-                    if let Some(service_tier) = settings.service_tier.as_deref() {
-                        summary_parts.push(service_tier.to_owned());
-                    }
-
                     self.selected_model = settings.model.clone();
                     if let Some(effort) = &settings.effort {
                         self.selected_effort = effort.clone();
@@ -978,13 +992,8 @@ impl ComposerView {
                         })
                         .unwrap_or(0);
                     self.actual_model = Some(settings.model);
-                    self.model_status = Some("设置已更新".to_owned());
+                    self.model_status = None;
                     self.safety_buffering = false;
-                    self.conversation_activity
-                        .push(ConversationActivity::SettingsUpdated {
-                            summary: format!("线程设置已更新：{}", summary_parts.join(" · ")),
-                            cwd: settings.cwd,
-                        });
                 }
                 AgentEvent::Warning { message } => {
                     self.conversation_activity
@@ -1344,9 +1353,59 @@ impl ComposerView {
         if mode == PermissionMode::Full && self.permission_mode != PermissionMode::Full {
             cx.emit(RequestFullAccessConfirmation);
         } else {
-            self.permission_mode = mode;
+            self.request_permission_mode(mode, cx);
         }
         cx.notify();
+    }
+
+    fn request_permission_mode(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.thread_id.clone() else {
+            self.permission_mode = mode;
+            self.permission_error = None;
+            return;
+        };
+        self.permission_update_cycle = self.permission_update_cycle.wrapping_add(1);
+        let update_cycle = self.permission_update_cycle;
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let receiver = CodexAppServerBackend::new().update_thread_permissions(
+            thread_id,
+            cwd,
+            mode.agent_mode(),
+        );
+        cx.spawn(async move |this, cx| {
+            let result = receiver
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err("权限设置连接在返回结果前关闭".to_owned()));
+            let _ = this.update(cx, |this, cx| {
+                if this.permission_update_cycle != update_cycle {
+                    return;
+                }
+                this.apply_permission_update_result(mode, result);
+                cx.emit(ConversationChanged);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn apply_permission_update_result(
+        &mut self,
+        mode: PermissionMode,
+        result: Result<crate::agent::AgentThreadSettings, String>,
+    ) {
+        match result {
+            Ok(settings) => {
+                self.permission_mode = mode;
+                self.apply_agent_event_batch(vec![AgentEvent::ThreadSettingsUpdated(settings)]);
+            }
+            Err(error) => {
+                let message = format!("无法更新权限模式：{error}");
+                self.permission_error = Some(message.clone());
+                self.conversation_activity
+                    .push(ConversationActivity::Error { message });
+            }
+        }
     }
 
     fn handle_permission_menu_key(
@@ -1442,7 +1501,7 @@ impl ComposerView {
     }
 
     pub fn confirm_full_access(&mut self, cx: &mut Context<Self>) {
-        self.permission_mode = PermissionMode::Full;
+        self.request_permission_mode(PermissionMode::Full, cx);
         self.permission_menu_open = false;
         self.permission_menu_keyboard_focus = false;
         cx.notify();
@@ -4246,9 +4305,10 @@ mod tests {
         push_coalesced_agent_event, submenu_layout, upsert_command_activity,
     };
     use crate::agent::{
-        AgentConfigWarning, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
-        AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentReasoningEffort,
-        AgentServiceTier, AgentThreadSettings, CommandExecution, CommandExecutionStatus,
+        AgentActivePermissionProfile, AgentConfigWarning, AgentEffectivePermissions, AgentEvent,
+        AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome, AgentModel,
+        AgentModelCatalog, AgentReasoningEffort, AgentServiceTier, AgentThreadSettings,
+        CommandExecution, CommandExecutionStatus,
     };
     use crate::components::user_input_request::{
         UserInputKeyboardFocus, UserInputKeyboardOutcome, UserInputOptionPresentation,
@@ -5090,6 +5150,7 @@ mod tests {
                     effort: Some("high".into()),
                     service_tier: Some("priority".into()),
                     cwd: "/tmp/project/updated".into(),
+                    permissions: None,
                 }),
             ]));
         });
@@ -5099,7 +5160,7 @@ mod tests {
             ConversationPhase::Thinking
         );
         assert!(app.read_entity(&composer, |composer, _| {
-            composer.model_status.as_deref() == Some("设置已更新")
+            composer.model_status.is_none()
                 && composer.selected_model == "model-b"
                 && composer.selected_effort == "high"
                 && composer.selected_service_tier.as_deref() == Some("priority")
@@ -5124,10 +5185,6 @@ mod tests {
                     line: Some(8),
                     column: Some(4),
                 }),
-                ConversationActivity::SettingsUpdated {
-                    summary: "线程设置已更新：Model B · 高推理 · priority".into(),
-                    cwd: "/tmp/project/updated".into(),
-                },
             ]
         );
 
@@ -5180,6 +5237,37 @@ mod tests {
 
         app.update_entity(&composer, |composer, cx| composer.close_picker(cx));
         assert!(!app.read_entity(&composer, |c, _| c.permission_menu_open));
+    }
+
+    #[test]
+    fn failed_permission_switch_keeps_effective_permissions_and_shows_error() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        app.update_entity(&composer, |composer, _| {
+            composer.permission_mode = PermissionMode::Assist;
+            composer.effective_permissions = Some(AgentEffectivePermissions {
+                approval_policy: "on-request".into(),
+                approvals_reviewer: "auto_review".into(),
+                sandbox_policy: Some(serde_json::json!({ "type": "workspaceWrite" })),
+                active_permission_profile: Some(AgentActivePermissionProfile {
+                    id: ":workspace".into(),
+                    extends: None,
+                }),
+            });
+            composer.apply_permission_update_result(PermissionMode::Full, Err("RPC -32602".into()));
+        });
+        assert!(app.read_entity(&composer, |composer, _| {
+            composer.permission_mode == PermissionMode::Assist
+                && composer
+                    .effective_permissions
+                    .as_ref()
+                    .is_some_and(|permissions| permissions.approvals_reviewer == "auto_review")
+                && composer
+                    .permission_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("RPC -32602"))
+                && matches!(composer.conversation_activity.last(), Some(ConversationActivity::Error { message }) if message.contains("RPC -32602"))
+        }));
     }
 
     #[test]

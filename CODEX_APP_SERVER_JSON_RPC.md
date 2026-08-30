@@ -55,12 +55,12 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 |---|---|---|---|
 | `initialize`、`initialized` | 客户端 → 服务端 | `initialize_connection` 连接生命周期（无 `AgentEvent`） | 为模型目录连接和 prompt 连接建立初始化握手；按本机 0.150.1 schema 显式声明 `capabilities.experimentalApi: false`、`requestAttestation: false` |
 | `model/list` | 客户端 → 服务端 | `CodexAppServerBackend::load_model_catalog` → `AgentModelCatalog` | 使用 `cursor`/`nextCursor` 拉取全部可见页；映射 model、`displayName`、默认模型、effort 与 service tier |
-| `thread/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 为本次 prompt 创建临时线程，传入所选 `model`、`serviceTier`；当前仍保留固定 `approvalPolicy: never`、`sandbox: read-only`，因为持久权限 session 与审批回复尚未接通，不读取 Composer 本地模式 |
-| `turn/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 提交文本 prompt，并传入所选 `model`、`effort`、`serviceTier` |
+| `thread/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session` → `AgentEvent::ThreadCreated` | 首回合创建可复用 thread，传入所选 `model`、`serviceTier`；不再发送固定权限字段 |
+| `turn/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 提交文本 prompt；新 thread 首回合同时携带 Composer 模式对应的完整权限字段，后续回合复用已生效的 thread 设置 |
 | `turn/interrupt` | 客户端 → 服务端 | `AgentInterruptHandle::interrupt` → `CodexTurnSession` | 在原 stdio 连接上使用已保存的 `threadId`、`turnId` 发送一次中断；开始阶段的停止请求会排队，重复请求及已结束 turn 不会重复写入 |
 | `turn/started` | 服务端 → 客户端 | `AgentEvent::Started` | 将 `Starting` 推进到可见的 `Thinking` 运行态；保留停止按钮与活动状态，不结束事件流 |
 | `error` | 服务端 → 客户端 | `AgentEvent::Error { message, details, will_retry }` | `willRetry: true` 显示低强调重试活动行，`false` 显示错误 Notice；两者都保持非终止，等待 `turn/completed` 决定最终状态 |
-| `thread/settings/updated` | 服务端 → 客户端 | `AgentEvent::ThreadSettingsUpdated` | 更新模型、effort、service tier 的有效选择，并显示包含工作目录的“线程设置已更新”状态行 |
+| `thread/settings/updated` | 服务端 → 客户端 | `AgentEvent::ThreadSettingsUpdated` | 静默同步模型、effort、service tier 与 effective 权限；当前状态由 Composer 控件直接呈现，不额外显示状态行 |
 | `warning` | 服务端 → 客户端 | `AgentEvent::Warning` | 显示带警告图标和可访问 alert 语义的 Notice；保持非终止 |
 | `configWarning` | 服务端 → 客户端 | `AgentEvent::ConfigWarning` | 显示 summary、details、文件与行列位置；存在 path 时提供“打开文件”按钮；保持非终止 |
 | `item/started` | 服务端 → 客户端 | `AgentEvent::AssistantMessageStarted { item_id }` / `AgentEvent::CommandStarted(CommandExecution)` | 建立 assistant message 或 command activity |
@@ -82,7 +82,7 @@ Composer 的视觉层以本机 ChatGPT App（CDP `127.0.0.1:9222`）的实际计
 
 ### Composer 权限模式：真实 wire 取证、UI 恢复与协议边界
 
-2026-08-30 用户明确将 `99.5%` 从发布硬门禁调整为“尽量对齐”的诊断指标，因此权限触发器和四模式菜单已恢复为普通产品 UI，可用鼠标和键盘交互，不再只在截图参数下出现。该放宽只改变 UI 可见性：未接入的服务端反向请求仍收到 `-32601`，当前每次 prompt 都创建并销毁独立 ephemeral thread，没有可供菜单即时更新的持久 thread/session；因此尚不发送 `thread/settings/update`，也不把本地选择标记为服务端已应用。现有固定 `approvalPolicy: never`、`sandbox: read-only` 行为暂时保持不变。
+2026-08-31 Composer 四种权限模式已接入 JSON-RPC。首回合创建可复用 thread 并在 `turn/start` 发送权限字段；已有 thread 切换通过 `thread/settings/update`，且只以 `thread/settings/updated` 保存服务端 effective 权限。RPC 失败保留原 effective 设置并显示错误。审批交互类 `item/*/requestApproval` 仍不在本次范围内。
 
 2026-08-30 已在真实 ChatGPT App 上对已有 thread `01a05195-1b99-7012-ac56-d651e2fada02` 分别选择四种模式。下表 request 列是 `thread/settings/update.params` 除 `threadId` 外的全部字段；四次 response 均为精确的 `result: {}`，不包含有效设置；最后一列只摘录随后 `thread/settings/updated.params.threadSettings` 中的权限相关服务端有效值。`V` 是该 thread 的 `/Users/zp/.codex/visualizations/2026/08/30/01a05195-1b99-7012-ac56-d651e2fada02`。
 
@@ -110,9 +110,9 @@ Assist 的三个值必须分层保存：菜单选择 request 发送 `guardian_su
 
 - 四次新对话的 `metadata.sawThreadStart` 均为 `false`；ChatGPT App 的 native/prewarm 路径没有让 renderer observer 看到直接 `thread/start` request。`thread/start` 中命名 profile 使用 `permissions`、Custom 使用旧式 `sandbox` 仍只是 schema + 当前 bundle 静态结论。
 - 真实 `permissionProfile/list` 请求为 `{cursor:null,limit:100,cwd:"/Users/zp/Desktop/GPUI"}`，只返回 `:read-only`、`:workspace`、`:danger-full-access`，均 `allowed:true`，`nextCursor:null`；本机 `profiles:{}`。只观测到内建 profile 的 `extends:null`，非 null `extends` 需要修改用户 config，本次未获授权，因此保持 blocked。
-- renderer reload 沿用既有 native transport，没有观察到 native host 的 `initialize.capabilities.experimentalApi`。当前 GPUI 仍声明 `experimentalApi:false`，而 `thread/settings/update` 及命名 profile 写入属于 experimental 能力，所以不得提前发送。
+- renderer reload 沿用既有 native transport，没有观察到 native host 的 `initialize.capabilities.experimentalApi`。为接入 `thread/settings/update`，当前 GPUI 已显式声明 `experimentalApi:true`；命名 profile 的可用性可通过 `permissionProfile/list` 查询。
 
-完整 schema/bundle/CDP 取证结论、trace SHA-256 和阻塞边界统一维护在本文件。四种已有 thread 证据是 `artifacts/chatgpt-permission-protocol-cdp-2026-08-30/select-existing-{request,assist,full,custom}-trace.json`；四种首回合证据是同目录的 `new-thread-{request,assist,full,custom}-trace.json`；profile/list 在 `reload-capture.json`。下表权限菜单的旧严格矩阵仍保留作诊断，但 8/8 未达原阈值不再隐藏 UI。生产协议仍保留固定 `approvalPolicy:never` + `sandbox:read-only`，原因是持久 session、反向审批和 effective 回写尚未接通，而不是像素分数。
+完整 schema/bundle/CDP 取证结论、trace SHA-256 和阻塞边界统一维护在本文件。四种已有 thread 证据是 `artifacts/chatgpt-permission-protocol-cdp-2026-08-30/select-existing-{request,assist,full,custom}-trace.json`；四种首回合证据是同目录的 `new-thread-{request,assist,full,custom}-trace.json`；profile/list 在 `reload-capture.json`。下表权限菜单的旧严格矩阵仍保留作诊断，但 8/8 未达原阈值不再隐藏 UI。
 
 ### P0 UI-first 对齐矩阵（2026-08-30）
 
@@ -151,7 +151,7 @@ Assist 的三个值必须分层保存：菜单选择 request 发送 `guardian_su
 |---:|---|---|---|---|---|:---:|
 | 1 | `initialize` | 请求（有 `id`） | `InitializeParams` | 默认 | `initialize_connection`（`load_model_catalog` 与 `run_prompt` 共用） | 是 |
 | 2 | `server/diagnostics` | 请求（有 `id`） | `ServerDiagnosticsParams` | 实验性 | — | 否 |
-| 3 | `thread/start` | 请求（有 `id`） | `ThreadStartParams` | 默认 | `AgentRequest` → `drive_session`（`model`、`serviceTier`；权限仍为既有固定 `never` / `read-only`，Composer 映射被门禁阻止） | 是 |
+| 3 | `thread/start` | 请求（有 `id`） | `ThreadStartParams` | 默认 | `AgentRequest` → `drive_session`（首回合创建可复用 thread，仅发送 `cwd`、`model`、`serviceTier` 等 thread 字段） | 是 |
 | 4 | `thread/resume` | 请求（有 `id`） | `ThreadResumeParams` | 默认 | — | 否 |
 | 5 | `thread/fork` | 请求（有 `id`） | `ThreadForkParams` | 默认 | — | 否 |
 | 6 | `thread/archive` | 请求（有 `id`） | `ThreadArchiveParams` | 默认 | — | 否 |
@@ -349,7 +349,7 @@ Assist 的三个值必须分层保存：菜单选择 request 发送 `guardian_su
 | 15 | `thread/project/updated` | 通知（无 `id`） | `ThreadProjectUpdatedNotification` | 默认 | — | 否 |
 | 16 | `thread/environment/connected` | 通知（无 `id`） | `EnvironmentConnectionNotification` | 默认 | — | 否 |
 | 17 | `thread/environment/disconnected` | 通知（无 `id`） | `EnvironmentConnectionNotification` | 默认 | — | 否 |
-| 18 | `thread/settings/updated` | 通知（无 `id`） | `ThreadSettingsUpdatedNotification` | 默认 | `parse_agent_notification` → `AgentEvent::ThreadSettingsUpdated` → 有效模型设置 + 状态行（非终止） | 是 |
+| 18 | `thread/settings/updated` | 通知（无 `id`） | `ThreadSettingsUpdatedNotification` | 默认 | `parse_agent_notification` → `AgentEvent::ThreadSettingsUpdated` → 静默同步有效模型与权限设置（非终止） | 是 |
 | 19 | `thread/tokenUsage/updated` | 通知（无 `id`） | `ThreadTokenUsageUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
 | 20 | `turn/started` | 通知（无 `id`） | `TurnStartedNotification` | 默认 | `parse_agent_notification` → `AgentEvent::Started` → `ConversationPhase::Thinking`（非终止） | 是 |
 | 21 | `hook/started` | 通知（无 `id`） | `HookStartedNotification` | 默认 | — | 否 |
