@@ -1,5 +1,9 @@
+pub mod approval;
 pub mod composer;
+pub mod file_change;
 pub mod home;
 pub mod icons;
+pub mod permissions_approval;
 pub mod prompt_input;
 pub mod sidebar;
+pub mod user_input_request;

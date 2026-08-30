@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    process::Command,
+    time::{Duration, Instant},
+};
 
 use gpui::{
     Animation, AnimationExt, BoxShadow, Context, Div, Entity, FocusHandle, IntoElement,
@@ -11,8 +14,12 @@ gpui::actions!(permission_ui, [DismissPermissionUi]);
 
 use crate::{
     components::{
-        composer::{ModelCatalogLoadFinished, RequestFullAccess},
-        home::HomeView,
+        composer::{ModelCatalogLoadFinished, RequestFullAccessConfirmation},
+        file_change::{
+            DiffFileVisualState, DiffReviewCallback, DiffReviewEvent, DiffReviewPresentation,
+            captured_diff_review_fixture, render_diff_review_panel,
+        },
+        home::{HomeView, OpenDiffReview},
         icons::icon,
         sidebar::{OpenProjectCreation, OpenSettings, SidebarView},
     },
@@ -54,6 +61,7 @@ pub struct ChatApp {
     right_panel_resize_hovered: bool,
     right_panel_resize_dragging: bool,
     right_panel_resize_pointer_offset: f32,
+    diff_review: Option<DiffReviewPresentation>,
     permission_confirmation_open: bool,
     project_creation_open: bool,
     project_creation_kind: ProjectCreationKind,
@@ -282,7 +290,7 @@ impl ChatApp {
             cx.notify();
         })
         .detach();
-        cx.subscribe(&home, |this, _, _: &RequestFullAccess, cx| {
+        cx.subscribe(&home, |this, _, _: &RequestFullAccessConfirmation, cx| {
             this.permission_confirmation_open = true;
             cx.notify();
         })
@@ -290,6 +298,10 @@ impl ChatApp {
         cx.subscribe(&home, |this, _, _: &ModelCatalogLoadFinished, cx| {
             this.startup_model_catalog_resolved = true;
             cx.notify();
+        })
+        .detach();
+        cx.subscribe(&home, |this, _, event: &OpenDiffReview, cx| {
+            this.open_diff_review(event.0.clone(), cx);
         })
         .detach();
         cx.spawn(async move |this, cx| {
@@ -338,6 +350,7 @@ impl ChatApp {
             right_panel_resize_hovered: false,
             right_panel_resize_dragging: false,
             right_panel_resize_pointer_offset: 0.0,
+            diff_review: None,
             permission_confirmation_open: false,
             project_creation_open: false,
             project_creation_kind: ProjectCreationKind::Local,
@@ -347,6 +360,12 @@ impl ChatApp {
             project_creation_focus: cx.focus_handle().tab_stop(true),
             project_creation_focus_pending: false,
         }
+    }
+
+    pub fn complete_startup_for_capture(&mut self, cx: &mut Context<Self>) {
+        self.startup_model_catalog_resolved = true;
+        self.startup_minimum_duration_elapsed = true;
+        cx.notify();
     }
 
     pub fn open_profile_menu(&mut self, cx: &mut Context<Self>) {
@@ -446,17 +465,131 @@ impl ChatApp {
         });
     }
 
-    pub fn set_permission_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
-        self.home
-            .update(cx, |home, cx| home.set_permission_mode(mode, cx));
+    pub fn set_approval_for_capture(&mut self, kind: &str, state: &str, cx: &mut Context<Self>) {
+        self.home.update(cx, |home, cx| {
+            home.set_approval_for_capture(kind, state, cx)
+        });
     }
 
-    pub fn open_permission_menu(&mut self, cx: &mut Context<Self>) {
+    pub fn set_user_input_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
         self.home
-            .update(cx, |home, cx| home.open_permission_menu(cx));
+            .update(cx, |home, cx| home.set_user_input_for_capture(state, cx));
     }
 
-    pub fn open_permission_confirmation(&mut self, cx: &mut Context<Self>) {
+    pub fn set_file_approval_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.home
+            .update(cx, |home, cx| home.set_file_approval_for_capture(state, cx));
+    }
+
+    pub fn set_permissions_approval_for_capture(
+        &mut self,
+        kind: &str,
+        state: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.home.update(cx, |home, cx| {
+            home.set_permissions_approval_for_capture(kind, state, cx)
+        });
+    }
+
+    pub fn set_file_change_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.home
+            .update(cx, |home, cx| home.set_file_change_for_capture(state, cx));
+    }
+
+    pub fn set_turn_diff_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.home.update(cx, |home, cx| {
+            home.set_file_change_for_capture("completed", cx)
+        });
+        self.open_diff_review(captured_diff_review_fixture(state), cx);
+    }
+
+    fn open_diff_review(&mut self, review: DiffReviewPresentation, cx: &mut Context<Self>) {
+        self.diff_review = Some(review);
+        self.right_panel_open = true;
+        self.right_panel_mode = None;
+        // Natural long-diff capture 29: the 2560px viewport split begins at
+        // x=1202.359375, leaving a 1357.640625px Review panel. Its 250px file
+        // tree leaves the measured 1107.640625px scroll viewport.
+        self.right_panel_width = Some(1_357.640_6);
+        self.right_panel_keyboard_focus = false;
+        self.right_panel_focus_pending = false;
+        cx.notify();
+    }
+
+    fn handle_diff_review_event(&mut self, event: DiffReviewEvent, cx: &mut Context<Self>) {
+        match event {
+            DiffReviewEvent::Close => {
+                self.diff_review = None;
+                self.right_panel_open = false;
+            }
+            DiffReviewEvent::ToggleFile(index) => {
+                let Some(file) = self
+                    .diff_review
+                    .as_mut()
+                    .and_then(|review| review.files.get_mut(index))
+                else {
+                    return;
+                };
+                file.visual_state = if file.visual_state.is_expanded() {
+                    DiffFileVisualState::Collapsed
+                } else {
+                    DiffFileVisualState::Expanded
+                };
+            }
+            DiffReviewEvent::HeaderHoverChanged { index, hovered } => {
+                let Some(file) = self
+                    .diff_review
+                    .as_mut()
+                    .and_then(|review| review.files.get_mut(index))
+                else {
+                    return;
+                };
+                if file.visual_state.is_expanded() {
+                    file.visual_state = if hovered {
+                        DiffFileVisualState::HeaderHovered
+                    } else {
+                        DiffFileVisualState::Expanded
+                    };
+                }
+            }
+            DiffReviewEvent::CopyPath(path) => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(path));
+            }
+            DiffReviewEvent::OpenLocation(path) => {
+                // Keep this as a native OS action. `Command::arg` passes the
+                // path as data (rather than through a shell), so spaces and
+                // other filename characters cannot be interpreted as code.
+                let _ = finder_reveal_command(&path).spawn();
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn enable_permission_ui_for_capture(&mut self, cx: &mut Context<Self>) {
+        self.home
+            .update(cx, |home, cx| home.enable_permission_ui_for_capture(cx));
+    }
+
+    pub fn set_permission_mode_for_capture(&mut self, mode: &str, cx: &mut Context<Self>) {
+        self.home.update(cx, |home, cx| {
+            home.set_permission_mode_for_capture(mode, cx)
+        });
+    }
+
+    pub fn open_permission_menu_for_capture(&mut self, cx: &mut Context<Self>) {
+        self.home
+            .update(cx, |home, cx| home.open_permission_menu_for_capture(cx));
+    }
+
+    pub fn set_permission_menu_capture_state(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.home.update(cx, |home, cx| {
+            home.set_permission_menu_capture_state(state, cx)
+        });
+    }
+
+    pub fn open_permission_confirmation_for_capture(&mut self, cx: &mut Context<Self>) {
+        self.enable_permission_ui_for_capture(cx);
         self.permission_confirmation_open = true;
         cx.notify();
     }
@@ -758,6 +891,7 @@ impl ChatApp {
     pub fn open_right_panel(&mut self, cx: &mut Context<Self>) {
         self.right_panel_open = true;
         self.right_panel_mode = None;
+        self.diff_review = None;
         self.right_panel_focused_item = 0;
         self.right_panel_keyboard_focus = false;
         self.right_panel_focus_pending = true;
@@ -768,6 +902,7 @@ impl ChatApp {
         if self.right_panel_open {
             self.right_panel_open = false;
             self.right_panel_mode = None;
+            self.diff_review = None;
             self.right_panel_keyboard_focus = false;
             self.right_panel_focus_pending = false;
             self.right_panel_resize_hovered = false;
@@ -789,6 +924,7 @@ impl ChatApp {
             return;
         };
         self.right_panel_mode = Some(*mode);
+        self.diff_review = None;
         self.right_panel_keyboard_focus = false;
         cx.notify();
     }
@@ -917,6 +1053,12 @@ impl ChatApp {
             });
         }
     }
+}
+
+fn finder_reveal_command(path: &str) -> Command {
+    let mut command = Command::new("open");
+    command.arg("-R").arg(path);
+    command
 }
 
 fn permission_risk_row(
@@ -1885,6 +2027,28 @@ impl ChatApp {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
+        if let Some(review) = self.diff_review.clone() {
+            let target = cx.entity();
+            let callback = DiffReviewCallback::new(move |event, _, cx| {
+                target.update(cx, move |app, cx| app.handle_diff_review_event(event, cx));
+            });
+            return div()
+                .id("right-panel")
+                .w(panel_width)
+                .min_w(panel_width)
+                .h_full()
+                .flex_none()
+                .relative()
+                .border_l_1()
+                .border_color(theme.border)
+                .bg(theme.surface)
+                .track_focus(&self.right_panel_focus)
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(self.right_panel_resize_handle(theme, cx))
+                .child(render_diff_review_panel(&review, theme, callback));
+        }
+
         let toolbar = div()
             .h(px(46.0))
             .w_full()
@@ -2257,7 +2421,7 @@ impl Render for ChatApp {
                                                 .hover(|style| style.bg(rgba(0xff676433)))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.permission_confirmation_open = false;
-                                                    this.home.update(cx, |home, cx| home.set_permission_mode("full", cx));
+                                                    this.home.update(cx, |home, cx| home.confirm_full_access(cx));
                                                     cx.notify();
                                                 }))
                                                 .child(icon("permission-warning", rgba(0xff6764ff).into()).size(px(16.0)))
@@ -2346,8 +2510,10 @@ mod tests {
         point, px, size,
     };
 
-    use super::{ChatApp, startup_loading_logo_opacity};
-    use crate::components::{composer::ModelCatalogLoadFinished, sidebar::OpenSettings};
+    use super::{ChatApp, finder_reveal_command, startup_loading_logo_opacity};
+    use crate::components::{
+        composer::ModelCatalogLoadFinished, file_change::DiffReviewEvent, sidebar::OpenSettings,
+    };
     use crate::theme::ThemeMode;
 
     fn simulate_next_frame(app: &mut TestApp, window: &TestAppWindow<ChatApp>, elapsed_ms: u64) {
@@ -2366,6 +2532,36 @@ mod tests {
         assert_eq!(startup_loading_logo_opacity(0.0), 1.0);
         assert!((startup_loading_logo_opacity(0.5) - 0.32).abs() < f32::EPSILON);
         assert_eq!(startup_loading_logo_opacity(1.0), 1.0);
+    }
+
+    #[test]
+    fn diff_review_copy_and_open_events_have_native_actions() {
+        let path = "/tmp/a file with spaces.txt";
+        let command = finder_reveal_command(path);
+        assert_eq!(command.get_program(), "open");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("-R"), std::ffi::OsStr::new(path)]
+        );
+
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
+        );
+        window.update(|chat, _, cx| {
+            chat.handle_diff_review_event(DiffReviewEvent::CopyPath(path.to_owned()), cx)
+        });
+        assert_eq!(
+            app.read_from_clipboard().and_then(|item| item.text()),
+            Some(path.to_owned())
+        );
     }
 
     #[test]
@@ -2726,12 +2922,12 @@ mod tests {
             |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
         );
 
-        window.update(|chat, _, cx| chat.open_permission_confirmation(cx));
+        window.update(|chat, _, cx| chat.open_permission_confirmation_for_capture(cx));
         window.draw();
         window.simulate_click(point(px(553.0), px(500.0)), MouseButton::Left);
         assert!(!window.read(|chat, _| chat.permission_confirmation_open));
 
-        window.update(|chat, _, cx| chat.open_permission_confirmation(cx));
+        window.update(|chat, _, cx| chat.open_permission_confirmation_for_capture(cx));
         window.draw();
         window.simulate_click(point(px(645.0), px(500.0)), MouseButton::Left);
         assert!(!window.read(|chat, _| chat.permission_confirmation_open));

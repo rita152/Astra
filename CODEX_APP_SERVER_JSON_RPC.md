@@ -3,21 +3,23 @@
 > 基准版本：`codex-cli 0.150.1`
 > 生成日期：2026-08-30
 > 接入状态更新：2026-08-30
-> 范围：`codex app-server generate-json-schema --experimental` 输出的全部方法，并与默认 schema 对比标注能力门槛。
+> 范围：`codex app-server generate-ts --experimental` 输出的全部方法联合类型，并与默认 TypeScript schema 对比标注能力门槛；同时用 JSON Schema 交叉校验字段定义。
 
 ## 结论
 
-Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准的 `"jsonrpc": "2.0"` 字段。当前版本完整 schema 共包含 **244** 个方法：
+Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准的 `"jsonrpc": "2.0"` 字段。以当前版本 `generate-ts` 输出的完整方法联合类型计，共包含 **249** 个方法：
 
 | 消息族 | 数量 | 含义 |
 |---|---:|---|
-| ClientRequest | 153 | 客户端调用 App Server，服务端按同一 `id` 返回 `result` 或 `error` |
+| ClientRequest | 156 | 客户端调用 App Server，服务端按同一 `id` 返回 `result` 或 `error` |
 | ServerRequest | 11 | App Server 反向调用客户端，客户端必须按同一 `id` 响应 |
 | ClientNotification | 1 | 客户端发送的无响应通知 |
-| ServerNotification | 79 | App Server 推送的无响应事件 |
-| **合计** | **244** | 默认 schema 185 个；仅实验 schema 额外 59 个 |
+| ServerNotification | 81 | App Server 推送的无响应事件 |
+| **合计** | **249** | 默认 TypeScript schema 190 个；仅实验 schema 额外 59 个 |
 
-“默认”表示该方法存在于不带 `--experimental` 的生成结果；“实验性”表示只存在于带 `--experimental` 的结果，连接初始化时通常还需声明 `capabilities.experimentalApi: true`。这不是产品成熟度评级；部分默认方法仍可能处于开发中或已经弃用。
+“默认”表示该方法存在于不带 `--experimental` 的 TypeScript 生成结果；“实验性”表示只存在于带 `--experimental` 的结果，连接初始化时通常还需声明 `capabilities.experimentalApi: true`。这不是产品成熟度评级；部分默认方法仍可能处于开发中或已经弃用。
+
+`codex-cli 0.150.1` 的两种生成器存在一处已验证的差异：`generate-json-schema` 的顶层方法联合仍为 244 个（默认 185 个），没有列出本次新增的 5 个方法；`generate-ts` 则已完整列出 249 个（默认 190 个）。这 5 个方法都存在于非实验 TypeScript 输出，因此下表按“默认”标注；其中仅由 TypeScript 方法联合暴露的情况也在状态栏中单独注明。
 
 ## 传输与消息格式
 
@@ -51,9 +53,9 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 
 | 已接入 JSON-RPC 方法 | 方向 | 内部协议 | 接入职责 |
 |---|---|---|---|
-| `initialize`、`initialized` | 客户端 → 服务端 | `initialize_connection` 连接生命周期（无 `AgentEvent`） | 为模型目录连接和 prompt 连接建立初始化握手 |
+| `initialize`、`initialized` | 客户端 → 服务端 | `initialize_connection` 连接生命周期（无 `AgentEvent`） | 为模型目录连接和 prompt 连接建立初始化握手；按本机 0.150.1 schema 显式声明 `capabilities.experimentalApi: false`、`requestAttestation: false` |
 | `model/list` | 客户端 → 服务端 | `CodexAppServerBackend::load_model_catalog` → `AgentModelCatalog` | 使用 `cursor`/`nextCursor` 拉取全部可见页；映射 model、`displayName`、默认模型、effort 与 service tier |
-| `thread/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 为本次 prompt 创建临时、只读线程，并传入所选 `model`、`serviceTier` |
+| `thread/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 为本次 prompt 创建临时线程，传入所选 `model`、`serviceTier`；当前仍保留固定 `approvalPolicy: never`、`sandbox: read-only`，因为持久权限 session 与审批回复尚未接通，不读取 Composer 本地模式 |
 | `turn/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 提交文本 prompt，并传入所选 `model`、`effort`、`serviceTier` |
 | `turn/interrupt` | 客户端 → 服务端 | `AgentInterruptHandle::interrupt` → `CodexTurnSession` | 在原 stdio 连接上使用已保存的 `threadId`、`turnId` 发送一次中断；开始阶段的停止请求会排队，重复请求及已结束 turn 不会重复写入 |
 | `turn/started` | 服务端 → 客户端 | `AgentEvent::Started` | 将 `Starting` 推进到可见的 `Thinking` 运行态；保留停止按钮与活动状态，不结束事件流 |
@@ -78,21 +80,78 @@ Composer 的视觉层以本机 ChatGPT App（CDP `127.0.0.1:9222`）的实际计
 
 本批事件也通过同一 CDP 入口在真实 ChatGPT App 中临时注入并还原状态后取样：运行态使用 14 px / 21 px、60% 前景的计时状态；`error(willRetry: true)` 使用透明背景、6 px 间距的低强调活动行；不可重试错误和配置警告使用 20 px 圆角、`8px 8px 8px 12px` 内边距、0.5 px 强边框 ring 的 Notice。`configWarning` 的图标为 18 px，正文为 13 px / 20 px，可选“打开文件”按钮为 24 px 高、8 px 水平内边距，并保留 hover 反馈。实现同时为错误和警告添加 `Alert` 角色、为设置变更添加 `Status` 角色，避免只靠颜色传达状态。
 
-未接入的服务端反向请求会收到 `-32601`，因此当前实现固定使用 `approvalPolicy: "never"`、`sandbox: "read-only"`。该策略下 app-server 自行执行的 `commandExecution` 可展示开始状态、增量输出和完成状态；需要用户审批或交互的操作仍未接入。
+### Composer 权限模式：真实 wire 取证、UI 恢复与协议边界
 
-本批明确不接入审批请求、自动审批、文件 Diff、用户输入/MCP 表单和 `permissionProfile/list`；这些方法在下表中继续保持“否”，没有新增本地自动审批或静默兜底。
+2026-08-30 用户明确将 `99.5%` 从发布硬门禁调整为“尽量对齐”的诊断指标，因此权限触发器和四模式菜单已恢复为普通产品 UI，可用鼠标和键盘交互，不再只在截图参数下出现。该放宽只改变 UI 可见性：未接入的服务端反向请求仍收到 `-32601`，当前每次 prompt 都创建并销毁独立 ephemeral thread，没有可供菜单即时更新的持久 thread/session；因此尚不发送 `thread/settings/update`，也不把本地选择标记为服务端已应用。现有固定 `approvalPolicy: never`、`sandbox: read-only` 行为暂时保持不变。
+
+2026-08-30 已在真实 ChatGPT App 上对已有 thread `01a05195-1b99-7012-ac56-d651e2fada02` 分别选择四种模式。下表 request 列是 `thread/settings/update.params` 除 `threadId` 外的全部字段；四次 response 均为精确的 `result: {}`，不包含有效设置；最后一列只摘录随后 `thread/settings/updated.params.threadSettings` 中的权限相关服务端有效值。`V` 是该 thread 的 `/Users/zp/.codex/visualizations/2026/08/30/01a05195-1b99-7012-ac56-d651e2fada02`。
+
+| Composer 模式 | `thread/settings/update.params` | RPC response | `thread/settings/updated` 有效权限 |
+|---|---|---|---|
+| Request / 请求批准 | `approvalPolicy:"on-request"`, `approvalsReviewer:"user"`, `permissions:":workspace"` | `result:{}` | `on-request` / `user` / `sandboxPolicy:{type:"workspaceWrite",writableRoots:[V],networkAccess:false,excludeTmpdirEnvVar:false,excludeSlashTmp:false}` / `activePermissionProfile:{id:":workspace",extends:null}` |
+| Assist / 帮我批准 | `approvalPolicy:"on-request"`, `approvalsReviewer:"guardian_subagent"`, `permissions:":workspace"` | `result:{}` | `on-request` / **`auto_review`** / 同上 `workspaceWrite` / `activePermissionProfile:{id:":workspace",extends:null}` |
+| Full / 完全访问权限 | `approvalPolicy:"never"`, `approvalsReviewer:"user"`, `permissions:":danger-full-access"` | `result:{}` | `never` / `user` / `sandboxPolicy:{type:"dangerFullAccess"}` / `activePermissionProfile:{id:":danger-full-access",extends:null}` |
+| Custom / 自定义 | `approvalPolicy:"on-request"`, `approvalsReviewer:"user"`, `sandboxPolicy:{type:"dangerFullAccess"}`（无 `permissions`） | `result:{}` | `on-request` / `user` / `sandboxPolicy:{type:"dangerFullAccess"}` / `activePermissionProfile:null` |
+
+Assist 的三个值必须分层保存：菜单选择 request 发送 `guardian_subagent`，服务端 effective 回写为 `auto_review`，另行创建的 Assist 新对话首回合 `turn/start` 也携带 `auto_review`。不能把 bundle catalog 的 request 值写死成 server-effective 值，也不能把回写的 `auto_review` 反向改写成 `guardian_subagent`。Custom 与 Full 也不等价：本机 Custom 虽然同样解析为 danger-full-access sandbox，但仍是 `on-request + user + 显式 sandboxPolicy`，且 effective profile 为 null；Full 是 `never + user + ":danger-full-access" profile`。
+
+另外对四种模式分别创建新对话并发送不调用工具的无害 prompt，四次均收到 `turn/completed`。首回合真实 `turn/start` 权限字段如下；这些是独立新对话的请求，不是上表同一已有 thread 紧跟的 turn：
+
+| 模式 | 新对话首回合 `turn/start` 的权限字段 |
+|---|---|
+| Request | `approvalPolicy:"on-request"`, `approvalsReviewer:"user"`, `sandboxPolicy:{type:"workspaceWrite",writableRoots:[GPUI,V],networkAccess:false,excludeTmpdirEnvVar:false,excludeSlashTmp:false}`, `permissions:null`, `runtimeWorkspaceRoots:null` |
+| Assist | `approvalPolicy:"on-request"`, `approvalsReviewer:"auto_review"`, 同上 `workspaceWrite`, `permissions:null`, `runtimeWorkspaceRoots:null` |
+| Full | `approvalPolicy:"never"`, `approvalsReviewer:"user"`, `sandboxPolicy:null`, `permissions:":danger-full-access"`, `runtimeWorkspaceRoots:[GPUI,V]` |
+| Custom | `approvalPolicy:"on-request"`, `approvalsReviewer:"user"`, `sandboxPolicy:{type:"dangerFullAccess"}`, `permissions:null`, `runtimeWorkspaceRoots:[GPUI,V]` |
+
+该表中 `GPUI` 是 `/Users/zp/Desktop/GPUI`，`V` 是各自 thread 的 visualization 目录。这一批新对话的 Request/Assist `thread/settings/updated` 都回写了 workspaceWrite 且 `activePermissionProfile:null`；Full 回写 `:danger-full-access`；Custom 仍为 null。因此实现必须以 response/notification 保存有效 policy 与 profile provenance，不能只依赖 Composer 四值 enum。
+
+尚未观测的边界保持阻塞，不从 bundle 推断伪造成实测：
+
+- 四次新对话的 `metadata.sawThreadStart` 均为 `false`；ChatGPT App 的 native/prewarm 路径没有让 renderer observer 看到直接 `thread/start` request。`thread/start` 中命名 profile 使用 `permissions`、Custom 使用旧式 `sandbox` 仍只是 schema + 当前 bundle 静态结论。
+- 真实 `permissionProfile/list` 请求为 `{cursor:null,limit:100,cwd:"/Users/zp/Desktop/GPUI"}`，只返回 `:read-only`、`:workspace`、`:danger-full-access`，均 `allowed:true`，`nextCursor:null`；本机 `profiles:{}`。只观测到内建 profile 的 `extends:null`，非 null `extends` 需要修改用户 config，本次未获授权，因此保持 blocked。
+- renderer reload 沿用既有 native transport，没有观察到 native host 的 `initialize.capabilities.experimentalApi`。当前 GPUI 仍声明 `experimentalApi:false`，而 `thread/settings/update` 及命名 profile 写入属于 experimental 能力，所以不得提前发送。
+
+完整 schema/bundle/CDP 取证结论、trace SHA-256 和阻塞边界统一维护在本文件。四种已有 thread 证据是 `artifacts/chatgpt-permission-protocol-cdp-2026-08-30/select-existing-{request,assist,full,custom}-trace.json`；四种首回合证据是同目录的 `new-thread-{request,assist,full,custom}-trace.json`；profile/list 在 `reload-capture.json`。下表权限菜单的旧严格矩阵仍保留作诊断，但 8/8 未达原阈值不再隐藏 UI。生产协议仍保留固定 `approvalPolicy:never` + `sandbox:read-only`，原因是持久 session、反向审批和 effective 回写尚未接通，而不是像素分数。
+
+### P0 UI-first 对齐矩阵（2026-08-30）
+
+本批先通过 CDP `http://127.0.0.1:9222` 采集真实 ChatGPT App，再实现纯 GPUI 的命令/网络审批、文件审批、文件变更活动、Diff Review、用户问答和权限模式候选表面；没有使用 WebView、HTML、PNG/JPEG 或截图充当产品 UI。证据清单在 `scripts/p0_ui_matrix_manifest.json`，校验器在 `scripts/verify_p0_ui_matrix.py`。所有审计结论统一维护在本文件；原始证据分别保存在 `artifacts/chatgpt-p0-ui-cdp-audit-2026-08-30/`、`artifacts/chatgpt-multifile-diff-cdp-audit-2026-08-30/`、`artifacts/chatgpt-user-input-multi-cdp-audit-2026-08-30/`、`artifacts/chatgpt-permissions-request-cdp-audit-2026-08-30/` 与 `artifacts/chatgpt-permission-protocol-cdp-2026-08-30/`。自然触发、受控协议重放和仅据重复结构推导的实现没有混称。
+
+多文件与长 Diff 的增量证据全部来自自然 Composer 工作流，而不是受控协议重放：请求 `2106` 的两文件 `item/fileChange/requestApproval` 实测为 `736×210`，内部列表 `704×66`，两行各 `33px`；请求 `2117` 的八文件审批实测为 `736×344`，列表 viewport `704×200`、内容 `264px`、最大滚动 `64px`。前者真实点击“允许一次”后观测到同 request id 的 `serverRequest/resolved`、`item/completed` 与 `turn/diff/updated`，后者真实 Escape 后观测到关闭与 resolved；被动 renderer observer 仍未捕获 Electron bridge 的精确 renderer→host decision response object，因此不能从点击结果反推或声称该 wire payload 已验证。
+
+同一自然工作流的精确 `turn/diff/updated` 为 3,780 bytes、123 个 `split('\n')` entries、两文件、`+16/-16` 与 80 行上下文，SHA-256 为 `9808146c5ab7541ec60f414633b66ab6204610fd3c96211e1d44efbd116801b5`。可跟踪的测试副本位于 `tests/fixtures/cdp/turn-diff-updated-two-file-123-entries.diff`，只供 capture/test harness；生产 `DiffReviewPresentation::from_unified_diff` 接受领域层真实 diff，不读取该 fixture。实测 Review viewport 为 `1107.641×1324`，两个文件区各 `1260.25px`，每个 56 个实际行、行高 `21.59375px`；跨文件滚动 `scrollTop=1100`，首文件折叠后为 `34px`。
+
+候选 GPUI 已按这些证据改为完整重复结构：审批遍历任意文件并保留原生 `ScrollHandle`（八文件严格 200px cap）；完成态显示 `64.5px` header、1px 分隔线与每文件 36px 行；Review 遍历所有文件与所有上下文/删除/新增行，使用单一真实行号 gutter、文件折叠及整面板滚动。Review 与完成态文件行传递其自身 `DiffReviewPresentation`，Copy 使用真实展示路径，Open 使用解析后的真实文件路径；没有可验证的领域回滚时 Undo 保持移除。最新离线重拍还修复了 GPUI flex 将每个 `21.59375px` Diff 行独立量化为 22px 的累计漂移：行层现在按 `2 + index × 21.59375px` 原生定位，同时保持单文件 `1260.25px` 总高。两/八文件、完成态和长 Review 的 16 个完整 light/dark 状态均已逐项生成 GPUI crop、diff 和分数；这些分数现在是对齐诊断，不再单独决定 UI 是否可见。
+
+严格比较器仍只比较完整控件或完整状态区域的未稀释裁剪。复核时撤销了用大面积不变背景抬分的结果；5 个命令关闭态和多个审批关闭态的旧宽裁剪已从 canonical evidence 删除，原始/debug 证据仍保留。旧 dark user-input default 也被证实与 hover crop 字节相同并降为 blocked。正式矩阵现有 15 个 required scenario、128 个独立主题/表面/状态条目：14 个 ready 单项通过，114 个保持诊断 blocked，ready 最低 `99.500764012311%`；校验器仍按其严格规则返回非零，但该结果不再作为 UI 可见性的发布开关。
+
+| 表面 | 严格逐状态结果 | 诊断与协议状态 |
+|---|---|---|
+| 命令/网络审批 pending | dark default/approve-hover/decline-hover/options/options-focus：`99.377621 / 99.324033 / 99.380064 / 98.971475 / 98.958139%`；light：`99.276492 / 99.218457 / 99.279315 / 98.738763 / 98.720820%` | blocked；`item/commandExecution/requestApproval` 仍返回 `-32601` |
+| 命令审批关闭态 | 真实 renderer 在 approved/declined/resolved 后卸载卡片；旧 `2200×194` 比较主要是背景和 Composer，不是状态局部 UI，已全部撤销；light approved 与 timeout 也没有可用真实参考 | 全部 blocked；不能用卸载后的大背景声明关闭态通过 |
+| 文件修改审批 | 旧单文件 light default/approve-hover/decline-hover/options/options-focus：`99.409058 / 99.352807 / 99.410098 / 98.935915 / 98.920439%`；dark：`99.499727 / 99.447893 / 99.500764 / 99.108220 / 99.099238%`，其中 dark decline-hover 单项 `99.500764%` 独立 ready。自然两文件 default 完整 `736×210`：dark/light `99.004312473782 / 98.817138087119%`；自然八文件完整 `736×344` top：`98.353087495952 / 98.031921396803%`，bottom：`98.349940129827 / 98.028268056464%`；timeout 未触发 | surface gate 仍 blocked；top/bottom 是各自独立 GPUI 滚动状态，不能用 header/action 或旧单文件局部替代，`item/fileChange/requestApproval` 未接入 |
+| `fileChange` activity | 旧单文件 completed light/dark strict `736×65`：`97.735994 / 98.017034%`；与 request 2106 对应的自然两文件 completed 完整 `736×138` dark/light：`98.069895412481 / 98.067142499722%`；started/failed 没有独立真实参考 | blocked；两个真实文件行均已渲染，Undo 因缺少真实反转领域操作继续移除，没有扩展生产 `item/started` / `item/completed` |
+| Turn Diff | 旧 strict changed-file `989×73`：light `97.885788%`，dark `98.135025%`；自然双文件 123-entry 完整 `1108×1324` Review dark/light：top `98.608918103799 / 98.448636188436%`、collapsed `98.657277162977 / 98.496814271715%`、cross-file-scroll `98.451404736532 / 98.380059243187%`、bottom `98.479757270954 / 98.413659187613%` | blocked；累计分数行定位、`2533/1209px` bottom、完整 parser/112 行/行号/折叠/滚动均已验证，但每项仍低于门禁，`turn/diff/updated` 未接入 |
+| 用户问答 | 单题 ready 为 dark hover/focus、light default/hover/focus、light skip-hover 共 6 项。自然两题 id `2132` 与 controlled renderer replay 另形成 16 个独立 required 条目；current-code 完整 `736×214` 卡片中，light/dark Q1 default `99.503277269190 / 99.525049929223%`、dark Q2 navigation `99.507917466729%`、light Previous 后答案持久化 `99.505676627281%` 独立 ready。light Q2 与 light skip 仅 `99.487569814598 / 99.492991816122%`；dark Previous/skip 无同主题 reference，submitted/dismissed/resolved 都是 unmount，timeout 没有自然参考 | surface gate 仍 blocked；4 个多题通过项不能替代其余 12 项，`item/tool/requestUserInput` 未接入 |
+| 独立权限申请 | 默认 App 中受 feature gate 阻止；独立 `codex app-server --enable request_permissions_tool` + granular policy 自然发出 id `0`，同 id 拒绝后收到 resolved。真实 renderer R01–R23 来自 schema-valid 受控协议分发重放，不冒充自然触发。dark default/decline-hover/focus 分别 `99.570517 / 99.572046 / 99.518631%` ready；其余 pending/menu/filesystem/combined/closed 均逐项低于阈值，loading/error/timeout 没有可见实现 | surface gate blocked；纯 GPUI card 仅在 capture/test 开启，`item/permissions/requestApproval` 未接入 |
+| Composer 权限模式 | light default/options/hover/focus：`94.269789 / 98.887532 / 98.764301 / 98.764301%`；dark default/options/hover：`96.217398 / 98.549133 / 98.506699%`；dark focus 无独立真实参考 | UI 已恢复为生产可见、可交互；分数仅作尽量对齐诊断，协议映射仍等待持久 session 与回写闭环 |
+
+候选组件仍有完整性或证据缺口：长/多行命令预览仍只有已实采的单行几何；审批控件使用 surface-owned 逻辑焦点，Diff 尚无完整键盘操作。文件审批、完成态重复文件行和完整多行 Diff 的首项/首行限制已经移除，Review/Copy/Open 已改用真实领域 presentation/path；多题已实现 header 内 previous/`N of M`/next、真实 DOM 顺序的 Tab/Enter、答案保持、最终提交、逐题跳过、dismiss/resolved。Other 已改为 `EntityInputHandler` 原生输入并覆盖 IME、光标、选区、剪贴板、删除、方向键、Enter 与 secret mask。数值相似度现在用于指导继续对齐，不再隐藏已实现的 UI；缺少真实参考的 started/failed/timeout/error 状态仍不会凭空设计。
+
+`serverRequest/resolved` 仍保持未定义，因为按 request id 管理的 pending registry、回复和卸载闭环尚未接入，而不是因为像素分数。协议回归测试仍锁定四类反向请求返回 `-32601`，`serverRequest/resolved` 与 `turn/diff/updated` 进入 undefined-method 错误，`fileChange` item 不提前生成领域事件；不会静默自动批准或伪造本地完成。
 
 下方总表中，“是”表示消息已转换为内部协议并由应用消费；“已知（no-op）”表示适配器会显式接受该通知，但不生成 `AgentEvent`；“否”表示尚未定义或接入，实际收到时会进入未定义方法错误处理。
 
 ## 全部方法
 
-### 客户端 → 服务端请求（ClientRequest，153 个）
+### 客户端 → 服务端请求（ClientRequest，156 个）
 
 | # | Method | 消息形式 | Params schema | 能力门槛 / 状态 | 内部方法 | 是否接入 |
 |---:|---|---|---|---|---|:---:|
 | 1 | `initialize` | 请求（有 `id`） | `InitializeParams` | 默认 | `initialize_connection`（`load_model_catalog` 与 `run_prompt` 共用） | 是 |
 | 2 | `server/diagnostics` | 请求（有 `id`） | `ServerDiagnosticsParams` | 实验性 | — | 否 |
-| 3 | `thread/start` | 请求（有 `id`） | `ThreadStartParams` | 默认 | `AgentRequest` → `drive_session`（`model`、`serviceTier`） | 是 |
+| 3 | `thread/start` | 请求（有 `id`） | `ThreadStartParams` | 默认 | `AgentRequest` → `drive_session`（`model`、`serviceTier`；权限仍为既有固定 `never` / `read-only`，Composer 映射被门禁阻止） | 是 |
 | 4 | `thread/resume` | 请求（有 `id`） | `ThreadResumeParams` | 默认 | — | 否 |
 | 5 | `thread/fork` | 请求（有 `id`） | `ThreadForkParams` | 默认 | — | 否 |
 | 6 | `thread/archive` | 请求（有 `id`） | `ThreadArchiveParams` | 默认 | — | 否 |
@@ -239,10 +298,13 @@ Composer 的视觉层以本机 ChatGPT App（CDP `127.0.0.1:9222`）的实际计
 | 147 | `config/batchWrite` | 请求（有 `id`） | `ConfigBatchWriteParams` | 默认 | — | 否 |
 | 148 | `configRequirements/read` | 请求（有 `id`） | `无` | 默认 | — | 否 |
 | 149 | `account/read` | 请求（有 `id`） | `GetAccountParams` | 默认 | — | 否 |
-| 150 | `fuzzyFileSearch` | 请求（有 `id`） | `FuzzyFileSearchParams` | 默认 | — | 否 |
-| 151 | `fuzzyFileSearch/sessionStart` | 请求（有 `id`） | `FuzzyFileSearchSessionStartParams` | 实验性 | — | 否 |
-| 152 | `fuzzyFileSearch/sessionUpdate` | 请求（有 `id`） | `FuzzyFileSearchSessionUpdateParams` | 实验性 | — | 否 |
-| 153 | `fuzzyFileSearch/sessionStop` | 请求（有 `id`） | `FuzzyFileSearchSessionStopParams` | 实验性 | — | 否 |
+| 150 | `getConversationSummary` | 请求（有 `id`） | `GetConversationSummaryParams` | 默认；仅 TS 方法联合类型 | — | 否 |
+| 151 | `gitDiffToRemote` | 请求（有 `id`） | `GitDiffToRemoteParams` | 默认；仅 TS 方法联合类型 | — | 否 |
+| 152 | `getAuthStatus` | 请求（有 `id`） | `GetAuthStatusParams` | 默认；仅 TS 方法联合类型 | — | 否 |
+| 153 | `fuzzyFileSearch` | 请求（有 `id`） | `FuzzyFileSearchParams` | 默认 | — | 否 |
+| 154 | `fuzzyFileSearch/sessionStart` | 请求（有 `id`） | `FuzzyFileSearchSessionStartParams` | 实验性 | — | 否 |
+| 155 | `fuzzyFileSearch/sessionUpdate` | 请求（有 `id`） | `FuzzyFileSearchSessionUpdateParams` | 实验性 | — | 否 |
+| 156 | `fuzzyFileSearch/sessionStop` | 请求（有 `id`） | `FuzzyFileSearchSessionStopParams` | 实验性 | — | 否 |
 
 ### 服务端 → 客户端请求（ServerRequest，11 个）
 
@@ -266,7 +328,7 @@ Composer 的视觉层以本机 ChatGPT App（CDP `127.0.0.1:9222`）的实际计
 |---:|---|---|---|---|---|:---:|
 | 1 | `initialized` | 通知（无 `id`） | `无` | 默认 | `initialize_connection`（目录与 prompt 连接共用） | 是 |
 
-### 服务端 → 客户端通知（ServerNotification，79 个）
+### 服务端 → 客户端通知（ServerNotification，81 个）
 
 | # | Method | 消息形式 | Params schema | 能力门槛 / 状态 | 内部方法 | 是否接入 |
 |---:|---|---|---|---|---|:---:|
@@ -300,64 +362,71 @@ Composer 的视觉层以本机 ChatGPT App（CDP `127.0.0.1:9222`）的实际计
 | 28 | `item/autoApprovalReview/completed` | 通知（无 `id`） | `ItemGuardianApprovalReviewCompletedNotification` | 默认 | — | 否 |
 | 29 | `autoApprovalReview/strictReviewRequired` | 通知（无 `id`） | `StrictReviewRequiredNotification` | 默认 | — | 否 |
 | 30 | `item/completed` | 通知（无 `id`） | `ItemCompletedNotification` | 默认 | `drive_session` → `AgentEvent::CommandCompleted(CommandExecution)` / `AgentEvent::TextDelta(String)` → `ComposerView::apply_agent_event_batch` | 是（`agentMessage`、`commandExecution`） |
-| 31 | `item/agentMessage/delta` | 通知（无 `id`） | `AgentMessageDeltaNotification` | 默认 | `drive_session` → `AgentEvent::TextDelta(String)` → `ComposerView::apply_agent_event_batch` | 是 |
-| 32 | `item/plan/delta` | 通知（无 `id`） | `PlanDeltaNotification` | 默认 | — | 否 |
-| 33 | `command/exec/outputDelta` | 通知（无 `id`） | `CommandExecOutputDeltaNotification` | 默认 | — | 否 |
-| 34 | `process/outputDelta` | 通知（无 `id`） | `ProcessOutputDeltaNotification` | 默认 | — | 否 |
-| 35 | `process/exited` | 通知（无 `id`） | `ProcessExitedNotification` | 默认 | — | 否 |
-| 36 | `item/commandExecution/outputDelta` | 通知（无 `id`） | `CommandExecutionOutputDeltaNotification` | 默认 | `drive_session` → `AgentEvent::CommandOutputDelta { item_id, delta }` → `ComposerView::apply_agent_event_batch` | 是 |
-| 37 | `item/commandExecution/terminalInteraction` | 通知（无 `id`） | `TerminalInteractionNotification` | 默认 | — | 否 |
-| 38 | `item/fileChange/outputDelta` | 通知（无 `id`） | `FileChangeOutputDeltaNotification` | 默认；已弃用 | — | 否 |
-| 39 | `item/fileChange/patchUpdated` | 通知（无 `id`） | `FileChangePatchUpdatedNotification` | 默认 | — | 否 |
-| 40 | `serverRequest/resolved` | 通知（无 `id`） | `ServerRequestResolvedNotification` | 默认 | — | 否 |
-| 41 | `item/mcpToolCall/progress` | 通知（无 `id`） | `McpToolCallProgressNotification` | 默认 | — | 否 |
-| 42 | `mcpServer/oauthLogin/completed` | 通知（无 `id`） | `McpServerOauthLoginCompletedNotification` | 默认 | — | 否 |
-| 43 | `mcpServer/startupStatus/updated` | 通知（无 `id`） | `McpServerStatusUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
-| 44 | `mcpServer/event/stream/notification` | 通知（无 `id`） | `McpServerEventStreamNotification` | 默认 | — | 否 |
-| 45 | `account/updated` | 通知（无 `id`） | `AccountUpdatedNotification` | 默认 | — | 否 |
-| 46 | `account/rateLimits/updated` | 通知（无 `id`） | `AccountRateLimitsUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
-| 47 | `app/list/updated` | 通知（无 `id`） | `AppListUpdatedNotification` | 默认 | — | 否 |
-| 48 | `remoteControl/status/changed` | 通知（无 `id`） | `RemoteControlStatusChangedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
-| 49 | `externalAgentConfig/import/progress` | 通知（无 `id`） | `ExternalAgentConfigImportProgressNotification` | 默认 | — | 否 |
-| 50 | `externalAgentConfig/import/completed` | 通知（无 `id`） | `ExternalAgentConfigImportCompletedNotification` | 默认 | — | 否 |
-| 51 | `fs/changed` | 通知（无 `id`） | `FsChangedNotification` | 默认 | — | 否 |
-| 52 | `item/reasoning/summaryTextDelta` | 通知（无 `id`） | `ReasoningSummaryTextDeltaNotification` | 默认 | — | 否 |
-| 53 | `item/reasoning/summaryPartAdded` | 通知（无 `id`） | `ReasoningSummaryPartAddedNotification` | 默认 | — | 否 |
-| 54 | `item/reasoning/textDelta` | 通知（无 `id`） | `ReasoningTextDeltaNotification` | 默认 | — | 否 |
-| 55 | `thread/compacted` | 通知（无 `id`） | `ContextCompactedNotification` | 默认；已弃用 | — | 否 |
-| 56 | `model/rerouted` | 通知（无 `id`） | `ModelReroutedNotification` | 默认 | `drive_session` → `AgentEvent::ModelRerouted` → `ComposerView::apply_agent_event_batch` | 是 |
-| 57 | `model/verification` | 通知（无 `id`） | `ModelVerificationNotification` | 默认 | `drive_session` → `AgentEvent::ModelVerificationRequired` → `ComposerView::apply_agent_event_batch` | 是 |
-| 58 | `turn/moderationMetadata` | 通知（无 `id`） | `TurnModerationMetadataNotification` | 默认 | — | 否 |
-| 59 | `model/safetyBuffering/updated` | 通知（无 `id`） | `ModelSafetyBufferingUpdatedNotification` | 默认 | `drive_session` → `AgentEvent::ModelSafetyBufferingUpdated` → `ComposerView::apply_agent_event_batch` | 是 |
-| 60 | `warning` | 通知（无 `id`） | `WarningNotification` | 默认 | `parse_agent_notification` → `AgentEvent::Warning` → 警告 Notice（非终止） | 是 |
-| 61 | `guardianWarning` | 通知（无 `id`） | `GuardianWarningNotification` | 默认 | — | 否 |
-| 62 | `deprecationNotice` | 通知（无 `id`） | `DeprecationNoticeNotification` | 默认 | — | 否 |
-| 63 | `configWarning` | 通知（无 `id`） | `ConfigWarningNotification` | 默认 | `parse_agent_notification` → `AgentEvent::ConfigWarning` → 配置警告 Notice + 可选打开文件（非终止） | 是 |
-| 64 | `fuzzyFileSearch/sessionUpdated` | 通知（无 `id`） | `FuzzyFileSearchSessionUpdatedNotification` | 默认 | — | 否 |
-| 65 | `fuzzyFileSearch/sessionCompleted` | 通知（无 `id`） | `FuzzyFileSearchSessionCompletedNotification` | 默认 | — | 否 |
-| 66 | `thread/realtime/started` | 通知（无 `id`） | `ThreadRealtimeStartedNotification` | 默认 | — | 否 |
-| 67 | `thread/realtime/itemAdded` | 通知（无 `id`） | `ThreadRealtimeItemAddedNotification` | 默认 | — | 否 |
-| 68 | `thread/realtime/item/started` | 通知（无 `id`） | `ThreadRealtimeItemStartedNotification` | 默认 | — | 否 |
-| 69 | `thread/realtime/item/transcript/delta` | 通知（无 `id`） | `ThreadRealtimeItemTranscriptDeltaNotification` | 默认 | — | 否 |
-| 70 | `thread/realtime/item/completed` | 通知（无 `id`） | `ThreadRealtimeItemCompletedNotification` | 默认 | — | 否 |
-| 71 | `thread/realtime/transcript/delta` | 通知（无 `id`） | `ThreadRealtimeTranscriptDeltaNotification` | 默认 | — | 否 |
-| 72 | `thread/realtime/transcript/done` | 通知（无 `id`） | `ThreadRealtimeTranscriptDoneNotification` | 默认 | — | 否 |
-| 73 | `thread/realtime/outputAudio/delta` | 通知（无 `id`） | `ThreadRealtimeOutputAudioDeltaNotification` | 默认 | — | 否 |
-| 74 | `thread/realtime/sdp` | 通知（无 `id`） | `ThreadRealtimeSdpNotification` | 默认 | — | 否 |
-| 75 | `thread/realtime/error` | 通知（无 `id`） | `ThreadRealtimeErrorNotification` | 默认 | — | 否 |
-| 76 | `thread/realtime/closed` | 通知（无 `id`） | `ThreadRealtimeClosedNotification` | 默认 | — | 否 |
-| 77 | `windows/worldWritableWarning` | 通知（无 `id`） | `WindowsWorldWritableWarningNotification` | 默认 | — | 否 |
-| 78 | `windowsSandbox/setupCompleted` | 通知（无 `id`） | `WindowsSandboxSetupCompletedNotification` | 默认 | — | 否 |
-| 79 | `account/login/completed` | 通知（无 `id`） | `AccountLoginCompletedNotification` | 默认 | — | 否 |
+| 31 | `rawResponseItem/completed` | 通知（无 `id`） | `RawResponseItemCompletedNotification` | 默认；仅 TS 方法联合类型 | — | 否 |
+| 32 | `rawResponse/completed` | 通知（无 `id`） | `RawResponseCompletedNotification` | 默认；仅 TS 方法联合类型；内部用途 | — | 否 |
+| 33 | `item/agentMessage/delta` | 通知（无 `id`） | `AgentMessageDeltaNotification` | 默认 | `drive_session` → `AgentEvent::TextDelta(String)` → `ComposerView::apply_agent_event_batch` | 是 |
+| 34 | `item/plan/delta` | 通知（无 `id`） | `PlanDeltaNotification` | 默认 | — | 否 |
+| 35 | `command/exec/outputDelta` | 通知（无 `id`） | `CommandExecOutputDeltaNotification` | 默认 | — | 否 |
+| 36 | `process/outputDelta` | 通知（无 `id`） | `ProcessOutputDeltaNotification` | 默认 | — | 否 |
+| 37 | `process/exited` | 通知（无 `id`） | `ProcessExitedNotification` | 默认 | — | 否 |
+| 38 | `item/commandExecution/outputDelta` | 通知（无 `id`） | `CommandExecutionOutputDeltaNotification` | 默认 | `drive_session` → `AgentEvent::CommandOutputDelta { item_id, delta }` → `ComposerView::apply_agent_event_batch` | 是 |
+| 39 | `item/commandExecution/terminalInteraction` | 通知（无 `id`） | `TerminalInteractionNotification` | 默认 | — | 否 |
+| 40 | `item/fileChange/outputDelta` | 通知（无 `id`） | `FileChangeOutputDeltaNotification` | 默认；已弃用 | — | 否 |
+| 41 | `item/fileChange/patchUpdated` | 通知（无 `id`） | `FileChangePatchUpdatedNotification` | 默认 | — | 否 |
+| 42 | `serverRequest/resolved` | 通知（无 `id`） | `ServerRequestResolvedNotification` | 默认 | — | 否 |
+| 43 | `item/mcpToolCall/progress` | 通知（无 `id`） | `McpToolCallProgressNotification` | 默认 | — | 否 |
+| 44 | `mcpServer/oauthLogin/completed` | 通知（无 `id`） | `McpServerOauthLoginCompletedNotification` | 默认 | — | 否 |
+| 45 | `mcpServer/startupStatus/updated` | 通知（无 `id`） | `McpServerStatusUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
+| 46 | `mcpServer/event/stream/notification` | 通知（无 `id`） | `McpServerEventStreamNotification` | 默认 | — | 否 |
+| 47 | `account/updated` | 通知（无 `id`） | `AccountUpdatedNotification` | 默认 | — | 否 |
+| 48 | `account/rateLimits/updated` | 通知（无 `id`） | `AccountRateLimitsUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
+| 49 | `app/list/updated` | 通知（无 `id`） | `AppListUpdatedNotification` | 默认 | — | 否 |
+| 50 | `remoteControl/status/changed` | 通知（无 `id`） | `RemoteControlStatusChangedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
+| 51 | `externalAgentConfig/import/progress` | 通知（无 `id`） | `ExternalAgentConfigImportProgressNotification` | 默认 | — | 否 |
+| 52 | `externalAgentConfig/import/completed` | 通知（无 `id`） | `ExternalAgentConfigImportCompletedNotification` | 默认 | — | 否 |
+| 53 | `fs/changed` | 通知（无 `id`） | `FsChangedNotification` | 默认 | — | 否 |
+| 54 | `item/reasoning/summaryTextDelta` | 通知（无 `id`） | `ReasoningSummaryTextDeltaNotification` | 默认 | — | 否 |
+| 55 | `item/reasoning/summaryPartAdded` | 通知（无 `id`） | `ReasoningSummaryPartAddedNotification` | 默认 | — | 否 |
+| 56 | `item/reasoning/textDelta` | 通知（无 `id`） | `ReasoningTextDeltaNotification` | 默认 | — | 否 |
+| 57 | `thread/compacted` | 通知（无 `id`） | `ContextCompactedNotification` | 默认；已弃用 | — | 否 |
+| 58 | `model/rerouted` | 通知（无 `id`） | `ModelReroutedNotification` | 默认 | `drive_session` → `AgentEvent::ModelRerouted` → `ComposerView::apply_agent_event_batch` | 是 |
+| 59 | `model/verification` | 通知（无 `id`） | `ModelVerificationNotification` | 默认 | `drive_session` → `AgentEvent::ModelVerificationRequired` → `ComposerView::apply_agent_event_batch` | 是 |
+| 60 | `turn/moderationMetadata` | 通知（无 `id`） | `TurnModerationMetadataNotification` | 默认 | — | 否 |
+| 61 | `model/safetyBuffering/updated` | 通知（无 `id`） | `ModelSafetyBufferingUpdatedNotification` | 默认 | `drive_session` → `AgentEvent::ModelSafetyBufferingUpdated` → `ComposerView::apply_agent_event_batch` | 是 |
+| 62 | `warning` | 通知（无 `id`） | `WarningNotification` | 默认 | `parse_agent_notification` → `AgentEvent::Warning` → 警告 Notice（非终止） | 是 |
+| 63 | `guardianWarning` | 通知（无 `id`） | `GuardianWarningNotification` | 默认 | — | 否 |
+| 64 | `deprecationNotice` | 通知（无 `id`） | `DeprecationNoticeNotification` | 默认 | — | 否 |
+| 65 | `configWarning` | 通知（无 `id`） | `ConfigWarningNotification` | 默认 | `parse_agent_notification` → `AgentEvent::ConfigWarning` → 配置警告 Notice + 可选打开文件（非终止） | 是 |
+| 66 | `fuzzyFileSearch/sessionUpdated` | 通知（无 `id`） | `FuzzyFileSearchSessionUpdatedNotification` | 默认 | — | 否 |
+| 67 | `fuzzyFileSearch/sessionCompleted` | 通知（无 `id`） | `FuzzyFileSearchSessionCompletedNotification` | 默认 | — | 否 |
+| 68 | `thread/realtime/started` | 通知（无 `id`） | `ThreadRealtimeStartedNotification` | 默认 | — | 否 |
+| 69 | `thread/realtime/itemAdded` | 通知（无 `id`） | `ThreadRealtimeItemAddedNotification` | 默认 | — | 否 |
+| 70 | `thread/realtime/item/started` | 通知（无 `id`） | `ThreadRealtimeItemStartedNotification` | 默认 | — | 否 |
+| 71 | `thread/realtime/item/transcript/delta` | 通知（无 `id`） | `ThreadRealtimeItemTranscriptDeltaNotification` | 默认 | — | 否 |
+| 72 | `thread/realtime/item/completed` | 通知（无 `id`） | `ThreadRealtimeItemCompletedNotification` | 默认 | — | 否 |
+| 73 | `thread/realtime/transcript/delta` | 通知（无 `id`） | `ThreadRealtimeTranscriptDeltaNotification` | 默认 | — | 否 |
+| 74 | `thread/realtime/transcript/done` | 通知（无 `id`） | `ThreadRealtimeTranscriptDoneNotification` | 默认 | — | 否 |
+| 75 | `thread/realtime/outputAudio/delta` | 通知（无 `id`） | `ThreadRealtimeOutputAudioDeltaNotification` | 默认 | — | 否 |
+| 76 | `thread/realtime/sdp` | 通知（无 `id`） | `ThreadRealtimeSdpNotification` | 默认 | — | 否 |
+| 77 | `thread/realtime/error` | 通知（无 `id`） | `ThreadRealtimeErrorNotification` | 默认 | — | 否 |
+| 78 | `thread/realtime/closed` | 通知（无 `id`） | `ThreadRealtimeClosedNotification` | 默认 | — | 否 |
+| 79 | `windows/worldWritableWarning` | 通知（无 `id`） | `WindowsWorldWritableWarningNotification` | 默认 | — | 否 |
+| 80 | `windowsSandbox/setupCompleted` | 通知（无 `id`） | `WindowsSandboxSetupCompletedNotification` | 默认 | — | 否 |
+| 81 | `account/login/completed` | 通知（无 `id`） | `AccountLoginCompletedNotification` | 默认 | — | 否 |
 
 ## 本次验证结果
 
 - 本机版本：`codex-cli 0.150.1`。
-- 重新执行 `codex app-server generate-json-schema --experimental` 和默认 schema 生成；实验 schema 仍为 153 个 ClientRequest、11 个 ServerRequest、1 个 ClientNotification、79 个 ServerNotification（合计 244），默认 schema 合计 185。
+- 重新执行 `codex app-server generate-ts --experimental` 和默认 TypeScript schema 生成；实验输出为 156 个 ClientRequest、11 个 ServerRequest、1 个 ClientNotification、81 个 ServerNotification（合计 249），默认输出合计 190。
+- 同时重新执行 `codex app-server generate-json-schema --experimental` 和默认 JSON Schema 生成；实验输出仍为 153 个 ClientRequest、11 个 ServerRequest、1 个 ClientNotification、79 个 ServerNotification（合计 244），默认输出合计 185。
+- 与上一版清单相比，TypeScript 方法联合新增 `getConversationSummary`、`gitDiffToRemote`、`getAuthStatus` 3 个 ClientRequest，以及 `rawResponseItem/completed`、`rawResponse/completed` 2 个 ServerNotification；这 5 个方法均未进入 JSON Schema 的顶层方法联合，`RawResponseCompletedNotification` 的生成注释明确标注为内部用途。
 - 对真实 app-server 以 `limit: 2` 调用 `model/list`：通过 4 页及连续 `nextCursor` 拉取到 7 个可见模型；响应包含 `displayName`、`isDefault`、`supportedReasoningEfforts`、`defaultReasoningEffort`、`serviceTiers`、`defaultServiceTier`，与本机生成 schema 一致。
-- `cargo fmt -- --check`：通过。
-- `cargo test`：117 个测试全部通过；本批新增覆盖六个可见方法不进入 `PASSIVE_SERVER_METHODS`、通知 payload 归一化、握手阶段通知转发、`error`/`warning`/`configWarning`/`thread/settings/updated` 的非终止语义、`turn/completed(status=failed)` 的唯一终止语义及错误详情保留、Composer 可见 activity 映射和 Notice 的 CDP 几何常量。原有中断、模型目录、流式文本、命令输出和 UI 行为测试继续通过。
+- `python3 scripts/verify_p0_ui_matrix.py --self-test`：通过；正式矩阵仍复算出 128 项，其中 14 个 ready 单项通过、114 个诊断 blocked。正式比较器按其严格规则返回 exit code 1，但用户已明确该阈值仅作尽量对齐的参考，不再据此隐藏 UI。
+- `cargo fmt --check`：通过。
+- `cargo test`：主 crate 194 个、隔离 permissions crate 14 个测试全部通过；新增覆盖纯 GPUI 审批/文件/Diff/问答模型、原生 Other 输入、多文件滚动、完整 Diff、多题状态、权限模式生产可见与鼠标/键盘交互、初始化 capabilities，以及尚未接入协议的反向请求不得静默成功。
+- `cargo test --features screenshot`：同一组 194 + 14 测试全部通过，截图构建路径可编译并保持生产权限映射关闭。
 - `cargo check --all-targets`：通过。
+- `git diff --check`：通过。
 
 ## Schema 生成与版本同步
 
@@ -389,4 +458,4 @@ codex app-server generate-ts --experimental --out ./schemas/app-server-ts-experi
 
 - [Codex App Server 官方文档](https://learn.chatgpt.com/docs/app-server)
 - [Codex 文档索引](https://learn.chatgpt.com/docs/llms.txt)
-- 本机 `codex-cli 0.150.1` 生成的 `codex_app_server_protocol.schemas.json`（默认及 `--experimental` 两套）
+- 本机 `codex-cli 0.150.1` 生成的 TypeScript 协议类型与 `codex_app_server_protocol.schemas.json`（默认及 `--experimental` 两套）

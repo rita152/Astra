@@ -1,0 +1,1404 @@
+{
+  "version": 1,
+  "evidence_policy": "Only independently captured real ChatGPT App CDP references may be paired with GPUI captures. Every theme/surface/state is judged independently: a passing sibling cannot rescue a failing state, and a failing sibling cannot suppress a passing state. A ready crop must tightly contain the visible state-local UI; an unmounted or background-dominated region cannot pass. A blocked entry intentionally has no reference/actual fields, so one-sided or synthetic evidence cannot pass the strict audit. As of 2026-08-30 this matrix is a best-effort alignment diagnostic, not a product-visibility switch.",
+  "source_audit": "artifacts/chatgpt-p0-ui-cdp-audit-2026-08-30/AUDIT.md",
+  "source_audits": [
+    "artifacts/chatgpt-p0-ui-cdp-audit-2026-08-30/AUDIT.md",
+    "artifacts/chatgpt-permissions-request-cdp-audit-2026-08-30/AUDIT.md",
+    "CODEX_APP_SERVER_JSON_RPC.md",
+    "artifacts/chatgpt-multifile-diff-cdp-audit-2026-08-30/AUDIT.md",
+    "artifacts/chatgpt-user-input-multi-cdp-audit-2026-08-30/AUDIT.md"
+  ],
+  "multifile_diff_evidence": {
+    "classification": "natural Composer workflows; no controlled protocol replay",
+    "two_file_approval": {
+      "request_id": 2106,
+      "reference_states": "artifacts/chatgpt-multifile-diff-cdp-audit-2026-08-30/{08..22,26,27}-*",
+      "geometry": "736x210 card; 704x66 list; two 33px rows",
+      "resolution": "real Allow Once click followed by serverRequest/resolved, item/completed, and turn/diff/updated",
+      "exact_renderer_to_host_decision_wire_captured": false
+    },
+    "eight_file_approval": {
+      "request_id": 2117,
+      "reference_states": "artifacts/chatgpt-multifile-diff-cdp-audit-2026-08-30/{43..47}-*",
+      "geometry": "736x344 card; 704x200 viewport; 264px content; 64px maximum scroll; eight 33px rows",
+      "resolution": "real Escape followed by serverRequest/resolved and closed state",
+      "exact_renderer_to_host_decision_wire_captured": false
+    },
+    "long_two_file_review": {
+      "reference_states": "artifacts/chatgpt-multifile-diff-cdp-audit-2026-08-30/{29,32,33,34,38,40,41,42}-*",
+      "fixture": "tests/fixtures/cdp/turn-diff-updated-two-file-123-entries.diff",
+      "sha256": "9808146c5ab7541ec60f414633b66ab6204610fd3c96211e1d44efbd116801b5",
+      "payload": "3780 bytes; 123 split-newline entries; two files; 16 additions; 16 deletions; 80 context rows",
+      "geometry": "1107.641x1324 viewport; 2533px scrollHeight; 1209px max scroll; two 1260.25px files; 56 rendered rows per file; 21.59375px row height"
+    },
+    "gpui_candidate": "Arbitrary repeated approval/activity files, the 200px approval scroll cap, full DiffReviewPresentation files/lines/numbers/folding/scroll, and real Review/Copy/Open data flow have targeted tests. Sixteen current-code light/dark state-local pairs now have independent scores: two/eight-file approvals and two-file completion score 98.028268056464%–99.004312473782%, while long Review top/collapsed/cross-file/bottom score 98.380059243187%–98.657277162977%. The scores remain diagnostic; related production RPCs are still disabled because their request registry and reply/state-machine paths are not connected."
+  },
+  "multi_question_evidence": {
+    "natural_app_server_renderer": {
+      "request_id": 2132,
+      "reference_states": "artifacts/chatgpt-user-input-multi-cdp-audit-2026-08-30/{N01..N05}-*",
+      "classification": "natural app-server request rendered and answered through the real ChatGPT App UI; the renderer returned the complete answer map on the same integer request id",
+      "observed_states": "light Q1 default, Q2 automatic navigation, previous with Q1 answer persisted, next restoration, and final submission/unmount"
+    },
+    "controlled_renderer_replay": {
+      "reference_states": "artifacts/chatgpt-user-input-multi-cdp-audit-2026-08-30/{C01..C07,D01..D03,T01..T04}-*",
+      "classification": "schema-valid requests dispatched through the real production renderer entrypoint; not a natural app-server trigger",
+      "observed_states": "light per-question skip, dismiss, resolved, dark navigation/resolved, and pending beyond autoResolutionMs",
+      "timeout_boundary": "T01-T04 bypass any app-server timer and therefore do not establish a natural timeout or timeout UI"
+    },
+    "pixel_gate": "Current-code pure-GPUI full-card pairs independently pass for light/dark Q1 default, dark Q2 navigation, and light previous-answer persistence at 99.503277269190%–99.525049929223%. Light Q2 navigation (99.487569814598%), light skip navigation (99.492991816122%), unpaired dark previous/skip, and every unmounted/timeout state remain blocked."
+  },
+  "required_scenarios": [
+    {
+      "surface": "command_approval",
+      "variant": "network",
+      "states": [
+        "default",
+        "hover_approve",
+        "hover_decline",
+        "options",
+        "options_focus",
+        "approved",
+        "declined",
+        "resolved",
+        "timeout"
+      ]
+    },
+    {
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "states": [
+        "default",
+        "hover_approve",
+        "hover_decline",
+        "options",
+        "options_focus",
+        "approved",
+        "declined",
+        "resolved",
+        "timeout"
+      ]
+    },
+    {
+      "surface": "file_change_approval",
+      "variant": "two_file",
+      "states": [
+        "default"
+      ]
+    },
+    {
+      "surface": "file_change_approval",
+      "variant": "eight_file_overflow",
+      "states": [
+        "default",
+        "scrolled"
+      ]
+    },
+    {
+      "surface": "file_change",
+      "variant": "item_activity",
+      "states": [
+        "started",
+        "completed",
+        "failed"
+      ]
+    },
+    {
+      "surface": "file_change",
+      "variant": "two_file_activity",
+      "states": [
+        "completed"
+      ]
+    },
+    {
+      "surface": "turn_diff",
+      "variant": "review_open",
+      "states": [
+        "default"
+      ]
+    },
+    {
+      "surface": "turn_diff",
+      "variant": "two_file_long",
+      "states": [
+        "default",
+        "collapsed",
+        "scrolled",
+        "bottom"
+      ]
+    },
+    {
+      "surface": "user_input",
+      "variant": "choice",
+      "states": [
+        "default",
+        "hover_approve",
+        "focus",
+        "loading",
+        "resolved",
+        "timeout"
+      ]
+    },
+    {
+      "surface": "user_input",
+      "variant": "skip",
+      "states": [
+        "hover_decline",
+        "loading",
+        "resolved"
+      ]
+    },
+    {
+      "surface": "user_input",
+      "variant": "multi_question",
+      "states": [
+        "question_1_default",
+        "question_2_navigation",
+        "previous_answer_persisted",
+        "submitted_closed",
+        "skipped",
+        "dismissed",
+        "resolved",
+        "timeout"
+      ]
+    },
+    {
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "states": [
+        "default",
+        "hover_approve",
+        "hover_decline",
+        "focus",
+        "options",
+        "options_focus",
+        "approved",
+        "declined",
+        "timeout",
+        "resolved",
+        "error"
+      ]
+    },
+    {
+      "surface": "permissions_approval",
+      "variant": "filesystem",
+      "states": [
+        "default"
+      ]
+    },
+    {
+      "surface": "permissions_approval",
+      "variant": "combined",
+      "states": [
+        "default"
+      ]
+    },
+    {
+      "surface": "permission_mode",
+      "variant": "composer",
+      "states": [
+        "default",
+        "options",
+        "hover_approve",
+        "focus"
+      ]
+    }
+  ],
+  "entries": [
+    {
+      "id": "command-network-default-dark",
+      "theme": "dark",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "Best-aligned strict 736x162 state-local crop ([1042,1232] reference, [1041,204] actual) scores 99.377621%, below 99.5%. Geometry and flat fills align; the remaining concentrated residual is Chromium-vs-CoreText mixed Chinese/Latin glyph coverage plus capsule/keycap antialiasing."
+    },
+    {
+      "id": "command-network-hover-approve-dark",
+      "theme": "dark",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "hover_approve",
+      "status": "blocked",
+      "blocker": "Best-aligned strict 736x162 state-local crop ([1042,1232] reference, [1041,204] actual) scores 99.324033%, below 99.5%. Geometry and hover fill align; residual is concentrated in mixed-script glyph and capsule/keycap antialiasing."
+    },
+    {
+      "id": "command-network-hover-decline-dark",
+      "theme": "dark",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "hover_decline",
+      "status": "blocked",
+      "blocker": "Best-aligned strict 736x162 state-local crop ([1042,1232] reference, [1041,204] actual) scores 99.380064%, below 99.5%. Geometry and hover fill align; residual is concentrated in mixed-script glyph and capsule/keycap antialiasing."
+    },
+    {
+      "id": "command-network-options-dark",
+      "theme": "dark",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "options",
+      "status": "blocked",
+      "blocker": "Strict 736x162 crop containing the complete 168x67.125 menu and card scores 98.971475%, below 99.5%. The captured resolved menu fill/outline and real information SVG now align; residual remains in menu-row/CoreText glyph coverage, popover shadow rasterization, and the underlying card text/keycaps."
+    },
+    {
+      "id": "command-network-options-focus-dark",
+      "theme": "dark",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "options_focus",
+      "status": "blocked",
+      "blocker": "Strict 736x162 crop containing the complete focused menu and card scores 98.958139%, below 99.5%. Residual remains in menu-row/CoreText glyph coverage, focused-row and popover-shadow rasterization, and the underlying card text/keycaps."
+    },
+    {
+      "id": "command-network-approved-dark",
+      "theme": "dark",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "approved",
+      "status": "blocked",
+      "blocker": "The real command-approval card unmounts immediately after approval. The former 2200x194 lower-window crop scored 99.556357%, but it contains only background and Composer, not a visible approved command-approval surface; that background-diluted score is invalid. A future ready entry requires a real, tight, same-size visible state-local surface, which the current App did not expose."
+    },
+    {
+      "id": "command-network-declined-dark",
+      "theme": "dark",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "declined",
+      "status": "blocked",
+      "blocker": "The real command-approval card unmounts immediately after decline. The former 2200x194 lower-window crop scored 99.604099%, but it contains only background and Composer, not a visible declined command-approval surface; that background-diluted score is invalid. A future ready entry requires a real, tight, same-size visible state-local surface, which the current App did not expose."
+    },
+    {
+      "id": "command-network-resolved-dark",
+      "theme": "dark",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "resolved",
+      "status": "blocked",
+      "blocker": "serverRequest/resolved unmounts the real command-approval card. The former 2200x194 lower-window crop scored 99.574545%, but it contains only background and Composer, not a visible resolved command-approval surface; that background-diluted score is invalid. A future ready entry requires a real, tight, same-size visible state-local surface, which the current App did not expose."
+    },
+    {
+      "id": "command-network-timeout-dark",
+      "theme": "dark",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "timeout",
+      "status": "blocked",
+      "blocker": "No real command-approval timeout could be triggered; the request exposed no configurable deadline and no timeout surface appeared during observation."
+    },
+    {
+      "id": "command-network-default-light",
+      "theme": "light",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "Best-aligned strict 736x162 state-local crop ([1042,1232] reference, [1041,204] actual) scores 99.276492%, below 99.5%. Geometry and flat fills align; the remaining concentrated residual is Chromium-vs-CoreText mixed Chinese/Latin glyph coverage plus capsule/keycap antialiasing."
+    },
+    {
+      "id": "command-network-hover-approve-light",
+      "theme": "light",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "hover_approve",
+      "status": "blocked",
+      "blocker": "Best-aligned strict 736x162 state-local crop ([1042,1232] reference, [1041,204] actual) scores 99.218457%, below 99.5%. Geometry and hover fill align; residual is concentrated in mixed-script glyph and capsule/keycap antialiasing."
+    },
+    {
+      "id": "command-network-hover-decline-light",
+      "theme": "light",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "hover_decline",
+      "status": "blocked",
+      "blocker": "Best-aligned strict 736x162 state-local crop ([1042,1232] reference, [1041,204] actual) scores 99.279315%, below 99.5%. Geometry and hover fill align; residual is concentrated in mixed-script glyph and capsule/keycap antialiasing."
+    },
+    {
+      "id": "command-network-options-light",
+      "theme": "light",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "options",
+      "status": "blocked",
+      "blocker": "Strict 736x162 crop containing the complete 168x67.125 menu and card scores 98.738763%, below 99.5%. The captured resolved menu fill/outline and real information SVG now align; residual remains in menu-row/CoreText glyph coverage, popover shadow rasterization, and the underlying card text/keycaps."
+    },
+    {
+      "id": "command-network-options-focus-light",
+      "theme": "light",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "options_focus",
+      "status": "blocked",
+      "blocker": "Strict 736x162 crop containing the complete focused menu and card scores 98.720820%, below 99.5%. Residual remains in menu-row/CoreText glyph coverage, focused-row and popover-shadow rasterization, and the underlying card text/keycaps."
+    },
+    {
+      "id": "command-network-approved-light",
+      "theme": "light",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "approved",
+      "status": "blocked",
+      "blocker": "No distinct light-theme approved-immediate reference was captured; 16 records only the later unmounted/resolved surface and cannot be relabeled as approved."
+    },
+    {
+      "id": "command-network-declined-light",
+      "theme": "light",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "declined",
+      "status": "blocked",
+      "blocker": "The real command-approval card unmounts immediately after decline. The former 2200x194 lower-window crop scored 99.671328%, but it contains only background and Composer, not a visible declined command-approval surface; that background-diluted score is invalid. A future ready entry requires a real, tight, same-size visible state-local surface, which the current App did not expose."
+    },
+    {
+      "id": "command-network-resolved-light",
+      "theme": "light",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "resolved",
+      "status": "blocked",
+      "blocker": "serverRequest/resolved unmounts the real command-approval card. The former 2200x194 lower-window crop scored 99.682099%, but it contains only background and Composer, not a visible resolved command-approval surface; that background-diluted score is invalid. A future ready entry requires a real, tight, same-size visible state-local surface, which the current App did not expose."
+    },
+    {
+      "id": "command-network-timeout-light",
+      "theme": "light",
+      "surface": "command_approval",
+      "variant": "network",
+      "state": "timeout",
+      "status": "blocked",
+      "blocker": "No real command-approval timeout could be triggered; the request exposed no configurable deadline and no timeout surface appeared during observation."
+    },
+    {
+      "id": "file-approval-default-dark",
+      "theme": "dark",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "The legacy single-file GPUI capture scores 99.499727% on its strict 736x177 crop, 0.000273 percentage points below the gate. Current complete dark two-file and eight-file top/bottom crops score 99.004312473782%, 98.353087495952%, and 98.349940129827%; repeated-list/scroll tests pass, but no complete state reaches 99.5%."
+    },
+    {
+      "id": "file-approval-hover-approve-dark",
+      "theme": "dark",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "hover_approve",
+      "status": "blocked",
+      "blocker": "Against 40-file-change-approval-allow-hover-dark.png, the current GPUI capture scores 99.447893% on the strict 736x177 card crop ([1042,1217] reference, [1043,1217] actual), below the 99.5% gate."
+    },
+    {
+      "id": "file-approval-hover-decline-dark",
+      "theme": "dark",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "hover_decline",
+      "status": "ready",
+      "reference": "reference/dark/file-approval-decline-hover.png",
+      "actual": "actual/dark/file-approval-decline-hover.png",
+      "reference_box": [1042, 1217, 736, 177],
+      "actual_box": [1043, 1217, 736, 177]
+    },
+    {
+      "id": "file-approval-options-dark",
+      "theme": "dark",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "options",
+      "status": "blocked",
+      "blocker": "Against 42-file-change-approval-options-dark.png, the current GPUI capture scores 99.108220% on the strict 736x177 card crop ([1042,1217] reference, [1043,1217] actual), below the 99.5% gate."
+    },
+    {
+      "id": "file-approval-options-focus-dark",
+      "theme": "dark",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "options_focus",
+      "status": "blocked",
+      "blocker": "Against 43-file-change-approval-options-focus-dark.png, the current GPUI capture scores 99.099238% on the strict 736x177 card crop ([1042,1217] reference, [1043,1217] actual), below the 99.5% gate."
+    },
+    {
+      "id": "file-approval-approved-dark",
+      "theme": "dark",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "approved",
+      "status": "blocked",
+      "blocker": "The real approval card unmounts after approval; no distinct dark approved-immediate card was captured. The completed activity at 38 is tracked as file_change/completed instead."
+    },
+    {
+      "id": "file-approval-declined-dark",
+      "theme": "dark",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "declined",
+      "status": "blocked",
+      "blocker": "The real card unmounts at 44-file-change-declined-immediate-dark.png. The former 2200x194 lower-window comparison contains no visible file-approval surface, so its 99.392998% diagnostic score is invalid regardless of threshold. An unmounted/background-only region cannot substitute for a tight declined-state UI pair."
+    },
+    {
+      "id": "file-approval-resolved-dark",
+      "theme": "dark",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "resolved",
+      "status": "blocked",
+      "blocker": "The real card unmounts at 45-file-change-declined-resolved-dark.png. The former 2200x194 lower-window comparison contains no visible file-approval surface, so its 99.516415% background-diluted score is invalid despite exceeding 99.5%. An unmounted/background-only region cannot substitute for a tight resolved-state UI pair."
+    },
+    {
+      "id": "file-approval-timeout-dark",
+      "theme": "dark",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "timeout",
+      "status": "blocked",
+      "blocker": "No real file-change approval timeout could be triggered; no timeout surface appeared during observation."
+    },
+    {
+      "id": "file-approval-default-light",
+      "theme": "light",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "The legacy single-file GPUI capture scores 99.409058% on its strict 736x177 crop. Current complete light two-file and eight-file top/bottom crops score 98.817138087119%, 98.031921396803%, and 98.028268056464%; repeated-list/scroll tests pass, but no complete state reaches 99.5%."
+    },
+    {
+      "id": "file-approval-hover-approve-light",
+      "theme": "light",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "hover_approve",
+      "status": "blocked",
+      "blocker": "Against 25-file-change-approval-allow-hover-light.png, the current GPUI capture scores 99.352807% on the strict 736x177 card crop ([1042,1217] reference, [1043,1217] actual), below the 99.5% gate."
+    },
+    {
+      "id": "file-approval-hover-decline-light",
+      "theme": "light",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "hover_decline",
+      "status": "blocked",
+      "blocker": "Against 26-file-change-approval-decline-hover-light.png, the current GPUI capture scores 99.410098% on the strict 736x177 card crop ([1042,1217] reference, [1043,1217] actual), below the 99.5% gate."
+    },
+    {
+      "id": "file-approval-options-light",
+      "theme": "light",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "options",
+      "status": "blocked",
+      "blocker": "Against 27-file-change-approval-options-light.png, the current GPUI capture scores 98.935915% on the strict 736x177 card crop ([1042,1217] reference, [1043,1217] actual), below the 99.5% gate."
+    },
+    {
+      "id": "file-approval-options-focus-light",
+      "theme": "light",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "options_focus",
+      "status": "blocked",
+      "blocker": "Against 28-file-change-approval-options-focus-light.png, the current GPUI capture scores 98.920439% on the strict 736x177 card crop ([1042,1217] reference, [1043,1217] actual), below the 99.5% gate."
+    },
+    {
+      "id": "file-approval-approved-light",
+      "theme": "light",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "approved",
+      "status": "blocked",
+      "blocker": "The real approval card unmounts after approval; no distinct light approved-immediate card was captured. The completed activity at 31 is tracked as file_change/completed instead."
+    },
+    {
+      "id": "file-approval-declined-light",
+      "theme": "light",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "declined",
+      "status": "blocked",
+      "blocker": "The real card unmounts at 29-file-change-declined-immediate-light.png. The former 2200x194 lower-window comparison contains no visible file-approval surface, so its 99.641717% background-diluted score is invalid despite exceeding 99.5%. An unmounted/background-only region cannot substitute for a tight declined-state UI pair."
+    },
+    {
+      "id": "file-approval-resolved-light",
+      "theme": "light",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "resolved",
+      "status": "blocked",
+      "blocker": "The real card unmounts at 30-file-change-declined-resolved-light.png. The former 2200x194 lower-window comparison contains no visible file-approval surface, so its 98.948805% diagnostic score is invalid regardless of threshold. An unmounted/background-only region cannot substitute for a tight resolved-state UI pair."
+    },
+    {
+      "id": "file-approval-timeout-light",
+      "theme": "light",
+      "surface": "file_change_approval",
+      "variant": "external_file",
+      "state": "timeout",
+      "status": "blocked",
+      "blocker": "No real file-change approval timeout could be triggered; no timeout surface appeared during observation."
+    },
+    {
+      "id": "file-change-started-dark",
+      "theme": "dark",
+      "surface": "file_change",
+      "variant": "item_activity",
+      "state": "started",
+      "status": "blocked",
+      "blocker": "No independently captured real dark item/started(fileChange) activity surface is available; the audit captured only the completed activity."
+    },
+    {
+      "id": "file-change-completed-dark",
+      "theme": "dark",
+      "surface": "file_change",
+      "variant": "item_activity",
+      "state": "completed",
+      "status": "blocked",
+      "blocker": "The legacy single-file strict 736x65 activity crop scores 98.017034%. The current complete dark two-file 736x138 state renders both real file/path/count rows and scores 98.069895412481%, below 99.5%."
+    },
+    {
+      "id": "file-change-failed-dark",
+      "theme": "dark",
+      "surface": "file_change",
+      "variant": "item_activity",
+      "state": "failed",
+      "status": "blocked",
+      "blocker": "No independently captured real dark failed fileChange activity surface is available."
+    },
+    {
+      "id": "file-change-started-light",
+      "theme": "light",
+      "surface": "file_change",
+      "variant": "item_activity",
+      "state": "started",
+      "status": "blocked",
+      "blocker": "No independently captured real light item/started(fileChange) activity surface is available; the audit captured only the completed activity."
+    },
+    {
+      "id": "file-change-completed-light",
+      "theme": "light",
+      "surface": "file_change",
+      "variant": "item_activity",
+      "state": "completed",
+      "status": "blocked",
+      "blocker": "The legacy single-file strict 736x65 activity crop scores 97.735994%. The current complete light two-file 736x138 state renders both real file/path/count rows and scores 98.067142499722%, below 99.5%."
+    },
+    {
+      "id": "file-change-failed-light",
+      "theme": "light",
+      "surface": "file_change",
+      "variant": "item_activity",
+      "state": "failed",
+      "status": "blocked",
+      "blocker": "No independently captured real light failed fileChange activity surface is available."
+    },
+    {
+      "id": "turn-diff-review-open-dark",
+      "theme": "dark",
+      "surface": "turn_diff",
+      "variant": "review_open",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "The legacy strict 989x73 changed-file crop scores 98.135025%. Current full two-file top/collapsed/cross-scroll/bottom dark viewports score 98.608918103799%, 98.657277162977%, 98.451404736532%, and 98.479757270954%; the exact 123-entry data/112 rows/line numbers/fold/scroll are present, but every complete state remains below 99.5%."
+    },
+    {
+      "id": "turn-diff-review-open-light",
+      "theme": "light",
+      "surface": "turn_diff",
+      "variant": "review_open",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "The legacy strict 989x73 changed-file crop scores 97.885788%. Current full two-file top/collapsed/cross-scroll/bottom light viewports score 98.448636188436%, 98.496814271715%, 98.380059243187%, and 98.413659187613%; the exact 123-entry data/112 rows/line numbers/fold/scroll are present, but every complete state remains below 99.5%."
+    },
+    {
+      "id": "user-input-choice-default-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "choice",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "CDP capture 47 was misclassified as dark default: its strict 736x214 reference crop is byte-identical to real hover capture 48, and both JSON records show the blue unselected row's hover background and visible arrow. D01 is a real multi-question dark default and now has its own passing multi_question pair, but its header/navigation variant cannot satisfy this single-question choice entry; no valid single-question dark-default reference exists."
+    },
+    {
+      "id": "user-input-choice-hover-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "choice",
+      "state": "hover_approve",
+      "status": "ready",
+      "reference": "reference/dark/user-input-choice-hover.png",
+      "actual": "actual/dark/user-input-choice-hover.png",
+      "reference_box": [1042, 1180, 736, 214],
+      "actual_box": [1042, 1180, 736, 214]
+    },
+    {
+      "id": "user-input-choice-focus-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "choice",
+      "state": "focus",
+      "status": "ready",
+      "reference": "reference/dark/user-input-choice-focus.png",
+      "actual": "actual/dark/user-input-choice-focus.png",
+      "reference_box": [1042, 1180, 736, 214],
+      "actual_box": [1042, 1180, 736, 214]
+    },
+    {
+      "id": "user-input-choice-loading-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "choice",
+      "state": "loading",
+      "status": "blocked",
+      "blocker": "Real post-submit running evidence exists at 61-request-user-input-square-submitting-dark.png, but the undiluted former-card crop [1042,1180,736,214] scores 98.901259983%, below 99.5%."
+    },
+    {
+      "id": "user-input-choice-resolved-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "choice",
+      "state": "resolved",
+      "status": "blocked",
+      "blocker": "Real resolved evidence exists at 62-request-user-input-resolved-square-dark.png, but the undiluted former-card crop [1042,1180,736,214] scores 98.825868184%, below 99.5%."
+    },
+    {
+      "id": "user-input-choice-timeout-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "choice",
+      "state": "timeout",
+      "status": "blocked",
+      "blocker": "No real request-user-input timeout could be triggered; the request exposed no configurable deadline and no timeout surface appeared."
+    },
+    {
+      "id": "user-input-choice-default-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "choice",
+      "state": "default",
+      "status": "ready",
+      "reference": "reference/light/user-input-choice-default.png",
+      "actual": "actual/light/user-input-choice-default.png",
+      "reference_box": [1042, 1180, 736, 214],
+      "actual_box": [1042, 1180, 736, 214]
+    },
+    {
+      "id": "user-input-choice-hover-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "choice",
+      "state": "hover_approve",
+      "status": "ready",
+      "reference": "reference/light/user-input-choice-hover.png",
+      "actual": "actual/light/user-input-choice-hover.png",
+      "reference_box": [1042, 1180, 736, 214],
+      "actual_box": [1042, 1180, 736, 214]
+    },
+    {
+      "id": "user-input-choice-focus-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "choice",
+      "state": "focus",
+      "status": "ready",
+      "reference": "reference/light/user-input-choice-focus.png",
+      "actual": "actual/light/user-input-choice-focus.png",
+      "reference_box": [1042, 1180, 736, 214],
+      "actual_box": [1042, 1180, 736, 214]
+    },
+    {
+      "id": "user-input-choice-loading-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "choice",
+      "state": "loading",
+      "status": "blocked",
+      "blocker": "Real post-submit running evidence exists at 53-request-user-input-blue-submitting-light.png, but the undiluted former-card crop [1042,1180,736,214] scores 98.998072546%, below 99.5%."
+    },
+    {
+      "id": "user-input-choice-resolved-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "choice",
+      "state": "resolved",
+      "status": "blocked",
+      "blocker": "Real resolved evidence exists at 54-request-user-input-resolved-blue-light.png, but the undiluted former-card crop [1042,1180,736,214] scores 98.826552055%, below 99.5%."
+    },
+    {
+      "id": "user-input-choice-timeout-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "choice",
+      "state": "timeout",
+      "status": "blocked",
+      "blocker": "No real request-user-input timeout could be triggered; the request exposed no configurable deadline and no timeout surface appeared."
+    },
+    {
+      "id": "user-input-skip-hover-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "skip",
+      "state": "hover_decline",
+      "status": "blocked",
+      "blocker": "No real dark-theme skip-hover reference was captured; the light state at 56 cannot be reused across themes."
+    },
+    {
+      "id": "user-input-skip-loading-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "skip",
+      "state": "loading",
+      "status": "blocked",
+      "blocker": "No real dark-theme skip-submitting reference was captured; the light state at 57 cannot be reused across themes."
+    },
+    {
+      "id": "user-input-skip-resolved-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "skip",
+      "state": "resolved",
+      "status": "blocked",
+      "blocker": "Real skipped/resolved evidence exists at 59-request-user-input-skipped-resolved-dark.png, but the undiluted former-card crop [1042,1180,736,214] scores 98.385802174%, below 99.5%."
+    },
+    {
+      "id": "user-input-skip-hover-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "skip",
+      "state": "hover_decline",
+      "status": "ready",
+      "reference": "reference/light/user-input-skip-hover.png",
+      "actual": "actual/light/user-input-skip-hover.png",
+      "reference_box": [1042, 1180, 736, 214],
+      "actual_box": [1042, 1180, 736, 214]
+    },
+    {
+      "id": "user-input-skip-loading-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "skip",
+      "state": "loading",
+      "status": "blocked",
+      "blocker": "Real skip-submitting evidence exists at 57-request-user-input-skip-submitting-light.png, but the undiluted former-card crop [1042,1180,736,214] scores 99.279737765%, below 99.5%."
+    },
+    {
+      "id": "user-input-skip-resolved-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "skip",
+      "state": "resolved",
+      "status": "blocked",
+      "blocker": "Real skipped/resolved evidence exists at 58-request-user-input-skipped-resolved-light.png, but the undiluted former-card crop [1042,1180,736,214] scores 99.195141097%, below 99.5%."
+    },
+    {
+      "id": "permissions-default-dark",
+      "theme": "dark",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "default",
+      "status": "ready",
+      "reference": "reference/dark/permissions-default.png",
+      "actual": "actual/dark/permissions-default.png",
+      "reference_box": [0, 0, 752, 165],
+      "actual_box": [1034, 1237, 752, 165]
+    },
+    {
+      "id": "permissions-hover-approve-dark",
+      "theme": "dark",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "hover_approve",
+      "status": "blocked",
+      "blocker": "Controlled schema-valid dispatch through the real ChatGPT renderer produced R14, but the undiluted 752x165 local surface scores 99.266017497%, below 99.5%. The natural non-Browser app-server tool trace is recorded separately and is not mislabeled as this renderer replay."
+    },
+    {
+      "id": "permissions-hover-decline-dark",
+      "theme": "dark",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "hover_decline",
+      "status": "ready",
+      "reference": "reference/dark/permissions-decline-hover.png",
+      "actual": "actual/dark/permissions-decline-hover.png",
+      "reference_box": [1025, 1237, 752, 165],
+      "actual_box": [1034, 1237, 752, 165]
+    },
+    {
+      "id": "permissions-focus-dark",
+      "theme": "dark",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "focus",
+      "status": "ready",
+      "reference": "reference/dark/permissions-focus.png",
+      "actual": "actual/dark/permissions-focus.png",
+      "reference_box": [0, 0, 752, 165],
+      "actual_box": [1034, 1237, 752, 165]
+    },
+    {
+      "id": "permissions-options-dark",
+      "theme": "dark",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "options",
+      "status": "blocked",
+      "blocker": "Real renderer controlled-replay R15 captures the open menu, but the undiluted 752x165 surface scores 99.177291269%, below 99.5%."
+    },
+    {
+      "id": "permissions-options-focus-dark",
+      "theme": "dark",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "options_focus",
+      "status": "blocked",
+      "blocker": "Real renderer controlled-replay R16 captures keyboard focus in the menu, but the undiluted 752x165 surface scores 99.165540469%, below 99.5%."
+    },
+    {
+      "id": "permissions-approved-dark",
+      "theme": "dark",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "approved",
+      "status": "blocked",
+      "blocker": "R18 proves the real renderer unmounts the card after an approved response with the original request id. The undiluted 760x173 closed-state surface (including the now-exposed composer) scores 98.602062790%, below 99.5%."
+    },
+    {
+      "id": "permissions-declined-dark",
+      "theme": "dark",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "declined",
+      "status": "blocked",
+      "blocker": "R20 proves the real renderer unmounts after the declined response with the original request id; the undiluted 760x173 closed surface scores 98.602062790%, below 99.5%."
+    },
+    {
+      "id": "permissions-timeout-dark",
+      "theme": "dark",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "timeout",
+      "status": "blocked",
+      "blocker": "The natural request_permissions_tool trace and controlled renderer replay exposed no permission-card-specific timeout UI or timer field. No static or invented timeout presentation is accepted."
+    },
+    {
+      "id": "permissions-resolved-dark",
+      "theme": "dark",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "resolved",
+      "status": "blocked",
+      "blocker": "R21 proves serverRequest/resolved removes the request without a client response; the undiluted 760x173 closed surface scores 98.593556315%, below 99.5%."
+    },
+    {
+      "id": "permissions-error-dark",
+      "theme": "dark",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "error",
+      "status": "blocked",
+      "blocker": "The installed schema, natural tool path, and controlled real renderer exposed no permission-card-specific error presentation. No synthetic error chrome is implemented."
+    },
+    {
+      "id": "permissions-default-light",
+      "theme": "light",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "Natural non-Browser request_permissions_tool protocol evidence exists, and controlled schema-valid real-renderer evidence is R01. The undiluted 752x165 native surface scores 99.482317965%, below 99.5%."
+    },
+    {
+      "id": "permissions-hover-approve-light",
+      "theme": "light",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "hover_approve",
+      "status": "blocked",
+      "blocker": "Controlled schema-valid dispatch through the real renderer produced R03; the undiluted 752x165 surface scores 99.100622411%, below 99.5%."
+    },
+    {
+      "id": "permissions-hover-decline-light",
+      "theme": "light",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "hover_decline",
+      "status": "blocked",
+      "blocker": "Controlled schema-valid dispatch through the real renderer produced R07; the undiluted 752x165 surface scores 99.418083631%, below 99.5%."
+    },
+    {
+      "id": "permissions-focus-light",
+      "theme": "light",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "focus",
+      "status": "blocked",
+      "blocker": "R02 is a real renderer keyboard-focus capture; the undiluted 752x165 native surface scores 99.445955171%, below 99.5%."
+    },
+    {
+      "id": "permissions-options-light",
+      "theme": "light",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "options",
+      "status": "blocked",
+      "blocker": "Real renderer controlled-replay R04 captures the open menu, but the undiluted 752x165 surface scores 98.977384399%, below 99.5%."
+    },
+    {
+      "id": "permissions-options-focus-light",
+      "theme": "light",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "options_focus",
+      "status": "blocked",
+      "blocker": "Real renderer controlled-replay R05 captures keyboard focus in the menu, but the undiluted 752x165 surface scores 98.960351323%, below 99.5%."
+    },
+    {
+      "id": "permissions-approved-light",
+      "theme": "light",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "approved",
+      "status": "blocked",
+      "blocker": "R06 proves approved unmount using the original request id. The undiluted 760x173 closed-state surface scores 99.241071482%, below 99.5%."
+    },
+    {
+      "id": "permissions-declined-light",
+      "theme": "light",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "declined",
+      "status": "blocked",
+      "blocker": "R08 proves declined unmount using the original request id. The undiluted 760x173 closed-state surface scores 99.241071482%, below 99.5%."
+    },
+    {
+      "id": "permissions-timeout-light",
+      "theme": "light",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "timeout",
+      "status": "blocked",
+      "blocker": "The natural request_permissions_tool trace and controlled renderer replay exposed no permission-card-specific timeout UI or timer field. No static or invented timeout presentation is accepted."
+    },
+    {
+      "id": "permissions-resolved-light",
+      "theme": "light",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "resolved",
+      "status": "blocked",
+      "blocker": "R09 proves serverRequest/resolved removes the request without a client response; the undiluted 760x173 closed surface scores 99.192755776%, below 99.5%."
+    },
+    {
+      "id": "permissions-error-light",
+      "theme": "light",
+      "surface": "permissions_approval",
+      "variant": "external_access",
+      "state": "error",
+      "status": "blocked",
+      "blocker": "The installed schema, natural tool path, and controlled real renderer exposed no permission-card-specific error presentation. No synthetic error chrome is implemented."
+    },
+    {
+      "id": "permissions-filesystem-default-dark",
+      "theme": "dark",
+      "surface": "permissions_approval",
+      "variant": "filesystem",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "R22 captures the real file-system permission wording and path mention; the undiluted 752x165 surface scores 99.460086893%, below 99.5%."
+    },
+    {
+      "id": "permissions-filesystem-default-light",
+      "theme": "light",
+      "surface": "permissions_approval",
+      "variant": "filesystem",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "R10 captures the real file-system permission wording and path mention; the undiluted 752x165 surface scores 99.379367307%, below 99.5%."
+    },
+    {
+      "id": "permissions-combined-default-dark",
+      "theme": "dark",
+      "surface": "permissions_approval",
+      "variant": "combined",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "R23 captures the real combined network/read/write wording and repeated mention layout; the undiluted 752x165 surface scores 98.969260818%, below 99.5%."
+    },
+    {
+      "id": "permissions-combined-default-light",
+      "theme": "light",
+      "surface": "permissions_approval",
+      "variant": "combined",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "R11 captures the real combined network/read/write wording and repeated mention layout; the undiluted 752x165 surface scores 98.828957072%, below 99.5%."
+    },
+    {
+      "id": "permission-mode-default-dark",
+      "theme": "dark",
+      "surface": "permission_mode",
+      "variant": "composer",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "Against 00-current-task-dark.png, the strict 90x28 trigger crop scores 96.217398%, below 99.5%. The real reference also carries an observed outer focus ring, so no broader crop is substituted."
+    },
+    {
+      "id": "permission-mode-options-dark",
+      "theme": "dark",
+      "surface": "permission_mode",
+      "variant": "composer",
+      "state": "options",
+      "status": "blocked",
+      "blocker": "Against 01-permission-mode-menu-default-dark.png, the undiluted 357x225 menu-wrapper crop scores 98.549133%, below 99.5%."
+    },
+    {
+      "id": "permission-mode-request-hover-dark",
+      "theme": "dark",
+      "surface": "permission_mode",
+      "variant": "composer",
+      "state": "hover_approve",
+      "status": "blocked",
+      "blocker": "Against 02-permission-mode-request-hover-dark.png, the undiluted 357x225 menu-wrapper crop scores 98.506699%, below 99.5%."
+    },
+    {
+      "id": "permission-mode-request-focus-dark",
+      "theme": "dark",
+      "surface": "permission_mode",
+      "variant": "composer",
+      "state": "focus",
+      "status": "blocked",
+      "blocker": "No independent real dark-theme keyboard-focus reference was captured; the hover capture at 02 is not reused as focus evidence."
+    },
+    {
+      "id": "permission-mode-default-light",
+      "theme": "light",
+      "surface": "permission_mode",
+      "variant": "composer",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "Against 102-permission-mode-closed-light.png, the strict 90x28 trigger crop scores 94.269789%, below 99.5%."
+    },
+    {
+      "id": "permission-mode-options-light",
+      "theme": "light",
+      "surface": "permission_mode",
+      "variant": "composer",
+      "state": "options",
+      "status": "blocked",
+      "blocker": "Against 99-permission-mode-menu-default-light.png, the undiluted 357x225 menu-wrapper crop scores 98.887532%, below 99.5%."
+    },
+    {
+      "id": "permission-mode-request-hover-light",
+      "theme": "light",
+      "surface": "permission_mode",
+      "variant": "composer",
+      "state": "hover_approve",
+      "status": "blocked",
+      "blocker": "Against 100-permission-mode-request-hover-light.png, the undiluted 357x225 menu-wrapper crop scores 98.764301%, below 99.5%."
+    },
+    {
+      "id": "permission-mode-request-focus-light",
+      "theme": "light",
+      "surface": "permission_mode",
+      "variant": "composer",
+      "state": "focus",
+      "status": "blocked",
+      "blocker": "Against 101-permission-mode-request-focus-light.png, the undiluted 357x225 menu-wrapper crop scores 98.764301%, below 99.5%."
+    },
+    {
+      "id": "file-approval-two-file-default-dark",
+      "theme": "dark",
+      "surface": "file_change_approval",
+      "variant": "two_file",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "Natural surface 16-external-pending-default-dark.surface-01.png and the current GPUI crop [1043,1184,736,210] compare the complete two-file card at 99.004312473782%, below 99.5%. The files band is 97.8228%; the stronger header/actions bands cannot average away that failure."
+    },
+    {
+      "id": "file-approval-two-file-default-light",
+      "theme": "light",
+      "surface": "file_change_approval",
+      "variant": "two_file",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "Natural surface 08-external-pending-default-light.surface-01.png and the current GPUI crop [1043,1184,736,210] compare the complete two-file card at 98.817138087119%, below 99.5%. The files band is 97.4262%; the stronger header/actions bands cannot average away that failure."
+    },
+    {
+      "id": "file-approval-eight-file-default-dark",
+      "theme": "dark",
+      "surface": "file_change_approval",
+      "variant": "eight_file_overflow",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "Natural surface 43-many-pending-list-top-dark.surface-01.png and the current GPUI crop [1043,1050,736,344] compare the complete eight-file card at top at 98.353087495952%, below 99.5%. The 704x200 files viewport is present but its undiluted band is 97.4943%."
+    },
+    {
+      "id": "file-approval-eight-file-default-light",
+      "theme": "light",
+      "surface": "file_change_approval",
+      "variant": "eight_file_overflow",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "Natural surface 45-many-pending-list-top-light.surface-01.png and the current GPUI crop [1043,1050,736,344] compare the complete eight-file card at top at 98.031921396803%, below 99.5%. The 704x200 files viewport is present but its undiluted band is 97.0076%."
+    },
+    {
+      "id": "file-approval-eight-file-scrolled-dark",
+      "theme": "dark",
+      "surface": "file_change_approval",
+      "variant": "eight_file_overflow",
+      "state": "scrolled",
+      "status": "blocked",
+      "blocker": "Natural surface 44-many-pending-list-bottom-dark.surface-01.png and the distinct current GPUI bottom-scroll crop [1043,1050,736,344] score 98.349940129827%, below 99.5%. The full list moved to its bottom state, but the files band remains 97.4889%."
+    },
+    {
+      "id": "file-approval-eight-file-scrolled-light",
+      "theme": "light",
+      "surface": "file_change_approval",
+      "variant": "eight_file_overflow",
+      "state": "scrolled",
+      "status": "blocked",
+      "blocker": "Natural surface 46-many-pending-list-bottom-light.surface-01.png and the distinct current GPUI bottom-scroll crop [1043,1050,736,344] score 98.028268056464%, below 99.5%. The full list moved to its bottom state, but the files band remains 97.0013%."
+    },
+    {
+      "id": "file-change-two-file-completed-dark",
+      "theme": "dark",
+      "surface": "file_change",
+      "variant": "two_file_activity",
+      "state": "completed",
+      "status": "blocked",
+      "blocker": "The request-2106-correlated natural surface 26-external-completed-multifile-dark.surface-03.png and current GPUI crop [1039,202,736,138] score 98.069895412481%, below 99.5%. Both real file rows are present; text raster/color residuals and the intentionally absent unverified Undo action remain structural differences."
+    },
+    {
+      "id": "file-change-two-file-completed-light",
+      "theme": "light",
+      "surface": "file_change",
+      "variant": "two_file_activity",
+      "state": "completed",
+      "status": "blocked",
+      "blocker": "The request-2106-correlated natural surface 27-external-completed-multifile-light.surface-03.png and current GPUI crop [1039,202,736,138] score 98.067142499722%, below 99.5%. Both real file rows are present; text raster/color residuals and the intentionally absent unverified Undo action remain structural differences."
+    },
+    {
+      "id": "turn-diff-two-file-long-default-dark",
+      "theme": "dark",
+      "surface": "turn_diff",
+      "variant": "two_file_long",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "Natural full viewport 38-review-long-top-dark.surface-01.png and current GPUI crop [1203,86,1108,1324] score 98.608918103799%, below 99.5%. Cumulative 21.59375px row positioning removed the prior multi-pixel drift, but native-vs-Chromium glyph raster/color and the missing captured scrollbar still fail the complete state."
+    },
+    {
+      "id": "turn-diff-two-file-long-default-light",
+      "theme": "light",
+      "surface": "turn_diff",
+      "variant": "two_file_long",
+      "state": "default",
+      "status": "blocked",
+      "blocker": "Natural full viewport 29-review-long-top-light.surface-01.png and current GPUI crop [1203,86,1108,1324] score 98.448636188436%, below 99.5%. Cumulative 21.59375px row positioning removed the prior multi-pixel drift, but native-vs-Chromium glyph raster/color and the missing captured scrollbar still fail the complete state."
+    },
+    {
+      "id": "turn-diff-two-file-long-collapsed-dark",
+      "theme": "dark",
+      "surface": "turn_diff",
+      "variant": "two_file_long",
+      "state": "collapsed",
+      "status": "blocked",
+      "blocker": "Natural full viewport 40-review-first-file-collapsed-dark.surface-01.png and the distinct current 34px-first-file collapsed crop [1203,86,1108,1324] score 98.657277162977%, below 99.5%. The state is not substituted by the default capture."
+    },
+    {
+      "id": "turn-diff-two-file-long-collapsed-light",
+      "theme": "light",
+      "surface": "turn_diff",
+      "variant": "two_file_long",
+      "state": "collapsed",
+      "status": "blocked",
+      "blocker": "Natural full viewport 32-review-first-file-collapsed-light.surface-01.png and the distinct current 34px-first-file collapsed crop [1203,86,1108,1324] score 98.496814271715%, below 99.5%. The state is not substituted by the default capture."
+    },
+    {
+      "id": "turn-diff-two-file-long-scrolled-dark",
+      "theme": "dark",
+      "surface": "turn_diff",
+      "variant": "two_file_long",
+      "state": "scrolled",
+      "status": "blocked",
+      "blocker": "Natural full viewport 41-review-cross-file-scroll-dark.surface-01.png and the distinct current cross-file-scroll crop [1203,86,1108,1324] score 98.451404736532%, below 99.5%. The real two-file boundary is visible, but the complete state still has glyph/scrollbar residuals."
+    },
+    {
+      "id": "turn-diff-two-file-long-scrolled-light",
+      "theme": "light",
+      "surface": "turn_diff",
+      "variant": "two_file_long",
+      "state": "scrolled",
+      "status": "blocked",
+      "blocker": "Natural full viewport 33-review-cross-file-scroll-light.surface-01.png and the distinct current cross-file-scroll crop [1203,86,1108,1324] score 98.380059243187%, below 99.5%. The real two-file boundary is visible, but the complete state still has glyph/scrollbar residuals."
+    },
+    {
+      "id": "turn-diff-two-file-long-bottom-dark",
+      "theme": "dark",
+      "surface": "turn_diff",
+      "variant": "two_file_long",
+      "state": "bottom",
+      "status": "blocked",
+      "blocker": "Natural full viewport 42-review-bottom-second-file-dark.surface-01.png and the distinct current 1209px-bottom crop [1203,86,1108,1324] score 98.479757270954%, below 99.5%. The second file and changed-row phase now align at the measured maximum; glyph/color and scrollbar residuals remain."
+    },
+    {
+      "id": "turn-diff-two-file-long-bottom-light",
+      "theme": "light",
+      "surface": "turn_diff",
+      "variant": "two_file_long",
+      "state": "bottom",
+      "status": "blocked",
+      "blocker": "Natural full viewport 34-review-bottom-second-file-light.surface-01.png and the distinct current 1209px-bottom crop [1203,86,1108,1324] score 98.413659187613%, below 99.5%. The second file and changed-row phase now align at the measured maximum; glyph/color and scrollbar residuals remain."
+    },
+    {
+      "id": "user-input-multi-question-q1-default-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "question_1_default",
+      "status": "ready",
+      "reference": "reference/dark/user-input-multi-q1-default.png",
+      "actual": "actual/dark/user-input-multi-q1-default.png",
+      "reference_box": [8, 8, 736, 214],
+      "actual_box": [1043, 1180, 736, 214]
+    },
+    {
+      "id": "user-input-multi-question-q1-default-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "question_1_default",
+      "status": "ready",
+      "reference": "reference/light/user-input-multi-q1-default.png",
+      "actual": "actual/light/user-input-multi-q1-default.png",
+      "reference_box": [8, 8, 736, 214],
+      "actual_box": [1043, 1180, 736, 214]
+    },
+    {
+      "id": "user-input-multi-question-q2-navigation-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "question_2_navigation",
+      "status": "ready",
+      "reference": "reference/dark/user-input-multi-q2-navigation.png",
+      "actual": "actual/dark/user-input-multi-q2-navigation.png",
+      "reference_box": [8, 8, 736, 214],
+      "actual_box": [1043, 1180, 736, 214]
+    },
+    {
+      "id": "user-input-multi-question-q2-navigation-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "question_2_navigation",
+      "status": "blocked",
+      "blocker": "Natural N02 light Q2 and its byte-identical N04 restoration reference use the complete 736x214 card crop [8,8,736,214]. The current GPUI crop [1043,1180,736,214] scores 99.487569814598%, below 99.5%; residual glyph/nav raster error remains and is not hidden with background."
+    },
+    {
+      "id": "user-input-multi-question-previous-answer-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "previous_answer_persisted",
+      "status": "blocked",
+      "blocker": "A configurable dark GPUI previous-answer capture exists in the multi-question audit, but no real dark renderer reference was captured. The light N03 state is not reused across themes, so no score or canonical pair is claimed."
+    },
+    {
+      "id": "user-input-multi-question-previous-answer-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "previous_answer_persisted",
+      "status": "ready",
+      "reference": "reference/light/user-input-multi-previous-answer.png",
+      "actual": "actual/light/user-input-multi-previous-answer.png",
+      "reference_box": [8, 8, 736, 214],
+      "actual_box": [1043, 1180, 736, 214]
+    },
+    {
+      "id": "user-input-multi-question-submitted-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "submitted_closed",
+      "status": "blocked",
+      "blocker": "No real dark final-submit reference was captured. The real renderer unmounts the card after submission, and an unmounted/background-only region cannot be invented or reused as a visible state-local pair."
+    },
+    {
+      "id": "user-input-multi-question-submitted-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "submitted_closed",
+      "status": "blocked",
+      "blocker": "Natural app-server evidence N05-natural-final-submit-closed-light.png proves final submission and immediate unmount, but exposes no persistent submitted UI surface. No tight matching GPUI state-local pair exists; a blank lower-window crop cannot satisfy the gate."
+    },
+    {
+      "id": "user-input-multi-question-skipped-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "skipped",
+      "status": "blocked",
+      "blocker": "A configurable dark GPUI skip-navigation capture exists in the multi-question audit, but no real dark renderer skip reference was captured. The light controlled replay is not reused across themes, so no score or canonical pair is claimed."
+    },
+    {
+      "id": "user-input-multi-question-skipped-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "skipped",
+      "status": "blocked",
+      "blocker": "Controlled real-renderer C02 proves Q1 skip navigation to Q2. Its complete 736x214 card crop [8,8,736,214] versus current GPUI [1043,1180,736,214] scores 99.492991816122%, below 99.5%; C03 is an unmounted final-skip state and is not substituted with background."
+    },
+    {
+      "id": "user-input-multi-question-dismissed-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "dismissed",
+      "status": "blocked",
+      "blocker": "No real dark dismiss reference was captured. The renderer's dismiss behavior unmounts the card, and no tight visible GPUI state-local pair exists."
+    },
+    {
+      "id": "user-input-multi-question-dismissed-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "dismissed",
+      "status": "blocked",
+      "blocker": "Controlled real-renderer evidence C04/C05 proves dismiss returns an empty answer map and immediately unmounts the light card. There is no persistent dismissed surface or tight matching GPUI pair; background-only comparison is forbidden."
+    },
+    {
+      "id": "user-input-multi-question-resolved-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "resolved",
+      "status": "blocked",
+      "blocker": "Controlled real-renderer evidence D03-controlled-dark-navigation-resolved-closed.png proves serverRequest/resolved immediately unmounts the dark card without a response. There is no persistent resolved UI or tight matching GPUI pair."
+    },
+    {
+      "id": "user-input-multi-question-resolved-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "resolved",
+      "status": "blocked",
+      "blocker": "Controlled real-renderer evidence C06/C07 proves serverRequest/resolved immediately unmounts the light card without a response. There is no persistent resolved UI or tight matching GPUI pair."
+    },
+    {
+      "id": "user-input-multi-question-timeout-dark",
+      "theme": "dark",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "timeout",
+      "status": "blocked",
+      "blocker": "No natural dark multi-question timeout or auto-resolution reference was observed. No timeout UI is designed or inferred."
+    },
+    {
+      "id": "user-input-multi-question-timeout-light",
+      "theme": "light",
+      "surface": "user_input",
+      "variant": "multi_question",
+      "state": "timeout",
+      "status": "blocked",
+      "blocker": "T01-T03 only prove that controlled renderer replay remains pending beyond autoResolutionMs; it bypasses any app-server timer and is not a natural timeout reference. No light timeout UI or matching GPUI pair exists."
+    }
+  ]
+}

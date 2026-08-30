@@ -491,6 +491,10 @@ fn initialize_connection<R: BufRead, W: Write>(
                     "name": "gpui_chat_clone",
                     "title": "GPUI Chat Clone",
                     "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "experimentalApi": false,
+                    "requestAttestation": false
                 }
             }
         }),
@@ -512,6 +516,10 @@ fn initialize_turn_connection<R: BufRead, W: Write + Send>(
                 "name": "gpui_chat_clone",
                 "title": "GPUI Chat Clone",
                 "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": false,
+                "requestAttestation": false
             }
         }
     }))?;
@@ -1261,6 +1269,20 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
+        let initialize = sent_messages
+            .iter()
+            .find(|message| {
+                message.get("method").and_then(|value| value.as_str()) == Some("initialize")
+            })
+            .unwrap();
+        assert_eq!(
+            initialize.pointer("/params/capabilities/experimentalApi"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            initialize.pointer("/params/capabilities/requestAttestation"),
+            Some(&json!(false))
+        );
         let thread_start = sent_messages
             .iter()
             .find(|message| {
@@ -1278,6 +1300,18 @@ mod tests {
                 .pointer("/params/serviceTier")
                 .and_then(|value| value.as_str()),
             Some("priority")
+        );
+        assert_eq!(
+            thread_start
+                .pointer("/params/approvalPolicy")
+                .and_then(Value::as_str),
+            Some("never")
+        );
+        assert_eq!(
+            thread_start
+                .pointer("/params/sandbox")
+                .and_then(Value::as_str),
+            Some("read-only")
         );
         let turn_start = sent_messages
             .iter()
@@ -1696,6 +1730,123 @@ mod tests {
         assert!(error.contains("item/futureApproval/request"));
         assert!(response.contains("\"id\":99"));
         assert!(response.contains("\"code\":-32601"));
+    }
+
+    #[test]
+    fn unsupported_command_approval_is_rejected_instead_of_entering_live_ui() {
+        let mut reader = Cursor::new(
+            b"{\"id\":77,\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"itemId\":\"item_1\"}}\n",
+        );
+        let mut output = Vec::new();
+
+        let error = wait_for_response(&mut reader, &mut output, INITIALIZE_ID, None)
+            .unwrap_err()
+            .to_string();
+        let response = String::from_utf8(output).unwrap();
+
+        assert!(error.contains("item/commandExecution/requestApproval"));
+        assert!(response.contains("\"id\":77"));
+        assert!(response.contains("\"code\":-32601"));
+    }
+
+    #[test]
+    fn every_other_unsupported_p0_server_request_is_rejected() {
+        for (id, method) in [
+            (78_u64, "item/fileChange/requestApproval"),
+            (79, "item/permissions/requestApproval"),
+            (80, "item/tool/requestUserInput"),
+        ] {
+            let input = format!(
+                "{}\n",
+                json!({
+                    "id": id,
+                    "method": method,
+                    "params": {
+                        "threadId": "thr_1",
+                        "turnId": "turn_1",
+                        "itemId": "item_1"
+                    }
+                })
+            );
+            let mut reader = Cursor::new(input.into_bytes());
+            let mut output = Vec::new();
+
+            let error = wait_for_response(&mut reader, &mut output, INITIALIZE_ID, None)
+                .unwrap_err()
+                .to_string();
+            let response = String::from_utf8(output).unwrap();
+
+            assert!(error.contains(method));
+            assert!(response.contains(&format!("\"id\":{id}")));
+            assert!(response.contains("\"code\":-32601"));
+        }
+    }
+
+    #[test]
+    fn unsupported_server_request_resolved_notification_is_undefined() {
+        let mut reader = Cursor::new(
+            b"{\"method\":\"serverRequest/resolved\",\"params\":{\"threadId\":\"thr_1\",\"requestId\":77}}\n",
+        );
+        let mut output = Vec::new();
+
+        let error = wait_for_response(&mut reader, &mut output, INITIALIZE_ID, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("serverRequest/resolved"));
+        assert!(error.contains("通知"));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn unsupported_turn_diff_notification_is_undefined() {
+        let mut reader = Cursor::new(
+            b"{\"method\":\"turn/diff/updated\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"diff\":\"*** Begin Patch\"}}\n",
+        );
+        let mut output = Vec::new();
+
+        let error = wait_for_response(&mut reader, &mut output, INITIALIZE_ID, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("turn/diff/updated"));
+        assert!(error.contains("通知"));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn unsupported_file_change_items_do_not_emit_domain_events() {
+        let input = concat!(
+            "{\"id\":1,\"result\":{}}\n",
+            "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n",
+            "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_1\"}}}\n",
+            "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"items\":[],\"status\":\"inProgress\"}}}\n",
+            "{\"method\":\"item/started\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"fileChange\",\"id\":\"file_1\",\"status\":\"inProgress\",\"changes\":[]}}}\n",
+            "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"fileChange\",\"id\":\"file_1\",\"status\":\"completed\",\"changes\":[]}}}\n",
+            "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let session = CodexTurnSession::new(Vec::new(), None);
+        let (tx, rx) = async_channel::unbounded();
+
+        let outcome = drive_session(
+            &mut reader,
+            &session,
+            &AgentRequest {
+                prompt: "test".into(),
+                cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                model: "gpt-test".into(),
+                effort: "medium".into(),
+                service_tier: None,
+            },
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(outcome, TurnOutcome::Completed);
+        drop(tx);
+
+        assert_eq!(rx.try_recv().unwrap(), AgentEvent::Started);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

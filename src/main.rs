@@ -144,6 +144,44 @@ fn main() {
             .map(ToOwned::to_owned)
     });
     let command_tool_expanded = args.iter().any(|arg| arg == "--command-tool-expanded");
+    let approval_ui_state = args.iter().find_map(|arg| {
+        arg.strip_prefix("--approval-ui-state=")
+            .map(ToOwned::to_owned)
+    });
+    let user_input_ui_state = args.iter().find_map(|arg| {
+        arg.strip_prefix("--user-input-ui-state=")
+            .map(ToOwned::to_owned)
+    });
+    let file_approval_ui_state = args.iter().find_map(|arg| {
+        arg.strip_prefix("--file-approval-ui-state=")
+            .map(ToOwned::to_owned)
+    });
+    let permissions_approval_ui_state = args.iter().find_map(|arg| {
+        arg.strip_prefix("--permissions-approval-ui-state=")
+            .map(ToOwned::to_owned)
+    });
+    let permissions_approval_ui_kind = args
+        .iter()
+        .find_map(|arg| {
+            arg.strip_prefix("--permissions-approval-ui-kind=")
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "network".to_owned());
+    let file_change_ui_state = args.iter().find_map(|arg| {
+        arg.strip_prefix("--file-change-ui-state=")
+            .map(ToOwned::to_owned)
+    });
+    let turn_diff_ui_state = args.iter().find_map(|arg| {
+        arg.strip_prefix("--turn-diff-ui-state=")
+            .map(ToOwned::to_owned)
+    });
+    let approval_ui_kind = args
+        .iter()
+        .find_map(|arg| {
+            arg.strip_prefix("--approval-ui-kind=")
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "command".to_owned());
     let user_message_actions_visible = args
         .iter()
         .any(|arg| arg == "--user-message-actions-visible");
@@ -214,9 +252,21 @@ fn main() {
             .map(ToOwned::to_owned)
     });
     let permission_menu_open = args.iter().any(|arg| arg == "--permission-menu-open");
+    let permission_menu_state = args.iter().find_map(|arg| {
+        arg.strip_prefix("--permission-menu-state=")
+            .map(ToOwned::to_owned)
+    });
     let permission_confirmation_open = args
         .iter()
         .any(|arg| arg == "--permission-confirmation-open");
+    // Permission controls are visible in ordinary product launches. These
+    // flags only select deterministic modes/states for visual capture; pixel
+    // similarity is not a production visibility gate.
+    let permission_ui_capture = screenshot_path.is_some()
+        || permission_mode.is_some()
+        || permission_menu_open
+        || permission_menu_state.is_some()
+        || permission_confirmation_open;
     let settings_open = args.iter().any(|arg| arg == "--settings-open");
     let settings_page = args.iter().find_map(|arg| {
         arg.strip_prefix("--settings-page=")
@@ -292,6 +342,22 @@ fn main() {
                     }
                     cx.new(|cx| {
                         let mut app = ChatApp::new(mode, sidebar_bottom, cx);
+                        if permission_ui_capture {
+                            app.enable_permission_ui_for_capture(cx);
+                        }
+                        if approval_ui_state.is_some()
+                            || user_input_ui_state.is_some()
+                            || file_approval_ui_state.is_some()
+                            || permissions_approval_ui_state.is_some()
+                            || file_change_ui_state.is_some()
+                            || turn_diff_ui_state.is_some()
+                            || permission_mode.is_some()
+                            || permission_menu_open
+                            || permission_menu_state.is_some()
+                            || permission_confirmation_open
+                        {
+                            app.complete_startup_for_capture(cx);
+                        }
                         if profile_menu_open {
                             app.open_profile_menu(cx);
                         }
@@ -343,13 +409,15 @@ fn main() {
                             app.set_dictation_state_for_capture(state, cx);
                         }
                         if let Some(mode) = permission_mode.as_deref() {
-                            app.set_permission_mode(mode, cx);
+                            app.set_permission_mode_for_capture(mode, cx);
                         }
-                        if permission_menu_open {
-                            app.open_permission_menu(cx);
+                        if let Some(state) = permission_menu_state.as_deref() {
+                            app.set_permission_menu_capture_state(state, cx);
+                        } else if permission_menu_open {
+                            app.open_permission_menu_for_capture(cx);
                         }
                         if permission_confirmation_open {
-                            app.open_permission_confirmation(cx);
+                            app.open_permission_confirmation_for_capture(cx);
                         }
                         if let Some(prompt) = submit_prompt.as_deref() {
                             app.submit_prompt_for_capture(prompt, cx);
@@ -363,6 +431,28 @@ fn main() {
                                 command_tool_expanded,
                                 cx,
                             );
+                        }
+                        if let Some(state) = approval_ui_state.as_deref() {
+                            app.set_approval_for_capture(&approval_ui_kind, state, cx);
+                        }
+                        if let Some(state) = user_input_ui_state.as_deref() {
+                            app.set_user_input_for_capture(state, cx);
+                        }
+                        if let Some(state) = file_approval_ui_state.as_deref() {
+                            app.set_file_approval_for_capture(state, cx);
+                        }
+                        if let Some(state) = permissions_approval_ui_state.as_deref() {
+                            app.set_permissions_approval_for_capture(
+                                &permissions_approval_ui_kind,
+                                state,
+                                cx,
+                            );
+                        }
+                        if let Some(state) = file_change_ui_state.as_deref() {
+                            app.set_file_change_for_capture(state, cx);
+                        }
+                        if let Some(state) = turn_diff_ui_state.as_deref() {
+                            app.set_turn_diff_for_capture(state, cx);
                         }
                         if let Some(slug) = settings_page {
                             app.open_settings_page(slug, cx);

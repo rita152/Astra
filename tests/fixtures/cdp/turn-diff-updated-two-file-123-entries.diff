@@ -1,0 +1,122 @@
+diff --git a//tmp/codex-cdp-multifile-natural-20260830-a.txt b//tmp/codex-cdp-multifile-natural-20260830-a.txt
+index 511bd90981d367b59100988b4780408ddeb3ae56..0707571347e2226c9e56b6ffc6e3c3d9c7dc5030
+--- a//tmp/codex-cdp-multifile-natural-20260830-a.txt
++++ b//tmp/codex-cdp-multifile-natural-20260830-a.txt
+@@ -1,48 +1,48 @@
+ A-01 baseline context line
+ A-02 baseline context line
+ A-03 baseline context line
+-A-04 baseline context line
++A-04 revised changed line
+ A-05 baseline context line
+ A-06 baseline context line
+ A-07 baseline context line
+ A-08 baseline context line
+ A-09 baseline context line
+ A-10 baseline context line
+-A-11 baseline context line
++A-11 revised changed line
+ A-12 baseline context line
+ A-13 baseline context line
+ A-14 baseline context line
+ A-15 baseline context line
+ A-16 baseline context line
+ A-17 baseline context line
+-A-18 baseline context line
++A-18 revised changed line
+ A-19 baseline context line
+ A-20 baseline context line
++A-20.5 inserted evidence line
+ A-21 baseline context line
+ A-22 baseline context line
+ A-23 baseline context line
+ A-24 baseline context line
+-A-25 baseline context line
++A-25 revised changed line
+ A-26 baseline context line
+ A-27 baseline context line
+ A-28 baseline context line
+ A-29 baseline context line
+ A-30 baseline context line
+ A-31 baseline context line
+-A-32 baseline context line
++A-32 revised changed line
+ A-33 baseline context line
+ A-34 baseline context line
+ A-35 baseline context line
+ A-36 baseline context line
+ A-37 baseline context line
+ A-38 baseline context line
+-A-39 baseline context line
++A-39 revised changed line
+ A-40 baseline context line
+ A-41 baseline context line
+-A-42 baseline context line
+ A-43 baseline context line
+ A-44 baseline context line
+ A-45 baseline context line
+-A-46 baseline context line
++A-46 revised changed line
+ A-47 baseline context line
+ A-48 baseline context line
+diff --git a//tmp/codex-cdp-multifile-natural-20260830-b.txt b//tmp/codex-cdp-multifile-natural-20260830-b.txt
+index e6901adb212ecb3916f4b6f62dfed71a8434ca64..db5f6f69ab71d1b3ca984544f7958a6db22fdf53
+--- a//tmp/codex-cdp-multifile-natural-20260830-b.txt
++++ b//tmp/codex-cdp-multifile-natural-20260830-b.txt
+@@ -1,48 +1,48 @@
+ B-01 baseline context line
+ B-02 baseline context line
+-B-03 baseline context line
++B-03 revised changed line
+ B-04 baseline context line
+ B-05 baseline context line
+ B-06 baseline context line
+ B-07 baseline context line
+ B-08 baseline context line
+ B-09 baseline context line
+-B-10 baseline context line
++B-10 revised changed line
+ B-11 baseline context line
+ B-12 baseline context line
+ B-13 baseline context line
+ B-14 baseline context line
+ B-15 baseline context line
+ B-16 baseline context line
+-B-17 baseline context line
++B-17 revised changed line
+ B-18 baseline context line
+ B-19 baseline context line
+ B-20 baseline context line
+ B-21 baseline context line
++B-21.5 inserted evidence line
+ B-22 baseline context line
+ B-23 baseline context line
+-B-24 baseline context line
++B-24 revised changed line
+ B-25 baseline context line
+ B-26 baseline context line
+ B-27 baseline context line
+ B-28 baseline context line
+ B-29 baseline context line
+ B-30 baseline context line
+-B-31 baseline context line
++B-31 revised changed line
+ B-32 baseline context line
+ B-33 baseline context line
+ B-34 baseline context line
+ B-35 baseline context line
+ B-36 baseline context line
+ B-37 baseline context line
+-B-38 baseline context line
++B-38 revised changed line
+ B-39 baseline context line
+ B-40 baseline context line
+ B-41 baseline context line
+ B-42 baseline context line
+-B-43 baseline context line
+ B-44 baseline context line
+-B-45 baseline context line
++B-45 revised changed line
+ B-46 baseline context line
+ B-47 baseline context line
+ B-48 baseline context line

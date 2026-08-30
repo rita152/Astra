@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use chrono::Local;
 use gpui::{
-    Animation, AnimationExt, BoxShadow, Context, Div, Entity, FocusHandle, KeyDownEvent,
-    MouseButton, Render, Transformation, Window, deferred, div, hsla, linear_color_stop,
-    linear_gradient, prelude::*, px, radians, rgba,
+    Animation, AnimationExt, BoxShadow, Context, Div, Entity, FocusHandle, Focusable, KeyDownEvent,
+    MouseButton, Render, SharedString, Transformation, Window, deferred, div, hsla,
+    linear_color_stop, linear_gradient, prelude::*, px, radians, rgba,
 };
 
 use crate::{
@@ -14,10 +14,31 @@ use crate::{
         CommandExecutionStatus,
     },
     components::{
+        approval::{
+            ApprovalCardEvent, ApprovalCardStatus, ApprovalCardViewModel, ApprovalKeyboardFocus,
+            ApprovalMenuItem, ApprovalRequestPresentation, ApprovalVisualState,
+        },
+        file_change::{
+            FileApprovalEvent, FileApprovalKeyboardFocus, FileApprovalMenuItem,
+            FileApprovalPresentation, FileApprovalStatus, FileApprovalVisualState,
+            FileChangeActivityPresentation, captured_file_approval_fixture,
+            captured_file_change_activity_fixture,
+        },
         icons::icon,
+        permissions_approval::{
+            PermissionApprovalDecision, PermissionApprovalEvent, PermissionApprovalHover,
+            PermissionApprovalKeyboardFocus, PermissionApprovalMenuItem,
+            PermissionApprovalPresentation, PermissionApprovalStatus,
+            PermissionApprovalVisualState, PermissionPathAccess, PermissionPathRequest,
+        },
         prompt_input::{PromptChanged, PromptInput, PromptSubmitted},
+        user_input_request::{
+            UserInputKeyboardFocus, UserInputKeyboardOutcome, UserInputOptionPresentation,
+            UserInputQuestionPresentation, UserInputRequestEvent, UserInputRequestPresentation,
+            UserInputRequestStatus, UserInputVisualState, captured_multi_question_fixture,
+        },
     },
-    theme::{Theme, ThemeMode},
+    theme::{Theme, ThemeMode, ui_font},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,8 +64,23 @@ enum PermissionMode {
     Custom,
 }
 
-pub struct RequestFullAccess;
-impl gpui::EventEmitter<RequestFullAccess> for ComposerView {}
+impl PermissionMode {
+    const fn at_menu_index(index: usize) -> Self {
+        match index {
+            0 => Self::Request,
+            1 => Self::Assist,
+            2 => Self::Full,
+            _ => Self::Custom,
+        }
+    }
+}
+
+/// Opens the native full-access confirmation dialog.
+///
+/// Permission selection is currently local Composer state; changing the real
+/// app-server policy remains a separate protocol operation.
+pub struct RequestFullAccessConfirmation;
+impl gpui::EventEmitter<RequestFullAccessConfirmation> for ComposerView {}
 
 pub struct ModelCatalogLoadFinished;
 impl gpui::EventEmitter<ModelCatalogLoadFinished> for ComposerView {}
@@ -72,6 +108,11 @@ pub enum ConversationActivity {
         text: String,
     },
     Command(CommandExecution),
+    Approval(ApprovalCardViewModel),
+    FileApproval(FileApprovalPresentation),
+    PermissionsApproval(PermissionApprovalPresentation),
+    FileChange(FileChangeActivityPresentation),
+    UserInput(UserInputRequestPresentation),
     ProtocolError {
         message: String,
         details: Option<String>,
@@ -271,6 +312,7 @@ fn particle_layers(ultra_mode: bool, accelerated: bool) -> (bool, bool) {
 pub struct ComposerView {
     mode: ThemeMode,
     prompt_input: Entity<PromptInput>,
+    user_input_other_input: Entity<PromptInput>,
     user_message: Option<String>,
     user_message_time: Option<String>,
     assistant_message: String,
@@ -299,13 +341,25 @@ pub struct ComposerView {
     slider_dragging: bool,
     dictation_state: DictationState,
     dictation_cycle: u64,
+    /// The permission selector is part of the normal Composer UI. Capture
+    /// helpers still use this flag to make fixture setup explicit, but product
+    /// launches enable it by default; visual similarity is no longer a
+    /// visibility gate.
+    permission_ui_enabled: bool,
     permission_mode: PermissionMode,
+    permission_menu_focus: FocusHandle,
+    permission_menu_focused_item: usize,
+    permission_menu_keyboard_focus: bool,
     permission_menu_open: bool,
+    approval_resolved_capture: bool,
 }
 
 impl ComposerView {
     pub fn new(mode: ThemeMode, cx: &mut Context<Self>) -> Self {
         let prompt_input = cx.new(|cx| PromptInput::new(mode, cx));
+        let user_input_other_input = cx.new(|cx| {
+            PromptInput::inline_other(mode, "否，并告诉 ChatGPT 应该如何做得不同", false, cx)
+        });
         cx.subscribe(&prompt_input, |_, _, _: &PromptChanged, cx| {
             cx.notify();
         })
@@ -314,9 +368,57 @@ impl ComposerView {
             this.submit_prompt(event.0.clone(), cx);
         })
         .detach();
+        cx.subscribe(
+            &user_input_other_input,
+            |this, input, _: &PromptChanged, cx| {
+                let answer = input.read(cx).text().to_owned();
+                if let Some(model) = this.conversation_activity.iter_mut().find_map(|activity| {
+                    let ConversationActivity::UserInput(model) = activity else {
+                        return None;
+                    };
+                    model.should_render().then_some(model)
+                }) {
+                    model.save_other_answer(answer);
+                    model.focus_other_answer();
+                    cx.emit(ConversationChanged);
+                }
+                cx.notify();
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &user_input_other_input,
+            |this, _, event: &PromptSubmitted, cx| {
+                let pending = this.conversation_activity.iter().find_map(|activity| {
+                    let ConversationActivity::UserInput(model) = activity else {
+                        return None;
+                    };
+                    let question = model.current_question()?;
+                    model.should_render().then(|| {
+                        (
+                            model.request_id.clone(),
+                            question.id.clone(),
+                            event.0.clone(),
+                        )
+                    })
+                });
+                if let Some((request_id, question_id, answer)) = pending {
+                    this.handle_user_input_request_event(
+                        &request_id,
+                        UserInputRequestEvent::SubmitOtherAnswer {
+                            question_id,
+                            answer,
+                        },
+                        cx,
+                    );
+                }
+            },
+        )
+        .detach();
         let view = Self {
             mode,
             prompt_input,
+            user_input_other_input,
             user_message: None,
             user_message_time: None,
             assistant_message: String::new(),
@@ -345,8 +447,13 @@ impl ComposerView {
             slider_dragging: false,
             dictation_state: DictationState::Idle,
             dictation_cycle: 0,
+            permission_ui_enabled: true,
             permission_mode: PermissionMode::Full,
+            permission_menu_focus: cx.focus_handle().tab_stop(true),
+            permission_menu_focused_item: 0,
+            permission_menu_keyboard_focus: false,
             permission_menu_open: false,
+            approval_resolved_capture: false,
         };
         #[cfg(not(test))]
         let mut view = view;
@@ -734,6 +841,7 @@ impl ComposerView {
         let cycle = self.conversation_cycle;
         self.menu_open = false;
         self.permission_menu_open = false;
+        self.permission_menu_keyboard_focus = false;
         self.submenu = None;
         self.prompt_input.update(cx, |input, cx| input.clear(cx));
 
@@ -1209,6 +1317,8 @@ impl ComposerView {
         self.mode = mode;
         self.prompt_input
             .update(cx, |input, cx| input.set_mode(mode, cx));
+        self.user_input_other_input
+            .update(cx, |input, cx| input.set_mode(mode, cx));
         cx.notify();
     }
 
@@ -1220,11 +1330,106 @@ impl ComposerView {
         }
         if self.permission_menu_open {
             self.permission_menu_open = false;
+            self.permission_menu_keyboard_focus = false;
             cx.notify();
         }
     }
 
-    pub fn set_permission_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
+    fn activate_permission_mode(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
+        if !self.permission_ui_enabled {
+            return;
+        }
+        self.permission_menu_open = false;
+        self.permission_menu_keyboard_focus = false;
+        if mode == PermissionMode::Full && self.permission_mode != PermissionMode::Full {
+            cx.emit(RequestFullAccessConfirmation);
+        } else {
+            self.permission_mode = mode;
+        }
+        cx.notify();
+    }
+
+    fn handle_permission_menu_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.permission_ui_enabled {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        if !self.permission_menu_open {
+            match key {
+                "enter" | "space" | "down" | "up" => {
+                    self.menu_open = false;
+                    self.submenu = None;
+                    self.permission_menu_open = true;
+                    self.permission_menu_keyboard_focus = matches!(key, "down" | "up");
+                    self.permission_menu_focused_item = if key == "up" { 3 } else { 0 };
+                    window.focus(&self.permission_menu_focus, cx);
+                }
+                _ => return,
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        match key {
+            "down" => {
+                self.permission_menu_focused_item = if self.permission_menu_keyboard_focus {
+                    (self.permission_menu_focused_item + 1) % 4
+                } else {
+                    0
+                };
+                self.permission_menu_keyboard_focus = true;
+            }
+            "up" => {
+                self.permission_menu_focused_item = if self.permission_menu_keyboard_focus {
+                    (self.permission_menu_focused_item + 3) % 4
+                } else {
+                    3
+                };
+                self.permission_menu_keyboard_focus = true;
+            }
+            "home" => {
+                self.permission_menu_focused_item = 0;
+                self.permission_menu_keyboard_focus = true;
+            }
+            "end" => {
+                self.permission_menu_focused_item = 3;
+                self.permission_menu_keyboard_focus = true;
+            }
+            "enter" | "space" if self.permission_menu_keyboard_focus => {
+                let mode = PermissionMode::at_menu_index(self.permission_menu_focused_item);
+                self.activate_permission_mode(mode, cx);
+                cx.stop_propagation();
+                return;
+            }
+            "escape" => {
+                self.permission_menu_open = false;
+                self.permission_menu_keyboard_focus = false;
+            }
+            "tab" => {
+                self.permission_menu_open = false;
+                self.permission_menu_keyboard_focus = false;
+                cx.notify();
+                return;
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    pub fn enable_permission_ui_for_capture(&mut self, cx: &mut Context<Self>) {
+        self.permission_ui_enabled = true;
+        cx.notify();
+    }
+
+    pub fn set_permission_mode_for_capture(&mut self, mode: &str, cx: &mut Context<Self>) {
+        self.permission_ui_enabled = true;
         self.permission_mode = match mode {
             "request" => PermissionMode::Request,
             "assist" => PermissionMode::Assist,
@@ -1232,14 +1437,33 @@ impl ComposerView {
             _ => PermissionMode::Full,
         };
         self.permission_menu_open = false;
+        self.permission_menu_keyboard_focus = false;
         cx.notify();
     }
 
-    pub fn open_permission_menu(&mut self, cx: &mut Context<Self>) {
+    pub fn confirm_full_access(&mut self, cx: &mut Context<Self>) {
+        self.permission_mode = PermissionMode::Full;
+        self.permission_menu_open = false;
+        self.permission_menu_keyboard_focus = false;
+        cx.notify();
+    }
+
+    pub fn open_permission_menu_for_capture(&mut self, cx: &mut Context<Self>) {
+        self.permission_ui_enabled = true;
         self.menu_open = false;
         self.submenu = None;
+        self.permission_menu_keyboard_focus = false;
         self.permission_menu_open = true;
         cx.notify();
+    }
+
+    pub fn set_permission_menu_capture_state(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.open_permission_menu_for_capture(cx);
+        if matches!(state, "request-hover" | "request-focus") {
+            self.permission_menu_focused_item = 0;
+            self.permission_menu_keyboard_focus = true;
+            cx.notify();
+        }
     }
 
     pub fn open_picker(&mut self, cx: &mut Context<Self>) {
@@ -1333,6 +1557,843 @@ impl ComposerView {
         }
         cx.emit(ConversationChanged);
         cx.notify();
+    }
+
+    pub fn set_approval_for_capture(&mut self, kind: &str, state: &str, cx: &mut Context<Self>) {
+        let resolved_capture = state == "resolved";
+        self.approval_resolved_capture = resolved_capture;
+        let (command, command_reason) = if self.mode == ThemeMode::Light {
+            (
+                "curl -I https://iana.org",
+                "是否允许我仅在终端运行命令 `curl -I https://iana.org`？",
+            )
+        } else {
+            (
+                "curl -I https://example.com",
+                "是否允许我仅运行命令 `curl -I https://example.com`？",
+            )
+        };
+        let request = match kind {
+            "network" => ApprovalRequestPresentation::network(
+                "example.com",
+                Some(command.to_owned()),
+                Some("是否允许 ChatGPT 连接到 example.com？".to_owned()),
+            ),
+            _ => ApprovalRequestPresentation::command(command, Some(command_reason.to_owned())),
+        };
+        let mut approval = ApprovalCardViewModel::pending("approval-ui-capture", request);
+        approval.visual_state = match state {
+            "approve-hover" => ApprovalVisualState::ApproveHovered,
+            "decline-hover" => ApprovalVisualState::DeclineHovered,
+            "options" => ApprovalVisualState::SplitMenu { focused: None },
+            "options-focus" => ApprovalVisualState::SplitMenu {
+                focused: Some(ApprovalMenuItem::AllowOnce),
+            },
+            _ => ApprovalVisualState::Default,
+        };
+        if matches!(state, "approved" | "declined" | "resolved") {
+            approval.status = ApprovalCardStatus::Resolved;
+        }
+
+        self.user_message = Some(
+            "请只执行命令 curl -I https://example.com，等待我的批准，不要采取其他行动。".to_owned(),
+        );
+        self.user_message_time = Some("16:27".to_owned());
+        self.assistant_message = if resolved_capture {
+            "命令未执行：你拒绝了批准。未采取其他行动。".to_owned()
+        } else {
+            "我将只申请运行该命令，并等待你的批准。".to_owned()
+        };
+        self.assistant_message_time = resolved_capture.then(|| "16:28".to_owned());
+        self.conversation_phase = if resolved_capture {
+            // CDP 12 is the independently captured, stable resolved fixture:
+            // the declined turn is complete, the approval card is unmounted,
+            // and the composer has returned to its ordinary send state.
+            ConversationPhase::Complete
+        } else {
+            ConversationPhase::Streaming
+        };
+        if resolved_capture {
+            self.permission_mode = PermissionMode::Request;
+            self.selected_model = "5.6 Sol".to_owned();
+            self.actual_model = Some("5.6 Sol".to_owned());
+            self.selected_effort = "ultra".to_owned();
+            self.selected_service_tier = Some("priority".to_owned());
+        }
+        self.conversation_activity = vec![
+            ConversationActivity::AssistantMessage {
+                item_id: "msg-approval-preamble".to_owned(),
+                text: self.assistant_message.clone(),
+            },
+            ConversationActivity::Approval(approval),
+        ];
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn set_file_approval_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        let approval = captured_file_approval_fixture(self.mode, state);
+        let resolved = approval.status == FileApprovalStatus::Resolved;
+        let immediate = state == "declined-immediate";
+        let (path, request, pending_message, resolved_message, time) = match self.mode {
+            ThemeMode::Light => (
+                "/Users/zp/Desktop/codex-cdp-file-approval-probe.txt",
+                "请仅使用文件修改工具在 /Users/zp/Desktop/codex-cdp-file-approval-probe.txt 新建文件，内容为 PROBE；必须等待我的批准，不要使用终端命令或其他方式。",
+                "我将仅通过文件修改工具申请创建该文件，并等待你的批准。",
+                "文件未创建：批准被拒绝。未使用终端命令或其他方式。",
+                "16:31",
+            ),
+            ThemeMode::Dark => (
+                "/Users/zp/Desktop/codex-cdp-file-approval-dark-probe.txt",
+                "请仅使用文件修改工具在 /Users/zp/Desktop/codex-cdp-file-approval-dark-probe.txt 新建文件，内容为 DARK_PROBE；请直接发起系统审批，不要先向我文字确认，不要使用终端。",
+                "正在直接发起文件修改系统审批。",
+                "系统审批被拒绝，文件未创建。未使用终端。",
+                "16:36",
+            ),
+        };
+        debug_assert_eq!(approval.files[0].path, path);
+
+        self.user_message = Some(request.to_owned());
+        self.user_message_time = Some(time.to_owned());
+        self.assistant_message = if resolved && !immediate {
+            resolved_message.to_owned()
+        } else {
+            pending_message.to_owned()
+        };
+        self.assistant_message_time = (resolved && !immediate).then(|| match self.mode {
+            ThemeMode::Light => "16:32".to_owned(),
+            ThemeMode::Dark => "16:37".to_owned(),
+        });
+        self.conversation_phase = if resolved && !immediate {
+            ConversationPhase::Complete
+        } else {
+            ConversationPhase::Streaming
+        };
+        self.conversation_activity = vec![
+            ConversationActivity::AssistantMessage {
+                item_id: if resolved && !immediate {
+                    "msg-file-approval-resolved".to_owned()
+                } else {
+                    "msg-file-approval-preamble".to_owned()
+                },
+                text: self.assistant_message.clone(),
+            },
+            ConversationActivity::FileApproval(approval),
+        ];
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn set_permissions_approval_for_capture(
+        &mut self,
+        kind: &str,
+        state: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let mut approval = match kind {
+            "filesystem" => PermissionApprovalPresentation::file_system(
+                "permissions-ui-capture",
+                vec![PermissionPathRequest::new(
+                    "/Users/zp/Downloads",
+                    PermissionPathAccess::Read,
+                )],
+                Some("Inspect downloaded fixtures needed by this task.".to_owned()),
+            ),
+            "combined" => PermissionApprovalPresentation::combined(
+                "permissions-ui-capture",
+                vec![
+                    PermissionPathRequest::new("/Users/zp/Downloads", PermissionPathAccess::Read),
+                    PermissionPathRequest::new(
+                        "/Users/zp/Desktop/GPUI",
+                        PermissionPathAccess::Write,
+                    ),
+                ],
+                Some("Download a fixture and store the generated result.".to_owned()),
+            ),
+            _ => PermissionApprovalPresentation::network(
+                "permissions-ui-capture",
+                Some("Connect to example.com to verify the integration.".to_owned()),
+            ),
+        };
+        approval.visual_state = match state {
+            "approve-hover" => PermissionApprovalVisualState::AllowHovered,
+            "decline-hover" => PermissionApprovalVisualState::DeclineHovered,
+            "options" => PermissionApprovalVisualState::Menu { focused: None },
+            "options-focus" => PermissionApprovalVisualState::Menu {
+                focused: Some(PermissionApprovalMenuItem::AllowOnce),
+            },
+            _ => PermissionApprovalVisualState::Default,
+        };
+        approval.keyboard_focus = match state {
+            "approve-focus" => Some(PermissionApprovalKeyboardFocus::AllowOnce),
+            "decline-focus" => Some(PermissionApprovalKeyboardFocus::Decline),
+            "options-focus" => Some(PermissionApprovalKeyboardFocus::MenuAllowOnce),
+            _ => None,
+        };
+        approval.status = match state {
+            "approved" => PermissionApprovalStatus::Approved,
+            "declined" => PermissionApprovalStatus::Declined,
+            "resolved" => PermissionApprovalStatus::Resolved,
+            _ => PermissionApprovalStatus::Pending,
+        };
+
+        self.user_message = None;
+        self.user_message_time = None;
+        self.assistant_message.clear();
+        self.assistant_message_time = None;
+        self.conversation_phase = if approval.should_render() {
+            ConversationPhase::Streaming
+        } else {
+            ConversationPhase::Complete
+        };
+        self.conversation_activity = vec![ConversationActivity::PermissionsApproval(approval)];
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn set_file_change_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        let activity = captured_file_change_activity_fixture(state);
+        self.user_message = Some(
+            "请仅使用文件修改工具在 /tmp/chatgpt-cdp-file-approval-approved.txt 新建文件，内容为 APPROVED_PROBE；必须等待我的批准，不要使用终端命令或其他方式。"
+                .to_owned(),
+        );
+        self.user_message_time = Some("16:32".to_owned());
+        self.assistant_message =
+            "已创建 /tmp/chatgpt-cdp-file-approval-approved.txt，内容为 APPROVED_PROBE。未使用终端命令或其他方式。"
+                .to_owned();
+        self.assistant_message_time = Some("16:33".to_owned());
+        self.conversation_phase = ConversationPhase::Complete;
+        self.conversation_activity = vec![
+            ConversationActivity::AssistantMessage {
+                item_id: "msg-file-change-completed".to_owned(),
+                text: self.assistant_message.clone(),
+            },
+            ConversationActivity::FileChange(activity),
+        ];
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn set_user_input_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        let multi_fixture = state.starts_with("multi-");
+        let skip_fixture = state.starts_with("skip-");
+        let shape_fixture = state.starts_with("shape-");
+        let other_fixture = state.starts_with("other-");
+        let keyboard_fixture = state.starts_with("keyboard-");
+        let question = if multi_fixture {
+            None
+        } else if skip_fixture {
+            Some(UserInputQuestionPresentation::single_choice(
+                "continue",
+                "是否继续？",
+                vec![
+                    UserInputOptionPresentation::recommended(
+                        "继续",
+                        Some("选择继续后保持当前流程进行。".to_owned()),
+                    ),
+                    UserInputOptionPresentation::new(
+                        "停止",
+                        Some("选择停止后结束当前流程。".to_owned()),
+                    ),
+                ],
+            ))
+        } else if shape_fixture {
+            Some(UserInputQuestionPresentation::single_choice(
+                "shape",
+                "请选择一种形状。",
+                vec![
+                    UserInputOptionPresentation::recommended(
+                        "圆形",
+                        Some("选择圆形作为你的单选答案。".to_owned()),
+                    ),
+                    UserInputOptionPresentation::new(
+                        "方形",
+                        Some("选择方形作为你的单选答案。".to_owned()),
+                    ),
+                ],
+            ))
+        } else if other_fixture {
+            if state == "other-focus" {
+                Some(UserInputQuestionPresentation::single_choice(
+                    "transport",
+                    "请选择一种交通工具。",
+                    vec![
+                        UserInputOptionPresentation::recommended(
+                            "火车",
+                            Some("选择乘坐火车。".to_owned()),
+                        ),
+                        UserInputOptionPresentation::new("飞机", Some("选择乘坐飞机。".to_owned())),
+                    ],
+                ))
+            } else {
+                // CDP 97's typed Other path was captured from the independently
+                // restarted drink fixture used by 92–98.
+                Some(UserInputQuestionPresentation::single_choice(
+                    "drink",
+                    "请选择一种饮料。",
+                    vec![
+                        UserInputOptionPresentation::recommended("水", Some("选择水。".to_owned())),
+                        UserInputOptionPresentation::new("咖啡", Some("选择咖啡。".to_owned())),
+                    ],
+                ))
+            }
+        } else if keyboard_fixture {
+            Some(UserInputQuestionPresentation::single_choice(
+                "drink",
+                "请选择一种饮料。",
+                vec![
+                    UserInputOptionPresentation::recommended("水", Some("选择水。".to_owned())),
+                    UserInputOptionPresentation::new("咖啡", Some("选择咖啡。".to_owned())),
+                ],
+            ))
+        } else {
+            Some(UserInputQuestionPresentation::single_choice(
+                "color",
+                "请选择一种颜色。",
+                vec![
+                    UserInputOptionPresentation::recommended(
+                        "红色",
+                        Some("选择红色作为你的单选答案。".to_owned()),
+                    ),
+                    UserInputOptionPresentation::new(
+                        "蓝色",
+                        Some("选择蓝色作为你的单选答案。".to_owned()),
+                    ),
+                ],
+            ))
+        };
+        let mut request = if multi_fixture {
+            captured_multi_question_fixture(self.mode, state)
+        } else {
+            UserInputRequestPresentation::pending(
+                "user-input-ui-capture",
+                vec![question.expect("single-question capture fixture")],
+            )
+        };
+        if !multi_fixture {
+            request.visual_state = match state {
+                "option-hover" => UserInputVisualState::option_active(1),
+                "option-focus" => UserInputVisualState::option_focused(1, 0),
+                "skip-hover" => UserInputVisualState::skip_hovered(),
+                "keyboard-arrow-selected" => UserInputVisualState::option_focused(1, 0),
+                _ => UserInputVisualState::option_active(0),
+            };
+            request.keyboard_focus = match state {
+                "keyboard-dismiss-focus" => Some(UserInputKeyboardFocus::Dismiss),
+                "keyboard-option-focus" | "keyboard-arrow-selected" => {
+                    Some(UserInputKeyboardFocus::Option(0))
+                }
+                "other-focus" | "other-text" => Some(UserInputKeyboardFocus::Other),
+                _ => None,
+            };
+            if state == "keyboard-arrow-selected" {
+                request.selected_option_index = Some(1);
+            }
+            if other_fixture {
+                // CDP 90/97 show that choosing Other clears the checked radio and
+                // removes the option activity fill/submit arrow.
+                request.selected_option_index = None;
+                request.visual_state.active_option_index = None;
+            }
+            if state == "other-text" {
+                request.other_answer = "我想喝茶。".to_owned();
+            }
+            request.status = match state {
+                "submitting" | "skip-submitting" | "shape-submitting" => {
+                    UserInputRequestStatus::Submitting
+                }
+                "resolved" | "skip-resolved" | "shape-resolved" => UserInputRequestStatus::Resolved,
+                _ => UserInputRequestStatus::Pending,
+            };
+            if matches!(
+                state,
+                "submitting"
+                    | "resolved"
+                    | "skip-submitting"
+                    | "skip-resolved"
+                    | "shape-submitting"
+                    | "shape-resolved"
+            ) {
+                request.selected_option_index = Some(1);
+            }
+        }
+
+        self.user_message = Some(if multi_fixture {
+            "请只通过请求用户输入表单依次询问界面主色和图标形状，并等待我的表单操作。".to_owned()
+        } else if skip_fixture {
+            "请直接调用请求用户输入表单，提一个单选问题：问题“是否继续？”，选项“继续”和“停止”，等待我的表单操作。".to_owned()
+        } else if shape_fixture {
+            "请直接调用请求用户输入表单，提一个单选问题：“选择形状”，选项“圆形”和“方形”，等待我的表单选择。".to_owned()
+        } else if other_fixture {
+            "请仅调用请求用户输入表单，提一个单选问题：标题“选择交通工具”，问题“请选择一种交通工具。”，选项“火车”和“飞机”，等待我的表单操作。不要修改文件、不要执行命令，也不要在普通回复中提问。".to_owned()
+        } else if keyboard_fixture {
+            "请仅调用请求用户输入表单，提一个单选问题：标题“选择饮料”，问题“请选择一种饮料。”，选项“水”和“咖啡”，等待我的表单操作。".to_owned()
+        } else {
+            "请直接调用请求用户输入/提问表单能力，向我提一个单选问题：标题“选择颜色”，选项“红色”和“蓝色”。不要在普通回复中提问，必须等待我的表单回答。".to_owned()
+        });
+        self.user_message_time = Some("16:43".to_owned());
+        self.assistant_message.clear();
+        self.assistant_message_time = None;
+        self.conversation_phase = ConversationPhase::Streaming;
+        self.conversation_activity = vec![ConversationActivity::UserInput(request)];
+        if let Some((placeholder, secret, answer)) =
+            self.conversation_activity.iter().find_map(|activity| {
+                let ConversationActivity::UserInput(model) = activity else {
+                    return None;
+                };
+                model.current_question().map(|question| {
+                    (
+                        question.other_placeholder.clone(),
+                        question.is_secret,
+                        model.other_answer.clone(),
+                    )
+                })
+            })
+        {
+            self.user_input_other_input.update(cx, |input, cx| {
+                input.configure_inline_other(placeholder, secret, cx);
+                input.set_text_silently(answer, cx);
+            });
+        }
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn handle_approval_card_event(
+        &mut self,
+        request_id: &str,
+        event: ApprovalCardEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.conversation_activity.iter().position(|activity| {
+            matches!(
+                activity,
+                ConversationActivity::Approval(model) if model.request_id == request_id
+            )
+        }) else {
+            return;
+        };
+
+        match event {
+            ApprovalCardEvent::Decision(_) => {
+                // Capture fixtures exercise the native card's closed state,
+                // but no live protocol response is wired until the request-id
+                // registry and decision reply path are connected.
+                if let ConversationActivity::Approval(model) =
+                    &mut self.conversation_activity[index]
+                {
+                    model.status = ApprovalCardStatus::Resolved;
+                }
+            }
+            ApprovalCardEvent::ToggleMenu => {
+                let ConversationActivity::Approval(model) = &mut self.conversation_activity[index]
+                else {
+                    return;
+                };
+                model.visual_state = if model.visual_state.menu_open() {
+                    if matches!(
+                        model.keyboard_focus,
+                        Some(
+                            ApprovalKeyboardFocus::MenuAllowOnce
+                                | ApprovalKeyboardFocus::MenuScoped(_)
+                        )
+                    ) {
+                        model.keyboard_focus = Some(ApprovalKeyboardFocus::MenuToggle);
+                    }
+                    ApprovalVisualState::Default
+                } else {
+                    ApprovalVisualState::SplitMenu { focused: None }
+                };
+            }
+            ApprovalCardEvent::MenuFocusChanged(focused) => {
+                let ConversationActivity::Approval(model) = &mut self.conversation_activity[index]
+                else {
+                    return;
+                };
+                model.visual_state = ApprovalVisualState::SplitMenu { focused };
+            }
+            ApprovalCardEvent::KeyboardFocusChanged(focused) => {
+                let ConversationActivity::Approval(model) = &mut self.conversation_activity[index]
+                else {
+                    return;
+                };
+                model.keyboard_focus = focused;
+                match focused {
+                    Some(ApprovalKeyboardFocus::MenuAllowOnce) => {
+                        model.visual_state = ApprovalVisualState::SplitMenu {
+                            focused: Some(ApprovalMenuItem::AllowOnce),
+                        };
+                    }
+                    Some(ApprovalKeyboardFocus::MenuScoped(scope)) => {
+                        model.visual_state = ApprovalVisualState::SplitMenu {
+                            focused: Some(ApprovalMenuItem::Scoped(scope)),
+                        };
+                    }
+                    _ => {}
+                }
+            }
+        }
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn handle_permissions_approval_event(
+        &mut self,
+        request_id: &str,
+        event: PermissionApprovalEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(model) = self.conversation_activity.iter_mut().find_map(|activity| {
+            let ConversationActivity::PermissionsApproval(model) = activity else {
+                return None;
+            };
+            (model.request_id == request_id).then_some(model)
+        }) else {
+            return;
+        };
+
+        match event {
+            PermissionApprovalEvent::Decision(decision) => {
+                model.status = if decision == PermissionApprovalDecision::Decline {
+                    PermissionApprovalStatus::Declined
+                } else {
+                    PermissionApprovalStatus::Approved
+                };
+            }
+            PermissionApprovalEvent::ToggleMenu => {
+                model.visual_state = if model.visual_state.menu_open() {
+                    if matches!(
+                        model.keyboard_focus,
+                        Some(
+                            PermissionApprovalKeyboardFocus::MenuAllowOnce
+                                | PermissionApprovalKeyboardFocus::MenuAllowForConversation
+                        )
+                    ) {
+                        model.keyboard_focus = Some(PermissionApprovalKeyboardFocus::MenuToggle);
+                    }
+                    PermissionApprovalVisualState::Default
+                } else {
+                    PermissionApprovalVisualState::Menu { focused: None }
+                };
+            }
+            PermissionApprovalEvent::HoverChanged(hovered) => {
+                if !model.visual_state.menu_open() {
+                    model.visual_state = match hovered {
+                        Some(PermissionApprovalHover::Allow) => {
+                            PermissionApprovalVisualState::AllowHovered
+                        }
+                        Some(PermissionApprovalHover::Decline) => {
+                            PermissionApprovalVisualState::DeclineHovered
+                        }
+                        None => PermissionApprovalVisualState::Default,
+                    };
+                }
+            }
+            PermissionApprovalEvent::MenuFocusChanged(focused) => {
+                model.visual_state = PermissionApprovalVisualState::Menu { focused };
+            }
+            PermissionApprovalEvent::KeyboardFocusChanged(focused) => {
+                model.keyboard_focus = focused;
+                match focused {
+                    Some(PermissionApprovalKeyboardFocus::MenuAllowOnce) => {
+                        model.visual_state = PermissionApprovalVisualState::Menu {
+                            focused: Some(PermissionApprovalMenuItem::AllowOnce),
+                        };
+                    }
+                    Some(PermissionApprovalKeyboardFocus::MenuAllowForConversation) => {
+                        model.visual_state = PermissionApprovalVisualState::Menu {
+                            focused: Some(PermissionApprovalMenuItem::AllowForConversation),
+                        };
+                    }
+                    _ => {}
+                }
+            }
+        }
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn handle_approval_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if let Some((request_id, card_event)) =
+            self.conversation_activity.iter().find_map(|activity| {
+                let ConversationActivity::Approval(model) = activity else {
+                    return None;
+                };
+                model.should_render().then(|| {
+                    model
+                        .keyboard_event(
+                            event.keystroke.key.as_str(),
+                            event.keystroke.modifiers.shift,
+                        )
+                        .map(|card_event| (model.request_id.clone(), card_event))
+                })?
+            })
+        {
+            self.handle_approval_card_event(&request_id, card_event, cx);
+            return true;
+        }
+
+        if let Some((request_id, card_event)) =
+            self.conversation_activity.iter().find_map(|activity| {
+                let ConversationActivity::PermissionsApproval(model) = activity else {
+                    return None;
+                };
+                model.should_render().then(|| {
+                    model
+                        .keyboard_event(
+                            event.keystroke.key.as_str(),
+                            event.keystroke.modifiers.shift,
+                        )
+                        .map(|card_event| (model.request_id.clone(), card_event))
+                })?
+            })
+        {
+            self.handle_permissions_approval_event(&request_id, card_event, cx);
+            return true;
+        }
+
+        let Some((request_id, card_event)) =
+            self.conversation_activity.iter().find_map(|activity| {
+                let ConversationActivity::FileApproval(model) = activity else {
+                    return None;
+                };
+                model.should_render().then(|| {
+                    model
+                        .keyboard_event(
+                            event.keystroke.key.as_str(),
+                            event.keystroke.modifiers.shift,
+                        )
+                        .map(|card_event| (model.request_id.clone(), card_event))
+                })?
+            })
+        else {
+            return false;
+        };
+        self.handle_file_approval_event(&request_id, card_event, cx);
+        true
+    }
+
+    pub fn prompt_focus_handle(&self, cx: &gpui::App) -> FocusHandle {
+        self.prompt_input.read(cx).focus_handle(cx)
+    }
+
+    pub fn user_input_other_entity(&self) -> Entity<PromptInput> {
+        self.user_input_other_input.clone()
+    }
+
+    pub fn user_input_other_focus_handle(&self, cx: &gpui::App) -> FocusHandle {
+        self.user_input_other_input.read(cx).focus_handle(cx)
+    }
+
+    pub fn handle_file_approval_event(
+        &mut self,
+        request_id: &str,
+        event: FileApprovalEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(model) = self.conversation_activity.iter_mut().find_map(|activity| {
+            let ConversationActivity::FileApproval(model) = activity else {
+                return None;
+            };
+            (model.request_id == request_id).then_some(model)
+        }) else {
+            return;
+        };
+
+        match event {
+            FileApprovalEvent::Decision(_) => model.status = FileApprovalStatus::Resolved,
+            FileApprovalEvent::ToggleMenu => {
+                model.visual_state = if model.visual_state.menu_open() {
+                    if matches!(
+                        model.keyboard_focus,
+                        Some(
+                            FileApprovalKeyboardFocus::MenuAllowOnce
+                                | FileApprovalKeyboardFocus::MenuAllowAllEdits
+                        )
+                    ) {
+                        model.keyboard_focus = Some(FileApprovalKeyboardFocus::MenuToggle);
+                    }
+                    FileApprovalVisualState::Default
+                } else {
+                    FileApprovalVisualState::SplitMenu { focused: None }
+                };
+            }
+            FileApprovalEvent::MenuFocusChanged(focused) => {
+                model.visual_state = FileApprovalVisualState::SplitMenu { focused };
+            }
+            FileApprovalEvent::KeyboardFocusChanged(focused) => {
+                model.keyboard_focus = focused;
+                match focused {
+                    Some(FileApprovalKeyboardFocus::MenuAllowOnce) => {
+                        model.visual_state = FileApprovalVisualState::SplitMenu {
+                            focused: Some(FileApprovalMenuItem::AllowOnce),
+                        };
+                    }
+                    Some(FileApprovalKeyboardFocus::MenuAllowAllEdits) => {
+                        model.visual_state = FileApprovalVisualState::SplitMenu {
+                            focused: Some(FileApprovalMenuItem::AllowAllEdits),
+                        };
+                    }
+                    _ => {}
+                }
+            }
+        }
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn handle_user_input_request_event(
+        &mut self,
+        request_id: &str,
+        event: UserInputRequestEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let input_configuration = {
+            let Some(model) = self.conversation_activity.iter_mut().find_map(|activity| {
+                let ConversationActivity::UserInput(model) = activity else {
+                    return None;
+                };
+                (model.request_id == request_id).then_some(model)
+            }) else {
+                return;
+            };
+
+            match event {
+                UserInputRequestEvent::SelectOption {
+                    option_index,
+                    label,
+                    ..
+                } => {
+                    model.save_selected_option(option_index, label);
+                    if !model.is_multi_question() || !model.next_question() {
+                        model.status = UserInputRequestStatus::Submitting;
+                    }
+                }
+                UserInputRequestEvent::BeginOtherAnswer { .. } => {
+                    model.visual_state.active_option_index = None;
+                    model.focus_other_answer();
+                }
+                UserInputRequestEvent::SubmitOtherAnswer { answer, .. } => {
+                    model.save_other_answer(answer);
+                    if !model.is_multi_question() || !model.next_question() {
+                        model.status = UserInputRequestStatus::Submitting;
+                    }
+                }
+                UserInputRequestEvent::Skip => {
+                    model.skip_current_question();
+                    if !model.is_multi_question() || !model.next_question() {
+                        model.status = UserInputRequestStatus::Submitting;
+                    }
+                }
+                UserInputRequestEvent::PreviousQuestion => {
+                    model.persist_current_answer();
+                    model.previous_question();
+                }
+                UserInputRequestEvent::NextQuestion => {
+                    model.persist_current_answer();
+                    if !model.next_question() {
+                        model.status = UserInputRequestStatus::Submitting;
+                    }
+                }
+                UserInputRequestEvent::Dismiss => {
+                    model.status = UserInputRequestStatus::Resolved;
+                }
+                UserInputRequestEvent::ActiveOptionChanged(index) => {
+                    model.visual_state.active_option_index = index.or(model.selected_option_index);
+                }
+            }
+
+            model.current_question().map(|question| {
+                (
+                    question.other_placeholder.clone(),
+                    question.is_secret,
+                    model.other_answer.clone(),
+                )
+            })
+        };
+        if let Some((placeholder, secret, answer)) = input_configuration {
+            self.user_input_other_input.update(cx, |input, cx| {
+                input.configure_inline_other(placeholder, secret, cx);
+                input.set_text_silently(answer, cx);
+            });
+        }
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn handle_user_input_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let modifiers = event.keystroke.modifiers;
+        let outcome = self.conversation_activity.iter_mut().find_map(|activity| {
+            let ConversationActivity::UserInput(model) = activity else {
+                return None;
+            };
+            if !model.should_render() {
+                return None;
+            }
+            let request_id = model.request_id.clone();
+            model
+                .keyboard_event(
+                    event.keystroke.key.as_str(),
+                    event.keystroke.key_char.as_deref(),
+                    modifiers.shift,
+                    modifiers.platform,
+                    modifiers.control,
+                )
+                .map(|outcome| (request_id, outcome))
+        });
+        let Some((request_id, outcome)) = outcome else {
+            return false;
+        };
+
+        match outcome {
+            UserInputKeyboardOutcome::Handled => {
+                cx.emit(ConversationChanged);
+                cx.notify();
+            }
+            UserInputKeyboardOutcome::PreviousQuestion => self.handle_user_input_request_event(
+                &request_id,
+                UserInputRequestEvent::PreviousQuestion,
+                cx,
+            ),
+            UserInputKeyboardOutcome::NextQuestion => self.handle_user_input_request_event(
+                &request_id,
+                UserInputRequestEvent::NextQuestion,
+                cx,
+            ),
+            UserInputKeyboardOutcome::SubmitOption {
+                question_id,
+                option_index,
+                label,
+            } => self.handle_user_input_request_event(
+                &request_id,
+                UserInputRequestEvent::SelectOption {
+                    question_id,
+                    option_index,
+                    label,
+                },
+                cx,
+            ),
+            UserInputKeyboardOutcome::SubmitOther {
+                question_id,
+                answer,
+            } => self.handle_user_input_request_event(
+                &request_id,
+                UserInputRequestEvent::SubmitOtherAnswer {
+                    question_id,
+                    answer,
+                },
+                cx,
+            ),
+            UserInputKeyboardOutcome::Skip => {
+                self.handle_user_input_request_event(&request_id, UserInputRequestEvent::Skip, cx)
+            }
+            UserInputKeyboardOutcome::Dismiss => self.handle_user_input_request_event(
+                &request_id,
+                UserInputRequestEvent::Dismiss,
+                cx,
+            ),
+        }
+        true
     }
 
     #[cfg(test)]
@@ -2573,27 +3634,39 @@ impl ComposerView {
         let selected = self.permission_mode == mode;
         let warning = mode == PermissionMode::Full;
         let color = if warning { theme.warning } else { theme.text };
+        let keyboard_focused =
+            self.permission_menu_keyboard_focus && self.permission_menu_focused_item == index;
+        let hover_group: SharedString = format!("permission-menu-row-{index}").into();
         div()
             .id(("permission-menu-item", index))
+            .group(hover_group.clone())
             .h(px(47.125))
             .px(px(8.0))
             .py(px(5.0))
+            .when(mode == PermissionMode::Custom, |row| {
+                row.pl(px(9.0)).pr(px(7.0))
+            })
+            // CDP 99–101: `rounded-lg` resolves to 12.5px in this desktop
+            // build, including both hover-highlighted and keyboard-focused rows.
             .rounded(px(12.5))
             .flex()
             .items_center()
             .cursor_pointer()
+            .when(keyboard_focused, |row| row.bg(theme.sidebar_hover))
             .hover(move |style| style.bg(theme.sidebar_hover))
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                this.permission_menu_open = false;
-                if mode == PermissionMode::Full && this.permission_mode != PermissionMode::Full {
-                    cx.emit(RequestFullAccess);
-                } else {
-                    this.permission_mode = mode;
-                }
-                cx.notify();
+                this.activate_permission_mode(mode, cx);
             }))
-            .child(icon(glyph, color.into()).size(px(20.0)).opacity(0.75))
+            // Although the source SVGs use 20×20 view boxes, the desktop
+            // `icon-sm` token resolves to an 18×18 layout box.
+            .child(
+                icon(glyph, color.into())
+                    .size(px(18.0))
+                    .opacity(if keyboard_focused { 1.0 } else { 0.75 })
+                    .group_hover(hover_group.clone(), |glyph| glyph.opacity(1.0))
+                    .when(mode == PermissionMode::Custom, |glyph| glyph.ml(px(-1.0))),
+            )
             .child(
                 div()
                     .min_w(px(0.0))
@@ -2604,10 +3677,31 @@ impl ComposerView {
                     // CoreText's Chinese glyph run is fractionally wider than
                     // Chromium's system-ui run sampled over CDP.
                     .text_size(px(12.75))
+                    .when(mode == PermissionMode::Custom, |column| {
+                        column.text_size(px(13.0))
+                    })
+                    .when(mode == PermissionMode::Custom, |column| {
+                        column.font_weight(gpui::FontWeight(350.0))
+                    })
                     .line_height(px(18.5625))
-                    .child(div().text_color(color).child(title))
+                    // Chromium fits the 21-CJK warning detail exactly in its
+                    // 273px flex slot. CoreText rounds that run just over the
+                    // boundary, so give the selected warning column two
+                    // non-layout pixels without moving the trailing check.
+                    .when(selected && warning, |column| column.mr(px(-2.0)))
                     .child(
                         div()
+                            .when(mode == PermissionMode::Custom, |text| {
+                                text.font_weight(gpui::FontWeight(350.0))
+                            })
+                            .text_color(color)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .when(mode == PermissionMode::Custom, |text| {
+                                text.font_weight(gpui::FontWeight(350.0))
+                            })
                             .text_color(if warning {
                                 theme.warning
                             } else {
@@ -2619,9 +3713,11 @@ impl ComposerView {
             .when(selected, |row| {
                 row.child(
                     icon("permission-check", color.into())
-                        .size(px(17.0))
+                        // `icon-xs` is a 16×16 layout box in the reference.
+                        .size(px(16.0))
                         .ml(px(12.0))
-                        .opacity(0.75),
+                        .opacity(if keyboard_focused { 1.0 } else { 0.75 })
+                        .group_hover(hover_group, |glyph| glyph.opacity(1.0)),
                 )
             })
     }
@@ -2631,6 +3727,13 @@ impl ComposerView {
             355.0
         } else {
             327.0
+        };
+        let surface = if self.mode == ThemeMode::Light {
+            // The real light popup is a 90%-opaque white surface over the
+            // white application background, so its captured pixel is white.
+            rgba(0xffffffff)
+        } else {
+            theme.model_picker_surface
         };
         div()
             .id("permission-menu")
@@ -2642,22 +3745,36 @@ impl ComposerView {
             .h(px(222.5))
             .p(px(4.0))
             .rounded(px(15.0))
-            .border(px(0.5))
-            .border_color(theme.border)
-            .bg(theme.model_picker_surface)
+            .bg(surface)
             .shadow(vec![
+                // ChatGPT uses two 0.5px rings. Keeping them as shadows is
+                // important: CSS rings do not consume the row's one-pixel
+                // layout budget the way a native border would.
+                BoxShadow::new(px(0.0), px(0.0), theme.border.into())
+                    .blur_radius(px(0.0))
+                    .spread_radius(px(0.5)),
+                BoxShadow::new(px(0.0), px(0.0), theme.border.into())
+                    .blur_radius(px(0.0))
+                    .spread_radius(px(0.5)),
                 BoxShadow::new(px(0.0), px(8.0), hsla(0.0, 0.0, 0.0, 0.12))
                     .blur_radius(px(16.0))
                     .spread_radius(px(-4.0)),
             ])
-            .font_family(".SystemUIFont")
+            .font(ui_font())
             .text_size(px(13.0))
-            .font_weight(gpui::FontWeight::NORMAL)
+            .font_weight(gpui::FontWeight::LIGHT)
             .text_color(theme.text)
+            .track_focus(&self.permission_menu_focus)
+            .on_key_down(cx.listener(Self::handle_permission_menu_key))
             .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
             .child(
                 div()
                     .h(px(26.0))
+                    // CoreText's header line box sits one raster row below
+                    // Chromium despite identical CSS metrics.
+                    .relative()
+                    .top(px(-1.0))
+                    .left(px(-1.0))
                     .px(px(8.0))
                     .py(px(5.0))
                     .flex()
@@ -2670,6 +3787,10 @@ impl ComposerView {
                         div()
                             .id("permission-learn-more")
                             .cursor_pointer()
+                            .relative()
+                            .left(px(1.0))
+                            .text_size(px(13.0))
+                            .line_height(px(16.0))
                             .underline()
                             .child("了解更多"),
                     ),
@@ -2831,51 +3952,73 @@ impl ComposerView {
                                                     icon("add", theme.text.into()).size(px(16.0)),
                                                 ),
                                         )
-                                        .child(
-                                            div()
-                                                .id("composer-permissions")
-                                                .h(px(28.0))
-                                                .px(px(8.0))
-                                                .rounded_full()
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(4.0))
-                                                .text_size(px(13.0))
-                                                .line_height(px(18.0))
-                                                .text_color(permission_color)
-                                                .cursor_pointer()
-                                                .when(self.permission_menu_open, |button| {
-                                                    button.bg(theme.sidebar_hover)
-                                                })
-                                                .hover(move |style| style.bg(theme.sidebar_hover))
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _, _, cx| {
+                                        .when(self.permission_ui_enabled, |controls| {
+                                            controls.child(
+                                                div()
+                                                    .id("composer-permissions")
+                                                    .h(px(28.0))
+                                                    .px(px(8.0))
+                                                    .rounded_full()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(4.0))
+                                                    .text_size(px(13.0))
+                                                    .line_height(px(18.0))
+                                                    .text_color(permission_color)
+                                                    .cursor_pointer()
+                                                    .when(!self.permission_menu_open, |button| {
+                                                        button.track_focus(
+                                                            &self.permission_menu_focus,
+                                                        )
+                                                    })
+                                                    .on_key_down(
+                                                        cx.listener(
+                                                            Self::handle_permission_menu_key,
+                                                        ),
+                                                    )
+                                                    .when(self.permission_menu_open, |button| {
+                                                        button.bg(theme.sidebar_hover)
+                                                    })
+                                                    .hover(move |style| {
+                                                        style.bg(theme.sidebar_hover)
+                                                    })
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, window, cx| {
+                                                            cx.stop_propagation();
+                                                            this.menu_open = false;
+                                                            this.submenu = None;
+                                                            this.permission_menu_open =
+                                                                !this.permission_menu_open;
+                                                            this.permission_menu_keyboard_focus =
+                                                                false;
+                                                            if this.permission_menu_open {
+                                                                window.focus(
+                                                                    &this.permission_menu_focus,
+                                                                    cx,
+                                                                );
+                                                            }
+                                                            cx.notify();
+                                                        }),
+                                                    )
+                                                    .on_click(cx.listener(|_, _, _, cx| {
                                                         cx.stop_propagation();
-                                                        this.menu_open = false;
-                                                        this.submenu = None;
-                                                        this.permission_menu_open =
-                                                            !this.permission_menu_open;
-                                                        cx.notify();
-                                                    }),
-                                                )
-                                                .on_click(cx.listener(|_, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                }))
-                                                .child(
-                                                    div()
-                                                        .size(px(16.0))
-                                                        .flex_none()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .child(icon(
-                                                            permission_icon,
-                                                            permission_color.into(),
-                                                        )),
-                                                )
-                                                .child(permission_label),
-                                        ),
+                                                    }))
+                                                    .child(
+                                                        div()
+                                                            .size(px(16.0))
+                                                            .flex_none()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .child(icon(
+                                                                permission_icon,
+                                                                permission_color.into(),
+                                                            )),
+                                                    )
+                                                    .child(permission_label),
+                                            )
+                                        }),
                                 )
                                 .child(div().flex_1())
                                 .child(
@@ -2905,6 +4048,7 @@ impl ComposerView {
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     cx.stop_propagation();
                                                     this.permission_menu_open = false;
+                                                    this.permission_menu_keyboard_focus = false;
                                                     this.menu_open = !this.menu_open;
                                                     if !this.menu_open {
                                                         this.submenu = None;
@@ -3026,9 +4170,56 @@ impl ComposerView {
             .when(self.menu_open, |composer| {
                 composer.child(deferred(self.model_menu(viewport_width, theme, cx)))
             })
-            .when(self.permission_menu_open, |composer| {
-                composer.child(deferred(self.permission_menu(theme, cx)))
-            })
+            .when(
+                self.permission_ui_enabled && self.permission_menu_open,
+                |composer| composer.child(deferred(self.permission_menu(theme, cx))),
+            )
+            .when(
+                self.approval_resolved_capture && self.mode == ThemeMode::Dark,
+                |composer| {
+                    // CDP 12 was captured while the real model trigger's
+                    // tooltip was visible. Keep that interaction state in the
+                    // resolved-only fixture instead of changing the live
+                    // composer or reusing a synthetic blank crop.
+                    composer.child(
+                        div()
+                            .absolute()
+                            .left(px(539.0))
+                            .top(px(26.0))
+                            .w(px(122.796875))
+                            .h(px(32.5625))
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .rounded(px(12.5))
+                            .border_1()
+                            .border_color(rgba(0xdfdfdfff))
+                            .bg(rgba(0xdfdfdfff))
+                            .font_family(".SystemUIFont")
+                            .text_size(px(13.0))
+                            .line_height(px(18.5714))
+                            .font_weight(gpui::FontWeight::NORMAL)
+                            .text_color(rgba(0x2d2d2dff))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(div().flex_none().child("选择模型"))
+                            .child(
+                                div()
+                                    .w(px(42.0))
+                                    .h(px(16.0))
+                                    .flex_none()
+                                    .rounded(px(6.0))
+                                    .bg(rgba(0x2d2d2d1a))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(12.0))
+                                    .line_height(px(12.0))
+                                    .child("⌃⇧M"),
+                            ),
+                    )
+                },
+            )
     }
 }
 
@@ -3048,16 +4239,20 @@ mod tests {
         ComposerView, ConversationActivity, ConversationChanged, ConversationPhase,
         MODEL_PICKER_DETAIL_ROW_HEIGHT, MODEL_PICKER_ROW_HEIGHT,
         MODEL_PICKER_SUBMENU_BOTTOM_OFFSET, MODEL_PICKER_SUBMENU_HEADER_HEIGHT,
-        MODEL_PICKER_SUBMENU_VERTICAL_PADDING, MODEL_PICKER_TRIGGER_GAP, STREAM_EVENTS_PER_UPDATE,
-        STREAM_UPDATE_INTERVAL, SubmenuLayout, collect_ready_agent_events,
-        current_local_time_label, ensure_closed_batch_is_terminal, find_command_activity_mut,
-        max_particle_drift, particle_layers, particle_transition_ease, push_coalesced_agent_event,
-        submenu_layout, upsert_command_activity,
+        MODEL_PICKER_SUBMENU_VERTICAL_PADDING, MODEL_PICKER_TRIGGER_GAP, PermissionMode,
+        STREAM_EVENTS_PER_UPDATE, STREAM_UPDATE_INTERVAL, SubmenuLayout,
+        collect_ready_agent_events, current_local_time_label, ensure_closed_batch_is_terminal,
+        find_command_activity_mut, max_particle_drift, particle_layers, particle_transition_ease,
+        push_coalesced_agent_event, submenu_layout, upsert_command_activity,
     };
     use crate::agent::{
         AgentConfigWarning, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
         AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentReasoningEffort,
         AgentServiceTier, AgentThreadSettings, CommandExecution, CommandExecutionStatus,
+    };
+    use crate::components::user_input_request::{
+        UserInputKeyboardFocus, UserInputKeyboardOutcome, UserInputOptionPresentation,
+        UserInputQuestionPresentation, UserInputRequestEvent, UserInputRequestPresentation,
     };
     use crate::theme::ThemeMode;
     use gpui::{
@@ -3159,6 +4354,118 @@ mod tests {
         fn abandon(&self) {
             self.abandoned.store(true, Ordering::Release);
         }
+    }
+
+    #[test]
+    fn resolved_approval_capture_uses_the_cdp12_completed_context() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+
+        app.update_entity(&composer, |composer, cx| {
+            composer.set_approval_for_capture("command", "resolved", cx)
+        });
+
+        app.read_entity(&composer, |composer, _| {
+            assert_eq!(composer.conversation_phase, ConversationPhase::Complete);
+            assert_eq!(composer.permission_mode, PermissionMode::Request);
+            assert_eq!(composer.selected_model, "5.6 Sol");
+            assert_eq!(composer.selected_effort, "ultra");
+            assert_eq!(composer.selected_service_tier.as_deref(), Some("priority"));
+            assert!(composer.approval_resolved_capture);
+            assert_eq!(
+                composer.assistant_message,
+                "命令未执行：你拒绝了批准。未采取其他行动。"
+            );
+            assert!(composer.conversation_activity.iter().any(|activity| {
+                matches!(activity, ConversationActivity::Approval(model) if !model.should_render())
+            }));
+        });
+    }
+
+    #[test]
+    fn keyboard_choice_on_second_question_survives_previous_and_next() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+
+        app.update_entity(&composer, |composer, cx| {
+            let color = UserInputQuestionPresentation::single_choice(
+                "color",
+                "请选择一种颜色。",
+                vec![
+                    UserInputOptionPresentation::recommended("红色", None),
+                    UserInputOptionPresentation::new("蓝色", None),
+                ],
+            );
+            let shape = UserInputQuestionPresentation::single_choice(
+                "shape",
+                "请选择一种形状。",
+                vec![
+                    UserInputOptionPresentation::recommended("圆形", None),
+                    UserInputOptionPresentation::new("方形", None),
+                ],
+            );
+            composer.conversation_activity = vec![ConversationActivity::UserInput(
+                UserInputRequestPresentation::pending(
+                    "request-keyboard-navigation",
+                    vec![color, shape],
+                ),
+            )];
+
+            composer.handle_user_input_request_event(
+                "request-keyboard-navigation",
+                UserInputRequestEvent::NextQuestion,
+                cx,
+            );
+            {
+                let model = composer
+                    .conversation_activity
+                    .iter_mut()
+                    .find_map(|activity| match activity {
+                        ConversationActivity::UserInput(model) => Some(model),
+                        _ => None,
+                    })
+                    .unwrap();
+                model.keyboard_focus = Some(UserInputKeyboardFocus::Option(0));
+                assert_eq!(
+                    model.keyboard_event("down", None, false, false, false),
+                    Some(UserInputKeyboardOutcome::Handled)
+                );
+                assert_eq!(model.selected_option_index, Some(1));
+                assert_eq!(model.answers[1].selected_option_index, None);
+            }
+
+            composer.handle_user_input_request_event(
+                "request-keyboard-navigation",
+                UserInputRequestEvent::PreviousQuestion,
+                cx,
+            );
+            composer.handle_user_input_request_event(
+                "request-keyboard-navigation",
+                UserInputRequestEvent::NextQuestion,
+                cx,
+            );
+        });
+
+        app.read_entity(&composer, |composer, _| {
+            let model = composer
+                .conversation_activity
+                .iter()
+                .find_map(|activity| match activity {
+                    ConversationActivity::UserInput(model) => Some(model),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(model.current_question_index, 1);
+            assert_eq!(model.selected_option_index, Some(1));
+            assert_eq!(model.answers[1].selected_option_index, Some(1));
+            assert_eq!(
+                model.response_answers(),
+                vec![
+                    ("color".to_owned(), vec!["红色".to_owned()]),
+                    ("shape".to_owned(), vec!["方形".to_owned()]),
+                ]
+            );
+        });
     }
 
     #[test]
@@ -3861,8 +5168,9 @@ mod tests {
             "full"
         );
         app.update_entity(&composer, |composer, cx| {
-            composer.set_permission_mode("assist", cx);
-            composer.open_permission_menu(cx);
+            composer.enable_permission_ui_for_capture(cx);
+            composer.set_permission_mode_for_capture("assist", cx);
+            composer.open_permission_menu_for_capture(cx);
         });
         assert_eq!(
             app.read_entity(&composer, |c, _| c.permission_mode_name()),
@@ -3872,6 +5180,36 @@ mod tests {
 
         app.update_entity(&composer, |composer, cx| composer.close_picker(cx));
         assert!(!app.read_entity(&composer, |c, _| c.permission_menu_open));
+    }
+
+    #[test]
+    fn production_permission_control_is_visible_and_interactive() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(786.0), px(138.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ComposerView::new(ThemeMode::Dark, cx),
+        );
+
+        assert!(window.read(|composer, _| composer.permission_ui_enabled));
+        window.draw();
+        window.simulate_mouse_move(point(px(83.0), px(111.0)));
+        window.simulate_mouse_down(point(px(83.0), px(111.0)), MouseButton::Left);
+        window.simulate_mouse_up(point(px(83.0), px(111.0)), MouseButton::Left);
+        assert!(window.read(|composer, _| composer.permission_menu_open));
+
+        window.update(|composer, _, cx| {
+            composer.activate_permission_mode(PermissionMode::Assist, cx);
+        });
+        assert_eq!(
+            window.read(|composer, _| composer.permission_mode),
+            PermissionMode::Assist
+        );
     }
 
     #[test]
@@ -3993,6 +5331,65 @@ mod tests {
         assert!(window.read(|composer, _| composer.permission_menu_open));
         window.simulate_mouse_up(point(px(83.0), px(111.0)), MouseButton::Left);
         assert!(window.read(|composer, _| composer.permission_menu_open));
+    }
+
+    #[test]
+    fn permission_menu_supports_trigger_and_menu_keyboard_navigation() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(748.0), px(400.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ComposerView::new(ThemeMode::Dark, cx),
+        );
+
+        window.draw();
+        window.update(|composer, window, cx| {
+            window.focus(&composer.permission_menu_focus, cx);
+        });
+        window.simulate_keystroke("enter");
+        assert!(window.read(|composer, _| composer.permission_menu_open));
+        assert!(!window.read(|composer, _| composer.permission_menu_keyboard_focus));
+
+        window.draw();
+        window.simulate_keystroke("down");
+        assert_eq!(
+            window.read(|composer, _| composer.permission_menu_focused_item),
+            0
+        );
+        window.simulate_keystroke("down");
+        assert_eq!(
+            window.read(|composer, _| composer.permission_menu_focused_item),
+            1
+        );
+        window.simulate_keystroke("enter");
+        assert_eq!(
+            window.read(|composer, _| composer.permission_mode),
+            PermissionMode::Assist
+        );
+        assert!(!window.read(|composer, _| composer.permission_menu_open));
+
+        window.update(|composer, window, cx| {
+            composer.open_permission_menu_for_capture(cx);
+            window.focus(&composer.permission_menu_focus, cx);
+        });
+        window.draw();
+        window.simulate_keystroke("end");
+        assert_eq!(
+            window.read(|composer, _| composer.permission_menu_focused_item),
+            3
+        );
+        window.simulate_keystroke("home");
+        assert_eq!(
+            window.read(|composer, _| composer.permission_menu_focused_item),
+            0
+        );
+        window.simulate_keystroke("escape");
+        assert!(!window.read(|composer, _| composer.permission_menu_open));
     }
 
     #[test]

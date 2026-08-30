@@ -5,19 +5,34 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, BoxShadow, ContentMask, Context, Div, Entity, FontWeight, MouseButton,
-    PathBuilder, Pixels, Render, Role, ScrollHandle, ShapedLine, SharedString, TextAlign, TextRun,
-    Transformation, Window, canvas, div, point, prelude::*, px, radians, relative, rgba,
+    App, Bounds, BoxShadow, ContentMask, Context, Div, Entity, FocusHandle, FontWeight,
+    KeyDownEvent, MouseButton, PathBuilder, Pixels, Render, Role, ScrollHandle, ShapedLine,
+    SharedString, TextAlign, TextRun, Transformation, Window, canvas, div, point, prelude::*, px,
+    radians, relative, rgba,
 };
 
 use crate::{
     agent::{CommandExecution, CommandExecutionStatus},
     components::{
+        approval::{ApprovalCardCallback, render_approval_card},
         composer::{
             ComposerView, ConversationActivity, ConversationChanged, ConversationPhase,
-            ModelCatalogLoadFinished, RequestFullAccess,
+            ModelCatalogLoadFinished, RequestFullAccessConfirmation,
+        },
+        file_change::{
+            DiffReviewPresentation, FileApprovalCallback, FileApprovalEvent,
+            FileApprovalPresentation, FileChangeActivityCallback, FileChangeActivityEvent,
+            render_file_approval_card, render_file_change_activity,
         },
         icons::{icon, suggestion_icon},
+        permissions_approval::{
+            PermissionApprovalCallback, PermissionApprovalEvent, PermissionApprovalPresentation,
+            render_permissions_approval,
+        },
+        prompt_input::PromptInput,
+        user_input_request::{
+            UserInputRequestCallback, UserInputRequestEvent, render_user_input_request,
+        },
     },
     theme::{Theme, ThemeMode, UI_MONOSPACE_FONT_FAMILY},
 };
@@ -38,10 +53,14 @@ pub struct HomeView {
     user_message_actions_visible_for_capture: bool,
     expanded_commands: HashSet<String>,
     command_scroll_handles: HashMap<String, ScrollHandle>,
+    approval_focus: FocusHandle,
 }
 
-impl gpui::EventEmitter<RequestFullAccess> for HomeView {}
+impl gpui::EventEmitter<RequestFullAccessConfirmation> for HomeView {}
 impl gpui::EventEmitter<ModelCatalogLoadFinished> for HomeView {}
+
+pub struct OpenDiffReview(pub DiffReviewPresentation);
+impl gpui::EventEmitter<OpenDiffReview> for HomeView {}
 
 const SUGGESTION_PRESSED_SCALE: f32 = 0.99;
 const SUGGESTION_TRANSITION_DURATION: Duration = Duration::from_millis(150);
@@ -212,8 +231,8 @@ fn suggestion_transition_ease(progress: f32) -> f32 {
 impl HomeView {
     pub fn new(mode: ThemeMode, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| ComposerView::new(mode, cx));
-        cx.subscribe(&composer, |_, _, _: &RequestFullAccess, cx| {
-            cx.emit(RequestFullAccess);
+        cx.subscribe(&composer, |_, _, _: &RequestFullAccessConfirmation, cx| {
+            cx.emit(RequestFullAccessConfirmation);
         })
         .detach();
         cx.subscribe(&composer, |_, _, _: &ModelCatalogLoadFinished, cx| {
@@ -242,6 +261,30 @@ impl HomeView {
             user_message_actions_visible_for_capture: false,
             expanded_commands: HashSet::new(),
             command_scroll_handles: HashMap::new(),
+            approval_focus: cx.focus_handle(),
+        }
+    }
+
+    fn handle_approval_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let other_focus = self.composer.read(cx).user_input_other_focus_handle(cx);
+        if other_focus.is_focused(window)
+            && !matches!(event.keystroke.key.as_str(), "tab" | "escape")
+        {
+            return;
+        }
+        let handled = self.composer.update(cx, |composer, cx| {
+            composer.handle_approval_key(event, cx) || composer.handle_user_input_key(event, cx)
+        });
+        if handled {
+            if other_focus.is_focused(window) && event.keystroke.key.as_str() == "tab" {
+                window.focus(&self.approval_focus, cx);
+            }
+            cx.stop_propagation();
         }
     }
 
@@ -306,14 +349,33 @@ impl HomeView {
             .update(cx, |composer, cx| composer.close_picker(cx));
     }
 
-    pub fn set_permission_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
-        self.composer
-            .update(cx, |composer, cx| composer.set_permission_mode(mode, cx));
+    pub fn enable_permission_ui_for_capture(&mut self, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.enable_permission_ui_for_capture(cx)
+        });
     }
 
-    pub fn open_permission_menu(&mut self, cx: &mut Context<Self>) {
+    pub fn set_permission_mode_for_capture(&mut self, mode: &str, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.set_permission_mode_for_capture(mode, cx)
+        });
+    }
+
+    pub fn confirm_full_access(&mut self, cx: &mut Context<Self>) {
         self.composer
-            .update(cx, |composer, cx| composer.open_permission_menu(cx));
+            .update(cx, |composer, cx| composer.confirm_full_access(cx));
+    }
+
+    pub fn open_permission_menu_for_capture(&mut self, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.open_permission_menu_for_capture(cx)
+        });
+    }
+
+    pub fn set_permission_menu_capture_state(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.set_permission_menu_capture_state(state, cx)
+        });
     }
 
     pub fn open_model_picker(&mut self, cx: &mut Context<Self>) {
@@ -369,6 +431,100 @@ impl HomeView {
             composer.set_command_tool_for_capture(running, cx)
         });
         cx.notify();
+    }
+
+    pub fn set_approval_for_capture(&mut self, kind: &str, state: &str, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.set_approval_for_capture(kind, state, cx)
+        });
+        cx.notify();
+    }
+
+    pub fn set_file_approval_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.set_file_approval_for_capture(state, cx)
+        });
+        cx.notify();
+    }
+
+    pub fn set_permissions_approval_for_capture(
+        &mut self,
+        kind: &str,
+        state: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |composer, cx| {
+            composer.set_permissions_approval_for_capture(kind, state, cx)
+        });
+        cx.notify();
+    }
+
+    pub fn set_file_change_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.set_file_change_for_capture(state, cx)
+        });
+        cx.notify();
+    }
+
+    pub fn set_user_input_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.set_user_input_for_capture(state, cx)
+        });
+        cx.notify();
+    }
+
+    fn handle_approval_card_event(
+        &mut self,
+        request_id: &str,
+        event: crate::components::approval::ApprovalCardEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |composer, cx| {
+            composer.handle_approval_card_event(request_id, event, cx)
+        });
+    }
+
+    fn handle_file_approval_event(
+        &mut self,
+        request_id: &str,
+        event: FileApprovalEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |composer, cx| {
+            composer.handle_file_approval_event(request_id, event, cx)
+        });
+    }
+
+    fn handle_permissions_approval_event(
+        &mut self,
+        request_id: &str,
+        event: PermissionApprovalEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |composer, cx| {
+            composer.handle_permissions_approval_event(request_id, event, cx)
+        });
+    }
+
+    fn handle_file_change_activity_event(
+        &mut self,
+        event: FileChangeActivityEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            FileChangeActivityEvent::OpenReview(review) => cx.emit(OpenDiffReview(review)),
+        }
+    }
+
+    fn handle_user_input_request_event(
+        &mut self,
+        request_id: &str,
+        event: UserInputRequestEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |composer, cx| {
+            composer.handle_user_input_request_event(request_id, event, cx)
+        });
     }
 
     fn set_suggestion_pressed(
@@ -521,7 +677,7 @@ impl HomeView {
 }
 
 impl Render for HomeView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_mode(self.mode);
         let (
             phase,
@@ -531,6 +687,25 @@ impl Render for HomeView {
             assistant_message_time,
             conversation_activity,
         ) = self.composer.read(cx).conversation_render_snapshot();
+        let user_input_other = self.composer.read(cx).user_input_other_entity();
+        let user_input_other_focus = self.composer.read(cx).user_input_other_focus_handle(cx);
+        let blocking_keyboard_request_pending = conversation_activity.iter().any(|activity| {
+            matches!(activity, ConversationActivity::Approval(model) if model.should_render())
+                || matches!(activity, ConversationActivity::FileApproval(model) if model.should_render())
+                || matches!(activity, ConversationActivity::PermissionsApproval(model) if model.should_render())
+                || matches!(activity, ConversationActivity::UserInput(model) if model.should_render())
+        });
+        if blocking_keyboard_request_pending
+            && !self.approval_focus.is_focused(window)
+            && !user_input_other_focus.is_focused(window)
+        {
+            window.focus(&self.approval_focus, cx);
+        } else if !blocking_keyboard_request_pending
+            && (self.approval_focus.is_focused(window) || user_input_other_focus.is_focused(window))
+        {
+            let prompt_focus = self.composer.read(cx).prompt_focus_handle(cx);
+            window.focus(&prompt_focus, cx);
+        }
         for activity in &conversation_activity {
             if let ConversationActivity::Command(command) = activity {
                 let scroll_handle = self
@@ -546,6 +721,7 @@ impl Render for HomeView {
             cx.entity(),
             theme,
             self.composer.clone(),
+            user_input_other,
             phase,
             user_message,
             user_message_time,
@@ -570,6 +746,8 @@ impl Render for HomeView {
                 cx,
             ),
         )
+        .track_focus(&self.approval_focus)
+        .on_key_down(cx.listener(Self::handle_approval_key))
     }
 }
 
@@ -577,6 +755,7 @@ fn home(
     home_entity: Entity<HomeView>,
     theme: Theme,
     composer: Entity<ComposerView>,
+    user_input_other: Entity<PromptInput>,
     phase: ConversationPhase,
     user_message: Option<String>,
     user_message_time: Option<String>,
@@ -591,6 +770,28 @@ fn home(
     first_suggestion: impl IntoElement,
     second_suggestion: impl IntoElement,
 ) -> Div {
+    let pending_user_input = conversation_activity.iter().find_map(|activity| {
+        let ConversationActivity::UserInput(model) = activity else {
+            return None;
+        };
+        model.should_render().then(|| model.clone())
+    });
+    let pending_file_approval = conversation_activity.iter().find_map(|activity| {
+        let ConversationActivity::FileApproval(model) = activity else {
+            return None;
+        };
+        model.should_render().then(|| model.clone())
+    });
+    let pending_permissions_approval = conversation_activity.iter().find_map(|activity| {
+        let ConversationActivity::PermissionsApproval(model) = activity else {
+            return None;
+        };
+        model.should_render().then(|| model.clone())
+    });
+    let blocking_request_pending = pending_user_input.is_some()
+        || pending_file_approval.is_some()
+        || pending_permissions_approval.is_some();
+
     div()
         .size_full()
         .flex()
@@ -639,7 +840,7 @@ fn home(
         })
         .when(phase != ConversationPhase::Empty, |root| {
             root.child(conversation(
-                home_entity,
+                home_entity.clone(),
                 theme,
                 phase,
                 user_message.unwrap_or_default(),
@@ -653,6 +854,54 @@ fn home(
                 expanded_commands,
                 command_scroll_handles,
             ))
+        })
+        .when_some(pending_user_input, |root, model| {
+            let card = user_input_request_card(
+                home_entity.clone(),
+                model,
+                theme,
+                user_input_other.clone(),
+            );
+            root.when_some(card, |root, card| {
+                root.child(
+                    div()
+                        .absolute()
+                        .bottom(px(16.0))
+                        .w_full()
+                        .max_w(px(736.0))
+                        .child(div().relative().left(px(2.671_875)).w_full().child(card)),
+                )
+            })
+        })
+        .when_some(pending_file_approval, |root, model| {
+            let card = file_approval_card(home_entity.clone(), model, theme);
+            root.when_some(card, |root, card| {
+                root.child(
+                    div()
+                        .absolute()
+                        .bottom(px(16.0))
+                        .w_full()
+                        .max_w(px(736.0))
+                        .child(
+                            // CDP 39-43 rasterize the left edge one pixel before
+                            // GPUI at the same fractional CSS coordinate.
+                            div().relative().left(px(1.671_875)).w_full().child(card),
+                        ),
+                )
+            })
+        })
+        .when_some(pending_permissions_approval, |root, model| {
+            let card = permissions_approval_card(home_entity.clone(), model, theme);
+            root.when_some(card, |root, card| {
+                root.child(
+                    div()
+                        .absolute()
+                        .bottom(px(16.0))
+                        .w_full()
+                        .max_w(px(736.0))
+                        .child(div().relative().left(px(0.671_875)).w_full().child(card)),
+                )
+            })
         })
         .child(
             div()
@@ -680,7 +929,9 @@ fn home(
                             .child(second_suggestion),
                     )
                 })
-                .child(composer),
+                .when(!blocking_request_pending, |container| {
+                    container.child(composer)
+                }),
         )
 }
 
@@ -947,6 +1198,33 @@ fn activity_stream(
                     theme,
                 ))
             }
+            ConversationActivity::Approval(model) => {
+                let request_id = model.request_id.clone();
+                let target = home_entity.clone();
+                let callback = ApprovalCardCallback::new(move |event, _, cx| {
+                    let request_id = request_id.clone();
+                    target.update(cx, move |home, cx| {
+                        home.handle_approval_card_event(&request_id, event, cx)
+                    });
+                });
+                if let Some(card) = render_approval_card(&model, theme, callback) {
+                    stream.child(card)
+                } else {
+                    stream
+                }
+            }
+            ConversationActivity::FileApproval(_) => stream,
+            ConversationActivity::PermissionsApproval(_) => stream,
+            ConversationActivity::FileChange(model) => {
+                let target = home_entity.clone();
+                let callback = FileChangeActivityCallback::new(move |event, _, cx| {
+                    target.update(cx, move |home, cx| {
+                        home.handle_file_change_activity_event(event, cx)
+                    });
+                });
+                stream.child(render_file_change_activity(&model, theme, callback))
+            }
+            ConversationActivity::UserInput(_) => stream,
             ConversationActivity::ProtocolError {
                 message,
                 details,
@@ -1009,6 +1287,63 @@ fn activity_stream(
             _ => stream,
         },
     )
+}
+
+fn file_approval_card(
+    home_entity: Entity<HomeView>,
+    model: FileApprovalPresentation,
+    theme: Theme,
+) -> Option<gpui::Stateful<Div>> {
+    let request_id = model.request_id.clone();
+    let target = home_entity;
+    let callback = FileApprovalCallback::new(move |event, _, cx| {
+        let request_id = request_id.clone();
+        target.update(cx, move |home, cx| {
+            home.handle_file_approval_event(&request_id, event, cx)
+        });
+    });
+    render_file_approval_card(&model, theme, callback)
+}
+
+fn permissions_approval_card(
+    home_entity: Entity<HomeView>,
+    model: PermissionApprovalPresentation,
+    theme: Theme,
+) -> Option<gpui::Stateful<Div>> {
+    let request_id = model.request_id.clone();
+    let target = home_entity;
+    let callback = PermissionApprovalCallback::new(move |event, _, cx| {
+        let request_id = request_id.clone();
+        target.update(cx, move |home, cx| {
+            home.handle_permissions_approval_event(&request_id, event, cx)
+        });
+    });
+    render_permissions_approval(&model, theme, callback)
+}
+
+fn user_input_request_card(
+    home_entity: Entity<HomeView>,
+    model: crate::components::user_input_request::UserInputRequestPresentation,
+    theme: Theme,
+    other_input: Entity<PromptInput>,
+) -> Option<gpui::Stateful<Div>> {
+    let request_id = model.request_id.clone();
+    let target = home_entity;
+    let callback = UserInputRequestCallback::new(move |event, window, cx| {
+        let request_id = request_id.clone();
+        if matches!(event, UserInputRequestEvent::BeginOtherAnswer { .. }) {
+            let focus = target
+                .read(cx)
+                .composer
+                .read(cx)
+                .user_input_other_focus_handle(cx);
+            window.focus(&focus, cx);
+        }
+        target.update(cx, move |home, cx| {
+            home.handle_user_input_request_event(&request_id, event, cx)
+        });
+    });
+    render_user_input_request(&model, theme, other_input, callback)
 }
 
 #[derive(Clone)]
@@ -1540,8 +1875,8 @@ mod tests {
     use std::time::Duration;
 
     use gpui::{
-        AppContext, Bounds, MouseButton, TestApp, TestAppWindow, WindowBounds, WindowOptions,
-        point, px, size,
+        AppContext, Bounds, KeyBinding, MouseButton, TestApp, TestAppWindow, WindowBounds,
+        WindowOptions, point, px, size,
     };
 
     use super::{
@@ -1562,7 +1897,11 @@ mod tests {
         thinking_shimmer_alpha, thinking_shimmer_band_left, thinking_shimmer_progress,
         thinking_shimmer_step,
     };
-    use crate::components::composer::ConversationPhase;
+    use crate::components::{
+        composer::{ConversationActivity, ConversationPhase},
+        prompt_input::Submit,
+        user_input_request::{UserInputKeyboardFocus, UserInputRequestStatus},
+    };
     use crate::theme::ThemeMode;
 
     fn simulate_next_frame(app: &mut TestApp, window: &TestAppWindow<HomeView>, elapsed_ms: u64) {
@@ -1781,5 +2120,378 @@ mod tests {
             app.read_from_clipboard().and_then(|item| item.text()),
             Some("clipboard prompt".to_owned())
         );
+    }
+
+    #[test]
+    fn approval_surface_owns_focus_and_drives_real_keyboard_events() {
+        use crate::components::{
+            approval::{ApprovalKeyboardFocus, ApprovalMenuItem, ApprovalVisualState},
+            composer::ConversationActivity,
+        };
+
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+
+        window.update(|home, _, cx| home.set_approval_for_capture("command", "default", cx));
+        window.draw();
+        window.update(|home, window, cx| {
+            assert!(home.approval_focus.is_focused(window));
+            assert!(home.composer.read(cx).conversation_render_snapshot().5.iter().any(
+                |activity| matches!(activity, ConversationActivity::Approval(model) if model.should_render())
+            ));
+        });
+
+        window.simulate_keystrokes("shift-tab enter tab");
+        window.read(|home, cx| {
+            let activities = home.composer.read(cx).conversation_render_snapshot().5;
+            let model = activities
+                .iter()
+                .find_map(|activity| {
+                    let ConversationActivity::Approval(model) = activity else {
+                        return None;
+                    };
+                    Some(model)
+                })
+                .unwrap();
+            assert_eq!(
+                model.keyboard_focus,
+                Some(ApprovalKeyboardFocus::MenuAllowOnce)
+            );
+            assert_eq!(
+                model.visual_state,
+                ApprovalVisualState::SplitMenu {
+                    focused: Some(ApprovalMenuItem::AllowOnce)
+                }
+            );
+        });
+
+        window.simulate_keystrokes("shift-tab escape");
+        window.read(|home, cx| {
+            let activities = home.composer.read(cx).conversation_render_snapshot().5;
+            let model = activities
+                .iter()
+                .find_map(|activity| {
+                    let ConversationActivity::Approval(model) = activity else {
+                        return None;
+                    };
+                    Some(model)
+                })
+                .unwrap();
+            assert_eq!(
+                model.keyboard_focus,
+                Some(ApprovalKeyboardFocus::MenuToggle)
+            );
+            assert_eq!(model.visual_state, ApprovalVisualState::Default);
+            assert!(model.should_render());
+        });
+
+        window.simulate_keystrokes("enter tab enter");
+        window.read(|home, cx| {
+            assert!(home.composer.read(cx).conversation_render_snapshot().5.iter().any(
+                |activity| matches!(activity, ConversationActivity::Approval(model) if !model.should_render())
+            ));
+        });
+        window.draw();
+        window.update(|home, window, _| {
+            assert!(!home.approval_focus.is_focused(window));
+        });
+    }
+
+    #[test]
+    fn file_approval_surface_drives_focus_enter_and_escape() {
+        use crate::components::{
+            composer::ConversationActivity,
+            file_change::{
+                FileApprovalKeyboardFocus, FileApprovalMenuItem, FileApprovalVisualState,
+            },
+        };
+
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+
+        window.update(|home, _, cx| home.set_file_approval_for_capture("default", cx));
+        window.draw();
+        window.update(|home, window, _| assert!(home.approval_focus.is_focused(window)));
+
+        // Shift-Tab focuses the split toggle, Enter opens it, and Tab moves
+        // focus into the first evidence-backed menu row.
+        window.simulate_keystrokes("shift-tab enter tab");
+        window.read(|home, cx| {
+            let activities = home.composer.read(cx).conversation_render_snapshot().5;
+            let model = activities
+                .iter()
+                .find_map(|activity| {
+                    let ConversationActivity::FileApproval(model) = activity else {
+                        return None;
+                    };
+                    Some(model)
+                })
+                .unwrap();
+            assert_eq!(
+                model.keyboard_focus,
+                Some(FileApprovalKeyboardFocus::MenuAllowOnce)
+            );
+            assert_eq!(
+                model.visual_state,
+                FileApprovalVisualState::SplitMenu {
+                    focused: Some(FileApprovalMenuItem::AllowOnce)
+                }
+            );
+        });
+
+        window.simulate_keystroke("escape");
+        window.read(|home, cx| {
+            let activities = home.composer.read(cx).conversation_render_snapshot().5;
+            let model = activities
+                .iter()
+                .find_map(|activity| {
+                    let ConversationActivity::FileApproval(model) = activity else {
+                        return None;
+                    };
+                    Some(model)
+                })
+                .unwrap();
+            assert_eq!(
+                model.keyboard_focus,
+                Some(FileApprovalKeyboardFocus::MenuToggle)
+            );
+            assert_eq!(model.visual_state, FileApprovalVisualState::Default);
+            assert!(model.should_render());
+        });
+
+        window.simulate_keystrokes("enter tab enter");
+        window.read(|home, cx| {
+            assert!(home.composer.read(cx).conversation_render_snapshot().5.iter().any(
+                |activity| matches!(activity, ConversationActivity::FileApproval(model) if !model.should_render())
+            ));
+        });
+        window.draw();
+        window.update(|home, window, _| assert!(!home.approval_focus.is_focused(window)));
+
+        window.update(|home, _, cx| home.set_file_approval_for_capture("default", cx));
+        window.draw();
+        window.simulate_keystroke("escape");
+        window.read(|home, cx| {
+            assert!(home.composer.read(cx).conversation_render_snapshot().5.iter().any(
+                |activity| matches!(activity, ConversationActivity::FileApproval(model) if !model.should_render())
+            ));
+        });
+    }
+
+    #[test]
+    fn permissions_approval_surface_drives_focus_menu_and_terminal_unmount() {
+        use crate::components::{
+            composer::ConversationActivity,
+            permissions_approval::{
+                PermissionApprovalKeyboardFocus, PermissionApprovalMenuItem,
+                PermissionApprovalVisualState,
+            },
+        };
+
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+
+        window.update(|home, _, cx| {
+            home.set_permissions_approval_for_capture("network", "default", cx)
+        });
+        window.draw();
+        window.update(|home, window, _| assert!(home.approval_focus.is_focused(window)));
+
+        // The pending permission card participates in the same native focus
+        // loop as command and file approvals: Shift-Tab reaches the split
+        // toggle, Enter opens it, and Tab advances into the first menu row.
+        window.simulate_keystrokes("shift-tab enter tab");
+        window.read(|home, cx| {
+            let activities = home.composer.read(cx).conversation_render_snapshot().5;
+            let model = activities
+                .iter()
+                .find_map(|activity| {
+                    let ConversationActivity::PermissionsApproval(model) = activity else {
+                        return None;
+                    };
+                    Some(model)
+                })
+                .expect("pending permissions approval");
+            assert_eq!(
+                model.keyboard_focus,
+                Some(PermissionApprovalKeyboardFocus::MenuAllowOnce)
+            );
+            assert_eq!(
+                model.visual_state,
+                PermissionApprovalVisualState::Menu {
+                    focused: Some(PermissionApprovalMenuItem::AllowOnce)
+                }
+            );
+        });
+
+        window.simulate_keystroke("escape");
+        window.read(|home, cx| {
+            let activities = home.composer.read(cx).conversation_render_snapshot().5;
+            let model = activities
+                .iter()
+                .find_map(|activity| {
+                    let ConversationActivity::PermissionsApproval(model) = activity else {
+                        return None;
+                    };
+                    Some(model)
+                })
+                .expect("pending permissions approval");
+            assert_eq!(
+                model.keyboard_focus,
+                Some(PermissionApprovalKeyboardFocus::MenuToggle)
+            );
+            assert_eq!(model.visual_state, PermissionApprovalVisualState::Default);
+            assert!(model.should_render());
+        });
+
+        window.simulate_keystrokes("enter tab enter");
+        window.read(|home, cx| {
+            assert!(home.composer.read(cx).conversation_render_snapshot().5.iter().any(
+                |activity| matches!(activity, ConversationActivity::PermissionsApproval(model) if !model.should_render())
+            ));
+        });
+        window.draw();
+        window.update(|home, window, _| assert!(!home.approval_focus.is_focused(window)));
+
+        window.update(|home, _, cx| {
+            home.set_permissions_approval_for_capture("network", "default", cx)
+        });
+        window.draw();
+        window.simulate_keystroke("escape");
+        window.read(|home, cx| {
+            assert!(home.composer.read(cx).conversation_render_snapshot().5.iter().any(
+                |activity| matches!(activity, ConversationActivity::PermissionsApproval(model) if !model.should_render())
+            ));
+        });
+    }
+
+    #[test]
+    fn file_change_review_event_keeps_the_completed_activity_mounted() {
+        use crate::components::file_change::FileChangeActivityEvent;
+
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+
+        window.update(|home, _, cx| home.set_file_change_for_capture("completed", cx));
+        let review = window.read(|home, cx| {
+            home.composer
+                .read(cx)
+                .conversation_render_snapshot()
+                .5
+                .iter()
+                .find_map(|activity| {
+                    let ConversationActivity::FileChange(model) = activity else {
+                        return None;
+                    };
+                    Some(model.review.clone())
+                })
+                .expect("completed fileChange activity")
+        });
+
+        window.update(|home, _, cx| {
+            home.handle_file_change_activity_event(
+                FileChangeActivityEvent::OpenReview(review.clone()),
+                cx,
+            )
+        });
+
+        window.read(|home, cx| {
+            let activities = home.composer.read(cx).conversation_render_snapshot().5;
+            assert!(activities.iter().any(|activity| {
+                matches!(activity, ConversationActivity::FileChange(model) if model.review == review)
+            }));
+        });
+    }
+
+    #[test]
+    fn user_input_other_is_a_native_editor_and_tab_returns_to_form_navigation() {
+        let mut app = TestApp::new();
+        app.update(|cx| {
+            cx.bind_keys([KeyBinding::new("enter", Submit, Some("PromptInput"))]);
+        });
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+
+        window.update(|home, window, cx| {
+            home.set_user_input_for_capture("other-focus", cx);
+            let focus = home.composer.read(cx).user_input_other_focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        window.draw();
+        window.simulate_input("我想喝茶。");
+        window.read(|home, cx| {
+            let composer = home.composer.read(cx);
+            assert_eq!(composer.user_input_other_entity().read(cx).text(), "我想喝茶。");
+            assert!(composer.conversation_render_snapshot().5.iter().any(|activity| {
+                matches!(activity, ConversationActivity::UserInput(model) if model.other_answer == "我想喝茶。")
+            }));
+        });
+
+        // Enter is handled by the PromptInput EntityInputHandler/action, not
+        // by the card's top-level KeyDown character concatenation.
+        window.simulate_keystroke("enter");
+        window.read(|home, cx| {
+            assert!(home.composer.read(cx).conversation_render_snapshot().5.iter().any(
+                |activity| matches!(activity, ConversationActivity::UserInput(model) if model.status == UserInputRequestStatus::Submitting)
+            ));
+        });
+
+        window.update(|home, window, cx| {
+            home.set_user_input_for_capture("other-focus", cx);
+            let focus = home.composer.read(cx).user_input_other_focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        window.draw();
+        window.simulate_keystroke("tab");
+        window.update(|home, window, cx| {
+            assert!(home.approval_focus.is_focused(window));
+            assert!(home.composer.read(cx).conversation_render_snapshot().5.iter().any(
+                |activity| matches!(activity, ConversationActivity::UserInput(model) if model.keyboard_focus == Some(UserInputKeyboardFocus::Skip))
+            ));
+        });
     }
 }
