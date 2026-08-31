@@ -41,22 +41,6 @@ const MODEL_LIST_FIRST_ID: u64 = 2;
 const MODEL_LIST_PAGE_SIZE: u32 = 50;
 const UNDEFINED_METHOD_PARAMS_LIMIT: usize = 2_000;
 
-// These protocol methods are intentionally recognized even though this view
-// does not render them yet. Keep the list exact: a prefix match or wildcard
-// would hide new app-server surface area instead of reporting it. Every method
-// with a user-facing event is handled outside this list.
-const PASSIVE_SERVER_METHODS: &[&str] = &[
-    "remoteControl/status/changed",
-    "thread/started",
-    "thread/goal/updated",
-    "thread/goal/cleared",
-    "mcpServer/startupStatus/updated",
-    "thread/status/changed",
-    "turn/plan/updated",
-    "thread/tokenUsage/updated",
-    "account/rateLimits/updated",
-];
-
 const TURN_SCOPED_SERVER_METHODS: &[&str] = &[
     "item/commandExecution/requestApproval",
     "item/permissions/requestApproval",
@@ -1568,9 +1552,11 @@ fn drive_session<R: BufRead, W: Write + Send + 'static>(
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .context("thread/start 响应缺少字符串 result.thread.id")?;
-            let _ = events.send_blocking(AgentEvent::ThreadCreated {
-                thread_id: thread_id.clone(),
-            });
+            events
+                .send_blocking(AgentEvent::ThreadCreated {
+                    thread_id: thread_id.clone(),
+                })
+                .map_err(|_| anyhow!("Composer thread created 事件通道已经关闭"))?;
             thread_id
         }
     };
@@ -1671,6 +1657,12 @@ fn process_turn_message<W: Write + Send + 'static>(
             )
             .map(|()| None);
         }
+        if matches!(
+            message.get("method").and_then(Value::as_str),
+            Some("item/started" | "item/completed")
+        ) {
+            return Err(turn_item_protocol_error(message, error));
+        }
         return Err(error);
     }
     respond_to_server_request_on_session(session, message, events)?;
@@ -1680,59 +1672,88 @@ fn process_turn_message<W: Write + Send + 'static>(
 
     match message.get("method").and_then(Value::as_str) {
         Some("item/started") => {
-            let item = message.pointer("/params/item");
-            match item
-                .and_then(|item| item.get("type"))
-                .and_then(Value::as_str)
-            {
-                Some("agentMessage") => {
-                    if let Some(item_id) =
-                        item.and_then(|item| item.get("id")).and_then(Value::as_str)
-                    {
-                        let _ = events.send_blocking(AgentEvent::AssistantMessageStarted {
-                            item_id: item_id.to_owned(),
-                        });
-                    }
+            let item = required_turn_item(message)?;
+            let item_type = required_turn_item_type(message, item)?;
+            match item_type {
+                "agentMessage" => {
+                    let (item_id, _text) = parse_agent_message(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::AssistantMessageStarted { item_id },
+                        "item/started agentMessage",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
-                Some("commandExecution") => {
-                    if let Some(command) = item.and_then(parse_command_execution) {
-                        let _ = events.send_blocking(AgentEvent::CommandStarted(command));
-                    }
+                "commandExecution" => {
+                    let command = parse_command_execution(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::CommandStarted(command),
+                        "item/started commandExecution",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
-                _ => {}
+                unsupported => {
+                    return Err(turn_item_protocol_error(
+                        message,
+                        format!("未接入的 item.type `{unsupported}`"),
+                    ));
+                }
             }
         }
         Some("item/agentMessage/delta") => {
-            if let Some(delta) = message.pointer("/params/delta").and_then(Value::as_str) {
-                *streamed_text = true;
-                let _ = events.send_blocking(AgentEvent::TextDelta(delta.to_owned()));
-            }
+            let _item_id = required_notification_string(message, "itemId")?;
+            let delta = required_notification_string(message, "delta")?;
+            send_turn_event(
+                events,
+                AgentEvent::TextDelta(delta),
+                "item/agentMessage/delta",
+            )?;
+            *streamed_text = true;
         }
         Some("item/commandExecution/outputDelta") => {
-            let item_id = message.pointer("/params/itemId").and_then(Value::as_str);
-            let delta = message.pointer("/params/delta").and_then(Value::as_str);
-            if let (Some(item_id), Some(delta)) = (item_id, delta) {
-                let _ = events.send_blocking(AgentEvent::CommandOutputDelta {
-                    item_id: item_id.to_owned(),
-                    delta: delta.to_owned(),
-                });
-            }
+            let item_id = required_notification_string(message, "itemId")?;
+            let delta = required_notification_string(message, "delta")?;
+            send_turn_event(
+                events,
+                AgentEvent::CommandOutputDelta { item_id, delta },
+                "item/commandExecution/outputDelta",
+            )?;
         }
         Some("item/completed") => {
-            let item = message.pointer("/params/item");
-            if let Some(command) = item.and_then(parse_command_execution) {
-                let _ = events.send_blocking(AgentEvent::CommandCompleted(command));
-            } else if !*streamed_text
-                && item
-                    .and_then(|item| item.get("type"))
-                    .and_then(Value::as_str)
-                    == Some("agentMessage")
-            {
-                if let Some(text) = item
-                    .and_then(|item| item.get("text"))
-                    .and_then(Value::as_str)
-                {
-                    let _ = events.send_blocking(AgentEvent::TextDelta(text.to_owned()));
+            let item = required_turn_item(message)?;
+            let item_type = required_turn_item_type(message, item)?;
+            match item_type {
+                "agentMessage" => {
+                    let (_item_id, text) = parse_agent_message(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    match *streamed_text {
+                        true => Ok(()),
+                        false => send_turn_event(
+                            events,
+                            AgentEvent::TextDelta(text),
+                            "item/completed agentMessage",
+                        )
+                        .map_err(|error| turn_item_protocol_error(message, error)),
+                    }?;
+                }
+                "commandExecution" => {
+                    let command = parse_command_execution(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::CommandCompleted(command),
+                        "item/completed commandExecution",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
+                unsupported => {
+                    return Err(turn_item_protocol_error(
+                        message,
+                        format!("未接入的 item.type `{unsupported}`"),
+                    ));
                 }
             }
         }
@@ -1761,10 +1782,9 @@ fn process_turn_message<W: Write + Send + 'static>(
             | "model/rerouted"
             | "model/verification"
             | "model/safetyBuffering/updated",
-        ) => {}
-        Some(method) if PASSIVE_SERVER_METHODS.contains(&method) => {}
+        ) => return Ok(None),
         Some(method) => return Err(undefined_server_method_error(method, message)),
-        None => {}
+        None => return Ok(None),
     }
     Ok(None)
 }
@@ -1789,21 +1809,22 @@ fn is_defined_server_method(method: &str) -> bool {
             | "model/rerouted"
             | "model/verification"
             | "model/safetyBuffering/updated"
-    ) || PASSIVE_SERVER_METHODS.contains(&method)
+    )
 }
 
 fn required_notification_string(message: &Value, field: &str) -> Result<String> {
-    message
-        .pointer(&format!("/params/{field}"))
+    let method = message
+        .get("method")
         .and_then(Value::as_str)
-        .map(str::to_owned)
-        .with_context(|| {
-            let method = message
-                .get("method")
-                .and_then(Value::as_str)
-                .unwrap_or("未知方法");
-            format!("{method} 通知缺少字符串字段 params.{field}")
-        })
+        .unwrap_or("未知方法");
+    match message.pointer(&format!("/params/{field}")) {
+        None => bail!("{method} 通知缺少字符串字段 params.{field}"),
+        Some(Value::String(value)) => Ok(value.clone()),
+        Some(value) => bail!(
+            "{method} 通知字段 params.{field} 必须是字符串，实际为 {}",
+            summarize_json(value)
+        ),
+    }
 }
 
 fn required_notification_strings(message: &Value, field: &str) -> Result<Vec<String>> {
@@ -2035,7 +2056,13 @@ fn parse_agent_notification(message: &Value) -> Result<Option<AgentEvent>> {
 
 fn forward_agent_notification(message: &Value, events: &Sender<AgentEvent>) -> Result<()> {
     if let Some(event) = parse_agent_notification(message)? {
-        let _ = events.send_blocking(event);
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .context("已解析的 AgentEvent 缺少字符串 JSON-RPC method")?;
+        events
+            .send_blocking(event)
+            .map_err(|_| anyhow!("Composer `{method}` 事件通道已经关闭"))?;
     }
     Ok(())
 }
@@ -2103,39 +2130,185 @@ fn summarize_json(value: &Value) -> String {
     summary
 }
 
-fn parse_command_execution(item: &Value) -> Option<CommandExecution> {
-    if item.get("type").and_then(Value::as_str) != Some("commandExecution") {
-        return None;
-    }
-    let status = match item.get("status").and_then(Value::as_str) {
-        Some("completed") if item.get("exitCode").and_then(Value::as_i64).unwrap_or(0) == 0 => {
-            CommandExecutionStatus::Completed
-        }
-        Some("failed" | "declined") => CommandExecutionStatus::Failed,
-        Some("completed") => CommandExecutionStatus::Failed,
-        _ => CommandExecutionStatus::InProgress,
-    };
-    let command = item
-        .pointer("/commandActions/0/command")
-        .or_else(|| item.get("command"))
+fn send_turn_event(events: &Sender<AgentEvent>, event: AgentEvent, source: &str) -> Result<()> {
+    events
+        .send_blocking(event)
+        .map_err(|_| anyhow!("Composer `{source}` 事件通道已经关闭"))
+}
+
+fn required_turn_item(message: &Value) -> Result<&serde_json::Map<String, Value>> {
+    message
+        .pointer("/params/item")
+        .and_then(Value::as_object)
+        .ok_or_else(|| turn_item_protocol_error(message, "params.item 必须是对象"))
+}
+
+fn required_turn_item_type<'a>(
+    message: &Value,
+    item: &'a serde_json::Map<String, Value>,
+) -> Result<&'a str> {
+    item.get("type")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    Some(CommandExecution {
-        id: item.get("id").and_then(Value::as_str)?.to_owned(),
-        command,
-        cwd: item
-            .get("cwd")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        output: item
-            .get("aggregatedOutput")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
+        .ok_or_else(|| turn_item_protocol_error(message, "params.item.type 必须是字符串"))
+}
+
+fn turn_item_field_context(value: Option<&Value>) -> String {
+    match value {
+        None => "缺少".to_owned(),
+        Some(Value::String(value)) => format!("`{value}`"),
+        Some(value) => format!("非字符串({})", summarize_json(value)),
+    }
+}
+
+fn turn_item_protocol_error(message: &Value, detail: impl std::fmt::Display) -> anyhow::Error {
+    let method = turn_item_field_context(message.get("method"));
+    let item = message.pointer("/params/item");
+    let item_type = turn_item_field_context(item.and_then(|item| item.get("type")));
+    let item_id = turn_item_field_context(item.and_then(|item| item.get("id")));
+    let thread_id = turn_item_field_context(message.pointer("/params/threadId"));
+    let turn_id = turn_item_field_context(message.pointer("/params/turnId"));
+    let summary = match item {
+        Some(item) => format!("item={}", summarize_json(item)),
+        None => format!(
+            "params={}",
+            message
+                .get("params")
+                .map(summarize_json)
+                .unwrap_or_else(|| "null".to_owned())
+        ),
+    };
+    anyhow!(
+        "{detail}；JSON-RPC method={method}；item.type={item_type}；item.id/itemId={item_id}；threadId={thread_id}；turnId={turn_id}；{summary}"
+    )
+}
+
+fn required_item_string(
+    item: &serde_json::Map<String, Value>,
+    item_kind: &str,
+    field: &str,
+) -> Result<String> {
+    item.get(field)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("{item_kind} item.{field} 必须是字符串"))
+}
+
+fn parse_agent_message(item: &serde_json::Map<String, Value>) -> Result<(String, String)> {
+    let item_type = required_item_string(item, "agentMessage", "type")?;
+    if item_type != "agentMessage" {
+        bail!("agentMessage item.type 必须是 `agentMessage`，实际为 `{item_type}`");
+    }
+    Ok((
+        required_item_string(item, "agentMessage", "id")?,
+        required_item_string(item, "agentMessage", "text")?,
+    ))
+}
+
+fn validate_nullable_command_action_string(
+    action: &serde_json::Map<String, Value>,
+    index: usize,
+    field: &str,
+) -> Result<()> {
+    match action.get(field) {
+        None | Some(Value::Null | Value::String(_)) => Ok(()),
+        Some(_) => {
+            bail!("commandExecution item.commandActions[{index}].{field} 必须是字符串或 null")
+        }
+    }
+}
+
+fn parse_command_execution(item: &serde_json::Map<String, Value>) -> Result<CommandExecution> {
+    let item_type = required_item_string(item, "commandExecution", "type")?;
+    if item_type != "commandExecution" {
+        bail!("commandExecution item.type 必须是 `commandExecution`，实际为 `{item_type}`");
+    }
+    let id = required_item_string(item, "commandExecution", "id")?;
+    let raw_command = required_item_string(item, "commandExecution", "command")?;
+    let cwd = required_item_string(item, "commandExecution", "cwd")?;
+    let actions = item
+        .get("commandActions")
+        .and_then(Value::as_array)
+        .context("commandExecution item.commandActions 必须是数组")?;
+    let mut first_action_command = None;
+    for (index, action) in actions.iter().enumerate() {
+        let action = action
+            .as_object()
+            .with_context(|| format!("commandExecution item.commandActions[{index}] 必须是对象"))?;
+        let action_type = required_item_string(
+            action,
+            &format!("commandExecution item.commandActions[{index}]"),
+            "type",
+        )?;
+        let action_command = required_item_string(
+            action,
+            &format!("commandExecution item.commandActions[{index}]"),
+            "command",
+        )?;
+        match action_type.as_str() {
+            "read" => {
+                let _name = required_item_string(
+                    action,
+                    &format!("commandExecution item.commandActions[{index}]"),
+                    "name",
+                )?;
+                let _path = required_item_string(
+                    action,
+                    &format!("commandExecution item.commandActions[{index}]"),
+                    "path",
+                )?;
+                Ok(())
+            }
+            "listFiles" => {
+                validate_nullable_command_action_string(action, index, "path")?;
+                Ok(())
+            }
+            "search" => {
+                validate_nullable_command_action_string(action, index, "path")?;
+                validate_nullable_command_action_string(action, index, "query")?;
+                Ok(())
+            }
+            "unknown" => Ok(()),
+            other => Err(anyhow!(
+                "commandExecution item.commandActions[{index}].type 包含未知值 `{other}`"
+            )),
+        }?;
+        if index == 0 {
+            first_action_command = Some(action_command);
+        }
+    }
+    let output = match item.get("aggregatedOutput") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(output)) => output.clone(),
+        Some(_) => bail!("commandExecution item.aggregatedOutput 必须是字符串或 null"),
+    };
+    let exit_code = match item.get("exitCode") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(exit_code)) => {
+            let exit_code = exit_code
+                .as_i64()
+                .context("commandExecution item.exitCode 必须是 int32 或 null")?;
+            i32::try_from(exit_code).context("commandExecution item.exitCode 超出 int32 范围")?;
+            Some(exit_code)
+        }
+        Some(_) => bail!("commandExecution item.exitCode 必须是 int32 或 null"),
+    };
+    let raw_status = required_item_string(item, "commandExecution", "status")?;
+    let status = match raw_status.as_str() {
+        "inProgress" => CommandExecutionStatus::InProgress,
+        "completed" if exit_code.is_some_and(|exit_code| exit_code != 0) => {
+            CommandExecutionStatus::Failed
+        }
+        "completed" => CommandExecutionStatus::Completed,
+        "failed" | "declined" => CommandExecutionStatus::Failed,
+        other => bail!("commandExecution item.status 包含未知值 `{other}`"),
+    };
+    Ok(CommandExecution {
+        id,
+        command: first_action_command.unwrap_or(raw_command),
+        cwd,
+        output,
         status,
-        exit_code: item.get("exitCode").and_then(Value::as_i64),
+        exit_code,
     })
 }
 
@@ -3101,12 +3274,11 @@ mod tests {
         AgentPermissionMode, AgentPermissionsApprovalChoice, AgentRequest,
         AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
         AgentServerRequestMetadata, AgentThreadSettings, AgentUserInputResponse, AppServerProcess,
-        CodexAppServerBackend, CodexTurnSession, INITIALIZE_ID, MODEL_LIST_PAGE_SIZE,
-        PASSIVE_SERVER_METHODS, TurnOutcome, UNDEFINED_METHOD_PARAMS_LIMIT,
-        cleanup_pending_server_requests, drive_model_catalog, drive_permission_profiles,
-        drive_session, drive_thread_settings_update, ensure_server_method_is_defined,
-        finish_prompt_session, handle_server_request_resolved, parse_agent_notification,
-        respond_to_server_request_on_session, run_model_catalog_process,
+        CodexAppServerBackend, CodexTurnSession, INITIALIZE_ID, MODEL_LIST_PAGE_SIZE, TurnOutcome,
+        UNDEFINED_METHOD_PARAMS_LIMIT, cleanup_pending_server_requests, drive_model_catalog,
+        drive_permission_profiles, drive_session, drive_thread_settings_update,
+        ensure_server_method_is_defined, finish_prompt_session, handle_server_request_resolved,
+        parse_agent_notification, respond_to_server_request_on_session, run_model_catalog_process,
         thread_settings_update_request, wait_for_response,
     };
     use crate::agent::AgentUserInputAnswer;
@@ -3233,6 +3405,57 @@ mod tests {
     fn take_session_output(session: &CodexTurnSession<Vec<u8>>) -> Vec<u8> {
         let mut writer = session.writer.lock().unwrap();
         std::mem::take(writer.as_mut().unwrap())
+    }
+
+    fn turn_item_message(method: &str, item: Value) -> Value {
+        json!({
+            "method": method,
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "item": item
+            }
+        })
+    }
+
+    fn assert_turn_message_fails(message: &Value, expected: &[&str]) -> String {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut streamed_text = false;
+        let error = super::process_turn_message(
+            &session,
+            message,
+            "thr_1",
+            "turn_1",
+            &tx,
+            &mut streamed_text,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            rx.try_recv().is_err(),
+            "unexpected event for {message}: {error}"
+        );
+        for fragment in expected {
+            assert!(
+                error.contains(fragment),
+                "error for {message} did not contain `{fragment}`: {error}"
+            );
+        }
+        error
+    }
+
+    fn command_execution_item(status: &str) -> Value {
+        json!({
+            "type": "commandExecution",
+            "id": "exec_1",
+            "command": "/bin/zsh -lc pwd",
+            "commandActions": [{"type": "unknown", "command": "pwd"}],
+            "cwd": "/tmp/project",
+            "status": status,
+            "aggregatedOutput": null,
+            "exitCode": null
+        })
     }
 
     fn turn_start_for_mode(mode: AgentPermissionMode, cwd: PathBuf) -> Value {
@@ -3514,10 +3737,9 @@ mod tests {
             "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n",
             "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"items\":[],\"status\":\"inProgress\"}}}\n",
             "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_1\"}}}\n",
-            "{\"method\":\"thread/status/changed\",\"params\":{\"threadId\":\"thr_1\"}}\n",
             "{\"method\":\"item/started\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_1\",\"text\":\"\"}}}\n",
-            "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"delta\":\"你好\"}}\n",
-            "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"delta\":\"！\"}}\n",
+            "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"itemId\":\"msg_1\",\"delta\":\"你好\"}}\n",
+            "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"itemId\":\"msg_1\",\"delta\":\"！\"}}\n",
             "{\"method\":\"item/started\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"commandExecution\",\"id\":\"exec_1\",\"command\":\"/bin/zsh -lc pwd\",\"cwd\":\"/tmp/project\",\"status\":\"inProgress\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"pwd\"}],\"aggregatedOutput\":null,\"exitCode\":null}}}\n",
             "{\"method\":\"item/commandExecution/outputDelta\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"itemId\":\"exec_1\",\"delta\":\"/tmp/project\\n\"}}\n",
             "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"commandExecution\",\"id\":\"exec_1\",\"command\":\"/bin/zsh -lc pwd\",\"cwd\":\"/tmp/project\",\"status\":\"completed\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"pwd\"}],\"aggregatedOutput\":\"/tmp/project\\n\",\"exitCode\":0}}}\n",
@@ -3689,9 +3911,7 @@ mod tests {
     fn existing_thread_resumes_before_turn_start() {
         let input = concat!(
             "{\"id\":1,\"result\":{}}\n",
-            "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"thr_existing\"}}}\n",
             "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_existing\",\"turns\":[]}}}\n",
-            "{\"method\":\"thread/goal/cleared\",\"params\":{\"threadId\":\"thr_existing\"}}\n",
             "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_existing\",\"turn\":{\"id\":\"turn_next\",\"items\":[],\"status\":\"inProgress\"}}}\n",
             "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thr_existing\",\"turnId\":\"turn_next\",\"itemId\":\"msg_next\",\"delta\":\"继续\"}}\n",
             "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_next\"}}}\n",
@@ -3782,11 +4002,10 @@ mod tests {
     }
 
     #[test]
-    fn active_goal_turn_is_not_forwarded_when_turn_start_fails() {
+    fn deferred_turn_is_not_forwarded_when_turn_start_fails() {
         let input = concat!(
             "{\"id\":1,\"result\":{}}\n",
             "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_existing\",\"turns\":[]}}}\n",
-            "{\"method\":\"thread/goal/updated\",\"params\":{\"threadId\":\"thr_existing\",\"turnId\":null,\"goal\":{\"status\":\"active\"}}}\n",
             "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_existing\",\"turn\":{\"id\":\"turn_auto\",\"items\":[],\"status\":\"inProgress\"}}}\n",
             "{\"id\":3,\"error\":{\"code\":-32600,\"message\":\"thread already has an active turn\"}}\n"
         );
@@ -4368,18 +4587,31 @@ mod tests {
     }
 
     #[test]
-    fn every_captured_passive_method_is_explicitly_defined() {
-        for method in PASSIVE_SERVER_METHODS {
-            ensure_server_method_is_defined(&json!({
+    fn formerly_passive_methods_are_all_undefined() {
+        for method in [
+            "remoteControl/status/changed",
+            "thread/started",
+            "thread/goal/updated",
+            "thread/goal/cleared",
+            "mcpServer/startupStatus/updated",
+            "thread/status/changed",
+            "turn/plan/updated",
+            "thread/tokenUsage/updated",
+            "account/rateLimits/updated",
+        ] {
+            let error = ensure_server_method_is_defined(&json!({
                 "method": method,
                 "params": { "probe": true }
             }))
-            .unwrap();
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("未定义"), "{method}: {error}");
+            assert!(error.contains(method), "{method}: {error}");
         }
     }
 
     #[test]
-    fn user_facing_methods_are_defined_and_never_passive() {
+    fn user_facing_methods_are_defined() {
         for method in [
             "turn/started",
             "error",
@@ -4388,7 +4620,6 @@ mod tests {
             "warning",
             "configWarning",
         ] {
-            assert!(!PASSIVE_SERVER_METHODS.contains(&method));
             ensure_server_method_is_defined(&json!({
                 "method": method,
                 "params": {}
@@ -5274,26 +5505,417 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_file_change_items_do_not_emit_domain_events() {
+    fn item_started_file_change_fails_fast_with_full_context() {
+        let message = turn_item_message(
+            "item/started",
+            json!({
+                "type": "fileChange",
+                "id": "file_1",
+                "status": "inProgress",
+                "changes": []
+            }),
+        );
+        assert_turn_message_fails(
+            &message,
+            &[
+                "item/started",
+                "fileChange",
+                "file_1",
+                "itemId",
+                "thr_1",
+                "turn_1",
+                "changes",
+            ],
+        );
+    }
+
+    #[test]
+    fn item_completed_file_change_fails_fast_with_full_context() {
+        let message = turn_item_message(
+            "item/completed",
+            json!({
+                "type": "fileChange",
+                "id": "file_1",
+                "status": "completed",
+                "changes": []
+            }),
+        );
+        assert_turn_message_fails(
+            &message,
+            &[
+                "item/completed",
+                "fileChange",
+                "file_1",
+                "itemId",
+                "thr_1",
+                "turn_1",
+                "changes",
+            ],
+        );
+    }
+
+    #[test]
+    fn future_item_type_fails_fast_for_started_and_completed() {
+        for method in ["item/started", "item/completed"] {
+            let message = turn_item_message(
+                method,
+                json!({"type": "futureItem", "id": "future_1", "payload": "probe"}),
+            );
+            assert_turn_message_fails(
+                &message,
+                &[method, "futureItem", "future_1", "thr_1", "turn_1", "probe"],
+            );
+        }
+    }
+
+    #[test]
+    fn every_unsupported_thread_item_type_fails_for_started_and_completed() {
+        for item_type in [
+            "userMessage",
+            "hookPrompt",
+            "functionCallOutput",
+            "plan",
+            "reasoning",
+            "fileChange",
+            "mcpToolCall",
+            "dynamicToolCall",
+            "collabAgentToolCall",
+            "subAgentActivity",
+            "webSearch",
+            "imageView",
+            "sleep",
+            "imageGeneration",
+            "enteredReviewMode",
+            "exitedReviewMode",
+            "contextCompaction",
+        ] {
+            for method in ["item/started", "item/completed"] {
+                let item_id = format!("{item_type}_1");
+                let message = turn_item_message(
+                    method,
+                    json!({"type": item_type, "id": item_id, "probe": true}),
+                );
+                assert_turn_message_fails(
+                    &message,
+                    &[method, item_type, &item_id, "thr_1", "turn_1"],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn required_item_and_delta_fields_never_fall_through() {
+        let cases = vec![
+            (
+                "started missing item",
+                json!({"method":"item/started","params":{"threadId":"thr_1","turnId":"turn_1"}}),
+                "params.item",
+            ),
+            (
+                "completed missing item",
+                json!({"method":"item/completed","params":{"threadId":"thr_1","turnId":"turn_1"}}),
+                "params.item",
+            ),
+            (
+                "item is not object",
+                turn_item_message("item/started", json!("agentMessage")),
+                "params.item",
+            ),
+            (
+                "missing type",
+                turn_item_message("item/started", json!({"id":"msg_1","text":"hello"})),
+                "item.type",
+            ),
+            (
+                "completed missing type",
+                turn_item_message("item/completed", json!({"id":"msg_1","text":"hello"})),
+                "item.type",
+            ),
+            (
+                "type is not string",
+                turn_item_message(
+                    "item/completed",
+                    json!({"type":1,"id":"msg_1","text":"hello"}),
+                ),
+                "item.type",
+            ),
+            (
+                "missing id",
+                turn_item_message(
+                    "item/started",
+                    json!({"type":"agentMessage","text":"hello"}),
+                ),
+                "item.id",
+            ),
+            (
+                "completed missing id",
+                turn_item_message(
+                    "item/completed",
+                    json!({"type":"agentMessage","text":"hello"}),
+                ),
+                "item.id",
+            ),
+            (
+                "id is not string",
+                turn_item_message(
+                    "item/completed",
+                    json!({"type":"agentMessage","id":1,"text":"hello"}),
+                ),
+                "item.id",
+            ),
+            (
+                "missing text",
+                turn_item_message("item/started", json!({"type":"agentMessage","id":"msg_1"})),
+                "item.text",
+            ),
+            (
+                "completed missing text",
+                turn_item_message(
+                    "item/completed",
+                    json!({"type":"agentMessage","id":"msg_1"}),
+                ),
+                "item.text",
+            ),
+            (
+                "text is not string",
+                turn_item_message(
+                    "item/completed",
+                    json!({"type":"agentMessage","id":"msg_1","text":1}),
+                ),
+                "item.text",
+            ),
+            (
+                "agent delta missing itemId",
+                json!({"method":"item/agentMessage/delta","params":{"threadId":"thr_1","turnId":"turn_1","delta":"hello"}}),
+                "params.itemId",
+            ),
+            (
+                "agent delta missing delta",
+                json!({"method":"item/agentMessage/delta","params":{"threadId":"thr_1","turnId":"turn_1","itemId":"msg_1"}}),
+                "params.delta",
+            ),
+            (
+                "agent delta itemId is not string",
+                json!({"method":"item/agentMessage/delta","params":{"threadId":"thr_1","turnId":"turn_1","itemId":1,"delta":"hello"}}),
+                "params.itemId",
+            ),
+            (
+                "agent delta is not string",
+                json!({"method":"item/agentMessage/delta","params":{"threadId":"thr_1","turnId":"turn_1","itemId":"msg_1","delta":1}}),
+                "params.delta",
+            ),
+            (
+                "command delta missing itemId",
+                json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thr_1","turnId":"turn_1","delta":"output"}}),
+                "params.itemId",
+            ),
+            (
+                "command delta missing delta",
+                json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thr_1","turnId":"turn_1","itemId":"exec_1"}}),
+                "params.delta",
+            ),
+            (
+                "command delta itemId is not string",
+                json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thr_1","turnId":"turn_1","itemId":1,"delta":"output"}}),
+                "params.itemId",
+            ),
+            (
+                "command delta is not string",
+                json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thr_1","turnId":"turn_1","itemId":"exec_1","delta":1}}),
+                "params.delta",
+            ),
+        ];
+        for (name, message, expected) in cases {
+            let error = assert_turn_message_fails(&message, &[expected]);
+            assert!(
+                error.contains("缺少字符串") || error.contains("必须是"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_execution_required_fields_and_nullable_fields_are_strict() {
+        for field in ["id", "command", "commandActions", "cwd", "status"] {
+            let mut item = command_execution_item("inProgress");
+            item.as_object_mut().unwrap().remove(field);
+            let message = turn_item_message("item/started", item);
+            assert_turn_message_fails(&message, &["commandExecution", field]);
+        }
+
+        for (field, invalid) in [
+            ("id", json!(1)),
+            ("command", json!(1)),
+            ("commandActions", json!({})),
+            ("cwd", json!(1)),
+            ("status", json!(1)),
+        ] {
+            let mut item = command_execution_item("inProgress");
+            item[field] = invalid;
+            let message = turn_item_message("item/started", item);
+            assert_turn_message_fails(&message, &["commandExecution", field]);
+        }
+
+        for (field, invalid) in [("aggregatedOutput", json!(7)), ("exitCode", json!("zero"))] {
+            let mut item = command_execution_item("completed");
+            item[field] = invalid;
+            let message = turn_item_message("item/completed", item);
+            assert_turn_message_fails(&message, &["commandExecution", field]);
+        }
+    }
+
+    #[test]
+    fn command_execution_unknown_status_fails_fast() {
+        let message = turn_item_message(
+            "item/completed",
+            command_execution_item("pausedByFutureServer"),
+        );
+        assert_turn_message_fails(
+            &message,
+            &[
+                "item/completed",
+                "commandExecution",
+                "exec_1",
+                "pausedByFutureServer",
+                "thr_1",
+                "turn_1",
+            ],
+        );
+    }
+
+    #[test]
+    fn agent_message_completion_is_explicit_with_and_without_streaming() {
+        for streamed in [false, true] {
+            let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+            let (tx, rx) = async_channel::unbounded();
+            let mut streamed_text = false;
+            let started = turn_item_message(
+                "item/started",
+                json!({"type":"agentMessage","id":"msg_1","text":""}),
+            );
+            super::process_turn_message(
+                &session,
+                &started,
+                "thr_1",
+                "turn_1",
+                &tx,
+                &mut streamed_text,
+            )
+            .unwrap();
+            if streamed {
+                let delta = json!({
+                    "method":"item/agentMessage/delta",
+                    "params":{"threadId":"thr_1","turnId":"turn_1","itemId":"msg_1","delta":"hello"}
+                });
+                super::process_turn_message(
+                    &session,
+                    &delta,
+                    "thr_1",
+                    "turn_1",
+                    &tx,
+                    &mut streamed_text,
+                )
+                .unwrap();
+            }
+            let completed = turn_item_message(
+                "item/completed",
+                json!({"type":"agentMessage","id":"msg_1","text":"hello"}),
+            );
+            super::process_turn_message(
+                &session,
+                &completed,
+                "thr_1",
+                "turn_1",
+                &tx,
+                &mut streamed_text,
+            )
+            .unwrap();
+            drop(tx);
+
+            let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert_eq!(
+                events,
+                vec![
+                    AgentEvent::AssistantMessageStarted {
+                        item_id: "msg_1".into()
+                    },
+                    AgentEvent::TextDelta("hello".into()),
+                ],
+                "streamed={streamed}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_turn_event_delivery_failure_is_fatal() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        drop(rx);
+        let mut streamed_text = false;
+        let message = turn_item_message(
+            "item/started",
+            json!({"type":"agentMessage","id":"msg_1","text":""}),
+        );
+        let error = super::process_turn_message(
+            &session,
+            &message,
+            "thr_1",
+            "turn_1",
+            &tx,
+            &mut streamed_text,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("事件通道已经关闭"));
+        assert!(error.contains("item/started agentMessage"));
+        for fragment in ["agentMessage", "msg_1", "thr_1", "turn_1", "item="] {
+            assert!(error.contains(fragment), "missing `{fragment}`: {error}");
+        }
+    }
+
+    #[test]
+    fn forwarded_notification_delivery_failure_is_fatal() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        drop(rx);
+        let mut streamed_text = false;
+        let message = json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "thr_1",
+                "turn": {"id": "turn_1", "items": [], "status": "inProgress"}
+            }
+        });
+        let error = super::process_turn_message(
+            &session,
+            &message,
+            "thr_1",
+            "turn_1",
+            &tx,
+            &mut streamed_text,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("事件通道已经关闭"));
+        assert!(error.contains("turn/started"));
+    }
+
+    #[test]
+    fn thread_created_delivery_failure_stops_the_session() {
         let input = concat!(
             "{\"id\":1,\"result\":{}}\n",
-            "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n",
-            "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_1\"}}}\n",
-            "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"items\":[],\"status\":\"inProgress\"}}}\n",
-            "{\"method\":\"item/started\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"fileChange\",\"id\":\"file_1\",\"status\":\"inProgress\",\"changes\":[]}}}\n",
-            "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"fileChange\",\"id\":\"file_1\",\"status\":\"completed\",\"changes\":[]}}}\n",
-            "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
+            "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
         let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
         let (tx, rx) = async_channel::unbounded();
-
-        let outcome = drive_session(
+        drop(rx);
+        let error = drive_session(
             &mut reader,
             &session,
             &AgentRequest {
-                prompt: "test".into(),
-                cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                prompt: "probe".into(),
+                cwd: PathBuf::from("/tmp/project"),
                 thread_id: None,
                 model: "gpt-test".into(),
                 effort: "medium".into(),
@@ -5302,18 +5924,9 @@ mod tests {
             },
             &tx,
         )
-        .unwrap();
-        assert_eq!(outcome, TurnOutcome::Completed);
-        drop(tx);
-
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            AgentEvent::ThreadCreated {
-                thread_id: "thr_1".into()
-            }
-        );
-        assert_eq!(rx.try_recv().unwrap(), AgentEvent::Started);
-        assert!(rx.try_recv().is_err());
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("thread created 事件通道已经关闭"));
     }
 
     #[test]
@@ -5358,63 +5971,6 @@ mod tests {
         );
         assert_eq!(rx.try_recv().unwrap(), AgentEvent::Started);
         assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn captured_method_set_replays_without_false_unknowns() {
-        let input = concat!(
-            "{\"method\":\"remoteControl/status/changed\",\"params\":{}}\n",
-            "{\"method\":\"mcpServer/startupStatus/updated\",\"params\":{}}\n",
-            "{\"id\":1,\"result\":{}}\n",
-            "{\"method\":\"thread/started\",\"params\":{}}\n",
-            "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n",
-            "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_1\"}}}\n",
-            "{\"method\":\"thread/status/changed\",\"params\":{}}\n",
-            "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"items\":[],\"status\":\"inProgress\"}}}\n",
-            "{\"method\":\"turn/plan/updated\",\"params\":{}}\n",
-            "{\"method\":\"thread/tokenUsage/updated\",\"params\":{}}\n",
-            "{\"method\":\"account/rateLimits/updated\",\"params\":{}}\n",
-            "{\"method\":\"item/started\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"commandExecution\",\"id\":\"exec_1\",\"command\":\"pwd\",\"cwd\":\"/tmp/project\",\"status\":\"inProgress\"}}}\n",
-            "{\"method\":\"item/commandExecution/outputDelta\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"itemId\":\"exec_1\",\"delta\":\"/tmp/project\\n\"}}\n",
-            "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"commandExecution\",\"id\":\"exec_1\",\"command\":\"pwd\",\"cwd\":\"/tmp/project\",\"status\":\"completed\",\"aggregatedOutput\":\"/tmp/project\\n\",\"exitCode\":0}}}\n",
-            "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
-        );
-
-        let mut reader = Cursor::new(input.as_bytes());
-        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
-        let (tx, rx) = async_channel::unbounded();
-        let outcome = drive_session(
-            &mut reader,
-            &session,
-            &AgentRequest {
-                prompt: "深入分析当前项目".into(),
-                cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-                thread_id: None,
-                model: "gpt-test".into(),
-                effort: "medium".into(),
-                service_tier: None,
-                permission_mode: AgentPermissionMode::Full,
-            },
-            &tx,
-        )
-        .unwrap();
-        assert_eq!(outcome, TurnOutcome::Completed);
-        tx.send_blocking(outcome.into_event()).unwrap();
-        drop(tx);
-
-        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert_eq!(
-            events.first(),
-            Some(&AgentEvent::ThreadCreated {
-                thread_id: "thr_1".into()
-            })
-        );
-        assert_eq!(events.last(), Some(&AgentEvent::Completed));
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::CommandOutputDelta { .. }))
-        );
     }
 
     #[test]

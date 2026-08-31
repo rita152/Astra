@@ -4,7 +4,7 @@
 
 客户端初始化时启用 experimental API。下表是当前协议的唯一维护来源，完整列出 250 个 JSON-RPC 方法：157 个客户端请求、11 个服务端请求、1 个客户端通知、81 个服务端通知。
 
-当前接入统计：已接入 23、后端已接入 1、部分接入 2、已知 passive 9、未接入 215。未接入的客户端方法不会发送；未接入的服务端请求按原 id 回复 `-32601` 后 fail-fast；未接入的服务端通知收到即 fail-fast。升级 Codex CLI 时直接核对并更新本表。
+当前接入统计：已接入 23、后端已接入 1、部分接入 2、未接入 224。未接入的客户端方法不会发送；未接入的服务端请求按原 id 回复 `-32601` 后 fail-fast；未接入的服务端通知收到即 fail-fast。升级 Codex CLI 时直接核对并更新本表。
 
 | 方法 | 方向与类型 | 协议范围 | 协议要点 | 运行时入口 | 领域映射 | UI／副作用 | 接入状态 | 兼容与测试 |
 |---|---|---|---|---|---|---|---|---|
@@ -178,7 +178,7 @@
 | `mcpServer/elicitation/request` | 服务端请求 | 默认 | MCP elicitation payload 当前不解析 | 同上 | 无 | 无 | 未接入 | `-32601` 后 fail-fast |
 | `initialized` | 客户端通知 | 默认 | `params={}`，无 id | 同上 | 无 | 解锁业务请求 | 已接入 | `drives_one_complete_prompt_and_normalizes_stream_events` 覆盖完整顺序 |
 | `account/login/completed` | 服务端通知 | 默认 | `params: AccountLoginCompletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `account/rateLimits/updated` | 服务端通知 | 默认 | payload 不读取 | 同上 | 无 | 无 | 已知 passive | 同上 |
+| `account/rateLimits/updated` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
 | `account/updated` | 服务端通知 | 默认 | `params: AccountUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `app/list/updated` | 服务端通知 | 默认 | `params: AppListUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `autoApprovalReview/strictReviewRequired` | 服务端通知 | 默认 | `params: StrictReviewRequiredNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
@@ -194,12 +194,12 @@
 | `guardianWarning` | 服务端通知 | 默认 | `params: GuardianWarningNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `hook/completed` | 服务端通知 | 默认 | `params: HookCompletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `hook/started` | 服务端通知 | 默认 | `params: HookStartedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `item/agentMessage/delta` | 服务端通知 | 默认 | `threadId`、`turnId`、`delta` | `process_turn_message` | `AgentEvent::TextDelta` | 合并流式助手文本 | 已接入 | 相邻 delta 在 UI 批次中合并但不跨事件边界；流式回归覆盖 |
+| `item/agentMessage/delta` | 服务端通知 | 默认 | 严格读取 `threadId`、`turnId`、`itemId`、`delta` | `process_turn_message` | `AgentEvent::TextDelta` | 合并流式助手文本 | 已接入 | 缺少字段或字段类型错误立即 fail-fast；相邻 delta 在 UI 批次中合并但不跨事件边界 |
 | `item/autoApprovalReview/completed` | 服务端通知 | 默认 | `params: ItemGuardianApprovalReviewCompletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `item/autoApprovalReview/started` | 服务端通知 | 默认 | `params: ItemGuardianApprovalReviewStartedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `item/commandExecution/outputDelta` | 服务端通知 | 默认 | `threadId`、`turnId`、`itemId`、`delta` | `process_turn_message` | `AgentEvent::CommandOutputDelta` | 追加命令输出，缺少 started 时创建最小活动行 | 已接入 | 当前 turn 归属校验；完整 prompt 回归覆盖 |
+| `item/commandExecution/outputDelta` | 服务端通知 | 默认 | 严格读取 `threadId`、`turnId`、`itemId`、`delta` | `process_turn_message` | `AgentEvent::CommandOutputDelta` | 追加命令输出，缺少 started 时创建最小活动行 | 已接入 | 缺少字段或字段类型错误立即 fail-fast；当前 turn 归属校验与完整 prompt 回归覆盖 |
 | `item/commandExecution/terminalInteraction` | 服务端通知 | 默认 | `params: TerminalInteractionNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `item/completed` | 服务端通知 | 默认 | 读取完整 `item`；命令读取状态、输出和 exit code；未流式的 agentMessage 读取最终 text | `process_turn_message` | `CommandCompleted` 或最终 `TextDelta` | 完成命令活动或补全助手消息 | 部分接入 | 其他 item type 当前无事件；`unsupported_file_change_items_do_not_emit_domain_events` |
+| `item/completed` | 服务端通知 | 默认 | 要求对象 `item` 及字符串 `type/id`；`agentMessage` 严格读取 `text`，`commandExecution` 严格读取命令、actions、cwd、已知状态及 nullable 输出/exit code | `process_turn_message` | `CommandCompleted` 或最终 `TextDelta` | 完成命令活动；未流式时补全助手消息，已流式时显式完成且不重复文本 | 部分接入 | 仅接入 `agentMessage`、`commandExecution`；其他 item.type、缺字段或错误类型立即 fail-fast，当前未支持 ThreadItem 全量回归覆盖 |
 | `item/fileChange/outputDelta` | 服务端通知 | 默认 | `params: FileChangeOutputDeltaNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `item/fileChange/patchUpdated` | 服务端通知 | 默认 | `params: FileChangePatchUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `item/mcpToolCall/progress` | 服务端通知 | 默认 | `params: McpToolCallProgressNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
@@ -207,10 +207,10 @@
 | `item/reasoning/summaryPartAdded` | 服务端通知 | 默认 | `params: ReasoningSummaryPartAddedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `item/reasoning/summaryTextDelta` | 服务端通知 | 默认 | `params: ReasoningSummaryTextDeltaNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `item/reasoning/textDelta` | 服务端通知 | 默认 | `params: ReasoningTextDeltaNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `item/started` | 服务端通知 | 默认 | 校验当前 thread/turn；读取 `item.type` 与 item 内容 | `process_turn_message` | `agentMessage` → `AssistantMessageStarted`；`commandExecution` → `CommandStarted` | 建立助手消息或命令活动行 | 部分接入 | 其他 item type 当前无事件；错误 thread/turn fail-fast；fileChange 不得误报已接入 |
+| `item/started` | 服务端通知 | 默认 | 校验当前 thread/turn；要求对象 `item` 及字符串 `type/id`；`agentMessage` 严格读取 `text`，`commandExecution` 严格读取命令、actions、cwd、已知状态及 nullable 输出/exit code | `process_turn_message` | `agentMessage` → `AssistantMessageStarted`；`commandExecution` → `CommandStarted` | 建立助手消息或命令活动行 | 部分接入 | 仅接入 `agentMessage`、`commandExecution`；其他 item.type、缺字段或错误类型立即 fail-fast，错误包含 method/type/itemId/threadId/turnId/摘要 |
 | `mcpServer/event/stream/notification` | 服务端通知 | 默认 | `params: McpServerEventStreamNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `mcpServer/oauthLogin/completed` | 服务端通知 | 默认 | `params: McpServerOauthLoginCompletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `mcpServer/startupStatus/updated` | 服务端通知 | 默认 | payload 不读取 | 同上 | 无 | 无 | 已知 passive | 同上 |
+| `mcpServer/startupStatus/updated` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
 | `model/rerouted` | 服务端通知 | 默认 | `fromModel`、`toModel`、`reason` 与 thread/turn | `parse_agent_notification` | `AgentEvent::ModelRerouted` | 更新实际模型和状态提示 | 已接入 | `model_notifications_are_normalized_into_agent_events` |
 | `model/safetyBuffering/updated` | 服务端通知 | 默认 | model、useCases、reasons、showBufferingUi、nullable fasterModel | `parse_agent_notification` | `AgentEvent::ModelSafetyBufferingUpdated` | 显示/清除安全检查状态并提示可选更快模型 | 已接入 | 字段类型严格校验；模型通知回归覆盖 |
 | `model/verification` | 服务端通知 | 默认 | `verifications[]` 与 thread/turn | `parse_agent_notification` | `AgentEvent::ModelVerificationRequired` | 显示需要账户验证并把 Composer 置为失败终态 | 已接入 | 模型通知解析和 UI 状态均有回归 |
@@ -219,7 +219,7 @@
 | `project/changed` | 服务端通知 | 默认 | `params: ProjectChangedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `rawResponse/completed` | 服务端通知 | 默认 | 无 params；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `rawResponseItem/completed` | 服务端通知 | 默认 | 无 params；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `remoteControl/status/changed` | 服务端通知 | 默认 | payload 不读取 | `PASSIVE_SERVER_METHODS` | 无 | 无 | 已知 passive | 精确匹配；`every_captured_passive_method_is_explicitly_defined` |
+| `remoteControl/status/changed` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
 | `serverRequest/resolved` | 服务端通知 | 默认 | `threadId` 与保持原类型的 `requestId`；由 registry 还原并核对 request 的 thread/turn/item/kind | `handle_server_request_resolved`、统一 pending/completed registry | `AgentEvent::ServerRequestResolved` | 最终结束并释放 command approval、user input、permissions approval 三类 responder 与等待状态 | 已接入 | 合法 response→resolved、三种请求、重复 resolved 幂等、错误 thread/turn/item、未知 request 和 turn 终止清理均覆盖 |
 | `skills/changed` | 服务端通知 | 默认 | `params: SkillsChangedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/archived` | 服务端通知 | 默认 | `params: ThreadArchivedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
@@ -228,8 +228,8 @@
 | `thread/deleted` | 服务端通知 | 默认 | `params: ThreadDeletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/environment/connected` | 服务端通知 | 默认 | `params: EnvironmentConnectionNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/environment/disconnected` | 服务端通知 | 默认 | `params: EnvironmentConnectionNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/goal/cleared` | 服务端通知 | 默认 | payload 不读取 | 同上 | 无 | 无 | 已知 passive | 同上 |
-| `thread/goal/updated` | 服务端通知 | 默认 | payload 不读取 | 同上 | 无 | 无 | 已知 passive | 同上 |
+| `thread/goal/cleared` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
+| `thread/goal/updated` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
 | `thread/name/updated` | 服务端通知 | 默认 | `params: ThreadNameUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/project/updated` | 服务端通知 | 默认 | `params: ThreadProjectUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/queue/changed` | 服务端通知 | 默认 | `params: ThreadQueueChangedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
@@ -246,14 +246,14 @@
 | `thread/realtime/transcript/done` | 服务端通知 | 默认 | `params: ThreadRealtimeTranscriptDoneNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/reverted` | 服务端通知 | 默认 | `params: ThreadRevertedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/settings/updated` | 服务端通知 | 默认 | thread id；model、effort、serviceTier、cwd；可选有效权限字段 | `parse_agent_notification` | `AgentEvent::ThreadSettingsUpdated` | 同步模型、目录和有效权限状态 | 已接入 | 权限切换必须等到含有效 permissions 的匹配通知 |
-| `thread/started` | 服务端通知 | 默认 | payload 不读取；thread id 仍以请求响应为准 | 同上 | 无 | 无 | 已知 passive | 同上 |
-| `thread/status/changed` | 服务端通知 | 默认 | payload 不读取 | 同上 | 无 | 无 | 已知 passive | 同上 |
-| `thread/tokenUsage/updated` | 服务端通知 | 默认 | payload 不读取 | 同上 | 无 | 无 | 已知 passive | 同上 |
+| `thread/started` | 服务端通知 | 默认 | payload 当前不读取；thread id 仍以请求响应为准 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
+| `thread/status/changed` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
+| `thread/tokenUsage/updated` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
 | `thread/unarchived` | 服务端通知 | 默认 | `params: ThreadUnarchivedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `turn/completed` | 服务端通知 | 默认 | `params.turn.status` 为 `completed`、`interrupted` 或 `failed`；失败读取 error message/details | `process_turn_message` | `Completed`、`Interrupted` 或 `Failed` | 设置完成、停止或失败终态并结束消费 | 已接入 | 未知终态 fail-fast；`failed_turn_completion_is_the_terminal_event_and_keeps_error_details` |
 | `turn/diff/updated` | 服务端通知 | 默认 | `params: TurnDiffUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `turn/moderationMetadata` | 服务端通知 | 默认 | `params: TurnModerationMetadataNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `turn/plan/updated` | 服务端通知 | 默认 | payload 不读取；没有计划 UI 映射 | 同上 | 无 | 无 | 已知 passive | 同上 |
+| `turn/plan/updated` | 服务端通知 | 默认 | payload 当前不读取；没有计划 UI 映射 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
 | `turn/started` | 服务端通知 | 默认 | 要求 `params.turn.status=inProgress`，并校验 thread/turn | `parse_agent_notification` | `AgentEvent::Started` | Composer 进入流式状态 | 已接入 | 缺字段、未知状态或错配 id 立即失败 |
 | `warning` | 服务端通知 | 默认 | `message`；可选 `threadId` | `parse_agent_notification` | `AgentEvent::Warning` | 非终止警告 Notice | 已接入 | 无可见事件通道的模型目录连接收到该通知时失败，不静默丢弃 |
 | `windows/worldWritableWarning` | 服务端通知 | 默认 | `params: WindowsWorldWritableWarningNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
