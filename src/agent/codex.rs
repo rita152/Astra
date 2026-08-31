@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
@@ -15,12 +15,19 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    AgentActivePermissionProfile, AgentApprovalControl, AgentApprovalHandle, AgentBackend,
+    AgentActivePermissionProfile, AgentAdditionalFileSystemPermissions,
+    AgentAdditionalNetworkPermissions, AgentApprovalControl, AgentApprovalHandle, AgentBackend,
     AgentCommandApprovalChoice, AgentCommandApprovalRequest, AgentConfigWarning,
-    AgentEffectivePermissions, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
-    AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentPermissionMode,
-    AgentPermissionProfile, AgentReasoningEffort, AgentRequest, AgentRun, AgentServerRequestId,
-    AgentServiceTier, AgentThreadSettings, CommandExecution, CommandExecutionStatus,
+    AgentEffectivePermissions, AgentEvent, AgentFileSystemAccess, AgentFileSystemPath,
+    AgentFileSystemPermissionEntry, AgentFileSystemSpecialPath, AgentInterruptControl,
+    AgentInterruptHandle, AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentOptionalField,
+    AgentPermissionMode, AgentPermissionProfile, AgentPermissionRequestProfile,
+    AgentPermissionsApprovalChoice, AgentPermissionsApprovalControl,
+    AgentPermissionsApprovalHandle, AgentPermissionsApprovalRequest, AgentReasoningEffort,
+    AgentRequest, AgentRun, AgentServerRequestFailureKind, AgentServerRequestId,
+    AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier, AgentThreadSettings,
+    AgentUserInputControl, AgentUserInputHandle, AgentUserInputOption, AgentUserInputQuestion,
+    AgentUserInputRequest, AgentUserInputResponse, CommandExecution, CommandExecutionStatus,
 };
 
 const INITIALIZE_ID: u64 = 1;
@@ -52,6 +59,8 @@ const PASSIVE_SERVER_METHODS: &[&str] = &[
 
 const TURN_SCOPED_SERVER_METHODS: &[&str] = &[
     "item/commandExecution/requestApproval",
+    "item/permissions/requestApproval",
+    "item/tool/requestUserInput",
     "item/started",
     "item/agentMessage/delta",
     "item/commandExecution/outputDelta",
@@ -131,12 +140,46 @@ struct TurnSessionState {
     terminal: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PendingCommandApproval {
     #[allow(dead_code)] // Retained verbatim for protocol auditing; exercised by registry tests.
     params: Value,
     available_decisions: Vec<Value>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingUserInputRequest {
+    question_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingPermissionsApprovalRequest {
+    permissions: AgentPermissionRequestProfile,
+}
+
+#[derive(Clone, Debug)]
+enum PendingServerRequestPayload {
+    CommandApproval(PendingCommandApproval),
+    UserInput(PendingUserInputRequest),
+    PermissionsApproval(PendingPermissionsApprovalRequest),
+}
+
+#[derive(Clone, Debug)]
+struct PendingServerRequest {
+    metadata: AgentServerRequestMetadata,
+    payload: PendingServerRequestPayload,
     responded: bool,
+}
+
+#[derive(Default)]
+struct ServerRequestRegistry {
+    pending: HashMap<AgentServerRequestId, PendingServerRequest>,
+    completed: HashMap<AgentServerRequestId, AgentServerRequestMetadata>,
+}
+
+enum ServerRequestResolution {
+    Resolved(AgentServerRequestMetadata),
+    AlreadyResolved,
 }
 
 struct AppServerProcess {
@@ -205,7 +248,7 @@ impl Drop for AppServerProcess {
 struct CodexTurnSession<W> {
     writer: Mutex<Option<W>>,
     state: Mutex<TurnSessionState>,
-    pending_command_approvals: Mutex<HashMap<AgentServerRequestId, PendingCommandApproval>>,
+    server_requests: Mutex<ServerRequestRegistry>,
     process: Option<Arc<AppServerProcess>>,
 }
 
@@ -214,42 +257,116 @@ impl<W: Write + Send> CodexTurnSession<W> {
         Self {
             writer: Mutex::new(Some(writer)),
             state: Mutex::new(TurnSessionState::default()),
-            pending_command_approvals: Mutex::new(HashMap::new()),
+            server_requests: Mutex::new(ServerRequestRegistry::default()),
             process,
         }
     }
 
-    fn register_command_approval(
+    fn register_server_request(
         &self,
-        request_id: AgentServerRequestId,
-        params: Value,
-        available_decisions: Vec<Value>,
+        metadata: AgentServerRequestMetadata,
+        payload: PendingServerRequestPayload,
     ) -> Result<()> {
-        let mut pending = self
-            .pending_command_approvals
+        let mut registry = self
+            .server_requests
             .lock()
-            .map_err(|_| anyhow!("Codex command approval registry 锁已损坏"))?;
-        if pending.contains_key(&request_id) {
-            bail!("收到重复的 command approval request id {request_id:?}");
+            .map_err(|_| anyhow!("Codex server request registry 锁已损坏"))?;
+        if registry.pending.contains_key(&metadata.request_id) {
+            bail!(
+                "收到重复的 Codex server request id {:?}",
+                metadata.request_id
+            );
         }
-        pending.insert(
-            request_id,
-            PendingCommandApproval {
-                params,
-                available_decisions,
+        registry.completed.remove(&metadata.request_id);
+        registry.pending.insert(
+            metadata.request_id.clone(),
+            PendingServerRequest {
+                metadata,
+                payload,
                 responded: false,
             },
         );
         Ok(())
     }
 
-    fn resolve_command_approval(&self, request_id: &AgentServerRequestId) -> Result<bool> {
-        Ok(self
-            .pending_command_approvals
+    fn register_command_approval(
+        &self,
+        metadata: AgentServerRequestMetadata,
+        params: Value,
+        available_decisions: Vec<Value>,
+    ) -> Result<()> {
+        self.register_server_request(
+            metadata,
+            PendingServerRequestPayload::CommandApproval(PendingCommandApproval {
+                params,
+                available_decisions,
+            }),
+        )
+    }
+
+    fn register_user_input(&self, request: &AgentUserInputRequest) -> Result<()> {
+        self.register_server_request(
+            request_metadata_for_user_input(request),
+            PendingServerRequestPayload::UserInput(PendingUserInputRequest {
+                question_ids: request
+                    .questions
+                    .iter()
+                    .map(|question| question.id.clone())
+                    .collect(),
+            }),
+        )
+    }
+
+    fn register_permissions_approval(
+        &self,
+        request: &AgentPermissionsApprovalRequest,
+    ) -> Result<()> {
+        self.register_server_request(
+            request_metadata_for_permissions(request),
+            PendingServerRequestPayload::PermissionsApproval(PendingPermissionsApprovalRequest {
+                permissions: request.permissions.clone(),
+            }),
+        )
+    }
+
+    fn resolve_server_request(
+        &self,
+        request_id: &AgentServerRequestId,
+        thread_id: &str,
+    ) -> Result<ServerRequestResolution> {
+        let mut registry = self
+            .server_requests
             .lock()
-            .map_err(|_| anyhow!("Codex command approval registry 锁已损坏"))?
-            .remove(request_id)
-            .is_some())
+            .map_err(|_| anyhow!("Codex server request registry 锁已损坏"))?;
+        if let Some(request) = registry.pending.get(request_id) {
+            if request.metadata.thread_id != thread_id {
+                bail!(
+                    "serverRequest/resolved threadId `{thread_id}` 与 pending request {:?} 的 threadId `{}` 不一致",
+                    request_id,
+                    request.metadata.thread_id
+                );
+            }
+            let metadata = request.metadata.clone();
+            registry.pending.remove(request_id);
+            registry
+                .completed
+                .insert(request_id.clone(), metadata.clone());
+            return Ok(ServerRequestResolution::Resolved(metadata));
+        }
+        if let Some(metadata) = registry.completed.get(request_id) {
+            if metadata.thread_id != thread_id {
+                bail!(
+                    "重复 serverRequest/resolved 的 threadId `{thread_id}` 与 request {:?} 的 threadId `{}` 不一致",
+                    request_id,
+                    metadata.thread_id
+                );
+            }
+            return Ok(ServerRequestResolution::AlreadyResolved);
+        }
+        bail!(
+            "serverRequest/resolved 引用了未知 request {:?}（threadId=`{thread_id}`）",
+            request_id
+        )
     }
 
     fn respond_to_command_approval(
@@ -257,19 +374,23 @@ impl<W: Write + Send> CodexTurnSession<W> {
         request_id: &AgentServerRequestId,
         choice: AgentCommandApprovalChoice,
     ) -> Result<()> {
+        self.ensure_server_request_responses_open(request_id)?;
         let decision = {
-            let mut pending = self
-                .pending_command_approvals
+            let mut registry = self
+                .server_requests
                 .lock()
-                .map_err(|_| anyhow!("Codex command approval registry 锁已损坏"))?;
-            let request = pending.get_mut(request_id).with_context(|| {
+                .map_err(|_| anyhow!("Codex server request registry 锁已损坏"))?;
+            let request = registry.pending.get_mut(request_id).with_context(|| {
                 format!("command approval {request_id:?} 已经 resolved 或不存在")
             })?;
             if request.responded {
                 bail!("command approval {request_id:?} 已经回复，拒绝重复 decision");
             }
+            let PendingServerRequestPayload::CommandApproval(command) = &request.payload else {
+                bail!("request {request_id:?} 不是 command approval，拒绝错误类型的 responder")
+            };
             let decision = match choice {
-                AgentCommandApprovalChoice::Accept => request
+                AgentCommandApprovalChoice::Accept => command
                     .available_decisions
                     .iter()
                     .find(|decision| decision.as_str() == Some("accept"))
@@ -278,12 +399,12 @@ impl<W: Write + Send> CodexTurnSession<W> {
                 // `decline` even when app-server advertises only `cancel`.
                 // The two values are not synonyms: `decline` rejects the item
                 // and lets the turn continue, while `cancel` interrupts it.
-                AgentCommandApprovalChoice::Decline => request
+                AgentCommandApprovalChoice::Decline => command
                     .available_decisions
                     .iter()
                     .any(|decision| matches!(decision.as_str(), Some("decline" | "cancel")))
                     .then(|| Value::String("decline".to_owned())),
-                AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment => request
+                AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment => command
                     .available_decisions
                     .iter()
                     .find(|decision| decision.get("acceptWithExecpolicyAmendment").is_some())
@@ -296,6 +417,132 @@ impl<W: Write + Send> CodexTurnSession<W> {
             decision
         };
         self.send(json!({ "id": request_id_value(request_id), "result": { "decision": decision } }))
+    }
+
+    fn respond_to_user_input(
+        &self,
+        request_id: &AgentServerRequestId,
+        response: AgentUserInputResponse,
+    ) -> Result<()> {
+        self.ensure_server_request_responses_open(request_id)?;
+        let answers = {
+            let mut registry = self
+                .server_requests
+                .lock()
+                .map_err(|_| anyhow!("Codex server request registry 锁已损坏"))?;
+            let request = registry.pending.get_mut(request_id).with_context(|| {
+                format!("user input request {request_id:?} 已经 resolved 或不存在")
+            })?;
+            if request.responded {
+                bail!("user input request {request_id:?} 已经回复，拒绝重复 answers");
+            }
+            let PendingServerRequestPayload::UserInput(pending) = &request.payload else {
+                bail!("request {request_id:?} 不是 user input，拒绝错误类型的 responder")
+            };
+            let question_ids = pending.question_ids.iter().collect::<HashSet<_>>();
+            let mut seen = HashSet::new();
+            let mut answers = serde_json::Map::new();
+            for answer in response.answers {
+                if !seen.insert(answer.question_id.clone()) {
+                    bail!(
+                        "user input request {request_id:?} 对 question id `{}` 提供了重复答案",
+                        answer.question_id
+                    );
+                }
+                if !question_ids.contains(&answer.question_id) {
+                    bail!(
+                        "user input request {request_id:?} 不包含 question id `{}`",
+                        answer.question_id
+                    );
+                }
+                answers.insert(answer.question_id, json!({ "answers": answer.answers }));
+            }
+            request.responded = true;
+            answers
+        };
+        self.send(json!({
+            "id": request_id_value(request_id),
+            "result": { "answers": answers }
+        }))
+        .with_context(|| {
+            format!("写入 user input request {request_id:?} 的 JSON-RPC response 失败")
+        })
+    }
+
+    fn respond_to_permissions_approval(
+        &self,
+        request_id: &AgentServerRequestId,
+        choice: AgentPermissionsApprovalChoice,
+    ) -> Result<()> {
+        self.ensure_server_request_responses_open(request_id)?;
+        let (permissions, scope) = {
+            let mut registry = self
+                .server_requests
+                .lock()
+                .map_err(|_| anyhow!("Codex server request registry 锁已损坏"))?;
+            let request = registry.pending.get_mut(request_id).with_context(|| {
+                format!("permissions approval {request_id:?} 已经 resolved 或不存在")
+            })?;
+            if request.responded {
+                bail!("permissions approval {request_id:?} 已经回复，拒绝重复 decision");
+            }
+            let PendingServerRequestPayload::PermissionsApproval(pending) = &request.payload else {
+                bail!("request {request_id:?} 不是 permissions approval，拒绝错误类型的 responder")
+            };
+            let response = match choice {
+                AgentPermissionsApprovalChoice::AllowOnce => {
+                    (permission_profile_value(&pending.permissions), "turn")
+                }
+                AgentPermissionsApprovalChoice::AllowForSession => {
+                    (permission_profile_value(&pending.permissions), "session")
+                }
+                AgentPermissionsApprovalChoice::Decline => {
+                    (Value::Object(Default::default()), "turn")
+                }
+            };
+            request.responded = true;
+            response
+        };
+        self.send(json!({
+            "id": request_id_value(request_id),
+            "result": {
+                "permissions": permissions,
+                "scope": scope
+            }
+        }))
+        .with_context(|| {
+            format!("写入 permissions approval {request_id:?} 的 JSON-RPC response 失败")
+        })
+    }
+
+    fn ensure_server_request_responses_open(
+        &self,
+        request_id: &AgentServerRequestId,
+    ) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Codex turn 会话状态锁已损坏"))?;
+        if state.terminal {
+            bail!("Codex turn 已结束，request {request_id:?} 不再可回复");
+        }
+        Ok(())
+    }
+
+    fn drain_pending_server_requests(&self) -> Result<Vec<AgentServerRequestMetadata>> {
+        let mut registry = self
+            .server_requests
+            .lock()
+            .map_err(|_| anyhow!("Codex server request registry 锁已损坏"))?;
+        let pending = std::mem::take(&mut registry.pending);
+        let mut metadata = Vec::with_capacity(pending.len());
+        for (request_id, request) in pending {
+            registry
+                .completed
+                .insert(request_id, request.metadata.clone());
+            metadata.push(request.metadata);
+        }
+        Ok(metadata)
     }
 
     fn send(&self, message: Value) -> Result<()> {
@@ -405,12 +652,34 @@ impl<W: Write + Send> CodexTurnSession<W> {
     }
 
     #[cfg(test)]
-    fn pending_approval_snapshot(&self) -> Vec<(AgentServerRequestId, Value, bool)> {
-        self.pending_command_approvals
+    fn pending_server_request_snapshot(
+        &self,
+    ) -> Vec<(AgentServerRequestMetadata, Option<Value>, bool)> {
+        self.server_requests
             .lock()
             .unwrap()
+            .pending
             .iter()
-            .map(|(id, approval)| (id.clone(), approval.params.clone(), approval.responded))
+            .map(|(_, request)| {
+                let params = match &request.payload {
+                    PendingServerRequestPayload::CommandApproval(approval) => {
+                        Some(approval.params.clone())
+                    }
+                    PendingServerRequestPayload::UserInput(_)
+                    | PendingServerRequestPayload::PermissionsApproval(_) => None,
+                };
+                (request.metadata.clone(), params, request.responded)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn pending_approval_snapshot(&self) -> Vec<(AgentServerRequestId, Value, bool)> {
+        self.pending_server_request_snapshot()
+            .into_iter()
+            .filter_map(|(metadata, params, responded)| {
+                params.map(|params| (metadata.request_id, params, responded))
+            })
             .collect()
     }
 }
@@ -437,6 +706,28 @@ impl<W: Write + Send + 'static> AgentApprovalControl for CodexTurnSession<W> {
     }
 }
 
+impl<W: Write + Send + 'static> AgentUserInputControl for CodexTurnSession<W> {
+    fn respond(
+        &self,
+        request_id: &AgentServerRequestId,
+        response: AgentUserInputResponse,
+    ) -> Result<(), String> {
+        self.respond_to_user_input(request_id, response)
+            .map_err(|error| format!("{error:#}"))
+    }
+}
+
+impl<W: Write + Send + 'static> AgentPermissionsApprovalControl for CodexTurnSession<W> {
+    fn respond(
+        &self,
+        request_id: &AgentServerRequestId,
+        choice: AgentPermissionsApprovalChoice,
+    ) -> Result<(), String> {
+        self.respond_to_permissions_approval(request_id, choice)
+            .map_err(|error| format!("{error:#}"))
+    }
+}
+
 fn request_id_from_value(value: &Value) -> Result<AgentServerRequestId> {
     match value {
         Value::String(id) => Ok(AgentServerRequestId::String(id.clone())),
@@ -452,6 +743,146 @@ fn request_id_value(request_id: &AgentServerRequestId) -> Value {
     match request_id {
         AgentServerRequestId::Number(id) => json!(id),
         AgentServerRequestId::String(id) => json!(id),
+    }
+}
+
+fn request_metadata_for_command(
+    request: &AgentCommandApprovalRequest,
+) -> AgentServerRequestMetadata {
+    AgentServerRequestMetadata {
+        request_id: request.request_id.clone(),
+        thread_id: request.thread_id.clone(),
+        turn_id: request.turn_id.clone(),
+        item_id: request.item_id.clone(),
+        kind: AgentServerRequestKind::CommandApproval,
+    }
+}
+
+fn request_metadata_for_user_input(request: &AgentUserInputRequest) -> AgentServerRequestMetadata {
+    AgentServerRequestMetadata {
+        request_id: request.request_id.clone(),
+        thread_id: request.thread_id.clone(),
+        turn_id: request.turn_id.clone(),
+        item_id: request.item_id.clone(),
+        kind: AgentServerRequestKind::UserInput,
+    }
+}
+
+fn request_metadata_for_permissions(
+    request: &AgentPermissionsApprovalRequest,
+) -> AgentServerRequestMetadata {
+    AgentServerRequestMetadata {
+        request_id: request.request_id.clone(),
+        thread_id: request.thread_id.clone(),
+        turn_id: request.turn_id.clone(),
+        item_id: request.item_id.clone(),
+        kind: AgentServerRequestKind::PermissionsApproval,
+    }
+}
+
+fn insert_optional_field<T>(
+    object: &mut serde_json::Map<String, Value>,
+    field: &str,
+    value: &AgentOptionalField<T>,
+    serialize: impl FnOnce(&T) -> Value,
+) {
+    match value {
+        AgentOptionalField::Unspecified => {}
+        AgentOptionalField::Null => {
+            object.insert(field.to_owned(), Value::Null);
+        }
+        AgentOptionalField::Value(value) => {
+            object.insert(field.to_owned(), serialize(value));
+        }
+    }
+}
+
+fn permission_profile_value(profile: &AgentPermissionRequestProfile) -> Value {
+    let mut object = serde_json::Map::new();
+    insert_optional_field(
+        &mut object,
+        "fileSystem",
+        &profile.file_system,
+        file_system_permissions_value,
+    );
+    insert_optional_field(
+        &mut object,
+        "network",
+        &profile.network,
+        network_permissions_value,
+    );
+    Value::Object(object)
+}
+
+fn file_system_permissions_value(permissions: &AgentAdditionalFileSystemPermissions) -> Value {
+    let mut object = serde_json::Map::new();
+    insert_optional_field(&mut object, "read", &permissions.read, |paths| json!(paths));
+    insert_optional_field(&mut object, "write", &permissions.write, |paths| {
+        json!(paths)
+    });
+    insert_optional_field(
+        &mut object,
+        "globScanMaxDepth",
+        &permissions.glob_scan_max_depth,
+        |depth| json!(depth),
+    );
+    insert_optional_field(&mut object, "entries", &permissions.entries, |entries| {
+        Value::Array(entries.iter().map(file_system_entry_value).collect())
+    });
+    Value::Object(object)
+}
+
+fn network_permissions_value(permissions: &AgentAdditionalNetworkPermissions) -> Value {
+    let mut object = serde_json::Map::new();
+    insert_optional_field(&mut object, "enabled", &permissions.enabled, |enabled| {
+        json!(enabled)
+    });
+    Value::Object(object)
+}
+
+fn file_system_entry_value(entry: &AgentFileSystemPermissionEntry) -> Value {
+    let access = match entry.access {
+        AgentFileSystemAccess::Read => "read",
+        AgentFileSystemAccess::Write => "write",
+        AgentFileSystemAccess::Deny => "deny",
+    };
+    json!({
+        "path": file_system_path_value(&entry.path),
+        "access": access
+    })
+}
+
+fn file_system_path_value(path: &AgentFileSystemPath) -> Value {
+    match path {
+        AgentFileSystemPath::Path(path) => json!({ "type": "path", "path": path }),
+        AgentFileSystemPath::GlobPattern(pattern) => {
+            json!({ "type": "glob_pattern", "pattern": pattern })
+        }
+        AgentFileSystemPath::Special(value) => {
+            json!({ "type": "special", "value": file_system_special_path_value(value) })
+        }
+    }
+}
+
+fn file_system_special_path_value(path: &AgentFileSystemSpecialPath) -> Value {
+    match path {
+        AgentFileSystemSpecialPath::Root => json!({ "kind": "root" }),
+        AgentFileSystemSpecialPath::Minimal => json!({ "kind": "minimal" }),
+        AgentFileSystemSpecialPath::ProjectRoots { subpath } => {
+            let mut value = serde_json::Map::new();
+            value.insert("kind".to_owned(), json!("project_roots"));
+            insert_optional_field(&mut value, "subpath", subpath, |subpath| json!(subpath));
+            Value::Object(value)
+        }
+        AgentFileSystemSpecialPath::Tmpdir => json!({ "kind": "tmpdir" }),
+        AgentFileSystemSpecialPath::SlashTmp => json!({ "kind": "slash_tmp" }),
+        AgentFileSystemSpecialPath::Unknown { path, subpath } => {
+            let mut value = serde_json::Map::new();
+            value.insert("kind".to_owned(), json!("unknown"));
+            value.insert("path".to_owned(), json!(path));
+            insert_optional_field(&mut value, "subpath", subpath, |subpath| json!(subpath));
+            Value::Object(value)
+        }
     }
 }
 
@@ -491,6 +922,49 @@ fn finish_prompt_session<W: Write + Send>(
             "{error:#}\nCodex app-server 资源回收同时失败：{cleanup_error:#}"
         )),
     }
+}
+
+fn cleanup_pending_server_requests<W: Write + Send>(
+    session: &CodexTurnSession<W>,
+    result: &Result<TurnOutcome>,
+    events: &Sender<AgentEvent>,
+) -> Result<()> {
+    let pending = session.drain_pending_server_requests()?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let (kind, message) = match result {
+        Ok(TurnOutcome::Interrupted) => (
+            AgentServerRequestFailureKind::Cancelled,
+            "Codex turn 已取消，等待中的请求不再可回复".to_owned(),
+        ),
+        Ok(TurnOutcome::Completed) => (
+            AgentServerRequestFailureKind::Failed,
+            "Codex turn 已完成，但请求未收到 serverRequest/resolved".to_owned(),
+        ),
+        Ok(TurnOutcome::Failed(_)) | Err(_) => (
+            AgentServerRequestFailureKind::Failed,
+            "Codex 连接或 turn 失败，等待中的请求不再可回复".to_owned(),
+        ),
+    };
+    for request in &pending {
+        events
+            .send_blocking(AgentEvent::ServerRequestFailed {
+                request: request.clone(),
+                kind,
+                message: message.clone(),
+            })
+            .map_err(|_| anyhow!("Composer server request 清理事件通道已经关闭"))?;
+    }
+    if matches!(result, Ok(TurnOutcome::Completed)) {
+        let requests = pending
+            .iter()
+            .map(|request| format!("{:?}:{:?}", request.kind, request.request_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("Codex turn 正常完成时仍有未 resolved 的 server request：{requests}");
+    }
+    Ok(())
 }
 
 fn turn_interrupt_request(thread_id: &str, turn_id: &str) -> Value {
@@ -590,6 +1064,14 @@ impl AgentBackend for CodexAppServerBackend {
                 let interrupt = AgentInterruptHandle::new(control);
                 std::thread::spawn(move || {
                     let result = drive_session(&mut reader, &session, &request, &events_tx);
+                    let cleanup = cleanup_pending_server_requests(&session, &result, &events_tx);
+                    let result = match (result, cleanup) {
+                        (result, Ok(())) => result,
+                        (Ok(_), Err(error)) => Err(error),
+                        (Err(error), Err(cleanup_error)) => Err(anyhow!(
+                            "{error:#}\n清理 pending server request 同时失败：{cleanup_error:#}"
+                        )),
+                    };
                     let event = finish_prompt_session(&session, result);
                     let _ = events_tx.send_blocking(event);
                 });
@@ -1125,7 +1607,12 @@ fn drive_session<R: BufRead, W: Write + Send + 'static>(
         .and_then(Value::as_str)
         .map(str::to_owned)
         .context("turn/start 响应缺少 result.turn.id")?;
-    ensure_deferred_session_messages_match(&deferred_turn_notifications, &thread_id, &turn_id)?;
+    ensure_deferred_session_messages_match(
+        session,
+        &deferred_turn_notifications,
+        &thread_id,
+        &turn_id,
+    )?;
     let mut streamed_text = false;
     for message in &deferred_turn_notifications {
         if let Some(outcome) = process_turn_message(
@@ -1166,7 +1653,26 @@ fn process_turn_message<W: Write + Send + 'static>(
     events: &Sender<AgentEvent>,
     streamed_text: &mut bool,
 ) -> Result<Option<TurnOutcome>> {
-    ensure_session_message_matches(message, expected_thread_id, expected_turn_id)?;
+    if let Err(error) =
+        ensure_session_message_matches(message, expected_thread_id, expected_turn_id)
+    {
+        if message.get("id").is_some()
+            && message
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(is_integrated_server_request_method)
+        {
+            return reject_server_request(
+                session,
+                message,
+                -32602,
+                "Server request does not match the active thread and turn",
+                error,
+            )
+            .map(|()| None);
+        }
+        return Err(error);
+    }
     respond_to_server_request_on_session(session, message, events)?;
     handle_server_request_resolved(session, message, events)?;
     forward_agent_notification(message, events)?;
@@ -1244,6 +1750,8 @@ fn process_turn_message<W: Write + Send + 'static>(
         }
         Some(
             "item/commandExecution/requestApproval"
+            | "item/permissions/requestApproval"
+            | "item/tool/requestUserInput"
             | "serverRequest/resolved"
             | "turn/started"
             | "error"
@@ -1265,6 +1773,8 @@ fn is_defined_server_method(method: &str) -> bool {
     matches!(
         method,
         "item/commandExecution/requestApproval"
+            | "item/permissions/requestApproval"
+            | "item/tool/requestUserInput"
             | "serverRequest/resolved"
             | "item/started"
             | "item/agentMessage/delta"
@@ -1710,15 +2220,43 @@ fn wait_for_session_response<R: BufRead, W: Write + Send + 'static>(
     }
 }
 
-fn ensure_deferred_session_messages_match(
+fn ensure_deferred_session_messages_match<W: Write + Send>(
+    session: &CodexTurnSession<W>,
     messages: &[Value],
     expected_thread_id: &str,
     expected_turn_id: &str,
 ) -> Result<()> {
     for message in messages {
-        ensure_session_message_matches(message, expected_thread_id, expected_turn_id)?;
+        if let Err(error) =
+            ensure_session_message_matches(message, expected_thread_id, expected_turn_id)
+        {
+            if message.get("id").is_some()
+                && message
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_integrated_server_request_method)
+            {
+                return reject_server_request(
+                    session,
+                    message,
+                    -32602,
+                    "Server request does not match the active thread and turn",
+                    error,
+                );
+            }
+            return Err(error);
+        }
     }
     Ok(())
+}
+
+fn is_integrated_server_request_method(method: &str) -> bool {
+    matches!(
+        method,
+        "item/commandExecution/requestApproval"
+            | "item/tool/requestUserInput"
+            | "item/permissions/requestApproval"
+    )
 }
 
 fn ensure_session_message_matches(
@@ -1799,13 +2337,139 @@ fn respond_to_server_request_on_session<W: Write + Send + 'static>(
     };
     if method == "item/commandExecution/requestApproval" {
         let (request_id, request, params, available_decisions) =
-            parse_command_approval_request(message)?;
-        session.register_command_approval(request_id.clone(), params, available_decisions)?;
+            match parse_command_approval_request(message) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return reject_server_request(
+                        session,
+                        message,
+                        -32602,
+                        "Invalid item/commandExecution/requestApproval params",
+                        error,
+                    );
+                }
+            };
+        if let Err(error) = session.register_command_approval(
+            request_metadata_for_command(&request),
+            params,
+            available_decisions,
+        ) {
+            return reject_server_request(
+                session,
+                message,
+                -32600,
+                "Duplicate or invalid server request",
+                error,
+            );
+        }
         let control: Arc<dyn AgentApprovalControl> = session.clone();
         let responder = AgentApprovalHandle::new(request_id, control);
-        events
+        if events
             .send_blocking(AgentEvent::CommandApprovalRequested { request, responder })
-            .map_err(|_| anyhow!("Composer 审批事件通道已经关闭"))?;
+            .is_err()
+        {
+            let error = match session.drain_pending_server_requests() {
+                Ok(_) => anyhow!("Composer command approval 事件通道已经关闭"),
+                Err(cleanup_error) => anyhow!(
+                    "Composer command approval 事件通道已经关闭，且 pending request 清理失败：{cleanup_error:#}"
+                ),
+            };
+            return reject_server_request(
+                session,
+                message,
+                -32603,
+                "Unable to present server request",
+                error,
+            );
+        }
+        return Ok(());
+    }
+    if method == "item/tool/requestUserInput" {
+        let (request_id, request) = match parse_user_input_request(message) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return reject_server_request(
+                    session,
+                    message,
+                    -32602,
+                    "Invalid item/tool/requestUserInput params",
+                    error,
+                );
+            }
+        };
+        if let Err(error) = session.register_user_input(&request) {
+            return reject_server_request(
+                session,
+                message,
+                -32600,
+                "Duplicate or invalid server request",
+                error,
+            );
+        }
+        let control: Arc<dyn AgentUserInputControl> = session.clone();
+        let responder = AgentUserInputHandle::new(request_id, control);
+        if events
+            .send_blocking(AgentEvent::UserInputRequested { request, responder })
+            .is_err()
+        {
+            let error = match session.drain_pending_server_requests() {
+                Ok(_) => anyhow!("Composer user input 事件通道已经关闭"),
+                Err(cleanup_error) => anyhow!(
+                    "Composer user input 事件通道已经关闭，且 pending request 清理失败：{cleanup_error:#}"
+                ),
+            };
+            return reject_server_request(
+                session,
+                message,
+                -32603,
+                "Unable to present server request",
+                error,
+            );
+        }
+        return Ok(());
+    }
+    if method == "item/permissions/requestApproval" {
+        let (request_id, request) = match parse_permissions_approval_request(message) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return reject_server_request(
+                    session,
+                    message,
+                    -32602,
+                    "Invalid item/permissions/requestApproval params",
+                    error,
+                );
+            }
+        };
+        if let Err(error) = session.register_permissions_approval(&request) {
+            return reject_server_request(
+                session,
+                message,
+                -32600,
+                "Duplicate or invalid server request",
+                error,
+            );
+        }
+        let control: Arc<dyn AgentPermissionsApprovalControl> = session.clone();
+        let responder = AgentPermissionsApprovalHandle::new(request_id, control);
+        if events
+            .send_blocking(AgentEvent::PermissionsApprovalRequested { request, responder })
+            .is_err()
+        {
+            let error = match session.drain_pending_server_requests() {
+                Ok(_) => anyhow!("Composer permissions approval 事件通道已经关闭"),
+                Err(cleanup_error) => anyhow!(
+                    "Composer permissions approval 事件通道已经关闭，且 pending request 清理失败：{cleanup_error:#}"
+                ),
+            };
+            return reject_server_request(
+                session,
+                message,
+                -32603,
+                "Unable to present server request",
+                error,
+            );
+        }
         return Ok(());
     }
     session.send(json!({
@@ -1815,6 +2479,33 @@ fn respond_to_server_request_on_session<W: Write + Send + 'static>(
             "message": "This minimal client does not implement server-initiated requests"
         }
     }))
+}
+
+fn reject_server_request<W: Write + Send>(
+    session: &CodexTurnSession<W>,
+    message: &Value,
+    code: i64,
+    response_message: &str,
+    error: anyhow::Error,
+) -> Result<()> {
+    let id = message
+        .get("id")
+        .filter(|id| matches!(id, Value::String(_) | Value::Number(_)))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let response = session.send(json!({
+        "id": id,
+        "error": {
+            "code": code,
+            "message": response_message
+        }
+    }));
+    match response {
+        Ok(()) => Err(error),
+        Err(response_error) => Err(anyhow!(
+            "{error:#}; 同时无法写入 JSON-RPC error response：{response_error:#}"
+        )),
+    }
 }
 
 fn parse_command_approval_request(
@@ -1899,13 +2590,25 @@ fn parse_command_approval_request(
     };
     let request = AgentCommandApprovalRequest {
         request_id: request_id.clone(),
+        thread_id: params["threadId"]
+            .as_str()
+            .expect("validated above")
+            .to_owned(),
+        turn_id: params["turnId"]
+            .as_str()
+            .expect("validated above")
+            .to_owned(),
+        item_id: params["itemId"]
+            .as_str()
+            .expect("validated above")
+            .to_owned(),
         command,
         reason: optional_string("reason")?,
         network_host,
         allow_once,
         decline,
         cancel,
-        accept_with_execpolicy_amendment,
+        can_accept_with_execpolicy_amendment: accept_with_execpolicy_amendment.is_some(),
     };
     Ok((
         request_id,
@@ -1913,6 +2616,445 @@ fn parse_command_approval_request(
         Value::Object(params.clone()),
         available_decisions,
     ))
+}
+
+fn required_request_string(
+    params: &serde_json::Map<String, Value>,
+    method: &str,
+    field: &str,
+) -> Result<String> {
+    params
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("{method} params.{field} 必须是字符串"))
+}
+
+fn optional_request_string(
+    params: &serde_json::Map<String, Value>,
+    method: &str,
+    field: &str,
+) -> Result<Option<String>> {
+    match params.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => bail!("{method} params.{field} 必须是字符串或 null"),
+    }
+}
+
+fn parse_user_input_request(
+    message: &Value,
+) -> Result<(AgentServerRequestId, AgentUserInputRequest)> {
+    const METHOD: &str = "item/tool/requestUserInput";
+    let request_id = request_id_from_value(
+        message
+            .get("id")
+            .context("user input request 缺少 JSON-RPC id")?,
+    )?;
+    let params = message
+        .get("params")
+        .and_then(Value::as_object)
+        .context("item/tool/requestUserInput 缺少对象 params")?;
+    let thread_id = required_request_string(params, METHOD, "threadId")?;
+    let turn_id = required_request_string(params, METHOD, "turnId")?;
+    let item_id = required_request_string(params, METHOD, "itemId")?;
+    let is_blocking = params
+        .get("isBlocking")
+        .and_then(Value::as_bool)
+        .context("item/tool/requestUserInput params.isBlocking 必须是布尔值")?;
+    let auto_resolution_ms =
+        match params.get("autoResolutionMs") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_u64().context(
+                "item/tool/requestUserInput params.autoResolutionMs 必须是 uint64 或 null",
+            )?),
+        };
+    let questions = params
+        .get("questions")
+        .and_then(Value::as_array)
+        .context("item/tool/requestUserInput params.questions 必须是数组")?;
+    let mut question_ids = HashSet::new();
+    let mut parsed_questions = Vec::with_capacity(questions.len());
+    for (index, question) in questions.iter().enumerate() {
+        let question = question.as_object().with_context(|| {
+            format!("item/tool/requestUserInput params.questions[{index}] 必须是对象")
+        })?;
+        let id = question
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .with_context(|| {
+                format!("item/tool/requestUserInput params.questions[{index}].id 必须是字符串")
+            })?;
+        if !question_ids.insert(id.clone()) {
+            bail!("item/tool/requestUserInput 包含重复 question id `{id}`");
+        }
+        let header = question
+            .get("header")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .with_context(|| {
+                format!("item/tool/requestUserInput params.questions[{index}].header 必须是字符串")
+            })?;
+        let question_text = question
+            .get("question")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .with_context(|| {
+                format!(
+                    "item/tool/requestUserInput params.questions[{index}].question 必须是字符串"
+                )
+            })?;
+        let allows_other = match question.get("isOther") {
+            None => false,
+            Some(value) => value.as_bool().with_context(|| {
+                format!("item/tool/requestUserInput params.questions[{index}].isOther 必须是布尔值")
+            })?,
+        };
+        let is_secret = match question.get("isSecret") {
+            None => false,
+            Some(value) => value.as_bool().with_context(|| {
+                format!(
+                    "item/tool/requestUserInput params.questions[{index}].isSecret 必须是布尔值"
+                )
+            })?,
+        };
+        let options = match question.get("options") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(options)) => {
+                let mut parsed = Vec::with_capacity(options.len());
+                for (option_index, option) in options.iter().enumerate() {
+                    let option = option.as_object().with_context(|| {
+                        format!(
+                            "item/tool/requestUserInput params.questions[{index}].options[{option_index}] 必须是对象"
+                        )
+                    })?;
+                    let label = option
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .with_context(|| {
+                            format!(
+                                "item/tool/requestUserInput params.questions[{index}].options[{option_index}].label 必须是字符串"
+                            )
+                        })?;
+                    let description = option
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .with_context(|| {
+                            format!(
+                                "item/tool/requestUserInput params.questions[{index}].options[{option_index}].description 必须是字符串"
+                            )
+                        })?;
+                    parsed.push(AgentUserInputOption { label, description });
+                }
+                parsed
+            }
+            Some(_) => bail!(
+                "item/tool/requestUserInput params.questions[{index}].options 必须是数组或 null"
+            ),
+        };
+        parsed_questions.push(AgentUserInputQuestion {
+            id,
+            header,
+            question: question_text,
+            options,
+            allows_other,
+            is_secret,
+        });
+    }
+    Ok((
+        request_id.clone(),
+        AgentUserInputRequest {
+            request_id,
+            thread_id,
+            turn_id,
+            item_id,
+            questions: parsed_questions,
+            is_blocking,
+            auto_resolution_ms,
+        },
+    ))
+}
+
+fn parse_optional_field<T>(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    parse: impl FnOnce(&Value) -> Result<T>,
+) -> Result<AgentOptionalField<T>> {
+    match object.get(field) {
+        None => Ok(AgentOptionalField::Unspecified),
+        Some(Value::Null) => Ok(AgentOptionalField::Null),
+        Some(value) => parse(value).map(AgentOptionalField::Value),
+    }
+}
+
+fn parse_permissions_approval_request(
+    message: &Value,
+) -> Result<(AgentServerRequestId, AgentPermissionsApprovalRequest)> {
+    const METHOD: &str = "item/permissions/requestApproval";
+    let request_id = request_id_from_value(
+        message
+            .get("id")
+            .context("permissions approval request 缺少 JSON-RPC id")?,
+    )?;
+    let params = message
+        .get("params")
+        .and_then(Value::as_object)
+        .context("item/permissions/requestApproval 缺少对象 params")?;
+    let thread_id = required_request_string(params, METHOD, "threadId")?;
+    let turn_id = required_request_string(params, METHOD, "turnId")?;
+    let item_id = required_request_string(params, METHOD, "itemId")?;
+    let cwd = required_request_string(params, METHOD, "cwd")?;
+    let cwd_path = Path::new(&cwd);
+    if !cwd_path.is_absolute()
+        || cwd_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        bail!("item/permissions/requestApproval params.cwd 必须是规范化绝对路径");
+    }
+    let started_at_ms = params
+        .get("startedAtMs")
+        .and_then(Value::as_i64)
+        .context("item/permissions/requestApproval params.startedAtMs 必须是 int64")?;
+    let environment_id = optional_request_string(params, METHOD, "environmentId")?;
+    let reason = optional_request_string(params, METHOD, "reason")?;
+    let permissions = params
+        .get("permissions")
+        .and_then(Value::as_object)
+        .context("item/permissions/requestApproval params.permissions 必须是对象")?;
+    if let Some(field) = permissions
+        .keys()
+        .find(|field| !matches!(field.as_str(), "fileSystem" | "network"))
+    {
+        bail!(
+            "item/permissions/requestApproval params.permissions 包含 schema 未定义字段 `{field}`"
+        );
+    }
+    let file_system = parse_optional_field(permissions, "fileSystem", |value| {
+        parse_additional_file_system_permissions(value)
+    })?;
+    let network = parse_optional_field(permissions, "network", |value| {
+        parse_additional_network_permissions(value)
+    })?;
+    Ok((
+        request_id.clone(),
+        AgentPermissionsApprovalRequest {
+            request_id,
+            thread_id,
+            turn_id,
+            item_id,
+            environment_id,
+            started_at_ms,
+            cwd,
+            reason,
+            permissions: AgentPermissionRequestProfile {
+                file_system,
+                network,
+            },
+        },
+    ))
+}
+
+fn parse_additional_network_permissions(
+    value: &Value,
+) -> Result<AgentAdditionalNetworkPermissions> {
+    let object = value
+        .as_object()
+        .context("item/permissions/requestApproval params.permissions.network 必须是对象或 null")?;
+    Ok(AgentAdditionalNetworkPermissions {
+        enabled: parse_optional_field(object, "enabled", |value| {
+            value.as_bool().context(
+                "item/permissions/requestApproval params.permissions.network.enabled 必须是布尔值或 null",
+            )
+        })?,
+    })
+}
+
+fn parse_additional_file_system_permissions(
+    value: &Value,
+) -> Result<AgentAdditionalFileSystemPermissions> {
+    let object = value.as_object().context(
+        "item/permissions/requestApproval params.permissions.fileSystem 必须是对象或 null",
+    )?;
+    let parse_paths = |value: &Value, field: &str| -> Result<Vec<String>> {
+        value
+            .as_array()
+            .with_context(|| {
+                format!(
+                    "item/permissions/requestApproval params.permissions.fileSystem.{field} 必须是字符串数组或 null"
+                )
+            })?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value.as_str().map(str::to_owned).with_context(|| {
+                    format!(
+                        "item/permissions/requestApproval params.permissions.fileSystem.{field}[{index}] 必须是字符串"
+                    )
+                })
+            })
+            .collect()
+    };
+    let read = parse_optional_field(object, "read", |value| parse_paths(value, "read"))?;
+    let write = parse_optional_field(object, "write", |value| parse_paths(value, "write"))?;
+    let glob_scan_max_depth = parse_optional_field(object, "globScanMaxDepth", |value| {
+        let depth = value.as_u64().context(
+            "item/permissions/requestApproval params.permissions.fileSystem.globScanMaxDepth 必须是正整数或 null",
+        )?;
+        if depth == 0 {
+            bail!(
+                "item/permissions/requestApproval params.permissions.fileSystem.globScanMaxDepth 必须至少为 1"
+            );
+        }
+        Ok(depth)
+    })?;
+    let entries = parse_optional_field(object, "entries", |value| {
+        value
+            .as_array()
+            .context(
+                "item/permissions/requestApproval params.permissions.fileSystem.entries 必须是数组或 null",
+            )?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| parse_file_system_permission_entry(value, index))
+            .collect()
+    })?;
+    Ok(AgentAdditionalFileSystemPermissions {
+        read,
+        write,
+        glob_scan_max_depth,
+        entries,
+    })
+}
+
+fn parse_file_system_permission_entry(
+    value: &Value,
+    index: usize,
+) -> Result<AgentFileSystemPermissionEntry> {
+    let object = value.as_object().with_context(|| {
+        format!(
+            "item/permissions/requestApproval params.permissions.fileSystem.entries[{index}] 必须是对象"
+        )
+    })?;
+    let access = match object.get("access").and_then(Value::as_str) {
+        Some("read") => AgentFileSystemAccess::Read,
+        Some("write") => AgentFileSystemAccess::Write,
+        Some("deny") => AgentFileSystemAccess::Deny,
+        Some(other) => bail!(
+            "item/permissions/requestApproval params.permissions.fileSystem.entries[{index}].access 包含未知值 `{other}`"
+        ),
+        None => bail!(
+            "item/permissions/requestApproval params.permissions.fileSystem.entries[{index}].access 必须是字符串"
+        ),
+    };
+    let path = parse_file_system_path(
+        object.get("path").with_context(|| {
+            format!(
+                "item/permissions/requestApproval params.permissions.fileSystem.entries[{index}] 缺少 path"
+            )
+        })?,
+        index,
+    )?;
+    Ok(AgentFileSystemPermissionEntry { path, access })
+}
+
+fn parse_file_system_path(value: &Value, entry_index: usize) -> Result<AgentFileSystemPath> {
+    let object = value.as_object().with_context(|| {
+        format!(
+            "item/permissions/requestApproval params.permissions.fileSystem.entries[{entry_index}].path 必须是对象"
+        )
+    })?;
+    match object.get("type").and_then(Value::as_str) {
+        Some("path") => Ok(AgentFileSystemPath::Path(
+            object
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .with_context(|| {
+                    format!(
+                        "item/permissions/requestApproval params.permissions.fileSystem.entries[{entry_index}].path.path 必须是字符串"
+                    )
+                })?,
+        )),
+        Some("glob_pattern") => Ok(AgentFileSystemPath::GlobPattern(
+            object
+                .get("pattern")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .with_context(|| {
+                    format!(
+                        "item/permissions/requestApproval params.permissions.fileSystem.entries[{entry_index}].path.pattern 必须是字符串"
+                    )
+                })?,
+        )),
+        Some("special") => Ok(AgentFileSystemPath::Special(parse_file_system_special_path(
+            object.get("value").with_context(|| {
+                format!(
+                    "item/permissions/requestApproval params.permissions.fileSystem.entries[{entry_index}].path 缺少 value"
+                )
+            })?,
+            entry_index,
+        )?)),
+        Some(other) => bail!(
+            "item/permissions/requestApproval params.permissions.fileSystem.entries[{entry_index}].path.type 包含未知值 `{other}`"
+        ),
+        None => bail!(
+            "item/permissions/requestApproval params.permissions.fileSystem.entries[{entry_index}].path.type 必须是字符串"
+        ),
+    }
+}
+
+fn parse_file_system_special_path(
+    value: &Value,
+    entry_index: usize,
+) -> Result<AgentFileSystemSpecialPath> {
+    let object = value.as_object().with_context(|| {
+        format!(
+            "item/permissions/requestApproval params.permissions.fileSystem.entries[{entry_index}].path.value 必须是对象"
+        )
+    })?;
+    let optional_subpath = || {
+        parse_optional_field(object, "subpath", |value| {
+            value.as_str().map(str::to_owned).with_context(|| {
+                format!(
+                    "item/permissions/requestApproval params.permissions.fileSystem.entries[{entry_index}].path.value.subpath 必须是字符串或 null"
+                )
+            })
+        })
+    };
+    match object.get("kind").and_then(Value::as_str) {
+        Some("root") => Ok(AgentFileSystemSpecialPath::Root),
+        Some("minimal") => Ok(AgentFileSystemSpecialPath::Minimal),
+        Some("project_roots") => Ok(AgentFileSystemSpecialPath::ProjectRoots {
+            subpath: optional_subpath()?,
+        }),
+        Some("tmpdir") => Ok(AgentFileSystemSpecialPath::Tmpdir),
+        Some("slash_tmp") => Ok(AgentFileSystemSpecialPath::SlashTmp),
+        Some("unknown") => Ok(AgentFileSystemSpecialPath::Unknown {
+            path: object
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .with_context(|| {
+                    format!(
+                        "item/permissions/requestApproval params.permissions.fileSystem.entries[{entry_index}].path.value.path 必须是字符串"
+                    )
+                })?,
+            subpath: optional_subpath()?,
+        }),
+        Some(other) => bail!(
+            "item/permissions/requestApproval params.permissions.fileSystem.entries[{entry_index}].path.value.kind 包含未知值 `{other}`"
+        ),
+        None => bail!(
+            "item/permissions/requestApproval params.permissions.fileSystem.entries[{entry_index}].path.value.kind 必须是字符串"
+        ),
+    }
 }
 
 fn handle_server_request_resolved<W: Write + Send>(
@@ -1923,7 +3065,7 @@ fn handle_server_request_resolved<W: Write + Send>(
     if message.get("method").and_then(Value::as_str) != Some("serverRequest/resolved") {
         return Ok(());
     }
-    message
+    let thread_id = message
         .pointer("/params/threadId")
         .and_then(Value::as_str)
         .context("serverRequest/resolved 缺少字符串 params.threadId")?;
@@ -1932,18 +3074,19 @@ fn handle_server_request_resolved<W: Write + Send>(
             .pointer("/params/requestId")
             .context("serverRequest/resolved 缺少 params.requestId")?,
     )?;
-    if !session.resolve_command_approval(&request_id)? {
-        return Ok(());
+    match session.resolve_server_request(&request_id, thread_id)? {
+        ServerRequestResolution::AlreadyResolved => Ok(()),
+        ServerRequestResolution::Resolved(request) => events
+            .send_blocking(AgentEvent::ServerRequestResolved { request })
+            .map_err(|_| anyhow!("Composer server request resolved 事件通道已经关闭")),
     }
-    events
-        .send_blocking(AgentEvent::CommandApprovalResolved { request_id })
-        .map_err(|_| anyhow!("Composer 审批事件通道已经关闭"))
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
-        io::Cursor,
+        collections::HashSet,
+        io::{Cursor, Error as IoError, ErrorKind, Write},
         path::{Path, PathBuf},
         process::Command,
         sync::Arc,
@@ -1954,15 +3097,34 @@ mod tests {
 
     use super::{
         AgentBackend, AgentCommandApprovalChoice, AgentConfigWarning, AgentEvent,
-        AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome, AgentPermissionMode,
-        AgentRequest, AgentServerRequestId, AgentThreadSettings, AppServerProcess,
+        AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome, AgentOptionalField,
+        AgentPermissionMode, AgentPermissionsApprovalChoice, AgentRequest,
+        AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
+        AgentServerRequestMetadata, AgentThreadSettings, AgentUserInputResponse, AppServerProcess,
         CodexAppServerBackend, CodexTurnSession, INITIALIZE_ID, MODEL_LIST_PAGE_SIZE,
-        PASSIVE_SERVER_METHODS, TurnOutcome, UNDEFINED_METHOD_PARAMS_LIMIT, drive_model_catalog,
-        drive_permission_profiles, drive_session, drive_thread_settings_update,
-        ensure_server_method_is_defined, finish_prompt_session, handle_server_request_resolved,
-        parse_agent_notification, respond_to_server_request_on_session, run_model_catalog_process,
+        PASSIVE_SERVER_METHODS, TurnOutcome, UNDEFINED_METHOD_PARAMS_LIMIT,
+        cleanup_pending_server_requests, drive_model_catalog, drive_permission_profiles,
+        drive_session, drive_thread_settings_update, ensure_server_method_is_defined,
+        finish_prompt_session, handle_server_request_resolved, parse_agent_notification,
+        respond_to_server_request_on_session, run_model_catalog_process,
         thread_settings_update_request, wait_for_response,
     };
+    use crate::agent::AgentUserInputAnswer;
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(IoError::new(
+                ErrorKind::BrokenPipe,
+                "fixture JSON-RPC write failure",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn command_approval_request(id: Value) -> Value {
         command_approval_request_for(id, "thr_1", "turn_1")
@@ -1995,6 +3157,75 @@ mod tests {
                     {"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["git","--version"]}},
                     "decline"
                 ]
+            }
+        })
+    }
+
+    fn user_input_request(id: Value) -> Value {
+        json!({
+            "id": id,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "itemId": "tool_1",
+                "questions": [
+                    {
+                        "id": "color",
+                        "header": "Color",
+                        "question": "Choose colors",
+                        "isOther": true,
+                        "isSecret": false,
+                        "options": [
+                            {"label": "red", "description": "Warm"},
+                            {"label": "blue", "description": "Cool"}
+                        ]
+                    },
+                    {
+                        "id": "token",
+                        "header": "Token",
+                        "question": "Enter the token",
+                        "isOther": true,
+                        "isSecret": true,
+                        "options": null
+                    }
+                ],
+                "isBlocking": true,
+                "autoResolutionMs": 1500
+            }
+        })
+    }
+
+    fn permissions_approval_request(id: Value) -> Value {
+        json!({
+            "id": id,
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "itemId": "permissions_1",
+                "environmentId": "env_1",
+                "startedAtMs": 1_777_777_777_000_i64,
+                "cwd": "/workspace/project",
+                "reason": "Read fixtures and contact the network",
+                "permissions": {
+                    "fileSystem": {
+                        "read": ["/legacy/read"],
+                        "write": null,
+                        "globScanMaxDepth": 4,
+                        "entries": [
+                            {"access":"read","path":{"type":"path","path":"/workspace/input"}},
+                            {"access":"write","path":{"type":"glob_pattern","pattern":"/workspace/out/**"}},
+                            {"access":"deny","path":{"type":"special","value":{"kind":"project_roots","subpath":"private"}}},
+                            {"access":"read","path":{"type":"special","value":{"kind":"root"}}},
+                            {"access":"read","path":{"type":"special","value":{"kind":"minimal"}}},
+                            {"access":"read","path":{"type":"special","value":{"kind":"tmpdir"}}},
+                            {"access":"read","path":{"type":"special","value":{"kind":"slash_tmp"}}},
+                            {"access":"read","path":{"type":"special","value":{"kind":"unknown","path":"/unknown","subpath":"child"}}}
+                        ]
+                    },
+                    "network": {"enabled": true}
+                }
             }
         })
     }
@@ -2715,8 +3946,14 @@ mod tests {
         assert_eq!(request.request_id, AgentServerRequestId::Number(77));
         assert_eq!(
             rx.try_recv().unwrap(),
-            AgentEvent::CommandApprovalResolved {
-                request_id: AgentServerRequestId::Number(77)
+            AgentEvent::ServerRequestResolved {
+                request: AgentServerRequestMetadata {
+                    request_id: AgentServerRequestId::Number(77),
+                    thread_id: "thr_existing".into(),
+                    turn_id: "turn_user".into(),
+                    item_id: "item_1".into(),
+                    kind: AgentServerRequestKind::CommandApproval,
+                }
             }
         );
         assert_eq!(rx.try_recv().unwrap(), AgentEvent::Completed);
@@ -3387,7 +4624,7 @@ mod tests {
         assert!(request.allow_once);
         assert!(request.decline);
         assert!(!request.cancel);
-        assert!(request.accept_with_execpolicy_amendment.is_some());
+        assert!(request.can_accept_with_execpolicy_amendment);
 
         responder
             .respond(AgentCommandApprovalChoice::Accept)
@@ -3464,12 +4701,185 @@ mod tests {
     }
 
     #[test]
-    fn every_other_unsupported_p0_server_request_is_rejected() {
-        for (id, method) in [
-            (78_u64, "item/fileChange/requestApproval"),
-            (79, "item/permissions/requestApproval"),
-            (80, "item/tool/requestUserInput"),
+    fn user_input_request_preserves_all_questions_answers_and_original_id_once() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let message = user_input_request(json!("user-input-7"));
+        respond_to_server_request_on_session(&session, &message, &tx).unwrap();
+
+        let AgentEvent::UserInputRequested { request, responder } = rx.try_recv().unwrap() else {
+            panic!("expected user input event");
+        };
+        assert_eq!(
+            request.request_id,
+            AgentServerRequestId::String("user-input-7".into())
+        );
+        assert_eq!(request.thread_id, "thr_1");
+        assert_eq!(request.turn_id, "turn_1");
+        assert_eq!(request.item_id, "tool_1");
+        assert!(request.is_blocking);
+        assert_eq!(request.auto_resolution_ms, Some(1500));
+        assert_eq!(request.questions.len(), 2);
+        assert_eq!(request.questions[0].header, "Color");
+        assert_eq!(request.questions[0].options.len(), 2);
+        assert!(request.questions[0].allows_other);
+        assert!(request.questions[1].is_secret);
+
+        let response = AgentUserInputResponse {
+            answers: vec![
+                AgentUserInputAnswer {
+                    question_id: "color".into(),
+                    answers: vec!["red".into(), "blue".into(), "custom shade".into()],
+                },
+                AgentUserInputAnswer {
+                    question_id: "token".into(),
+                    answers: vec!["super-secret-value".into()],
+                },
+            ],
+        };
+        let debug = format!("{response:?}");
+        assert!(!debug.contains("super-secret-value"));
+        assert!(debug.contains("<redacted>"));
+        responder.respond(response).unwrap();
+        let wire: Value = serde_json::from_slice(&take_session_output(&session)).unwrap();
+        assert_eq!(wire["id"], json!("user-input-7"));
+        assert_eq!(
+            wire["result"],
+            json!({
+                "answers": {
+                    "color": {"answers": ["red", "blue", "custom shade"]},
+                    "token": {"answers": ["super-secret-value"]}
+                }
+            })
+        );
+
+        let duplicate = responder
+            .respond(AgentUserInputResponse::default())
+            .unwrap_err();
+        assert!(duplicate.contains("拒绝重复 answers"));
+        assert!(!duplicate.contains("super-secret-value"));
+        assert!(take_session_output(&session).is_empty());
+    }
+
+    #[test]
+    fn user_input_invalid_params_receive_minus_32602_without_creating_pending_ui() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut message = user_input_request(json!(81));
+        message["params"]["questions"][0]["isSecret"] = json!("yes");
+
+        let error = respond_to_server_request_on_session(&session, &message, &tx)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("isSecret"));
+        assert!(rx.try_recv().is_err());
+        assert!(session.pending_server_request_snapshot().is_empty());
+        let wire: Value = serde_json::from_slice(&take_session_output(&session)).unwrap();
+        assert_eq!(wire["id"], json!(81));
+        assert_eq!(wire["error"]["code"], json!(-32602));
+    }
+
+    #[test]
+    fn permissions_approval_preserves_structured_permissions_and_maps_all_scopes() {
+        for (id, choice, expected_scope, expected_permissions) in [
+            (
+                91,
+                AgentPermissionsApprovalChoice::AllowOnce,
+                "turn",
+                Some(permissions_approval_request(json!(91))["params"]["permissions"].clone()),
+            ),
+            (
+                92,
+                AgentPermissionsApprovalChoice::AllowForSession,
+                "session",
+                Some(permissions_approval_request(json!(92))["params"]["permissions"].clone()),
+            ),
+            (93, AgentPermissionsApprovalChoice::Decline, "turn", None),
         ] {
+            let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+            let (tx, rx) = async_channel::unbounded();
+            respond_to_server_request_on_session(
+                &session,
+                &permissions_approval_request(json!(id)),
+                &tx,
+            )
+            .unwrap();
+            let AgentEvent::PermissionsApprovalRequested { request, responder } =
+                rx.try_recv().unwrap()
+            else {
+                panic!("expected permissions approval event");
+            };
+            assert_eq!(request.cwd, "/workspace/project");
+            assert_eq!(
+                request.reason.as_deref(),
+                Some("Read fixtures and contact the network")
+            );
+            assert_eq!(request.environment_id.as_deref(), Some("env_1"));
+            responder.respond(choice).unwrap();
+            let wire: Value = serde_json::from_slice(&take_session_output(&session)).unwrap();
+            assert_eq!(wire["id"], json!(id));
+            assert_eq!(wire["result"]["scope"], json!(expected_scope));
+            assert!(wire["result"].get("strictAutoReview").is_none());
+            match expected_permissions {
+                Some(permissions) => assert_eq!(wire["result"]["permissions"], permissions),
+                None => assert_eq!(wire["result"]["permissions"], json!({})),
+            }
+            let duplicate = responder.respond(choice).unwrap_err();
+            assert!(duplicate.contains("拒绝重复 decision"));
+            assert!(take_session_output(&session).is_empty());
+        }
+    }
+
+    #[test]
+    fn permissions_file_network_and_mixed_profiles_are_all_parsed() {
+        for (id, file_system, network) in [(94, true, false), (95, false, true), (96, true, true)] {
+            let mut message = permissions_approval_request(json!(id));
+            if !file_system {
+                message["params"]["permissions"]["fileSystem"] = Value::Null;
+            }
+            if !network {
+                message["params"]["permissions"]["network"] = Value::Null;
+            }
+            let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+            let (tx, rx) = async_channel::unbounded();
+            respond_to_server_request_on_session(&session, &message, &tx).unwrap();
+            let AgentEvent::PermissionsApprovalRequested { request, .. } = rx.try_recv().unwrap()
+            else {
+                panic!("expected permissions approval event");
+            };
+            assert_eq!(
+                matches!(
+                    request.permissions.file_system,
+                    AgentOptionalField::Value(_)
+                ),
+                file_system
+            );
+            assert_eq!(
+                matches!(request.permissions.network, AgentOptionalField::Value(_)),
+                network
+            );
+        }
+    }
+
+    #[test]
+    fn permissions_invalid_params_receive_minus_32602() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut message = permissions_approval_request(json!(97));
+        message["params"]["permissions"]["fileSystem"]["entries"][0]["path"]["type"] =
+            json!("future_path");
+        let error = respond_to_server_request_on_session(&session, &message, &tx)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("future_path"));
+        assert!(rx.try_recv().is_err());
+        let wire: Value = serde_json::from_slice(&take_session_output(&session)).unwrap();
+        assert_eq!(wire["error"]["code"], json!(-32602));
+    }
+
+    #[test]
+    fn unsupported_file_change_server_request_is_rejected() {
+        for (id, method) in [(78_u64, "item/fileChange/requestApproval")] {
             let input = format!(
                 "{}\n",
                 json!({
@@ -3518,11 +4928,280 @@ mod tests {
         );
         assert_eq!(
             rx.try_recv().unwrap(),
-            AgentEvent::CommandApprovalResolved {
-                request_id: AgentServerRequestId::Number(77)
+            AgentEvent::ServerRequestResolved {
+                request: AgentServerRequestMetadata {
+                    request_id: AgentServerRequestId::Number(77),
+                    thread_id: "thr_1".into(),
+                    turn_id: "turn_1".into(),
+                    item_id: "item_1".into(),
+                    kind: AgentServerRequestKind::CommandApproval,
+                }
             }
         );
         ensure_server_method_is_defined(&resolved).unwrap();
+    }
+
+    #[test]
+    fn all_three_server_request_kinds_follow_response_then_resolved_and_duplicate_is_idempotent() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+
+        respond_to_server_request_on_session(&session, &command_approval_request(json!(101)), &tx)
+            .unwrap();
+        let AgentEvent::CommandApprovalRequested {
+            responder: command, ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected command approval");
+        };
+        command.respond(AgentCommandApprovalChoice::Accept).unwrap();
+
+        respond_to_server_request_on_session(&session, &user_input_request(json!(102)), &tx)
+            .unwrap();
+        let AgentEvent::UserInputRequested {
+            responder: user_input,
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected user input");
+        };
+        user_input
+            .respond(AgentUserInputResponse {
+                answers: vec![AgentUserInputAnswer {
+                    question_id: "color".into(),
+                    answers: vec!["red".into()],
+                }],
+            })
+            .unwrap();
+
+        respond_to_server_request_on_session(
+            &session,
+            &permissions_approval_request(json!(103)),
+            &tx,
+        )
+        .unwrap();
+        let AgentEvent::PermissionsApprovalRequested {
+            responder: permissions,
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected permissions approval");
+        };
+        permissions
+            .respond(AgentPermissionsApprovalChoice::AllowOnce)
+            .unwrap();
+        take_session_output(&session);
+
+        assert_eq!(session.pending_server_request_snapshot().len(), 3);
+        for (request_id, expected_kind) in [
+            (101, AgentServerRequestKind::CommandApproval),
+            (102, AgentServerRequestKind::UserInput),
+            (103, AgentServerRequestKind::PermissionsApproval),
+        ] {
+            let resolved = json!({
+                "method": "serverRequest/resolved",
+                "params": {"threadId": "thr_1", "requestId": request_id}
+            });
+            handle_server_request_resolved(&session, &resolved, &tx).unwrap();
+            let AgentEvent::ServerRequestResolved { request } = rx.try_recv().unwrap() else {
+                panic!("expected resolved event");
+            };
+            assert_eq!(request.request_id, AgentServerRequestId::Number(request_id));
+            assert_eq!(request.kind, expected_kind);
+            assert_eq!(request.thread_id, "thr_1");
+            assert_eq!(request.turn_id, "turn_1");
+
+            handle_server_request_resolved(&session, &resolved, &tx).unwrap();
+            assert!(
+                rx.try_recv().is_err(),
+                "duplicate resolved must be idempotent"
+            );
+        }
+        assert!(session.pending_server_request_snapshot().is_empty());
+    }
+
+    #[test]
+    fn resolved_rejects_wrong_thread_and_unknown_request_without_clearing_pending() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        respond_to_server_request_on_session(&session, &user_input_request(json!(111)), &tx)
+            .unwrap();
+        rx.try_recv().unwrap();
+
+        let wrong_thread = json!({
+            "method": "serverRequest/resolved",
+            "params": {"threadId": "thr_wrong", "requestId": 111}
+        });
+        let error = handle_server_request_resolved(&session, &wrong_thread, &tx)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("不一致"));
+        assert_eq!(session.pending_server_request_snapshot().len(), 1);
+
+        let unknown = json!({
+            "method": "serverRequest/resolved",
+            "params": {"threadId": "thr_1", "requestId": 999}
+        });
+        let error = handle_server_request_resolved(&session, &unknown, &tx)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("未知 request"));
+        assert_eq!(session.pending_server_request_snapshot().len(), 1);
+    }
+
+    #[test]
+    fn mismatched_server_request_turn_returns_minus_32602_and_no_ui_event() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut message = user_input_request(json!(112));
+        message["params"]["turnId"] = json!("turn_wrong");
+        let mut streamed_text = false;
+        let error = super::process_turn_message(
+            &session,
+            &message,
+            "thr_1",
+            "turn_1",
+            &tx,
+            &mut streamed_text,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("属于其他 turn"));
+        assert!(rx.try_recv().is_err());
+        assert!(session.pending_server_request_snapshot().is_empty());
+        let wire: Value = serde_json::from_slice(&take_session_output(&session)).unwrap();
+        assert_eq!(wire["id"], json!(112));
+        assert_eq!(wire["error"]["code"], json!(-32602));
+    }
+
+    #[test]
+    fn turn_end_drains_all_pending_responders_and_reports_visible_terminal_states() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        respond_to_server_request_on_session(&session, &command_approval_request(json!(121)), &tx)
+            .unwrap();
+        let AgentEvent::CommandApprovalRequested {
+            responder: command, ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected command approval");
+        };
+        respond_to_server_request_on_session(&session, &user_input_request(json!(122)), &tx)
+            .unwrap();
+        let AgentEvent::UserInputRequested {
+            responder: user_input,
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected user input");
+        };
+        respond_to_server_request_on_session(
+            &session,
+            &permissions_approval_request(json!(123)),
+            &tx,
+        )
+        .unwrap();
+        let AgentEvent::PermissionsApprovalRequested {
+            responder: permissions,
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected permissions approval");
+        };
+
+        cleanup_pending_server_requests(&session, &Ok(TurnOutcome::Interrupted), &tx).unwrap();
+        let mut kinds = HashSet::new();
+        for _ in 0..3 {
+            let AgentEvent::ServerRequestFailed {
+                request,
+                kind,
+                message,
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("expected pending cleanup event");
+            };
+            assert_eq!(kind, AgentServerRequestFailureKind::Cancelled);
+            assert!(message.contains("已取消"));
+            kinds.insert(request.kind);
+        }
+        assert_eq!(kinds.len(), 3);
+        assert!(session.pending_server_request_snapshot().is_empty());
+        assert!(
+            command
+                .respond(AgentCommandApprovalChoice::Decline)
+                .is_err()
+        );
+        assert!(
+            user_input
+                .respond(AgentUserInputResponse::default())
+                .is_err()
+        );
+        assert!(
+            permissions
+                .respond(AgentPermissionsApprovalChoice::Decline)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn normal_completion_with_unresolved_request_is_a_protocol_consistency_error() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        respond_to_server_request_on_session(&session, &user_input_request(json!(131)), &tx)
+            .unwrap();
+        rx.try_recv().unwrap();
+        let error = cleanup_pending_server_requests(&session, &Ok(TurnOutcome::Completed), &tx)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("未 resolved"));
+        let AgentEvent::ServerRequestFailed { kind, .. } = rx.try_recv().unwrap() else {
+            panic!("expected cleanup failure event");
+        };
+        assert_eq!(kind, AgentServerRequestFailureKind::Failed);
+    }
+
+    #[test]
+    fn closed_writer_and_failed_write_are_explicit_and_still_one_shot() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        respond_to_server_request_on_session(&session, &user_input_request(json!(141)), &tx)
+            .unwrap();
+        let AgentEvent::UserInputRequested { responder, .. } = rx.try_recv().unwrap() else {
+            panic!("expected user input");
+        };
+        session.close_writer();
+        let error = responder
+            .respond(AgentUserInputResponse::default())
+            .unwrap_err();
+        assert!(error.contains("连接已经关闭"));
+        let duplicate = responder
+            .respond(AgentUserInputResponse::default())
+            .unwrap_err();
+        assert!(duplicate.contains("拒绝重复 answers"));
+
+        let session = Arc::new(CodexTurnSession::new(FailingWriter, None));
+        let (tx, rx) = async_channel::unbounded();
+        respond_to_server_request_on_session(&session, &user_input_request(json!(142)), &tx)
+            .unwrap();
+        let AgentEvent::UserInputRequested { responder, .. } = rx.try_recv().unwrap() else {
+            panic!("expected user input");
+        };
+        let failure = responder
+            .respond(AgentUserInputResponse {
+                answers: vec![AgentUserInputAnswer {
+                    question_id: "token".into(),
+                    answers: vec!["never-log-this-secret".into()],
+                }],
+            })
+            .unwrap_err();
+        assert!(failure.contains("fixture JSON-RPC write failure"));
+        assert!(!failure.contains("never-log-this-secret"));
+        assert!(
+            responder
+                .respond(AgentUserInputResponse::default())
+                .unwrap_err()
+                .contains("拒绝重复 answers")
+        );
     }
 
     #[test]
@@ -3558,8 +5237,8 @@ mod tests {
                         .respond(AgentCommandApprovalChoice::Accept)
                         .unwrap();
                 }
-                Ok(AgentEvent::CommandApprovalResolved { request_id }) => {
-                    assert_eq!(Some(&request_id), approval_id.as_ref());
+                Ok(AgentEvent::ServerRequestResolved { request }) => {
+                    assert_eq!(Some(&request.request_id), approval_id.as_ref());
                     resolved = true;
                 }
                 Ok(AgentEvent::Completed) => completed = true,

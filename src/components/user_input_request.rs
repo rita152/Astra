@@ -7,13 +7,12 @@
 //! Two-question navigation and per-question answer persistence come from the
 //! natural request and controlled renderer captures in
 //! `artifacts/chatgpt-user-input-multi-cdp-audit-2026-08-30/`.
-//! Captures 53/54 and 57/58 show the card unmounting immediately while a
-//! response is submitted and after it resolves, so those states render no
-//! placeholder or spinner. A controlled `autoResolutionMs=1500` request also
-//! remained unchanged after seven seconds, so timeout/error chrome is
-//! intentionally not represented here.
+//! The production integration keeps a submitted request mounted and disabled
+//! until `serverRequest/resolved` arrives. Cancellation and transport failures
+//! are also represented explicitly so pending protocol state never disappears
+//! without an observable outcome.
 
-use std::rc::Rc;
+use std::{fmt, rc::Rc};
 
 use gpui::{
     App, BoxShadow, Div, Entity, FontWeight, Role, SharedString, Stateful, Transformation, Window,
@@ -42,13 +41,15 @@ fn element_id(prefix: &str, request_id: &str, suffix: impl std::fmt::Display) ->
     format!("{prefix}-{request_id}-{suffix}").into()
 }
 
-/// Lifecycle states directly observed in the CDP evidence.
+/// Lifecycle states for the protocol-backed request card.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UserInputRequestStatus {
     #[default]
     Pending,
     Submitting,
     Resolved,
+    Cancelled,
+    Failed,
 }
 
 /// One selectable answer in a request question.
@@ -180,13 +181,16 @@ impl UserInputVisualState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UserInputRequestPresentation {
     pub request_id: String,
     pub questions: Vec<UserInputQuestionPresentation>,
     pub current_question_index: usize,
     pub selected_option_index: Option<usize>,
     pub status: UserInputRequestStatus,
+    pub is_blocking: bool,
+    pub auto_resolution_ms: Option<u64>,
+    pub failure_message: Option<String>,
     pub visual_state: UserInputVisualState,
     /// Logical focus inside the blocking form. The enclosing GPUI surface
     /// owns native window focus; this preserves the CDP-observed Tab order.
@@ -198,12 +202,51 @@ pub struct UserInputRequestPresentation {
     pub answers: Vec<UserInputQuestionAnswer>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct UserInputQuestionAnswer {
     pub selected_option_index: Option<usize>,
     pub selected_label: Option<String>,
+    pub selected_labels: Vec<String>,
     pub other_answer: String,
     pub skipped: bool,
+}
+
+impl fmt::Debug for UserInputQuestionAnswer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UserInputQuestionAnswer")
+            .field("selected_option_index", &self.selected_option_index)
+            .field(
+                "answer_count",
+                &self
+                    .selected_labels
+                    .len()
+                    .max(usize::from(self.selected_label.is_some())),
+            )
+            .field("answers", &"<redacted>")
+            .field("skipped", &self.skipped)
+            .finish()
+    }
+}
+
+impl fmt::Debug for UserInputRequestPresentation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UserInputRequestPresentation")
+            .field("request_id", &self.request_id)
+            .field("questions", &self.questions)
+            .field("current_question_index", &self.current_question_index)
+            .field("selected_option_index", &self.selected_option_index)
+            .field("status", &self.status)
+            .field("is_blocking", &self.is_blocking)
+            .field("auto_resolution_ms", &self.auto_resolution_ms)
+            .field("visual_state", &self.visual_state)
+            .field("keyboard_focus", &self.keyboard_focus)
+            .field("answers", &self.answers)
+            .field("other_answer", &"<redacted>")
+            .field("failure_message", &self.failure_message)
+            .finish()
+    }
 }
 
 impl UserInputRequestPresentation {
@@ -227,6 +270,9 @@ impl UserInputRequestPresentation {
             current_question_index: 0,
             selected_option_index,
             status: UserInputRequestStatus::Pending,
+            is_blocking: true,
+            auto_resolution_ms: None,
+            failure_message: None,
             visual_state: UserInputVisualState {
                 active_option_index: selected_option_index,
                 ..UserInputVisualState::default()
@@ -242,6 +288,11 @@ impl UserInputRequestPresentation {
     }
 
     pub fn should_render(&self) -> bool {
+        self.status != UserInputRequestStatus::Resolved
+            && (self.current_question().is_some() || self.status != UserInputRequestStatus::Pending)
+    }
+
+    pub fn is_interactive(&self) -> bool {
         self.status == UserInputRequestStatus::Pending && self.current_question().is_some()
     }
 
@@ -276,11 +327,10 @@ impl UserInputRequestPresentation {
     pub fn save_selected_option(&mut self, option_index: usize, label: String) {
         self.selected_option_index = Some(option_index);
         self.other_answer.clear();
+        let question_index = self.current_question_index;
+        self.save_answer_values(question_index, vec![label]);
         if let Some(answer) = self.answers.get_mut(self.current_question_index) {
             answer.selected_option_index = Some(option_index);
-            answer.selected_label = Some(label);
-            answer.other_answer.clear();
-            answer.skipped = false;
         }
         self.visual_state.active_option_index = Some(option_index);
     }
@@ -291,6 +341,7 @@ impl UserInputRequestPresentation {
         if let Some(saved) = self.answers.get_mut(self.current_question_index) {
             saved.selected_option_index = None;
             saved.selected_label = None;
+            saved.selected_labels.clear();
             saved.other_answer = answer;
             saved.skipped = false;
         }
@@ -357,7 +408,6 @@ impl UserInputRequestPresentation {
         true
     }
 
-    #[cfg(test)]
     pub fn response_answers(&self) -> Vec<(String, Vec<String>)> {
         self.questions
             .iter()
@@ -366,14 +416,29 @@ impl UserInputRequestPresentation {
                 if answer.skipped {
                     return None;
                 }
-                let values = if !answer.other_answer.trim().is_empty() {
-                    vec![answer.other_answer.trim().to_owned()]
-                } else {
+                let mut values = if answer.selected_labels.is_empty() {
                     answer.selected_label.clone().into_iter().collect()
+                } else {
+                    answer.selected_labels.clone()
                 };
+                if !answer.other_answer.trim().is_empty() {
+                    values.push(answer.other_answer.trim().to_owned());
+                }
                 (!values.is_empty()).then(|| (question.id.clone(), values))
             })
             .collect()
+    }
+
+    pub fn save_answer_values(&mut self, question_index: usize, values: Vec<String>) -> bool {
+        let Some(answer) = self.answers.get_mut(question_index) else {
+            return false;
+        };
+        answer.selected_option_index = None;
+        answer.selected_label = values.first().cloned();
+        answer.selected_labels = values;
+        answer.other_answer.clear();
+        answer.skipped = false;
+        true
     }
 
     fn load_current_answer(&mut self) {
@@ -746,8 +811,8 @@ impl UserInputPalette {
     }
 }
 
-/// Render the currently active question. Submitting and resolved requests are
-/// intentionally unmounted, matching captures 53/54 and 57/58.
+/// Render the currently active question. A submitted request stays mounted in
+/// a disabled status state until `serverRequest/resolved` finalizes it.
 pub fn render_user_input_request(
     model: &UserInputRequestPresentation,
     theme: Theme,
@@ -756,6 +821,9 @@ pub fn render_user_input_request(
 ) -> Option<Stateful<Div>> {
     if !model.should_render() {
         return None;
+    }
+    if !model.is_interactive() {
+        return Some(render_user_input_status(model, theme));
     }
 
     let question = model.current_question()?;
@@ -888,6 +956,61 @@ pub fn render_user_input_request(
                     .child(options),
             ),
     )
+}
+
+fn render_user_input_status(model: &UserInputRequestPresentation, theme: Theme) -> Stateful<Div> {
+    let palette = UserInputPalette::for_theme(theme).for_multi_question(model.is_multi_question());
+    let title = model
+        .current_question()
+        .map(UserInputQuestionPresentation::display_question)
+        .unwrap_or("用户输入请求")
+        .to_owned();
+    let status = match model.status {
+        UserInputRequestStatus::Submitting => "正在提交…",
+        UserInputRequestStatus::Cancelled => "请求已取消",
+        UserInputRequestStatus::Failed => "提交失败",
+        UserInputRequestStatus::Pending => "等待输入",
+        UserInputRequestStatus::Resolved => "已完成",
+    };
+    div()
+        .id(element_id("user-input-card", &model.request_id, "status"))
+        .role(Role::Alert)
+        .aria_label(format!("{title}，{status}"))
+        .min_h(px(104.0))
+        .w_full()
+        .px(px(16.0))
+        .py(px(16.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .rounded(px(USER_INPUT_CARD_RADIUS))
+        .bg(palette.card)
+        .shadow(palette.shadows())
+        .font_family("PingFang SC")
+        .text_color(palette.text)
+        .child(
+            div()
+                .text_size(px(14.0))
+                .line_height(px(20.0))
+                .font_weight(FontWeight::MEDIUM)
+                .child(title),
+        )
+        .child(
+            div()
+                .text_size(px(13.0))
+                .line_height(px(19.0))
+                .text_color(palette.secondary)
+                .child(status),
+        )
+        .when_some(model.failure_message.clone(), |card, message| {
+            card.child(
+                div()
+                    .text_size(px(12.0))
+                    .line_height(px(18.0))
+                    .text_color(palette.secondary)
+                    .child(message),
+            )
+        })
 }
 
 fn render_question_navigation(
@@ -1454,14 +1577,41 @@ mod tests {
     }
 
     #[test]
-    fn submitting_and_resolved_states_unmount_without_invented_feedback() {
+    fn submitting_stays_visible_and_disabled_until_resolved_unmounts() {
         let mut model =
             UserInputRequestPresentation::pending("request-1", vec![captured_question()]);
         assert!(model.should_render());
         model.status = UserInputRequestStatus::Submitting;
-        assert!(!model.should_render());
+        assert!(model.should_render());
+        assert!(!model.is_interactive());
         model.status = UserInputRequestStatus::Resolved;
         assert!(!model.should_render());
+    }
+
+    #[test]
+    fn production_answer_serialization_preserves_multi_select_other_and_redacts_debug() {
+        let mut question = captured_question();
+        question.id = "secret-choice".into();
+        question.is_secret = true;
+        let mut model = UserInputRequestPresentation::pending("request-secret", vec![question]);
+        assert!(model.save_answer_values(0, vec!["red".into(), "blue".into(), "green".into()]));
+        model.answers[0].other_answer = "private custom value".into();
+        assert_eq!(
+            model.response_answers(),
+            vec![(
+                "secret-choice".into(),
+                vec![
+                    "red".into(),
+                    "blue".into(),
+                    "green".into(),
+                    "private custom value".into(),
+                ],
+            )]
+        );
+        let debug = format!("{model:?}");
+        assert!(!debug.contains("private custom value"));
+        assert!(!debug.contains("green"));
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]

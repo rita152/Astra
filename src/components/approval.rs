@@ -32,6 +32,7 @@ pub const APPROVAL_MENU_ROW_HEIGHT: f32 = 28.5625;
 pub enum ApprovalCardStatus {
     #[default]
     Pending,
+    Submitting,
     Resolved,
 }
 

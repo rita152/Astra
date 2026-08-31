@@ -1,9 +1,8 @@
-//! Isolated compile/test entry for the capture-only permission card.
+//! Isolated compile/test entry for the protocol-neutral permission card.
 //!
-//! The component is available to the deterministic screenshot harness, but
-//! production app-server dispatch remains gated until every required renderer
-//! state clears the per-state pixel threshold. This crate also compiles the
-//! presentation model independently of that protocol layer.
+//! Production app-server dispatch adapts typed domain data into this model;
+//! this crate additionally compiles the presentation layer independently of
+//! the protocol adapter.
 
 #![allow(dead_code)]
 
@@ -22,7 +21,7 @@ mod components {
 mod permissions_approval;
 
 #[test]
-fn isolated_component_is_linked_without_protocol_integration() {
+fn isolated_component_is_linked_without_protocol_types() {
     let model =
         permissions_approval::PermissionApprovalPresentation::network("isolated-link-check", None);
     assert!(model.should_render());

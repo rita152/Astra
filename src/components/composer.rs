@@ -10,8 +10,12 @@ use gpui::{
 use crate::{
     agent::{
         AgentApprovalHandle, AgentBackend, AgentCommandApprovalChoice, AgentConfigWarning,
-        AgentEffectivePermissions, AgentEvent, AgentInterruptHandle, AgentInterruptOutcome,
-        AgentModel, AgentModelCatalog, AgentPermissionMode, AgentRequest, CodexAppServerBackend,
+        AgentEffectivePermissions, AgentEvent, AgentFileSystemAccess, AgentFileSystemPath,
+        AgentFileSystemSpecialPath, AgentInterruptHandle, AgentInterruptOutcome, AgentModel,
+        AgentModelCatalog, AgentOptionalField, AgentPermissionMode, AgentPermissionRequestProfile,
+        AgentPermissionsApprovalChoice, AgentPermissionsApprovalHandle, AgentRequest,
+        AgentServerRequestFailureKind, AgentServerRequestKind, AgentServerRequestMetadata,
+        AgentUserInputAnswer, AgentUserInputHandle, AgentUserInputResponse, CodexAppServerBackend,
         CommandExecution, CommandExecutionStatus,
     },
     components::{
@@ -167,6 +171,69 @@ const STREAM_DISCONNECTED_MESSAGE: &str = "Codex 事件流意外断开";
 
 fn current_local_time_label() -> String {
     Local::now().format("%H:%M").to_string()
+}
+
+fn permission_presentation_data(
+    permissions: &AgentPermissionRequestProfile,
+) -> (bool, Vec<PermissionPathRequest>) {
+    let network_enabled = matches!(
+        &permissions.network,
+        AgentOptionalField::Value(network)
+            if matches!(network.enabled, AgentOptionalField::Value(true))
+    );
+    let mut paths = Vec::new();
+    let AgentOptionalField::Value(file_system) = &permissions.file_system else {
+        return (network_enabled, paths);
+    };
+    if let AgentOptionalField::Value(read) = &file_system.read {
+        paths.extend(
+            read.iter()
+                .cloned()
+                .map(|path| PermissionPathRequest::new(path, PermissionPathAccess::Read)),
+        );
+    }
+    if let AgentOptionalField::Value(write) = &file_system.write {
+        paths.extend(
+            write
+                .iter()
+                .cloned()
+                .map(|path| PermissionPathRequest::new(path, PermissionPathAccess::Write)),
+        );
+    }
+    if let AgentOptionalField::Value(entries) = &file_system.entries {
+        paths.extend(entries.iter().map(|entry| {
+            let access = match entry.access {
+                AgentFileSystemAccess::Read => PermissionPathAccess::Read,
+                AgentFileSystemAccess::Write => PermissionPathAccess::Write,
+                AgentFileSystemAccess::Deny => PermissionPathAccess::Deny,
+            };
+            PermissionPathRequest::new(permission_path_display(&entry.path), access)
+        }));
+    }
+    (network_enabled, paths)
+}
+
+fn permission_path_display(path: &AgentFileSystemPath) -> String {
+    match path {
+        AgentFileSystemPath::Path(path) => path.clone(),
+        AgentFileSystemPath::GlobPattern(pattern) => format!("glob:{pattern}"),
+        AgentFileSystemPath::Special(special) => match special {
+            AgentFileSystemSpecialPath::Root => "/".to_owned(),
+            AgentFileSystemSpecialPath::Minimal => "<minimal>".to_owned(),
+            AgentFileSystemSpecialPath::ProjectRoots { subpath } => match subpath {
+                AgentOptionalField::Value(subpath) => format!("<project_roots>/{subpath}"),
+                AgentOptionalField::Unspecified | AgentOptionalField::Null => {
+                    "<project_roots>".to_owned()
+                }
+            },
+            AgentFileSystemSpecialPath::Tmpdir => "<tmpdir>".to_owned(),
+            AgentFileSystemSpecialPath::SlashTmp => "/tmp".to_owned(),
+            AgentFileSystemSpecialPath::Unknown { path, subpath } => match subpath {
+                AgentOptionalField::Value(subpath) => format!("{path}/{subpath}"),
+                AgentOptionalField::Unspecified | AgentOptionalField::Null => path.clone(),
+            },
+        },
+    }
 }
 
 fn push_coalesced_agent_event(batch: &mut Vec<AgentEvent>, event: AgentEvent) {
@@ -329,6 +396,9 @@ pub struct ComposerView {
     conversation_cycle: u64,
     active_turn: Option<AgentInterruptHandle>,
     approval_responders: HashMap<String, AgentApprovalHandle>,
+    user_input_responders: HashMap<String, AgentUserInputHandle>,
+    permissions_approval_responders: HashMap<String, AgentPermissionsApprovalHandle>,
+    server_request_contexts: HashMap<String, AgentServerRequestMetadata>,
     thread_id: Option<String>,
     model_menu_focus: FocusHandle,
     model_menu_focused_item: usize,
@@ -388,7 +458,7 @@ impl ComposerView {
                     let ConversationActivity::UserInput(model) = activity else {
                         return None;
                     };
-                    model.should_render().then_some(model)
+                    model.is_interactive().then_some(model)
                 }) {
                     model.save_other_answer(answer);
                     model.focus_other_answer();
@@ -406,7 +476,7 @@ impl ComposerView {
                         return None;
                     };
                     let question = model.current_question()?;
-                    model.should_render().then(|| {
+                    model.is_interactive().then(|| {
                         (
                             model.request_id.clone(),
                             question.id.clone(),
@@ -440,6 +510,9 @@ impl ComposerView {
             conversation_cycle: 0,
             active_turn: None,
             approval_responders: HashMap::new(),
+            user_input_responders: HashMap::new(),
+            permissions_approval_responders: HashMap::new(),
+            server_request_contexts: HashMap::new(),
             thread_id: None,
             model_menu_focus: cx.focus_handle(),
             model_menu_focused_item: 0,
@@ -853,6 +926,9 @@ impl ComposerView {
         self.assistant_message.clear();
         self.conversation_activity.clear();
         self.approval_responders.clear();
+        self.user_input_responders.clear();
+        self.permissions_approval_responders.clear();
+        self.server_request_contexts.clear();
         self.assistant_message_time = None;
         self.conversation_phase = ConversationPhase::Starting;
         self.conversation_cycle = self.conversation_cycle.wrapping_add(1);
@@ -1073,6 +1149,13 @@ impl ComposerView {
                     }
                 }
                 AgentEvent::CommandApprovalRequested { request, responder } => {
+                    let context = AgentServerRequestMetadata {
+                        request_id: request.request_id.clone(),
+                        thread_id: request.thread_id.clone(),
+                        turn_id: request.turn_id.clone(),
+                        item_id: request.item_id.clone(),
+                        kind: AgentServerRequestKind::CommandApproval,
+                    };
                     let request_id = request.request_id.ui_key();
                     let presentation = if let Some(host) = request.network_host {
                         ApprovalRequestPresentation::network(
@@ -1089,10 +1172,11 @@ impl ComposerView {
                         request.decline,
                         request.cancel,
                         request
-                            .accept_with_execpolicy_amendment
-                            .is_some()
+                            .can_accept_with_execpolicy_amendment
                             .then_some(ApprovalScope::SimilarCommands),
                     );
+                    self.server_request_contexts
+                        .insert(request_id.clone(), context);
                     self.approval_responders
                         .insert(request_id.clone(), responder);
                     self.conversation_activity
@@ -1101,12 +1185,278 @@ impl ComposerView {
                         self.conversation_phase = ConversationPhase::Streaming;
                     }
                 }
-                AgentEvent::CommandApprovalResolved { request_id } => {
-                    let request_id = request_id.ui_key();
-                    self.approval_responders.remove(&request_id);
-                    self.conversation_activity.retain(|activity| {
-                        !matches!(activity, ConversationActivity::Approval(model) if model.request_id == request_id)
-                    });
+                AgentEvent::UserInputRequested { request, responder } => {
+                    let context = AgentServerRequestMetadata {
+                        request_id: request.request_id.clone(),
+                        thread_id: request.thread_id.clone(),
+                        turn_id: request.turn_id.clone(),
+                        item_id: request.item_id.clone(),
+                        kind: AgentServerRequestKind::UserInput,
+                    };
+                    let request_id = request.request_id.ui_key();
+                    let questions = request
+                        .questions
+                        .into_iter()
+                        .map(|question| UserInputQuestionPresentation {
+                            id: question.id,
+                            header: Some(question.header),
+                            question: question.question,
+                            options: question
+                                .options
+                                .into_iter()
+                                .map(|option| {
+                                    UserInputOptionPresentation::new(
+                                        option.label,
+                                        Some(option.description),
+                                    )
+                                })
+                                .collect(),
+                            allows_other: question.allows_other,
+                            other_placeholder: "其他".to_owned(),
+                            is_secret: question.is_secret,
+                        })
+                        .collect();
+                    let mut model = UserInputRequestPresentation::pending(&request_id, questions);
+                    model.is_blocking = request.is_blocking;
+                    model.auto_resolution_ms = request.auto_resolution_ms;
+                    let has_questions = !model.questions.is_empty();
+                    self.server_request_contexts
+                        .insert(request_id.clone(), context);
+                    self.user_input_responders
+                        .insert(request_id.clone(), responder);
+                    self.conversation_activity
+                        .push(ConversationActivity::UserInput(model));
+                    if !has_questions {
+                        let response = self
+                            .user_input_responders
+                            .get(&request_id)
+                            .map(|responder| responder.respond(AgentUserInputResponse::default()));
+                        if let Some(ConversationActivity::UserInput(model)) =
+                            self.conversation_activity.last_mut()
+                        {
+                            match response {
+                                Some(Ok(())) => {
+                                    model.status = UserInputRequestStatus::Submitting;
+                                }
+                                Some(Err(error)) => {
+                                    model.status = UserInputRequestStatus::Failed;
+                                    model.failure_message = Some(error);
+                                }
+                                None => {
+                                    model.status = UserInputRequestStatus::Failed;
+                                    model.failure_message =
+                                        Some("用户输入 responder 不存在".to_owned());
+                                }
+                            }
+                        }
+                    }
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Streaming;
+                    }
+                }
+                AgentEvent::PermissionsApprovalRequested { request, responder } => {
+                    let context = AgentServerRequestMetadata {
+                        request_id: request.request_id.clone(),
+                        thread_id: request.thread_id.clone(),
+                        turn_id: request.turn_id.clone(),
+                        item_id: request.item_id.clone(),
+                        kind: AgentServerRequestKind::PermissionsApproval,
+                    };
+                    let request_id = request.request_id.ui_key();
+                    let (network_enabled, file_system) =
+                        permission_presentation_data(&request.permissions);
+                    let model = PermissionApprovalPresentation::pending(
+                        &request_id,
+                        network_enabled,
+                        file_system,
+                        request.reason,
+                    )
+                    .with_cwd(request.cwd);
+                    let has_actions = !model.actions().is_empty();
+                    self.server_request_contexts
+                        .insert(request_id.clone(), context);
+                    self.permissions_approval_responders
+                        .insert(request_id.clone(), responder);
+                    self.conversation_activity
+                        .push(ConversationActivity::PermissionsApproval(model));
+                    if !has_actions {
+                        let response = self.permissions_approval_responders.get(&request_id).map(
+                            |responder| {
+                                responder.respond(AgentPermissionsApprovalChoice::AllowOnce)
+                            },
+                        );
+                        if let Some(ConversationActivity::PermissionsApproval(model)) =
+                            self.conversation_activity.last_mut()
+                        {
+                            match response {
+                                Some(Ok(())) => {
+                                    model.status = PermissionApprovalStatus::Approved;
+                                }
+                                Some(Err(error)) => {
+                                    model.status = PermissionApprovalStatus::Failed;
+                                    model.failure_message = Some(error);
+                                }
+                                None => {
+                                    model.status = PermissionApprovalStatus::Failed;
+                                    model.failure_message =
+                                        Some("权限审批 responder 不存在".to_owned());
+                                }
+                            }
+                        }
+                    }
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Streaming;
+                    }
+                }
+                AgentEvent::ServerRequestResolved { request } => {
+                    let request_id = request.request_id.ui_key();
+                    match self.server_request_contexts.get(&request_id) {
+                        Some(expected) if expected == &request => {}
+                        Some(expected) => {
+                            self.conversation_activity
+                                .push(ConversationActivity::ProtocolError {
+                                message:
+                                    "serverRequest/resolved 标识与 Composer pending request 不一致"
+                                        .to_owned(),
+                                details: Some(format!("expected={expected:?}; actual={request:?}")),
+                                will_retry: false,
+                            });
+                            continue;
+                        }
+                        None => {
+                            self.conversation_activity
+                                .push(ConversationActivity::ProtocolError {
+                                message:
+                                    "serverRequest/resolved 在 Composer 中没有对应 pending request"
+                                        .to_owned(),
+                                details: Some(format!("actual={request:?}")),
+                                will_retry: false,
+                            });
+                            continue;
+                        }
+                    }
+                    self.server_request_contexts.remove(&request_id);
+                    match request.kind {
+                        AgentServerRequestKind::CommandApproval => {
+                            self.approval_responders.remove(&request_id);
+                            if let Some(ConversationActivity::Approval(model)) =
+                                self.conversation_activity.iter_mut().find(|activity| {
+                                    matches!(activity, ConversationActivity::Approval(model) if model.request_id == request_id)
+                                })
+                            {
+                                model.status = ApprovalCardStatus::Resolved;
+                            }
+                        }
+                        AgentServerRequestKind::UserInput => {
+                            self.user_input_responders.remove(&request_id);
+                            if let Some(ConversationActivity::UserInput(model)) =
+                                self.conversation_activity.iter_mut().find(|activity| {
+                                    matches!(activity, ConversationActivity::UserInput(model) if model.request_id == request_id)
+                                })
+                            {
+                                model.status = UserInputRequestStatus::Resolved;
+                            }
+                        }
+                        AgentServerRequestKind::PermissionsApproval => {
+                            self.permissions_approval_responders.remove(&request_id);
+                            if let Some(ConversationActivity::PermissionsApproval(model)) =
+                                self.conversation_activity.iter_mut().find(|activity| {
+                                    matches!(activity, ConversationActivity::PermissionsApproval(model) if model.request_id == request_id)
+                                })
+                            {
+                                model.status = PermissionApprovalStatus::Resolved;
+                            }
+                        }
+                    }
+                }
+                AgentEvent::ServerRequestFailed {
+                    request,
+                    kind,
+                    message,
+                } => {
+                    let request_id = request.request_id.ui_key();
+                    match self.server_request_contexts.get(&request_id) {
+                        Some(expected) if expected == &request => {}
+                        Some(expected) => {
+                            self.conversation_activity
+                                .push(ConversationActivity::ProtocolError {
+                                    message:
+                                        "server request 清理标识与 Composer pending request 不一致"
+                                            .to_owned(),
+                                    details: Some(format!(
+                                        "expected={expected:?}; actual={request:?}"
+                                    )),
+                                    will_retry: false,
+                                });
+                            continue;
+                        }
+                        None => {
+                            self.conversation_activity
+                                .push(ConversationActivity::ProtocolError {
+                                    message:
+                                        "server request 清理在 Composer 中没有对应 pending request"
+                                            .to_owned(),
+                                    details: Some(format!("actual={request:?}")),
+                                    will_retry: false,
+                                });
+                            continue;
+                        }
+                    }
+                    self.server_request_contexts.remove(&request_id);
+                    match request.kind {
+                        AgentServerRequestKind::CommandApproval => {
+                            self.approval_responders.remove(&request_id);
+                            if let Some(ConversationActivity::Approval(model)) =
+                                self.conversation_activity.iter_mut().find(|activity| {
+                                    matches!(activity, ConversationActivity::Approval(model) if model.request_id == request_id)
+                                })
+                            {
+                                model.status = ApprovalCardStatus::Resolved;
+                            }
+                        }
+                        AgentServerRequestKind::UserInput => {
+                            self.user_input_responders.remove(&request_id);
+                            if let Some(ConversationActivity::UserInput(model)) =
+                                self.conversation_activity.iter_mut().find(|activity| {
+                                    matches!(activity, ConversationActivity::UserInput(model) if model.request_id == request_id)
+                                })
+                            {
+                                model.status = match kind {
+                                    AgentServerRequestFailureKind::Cancelled => {
+                                        UserInputRequestStatus::Cancelled
+                                    }
+                                    AgentServerRequestFailureKind::Failed => {
+                                        UserInputRequestStatus::Failed
+                                    }
+                                };
+                                model.failure_message = Some(message.clone());
+                            }
+                        }
+                        AgentServerRequestKind::PermissionsApproval => {
+                            self.permissions_approval_responders.remove(&request_id);
+                            if let Some(ConversationActivity::PermissionsApproval(model)) =
+                                self.conversation_activity.iter_mut().find(|activity| {
+                                    matches!(activity, ConversationActivity::PermissionsApproval(model) if model.request_id == request_id)
+                                })
+                            {
+                                model.status = match kind {
+                                    AgentServerRequestFailureKind::Cancelled => {
+                                        PermissionApprovalStatus::Cancelled
+                                    }
+                                    AgentServerRequestFailureKind::Failed => {
+                                        PermissionApprovalStatus::Failed
+                                    }
+                                };
+                                model.failure_message = Some(message.clone());
+                            }
+                        }
+                    }
+                    self.conversation_activity
+                        .push(ConversationActivity::ProtocolError {
+                            message,
+                            details: Some(format!("request={request:?}")),
+                            will_retry: false,
+                        });
                 }
                 AgentEvent::ModelRerouted {
                     from_model,
@@ -2094,14 +2444,14 @@ impl ComposerView {
                     .get(request_id)
                     .map(|responder| responder.respond(choice));
                 match response {
-                    Some(Ok(())) | None => {
+                    Some(Ok(())) => {
                         // Keep the activity until serverRequest/resolved so the
                         // server remains authoritative, while immediately
                         // unmounting the card and blocking duplicate clicks.
                         if let ConversationActivity::Approval(model) =
                             &mut self.conversation_activity[index]
                         {
-                            model.status = ApprovalCardStatus::Resolved;
+                            model.status = ApprovalCardStatus::Submitting;
                         }
                     }
                     Some(Err(error)) => {
@@ -2111,6 +2461,20 @@ impl ComposerView {
                                 details: Some(error),
                                 will_retry: false,
                             });
+                    }
+                    None => {
+                        if self.server_request_contexts.contains_key(request_id) {
+                            self.conversation_activity
+                                .push(ConversationActivity::ProtocolError {
+                                    message: "无法回复命令审批".to_owned(),
+                                    details: Some("命令审批 responder 不存在".to_owned()),
+                                    will_retry: false,
+                                });
+                        } else if let ConversationActivity::Approval(model) =
+                            &mut self.conversation_activity[index]
+                        {
+                            model.status = ApprovalCardStatus::Submitting;
+                        }
                     }
                 }
             }
@@ -2172,24 +2536,96 @@ impl ComposerView {
         event: PermissionApprovalEvent,
         cx: &mut Context<Self>,
     ) {
-        let Some(model) = self.conversation_activity.iter_mut().find_map(|activity| {
-            let ConversationActivity::PermissionsApproval(model) = activity else {
-                return None;
-            };
-            (model.request_id == request_id).then_some(model)
+        let Some(index) = self.conversation_activity.iter().position(|activity| {
+            matches!(
+                activity,
+                ConversationActivity::PermissionsApproval(model)
+                    if model.request_id == request_id
+            )
         }) else {
             return;
         };
+        if !matches!(
+            &self.conversation_activity[index],
+            ConversationActivity::PermissionsApproval(model) if model.is_interactive()
+        ) {
+            return;
+        }
 
         match event {
             PermissionApprovalEvent::Decision(decision) => {
-                model.status = if decision == PermissionApprovalDecision::Decline {
-                    PermissionApprovalStatus::Declined
-                } else {
-                    PermissionApprovalStatus::Approved
+                let choice = match decision {
+                    PermissionApprovalDecision::AllowOnce => {
+                        AgentPermissionsApprovalChoice::AllowOnce
+                    }
+                    PermissionApprovalDecision::AllowForConversation => {
+                        AgentPermissionsApprovalChoice::AllowForSession
+                    }
+                    PermissionApprovalDecision::Decline => AgentPermissionsApprovalChoice::Decline,
                 };
+                let response = self
+                    .permissions_approval_responders
+                    .get(request_id)
+                    .map(|responder| responder.respond(choice));
+                match response {
+                    Some(Ok(())) => {
+                        let ConversationActivity::PermissionsApproval(model) =
+                            &mut self.conversation_activity[index]
+                        else {
+                            unreachable!("activity kind was checked above")
+                        };
+                        model.status = if decision == PermissionApprovalDecision::Decline {
+                            PermissionApprovalStatus::Declined
+                        } else {
+                            PermissionApprovalStatus::Approved
+                        };
+                    }
+                    Some(Err(error)) => {
+                        let ConversationActivity::PermissionsApproval(model) =
+                            &mut self.conversation_activity[index]
+                        else {
+                            unreachable!("activity kind was checked above")
+                        };
+                        model.status = PermissionApprovalStatus::Failed;
+                        model.failure_message = Some("无法写入权限审批响应".to_owned());
+                        self.conversation_activity
+                            .push(ConversationActivity::ProtocolError {
+                                message: "无法回复权限审批".to_owned(),
+                                details: Some(error),
+                                will_retry: false,
+                            });
+                    }
+                    None => {
+                        let ConversationActivity::PermissionsApproval(model) =
+                            &mut self.conversation_activity[index]
+                        else {
+                            unreachable!("activity kind was checked above")
+                        };
+                        if self.server_request_contexts.contains_key(request_id) {
+                            model.status = PermissionApprovalStatus::Failed;
+                            model.failure_message = Some("权限审批 responder 不存在".to_owned());
+                            self.conversation_activity
+                                .push(ConversationActivity::ProtocolError {
+                                    message: "无法回复权限审批".to_owned(),
+                                    details: Some("权限审批 responder 不存在".to_owned()),
+                                    will_retry: false,
+                                });
+                        } else {
+                            model.status = if decision == PermissionApprovalDecision::Decline {
+                                PermissionApprovalStatus::Declined
+                            } else {
+                                PermissionApprovalStatus::Approved
+                            };
+                        }
+                    }
+                }
             }
             PermissionApprovalEvent::ToggleMenu => {
+                let ConversationActivity::PermissionsApproval(model) =
+                    &mut self.conversation_activity[index]
+                else {
+                    unreachable!("activity kind was checked above")
+                };
                 model.visual_state = if model.visual_state.menu_open() {
                     if matches!(
                         model.keyboard_focus,
@@ -2206,6 +2642,11 @@ impl ComposerView {
                 };
             }
             PermissionApprovalEvent::HoverChanged(hovered) => {
+                let ConversationActivity::PermissionsApproval(model) =
+                    &mut self.conversation_activity[index]
+                else {
+                    unreachable!("activity kind was checked above")
+                };
                 if !model.visual_state.menu_open() {
                     model.visual_state = match hovered {
                         Some(PermissionApprovalHover::Allow) => {
@@ -2219,9 +2660,19 @@ impl ComposerView {
                 }
             }
             PermissionApprovalEvent::MenuFocusChanged(focused) => {
+                let ConversationActivity::PermissionsApproval(model) =
+                    &mut self.conversation_activity[index]
+                else {
+                    unreachable!("activity kind was checked above")
+                };
                 model.visual_state = PermissionApprovalVisualState::Menu { focused };
             }
             PermissionApprovalEvent::KeyboardFocusChanged(focused) => {
+                let ConversationActivity::PermissionsApproval(model) =
+                    &mut self.conversation_activity[index]
+                else {
+                    unreachable!("activity kind was checked above")
+                };
                 model.keyboard_focus = focused;
                 match focused {
                     Some(PermissionApprovalKeyboardFocus::MenuAllowOnce) => {
@@ -2377,42 +2828,71 @@ impl ComposerView {
         event: UserInputRequestEvent,
         cx: &mut Context<Self>,
     ) {
-        let input_configuration = {
-            let Some(model) = self.conversation_activity.iter_mut().find_map(|activity| {
-                let ConversationActivity::UserInput(model) = activity else {
-                    return None;
-                };
-                (model.request_id == request_id).then_some(model)
-            }) else {
-                return;
-            };
+        let Some(index) = self.conversation_activity.iter().position(|activity| {
+            matches!(activity, ConversationActivity::UserInput(model) if model.request_id == request_id)
+        }) else {
+            return;
+        };
+        if !matches!(
+            &self.conversation_activity[index],
+            ConversationActivity::UserInput(model) if model.is_interactive()
+        ) {
+            return;
+        }
 
+        let mut submit = false;
+        let mut dismiss = false;
+        let mut mismatch = None;
+        let input_configuration = {
+            let ConversationActivity::UserInput(model) = &mut self.conversation_activity[index]
+            else {
+                unreachable!("activity kind was checked above")
+            };
+            let current_question_id = model.current_question().map(|question| question.id.clone());
             match event {
                 UserInputRequestEvent::SelectOption {
+                    question_id,
                     option_index,
                     label,
-                    ..
                 } => {
-                    model.save_selected_option(option_index, label);
-                    if !model.is_multi_question() || !model.next_question() {
-                        model.status = UserInputRequestStatus::Submitting;
+                    if current_question_id.as_deref() != Some(question_id.as_str()) {
+                        mismatch = Some(format!(
+                            "选择事件 question id `{question_id}` 与当前 question id {:?} 不一致",
+                            current_question_id
+                        ));
+                    } else {
+                        model.save_selected_option(option_index, label);
+                        submit = !model.is_multi_question() || !model.next_question();
                     }
                 }
-                UserInputRequestEvent::BeginOtherAnswer { .. } => {
-                    model.visual_state.active_option_index = None;
-                    model.focus_other_answer();
+                UserInputRequestEvent::BeginOtherAnswer { question_id, .. } => {
+                    if current_question_id.as_deref() != Some(question_id.as_str()) {
+                        mismatch = Some(format!(
+                            "Other 事件 question id `{question_id}` 与当前 question id {:?} 不一致",
+                            current_question_id
+                        ));
+                    } else {
+                        model.visual_state.active_option_index = None;
+                        model.focus_other_answer();
+                    }
                 }
-                UserInputRequestEvent::SubmitOtherAnswer { answer, .. } => {
-                    model.save_other_answer(answer);
-                    if !model.is_multi_question() || !model.next_question() {
-                        model.status = UserInputRequestStatus::Submitting;
+                UserInputRequestEvent::SubmitOtherAnswer {
+                    question_id,
+                    answer,
+                } => {
+                    if current_question_id.as_deref() != Some(question_id.as_str()) {
+                        mismatch = Some(format!(
+                            "Other 提交 question id `{question_id}` 与当前 question id {:?} 不一致",
+                            current_question_id
+                        ));
+                    } else {
+                        model.save_other_answer(answer);
+                        submit = !model.is_multi_question() || !model.next_question();
                     }
                 }
                 UserInputRequestEvent::Skip => {
                     model.skip_current_question();
-                    if !model.is_multi_question() || !model.next_question() {
-                        model.status = UserInputRequestStatus::Submitting;
-                    }
+                    submit = !model.is_multi_question() || !model.next_question();
                 }
                 UserInputRequestEvent::PreviousQuestion => {
                     model.persist_current_answer();
@@ -2420,12 +2900,11 @@ impl ComposerView {
                 }
                 UserInputRequestEvent::NextQuestion => {
                     model.persist_current_answer();
-                    if !model.next_question() {
-                        model.status = UserInputRequestStatus::Submitting;
-                    }
+                    submit = !model.next_question();
                 }
                 UserInputRequestEvent::Dismiss => {
-                    model.status = UserInputRequestStatus::Resolved;
+                    submit = true;
+                    dismiss = true;
                 }
                 UserInputRequestEvent::ActiveOptionChanged(index) => {
                     model.visual_state.active_option_index = index.or(model.selected_option_index);
@@ -2440,6 +2919,83 @@ impl ComposerView {
                 )
             })
         };
+        if let Some(details) = mismatch {
+            self.conversation_activity
+                .push(ConversationActivity::ProtocolError {
+                    message: "用户输入请求事件标识不一致".to_owned(),
+                    details: Some(details),
+                    will_retry: false,
+                });
+            cx.emit(ConversationChanged);
+            cx.notify();
+            return;
+        }
+        if submit {
+            let answers = if dismiss {
+                Vec::new()
+            } else {
+                let ConversationActivity::UserInput(model) = &self.conversation_activity[index]
+                else {
+                    unreachable!("activity kind was checked above")
+                };
+                model
+                    .response_answers()
+                    .into_iter()
+                    .map(|(question_id, answers)| AgentUserInputAnswer {
+                        question_id,
+                        answers,
+                    })
+                    .collect()
+            };
+            let response = self
+                .user_input_responders
+                .get(request_id)
+                .map(|responder| responder.respond(AgentUserInputResponse { answers }));
+            match response {
+                Some(Ok(())) => {
+                    let ConversationActivity::UserInput(model) =
+                        &mut self.conversation_activity[index]
+                    else {
+                        unreachable!("activity kind was checked above")
+                    };
+                    model.status = UserInputRequestStatus::Submitting;
+                }
+                Some(Err(error)) => {
+                    let ConversationActivity::UserInput(model) =
+                        &mut self.conversation_activity[index]
+                    else {
+                        unreachable!("activity kind was checked above")
+                    };
+                    model.status = UserInputRequestStatus::Failed;
+                    model.failure_message = Some("无法写入用户输入响应".to_owned());
+                    self.conversation_activity
+                        .push(ConversationActivity::ProtocolError {
+                            message: "无法回复用户输入请求".to_owned(),
+                            details: Some(error),
+                            will_retry: false,
+                        });
+                }
+                None => {
+                    let ConversationActivity::UserInput(model) =
+                        &mut self.conversation_activity[index]
+                    else {
+                        unreachable!("activity kind was checked above")
+                    };
+                    if self.server_request_contexts.contains_key(request_id) {
+                        model.status = UserInputRequestStatus::Failed;
+                        model.failure_message = Some("用户输入 responder 不存在".to_owned());
+                        self.conversation_activity
+                            .push(ConversationActivity::ProtocolError {
+                                message: "无法回复用户输入请求".to_owned(),
+                                details: Some("用户输入 responder 不存在".to_owned()),
+                                will_retry: false,
+                            });
+                    } else {
+                        model.status = UserInputRequestStatus::Submitting;
+                    }
+                }
+            }
+        }
         if let Some((placeholder, secret, answer)) = input_configuration {
             self.user_input_other_input.update(cx, |input, cx| {
                 input.configure_inline_other(placeholder, secret, cx);
@@ -4375,23 +4931,31 @@ mod tests {
         push_coalesced_agent_event, submenu_layout, upsert_command_activity,
     };
     use crate::agent::{
-        AgentActivePermissionProfile, AgentApprovalControl, AgentApprovalHandle,
-        AgentCommandApprovalChoice, AgentCommandApprovalRequest, AgentConfigWarning,
-        AgentEffectivePermissions, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
-        AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentReasoningEffort,
-        AgentServerRequestId, AgentServiceTier, AgentThreadSettings, CommandExecution,
-        CommandExecutionStatus,
+        AgentActivePermissionProfile, AgentAdditionalNetworkPermissions, AgentApprovalControl,
+        AgentApprovalHandle, AgentCommandApprovalChoice, AgentCommandApprovalRequest,
+        AgentConfigWarning, AgentEffectivePermissions, AgentEvent, AgentInterruptControl,
+        AgentInterruptHandle, AgentInterruptOutcome, AgentModel, AgentModelCatalog,
+        AgentOptionalField, AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
+        AgentPermissionsApprovalControl, AgentPermissionsApprovalHandle,
+        AgentPermissionsApprovalRequest, AgentReasoningEffort, AgentServerRequestFailureKind,
+        AgentServerRequestId, AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier,
+        AgentThreadSettings, AgentUserInputAnswer, AgentUserInputControl, AgentUserInputHandle,
+        AgentUserInputOption, AgentUserInputQuestion, AgentUserInputRequest,
+        AgentUserInputResponse, CommandExecution, CommandExecutionStatus,
     };
     use crate::components::approval::{ApprovalCardEvent, ApprovalDecision, ApprovalScope};
+    use crate::components::permissions_approval::{
+        PermissionApprovalDecision, PermissionApprovalEvent, PermissionApprovalStatus,
+    };
     use crate::components::user_input_request::{
         UserInputKeyboardFocus, UserInputKeyboardOutcome, UserInputOptionPresentation,
         UserInputQuestionPresentation, UserInputRequestEvent, UserInputRequestPresentation,
+        UserInputRequestStatus,
     };
     use crate::theme::ThemeMode;
     use gpui::{
         Bounds, Focusable, MouseButton, TestApp, WindowBounds, WindowOptions, point, px, size,
     };
-    use serde_json::json;
     use std::{
         sync::{
             Arc, Mutex,
@@ -4416,6 +4980,103 @@ mod tests {
                 .unwrap()
                 .push((request_id.clone(), choice));
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingUserInputControl {
+        responses: Mutex<Vec<(AgentServerRequestId, AgentUserInputResponse)>>,
+    }
+
+    impl AgentUserInputControl for RecordingUserInputControl {
+        fn respond(
+            &self,
+            request_id: &AgentServerRequestId,
+            response: AgentUserInputResponse,
+        ) -> Result<(), String> {
+            self.responses
+                .lock()
+                .unwrap()
+                .push((request_id.clone(), response));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingPermissionsControl {
+        responses: Mutex<Vec<(AgentServerRequestId, AgentPermissionsApprovalChoice)>>,
+    }
+
+    impl AgentPermissionsApprovalControl for RecordingPermissionsControl {
+        fn respond(
+            &self,
+            request_id: &AgentServerRequestId,
+            choice: AgentPermissionsApprovalChoice,
+        ) -> Result<(), String> {
+            self.responses
+                .lock()
+                .unwrap()
+                .push((request_id.clone(), choice));
+            Ok(())
+        }
+    }
+
+    fn user_input_agent_request(request_id: AgentServerRequestId) -> AgentUserInputRequest {
+        AgentUserInputRequest {
+            request_id,
+            thread_id: "thr_1".into(),
+            turn_id: "turn_1".into(),
+            item_id: "tool_1".into(),
+            questions: vec![
+                AgentUserInputQuestion {
+                    id: "color".into(),
+                    header: "Color".into(),
+                    question: "Choose a color".into(),
+                    options: vec![
+                        AgentUserInputOption {
+                            label: "red".into(),
+                            description: "Warm".into(),
+                        },
+                        AgentUserInputOption {
+                            label: "blue".into(),
+                            description: "Cool".into(),
+                        },
+                    ],
+                    allows_other: true,
+                    is_secret: false,
+                },
+                AgentUserInputQuestion {
+                    id: "token".into(),
+                    header: "Token".into(),
+                    question: "Enter token".into(),
+                    options: Vec::new(),
+                    allows_other: true,
+                    is_secret: true,
+                },
+            ],
+            is_blocking: true,
+            auto_resolution_ms: Some(1500),
+        }
+    }
+
+    fn permissions_agent_request(
+        request_id: AgentServerRequestId,
+    ) -> AgentPermissionsApprovalRequest {
+        AgentPermissionsApprovalRequest {
+            request_id,
+            thread_id: "thr_1".into(),
+            turn_id: "turn_1".into(),
+            item_id: "permissions_1".into(),
+            environment_id: Some("env_1".into()),
+            started_at_ms: 1_777_777_777_000,
+            cwd: "/workspace/project".into(),
+            reason: Some("Connect for a fixture".into()),
+            permissions: AgentPermissionRequestProfile {
+                file_system: AgentOptionalField::Unspecified,
+                network: AgentOptionalField::Value(AgentAdditionalNetworkPermissions {
+                    enabled: AgentOptionalField::Value(true),
+                }),
+            },
         }
     }
 
@@ -4522,17 +5183,16 @@ mod tests {
                 AgentEvent::CommandApprovalRequested {
                     request: AgentCommandApprovalRequest {
                         request_id: request_id.clone(),
+                        thread_id: "thr_1".into(),
+                        turn_id: "turn_1".into(),
+                        item_id: "item_1".into(),
                         command: "git --version".into(),
                         reason: Some("需要读取版本".into()),
                         network_host: None,
                         allow_once: false,
                         decline: true,
                         cancel: false,
-                        accept_with_execpolicy_amendment: Some(json!({
-                            "acceptWithExecpolicyAmendment": {
-                                "execpolicy_amendment": ["git", "--version"]
-                            }
-                        })),
+                        can_accept_with_execpolicy_amendment: true,
                     },
                     responder,
                 },
@@ -4575,11 +5235,17 @@ mod tests {
         );
 
         app.update_entity(&composer, |composer, _| {
-            composer.apply_agent_event_batch(vec![AgentEvent::CommandApprovalResolved {
-                request_id: request_id.clone(),
+            composer.apply_agent_event_batch(vec![AgentEvent::ServerRequestResolved {
+                request: AgentServerRequestMetadata {
+                    request_id: request_id.clone(),
+                    thread_id: "thr_1".into(),
+                    turn_id: "turn_1".into(),
+                    item_id: "item_1".into(),
+                    kind: AgentServerRequestKind::CommandApproval,
+                },
             }]);
-            assert!(!composer.conversation_activity.iter().any(
-                |activity| matches!(activity, ConversationActivity::Approval(model) if model.request_id == ui_key)
+            assert!(composer.conversation_activity.iter().any(
+                |activity| matches!(activity, ConversationActivity::Approval(model) if model.request_id == ui_key && !model.should_render())
             ));
             assert!(!composer.approval_responders.contains_key(&ui_key));
         });
@@ -4597,13 +5263,16 @@ mod tests {
             composer.apply_agent_event_batch(vec![AgentEvent::CommandApprovalRequested {
                 request: AgentCommandApprovalRequest {
                     request_id: request_id.clone(),
+                    thread_id: "thr_1".into(),
+                    turn_id: "turn_1".into(),
+                    item_id: "item_1".into(),
                     command: "pwd".into(),
                     reason: Some("仅显示当前目录".into()),
                     network_host: None,
                     allow_once: true,
                     decline: false,
                     cancel: true,
-                    accept_with_execpolicy_amendment: None,
+                    can_accept_with_execpolicy_amendment: false,
                 },
                 responder,
             }]);
@@ -4635,14 +5304,258 @@ mod tests {
 
         app.update_entity(&composer, |composer, _| {
             composer.apply_agent_event_batch(vec![
-                AgentEvent::CommandApprovalResolved {
-                    request_id: request_id.clone(),
+                AgentEvent::ServerRequestResolved {
+                    request: AgentServerRequestMetadata {
+                        request_id: request_id.clone(),
+                        thread_id: "thr_1".into(),
+                        turn_id: "turn_1".into(),
+                        item_id: "item_1".into(),
+                        kind: AgentServerRequestKind::CommandApproval,
+                    },
                 },
                 AgentEvent::TextDelta("命令未执行，继续当前回合".into()),
                 AgentEvent::Completed,
             ]);
             assert_eq!(composer.conversation_phase, ConversationPhase::Complete);
             assert_eq!(composer.assistant_message, "命令未执行，继续当前回合");
+        });
+    }
+
+    #[test]
+    fn live_user_input_submits_all_questions_once_waits_for_resolved_and_redacts_secret_debug() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        let request_id = AgentServerRequestId::String("user-input-live".into());
+        let control = Arc::new(RecordingUserInputControl::default());
+        let responder = AgentUserInputHandle::new(request_id.clone(), control.clone());
+        let request = user_input_agent_request(request_id.clone());
+
+        app.update_entity(&composer, |composer, _| {
+            composer.apply_agent_event_batch(vec![AgentEvent::UserInputRequested {
+                request,
+                responder,
+            }]);
+        });
+        let ui_key = request_id.ui_key();
+        app.update_entity(&composer, |composer, cx| {
+            composer.handle_user_input_request_event(
+                &ui_key,
+                UserInputRequestEvent::SelectOption {
+                    question_id: "color".into(),
+                    option_index: 1,
+                    label: "blue".into(),
+                },
+                cx,
+            );
+            composer.handle_user_input_request_event(
+                &ui_key,
+                UserInputRequestEvent::SubmitOtherAnswer {
+                    question_id: "token".into(),
+                    answer: "top-secret-token".into(),
+                },
+                cx,
+            );
+            composer.handle_user_input_request_event(&ui_key, UserInputRequestEvent::Dismiss, cx);
+            let debug = format!("{:?}", composer.conversation_activity_snapshot());
+            assert!(!debug.contains("top-secret-token"));
+            assert!(debug.contains("<redacted>"));
+            assert!(composer.conversation_activity.iter().any(|activity| {
+                matches!(activity, ConversationActivity::UserInput(model)
+                    if model.request_id == ui_key
+                        && model.status == UserInputRequestStatus::Submitting
+                        && model.should_render()
+                        && !model.is_interactive())
+            }));
+        });
+        let responses = control.responses.lock().unwrap();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].0, request_id);
+        assert_eq!(
+            responses[0].1,
+            AgentUserInputResponse {
+                answers: vec![
+                    AgentUserInputAnswer {
+                        question_id: "color".into(),
+                        answers: vec!["blue".into()],
+                    },
+                    AgentUserInputAnswer {
+                        question_id: "token".into(),
+                        answers: vec!["top-secret-token".into()],
+                    },
+                ]
+            }
+        );
+        drop(responses);
+
+        app.update_entity(&composer, |composer, _| {
+            composer.apply_agent_event_batch(vec![AgentEvent::ServerRequestResolved {
+                request: AgentServerRequestMetadata {
+                    request_id: request_id.clone(),
+                    thread_id: "thr_1".into(),
+                    turn_id: "turn_1".into(),
+                    item_id: "tool_1".into(),
+                    kind: AgentServerRequestKind::UserInput,
+                },
+            }]);
+            assert!(!composer.user_input_responders.contains_key(&ui_key));
+            assert!(!composer.server_request_contexts.contains_key(&ui_key));
+            assert!(composer.conversation_activity.iter().any(|activity| {
+                matches!(activity, ConversationActivity::UserInput(model)
+                    if model.request_id == ui_key
+                        && model.status == UserInputRequestStatus::Resolved
+                        && !model.should_render())
+            }));
+        });
+    }
+
+    #[test]
+    fn live_permissions_actions_map_to_turn_session_and_decline_once() {
+        for (suffix, decision, expected) in [
+            (
+                "once",
+                PermissionApprovalDecision::AllowOnce,
+                AgentPermissionsApprovalChoice::AllowOnce,
+            ),
+            (
+                "session",
+                PermissionApprovalDecision::AllowForConversation,
+                AgentPermissionsApprovalChoice::AllowForSession,
+            ),
+            (
+                "decline",
+                PermissionApprovalDecision::Decline,
+                AgentPermissionsApprovalChoice::Decline,
+            ),
+        ] {
+            let mut app = TestApp::new();
+            let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+            let request_id = AgentServerRequestId::String(format!("permissions-{suffix}"));
+            let control = Arc::new(RecordingPermissionsControl::default());
+            let responder =
+                AgentPermissionsApprovalHandle::new(request_id.clone(), control.clone());
+            let request = permissions_agent_request(request_id.clone());
+            app.update_entity(&composer, |composer, _| {
+                composer.apply_agent_event_batch(vec![AgentEvent::PermissionsApprovalRequested {
+                    request,
+                    responder,
+                }]);
+                let model = composer
+                    .conversation_activity
+                    .iter()
+                    .find_map(|activity| match activity {
+                        ConversationActivity::PermissionsApproval(model) => Some(model),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(model.cwd(), Some("/workspace/project"));
+                assert!(model.network_enabled);
+            });
+            let ui_key = request_id.ui_key();
+            app.update_entity(&composer, |composer, cx| {
+                composer.handle_permissions_approval_event(
+                    &ui_key,
+                    PermissionApprovalEvent::Decision(decision),
+                    cx,
+                );
+                composer.handle_permissions_approval_event(
+                    &ui_key,
+                    PermissionApprovalEvent::Decision(PermissionApprovalDecision::Decline),
+                    cx,
+                );
+            });
+            assert_eq!(
+                *control.responses.lock().unwrap(),
+                vec![(request_id.clone(), expected)]
+            );
+            app.update_entity(&composer, |composer, _| {
+                composer.apply_agent_event_batch(vec![AgentEvent::ServerRequestResolved {
+                    request: AgentServerRequestMetadata {
+                        request_id: request_id.clone(),
+                        thread_id: "thr_1".into(),
+                        turn_id: "turn_1".into(),
+                        item_id: "permissions_1".into(),
+                        kind: AgentServerRequestKind::PermissionsApproval,
+                    },
+                }]);
+                assert!(
+                    !composer
+                        .permissions_approval_responders
+                        .contains_key(&ui_key)
+                );
+                assert!(composer.conversation_activity.iter().any(|activity| {
+                    matches!(activity, ConversationActivity::PermissionsApproval(model)
+                        if model.request_id == ui_key
+                            && model.status == PermissionApprovalStatus::Resolved)
+                }));
+            });
+        }
+    }
+
+    #[test]
+    fn composer_rejects_resolved_item_mismatch_without_releasing_responder() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        let request_id = AgentServerRequestId::Number(211);
+        let control = Arc::new(RecordingUserInputControl::default());
+        let responder = AgentUserInputHandle::new(request_id.clone(), control);
+        app.update_entity(&composer, |composer, _| {
+            composer.apply_agent_event_batch(vec![AgentEvent::UserInputRequested {
+                request: user_input_agent_request(request_id.clone()),
+                responder,
+            }]);
+            composer.apply_agent_event_batch(vec![AgentEvent::ServerRequestResolved {
+                request: AgentServerRequestMetadata {
+                    request_id: request_id.clone(),
+                    thread_id: "thr_1".into(),
+                    turn_id: "turn_1".into(),
+                    item_id: "wrong_item".into(),
+                    kind: AgentServerRequestKind::UserInput,
+                },
+            }]);
+            let ui_key = request_id.ui_key();
+            assert!(composer.user_input_responders.contains_key(&ui_key));
+            assert!(composer.server_request_contexts.contains_key(&ui_key));
+            assert!(composer.conversation_activity.iter().any(|activity| {
+                matches!(activity, ConversationActivity::ProtocolError { message, .. }
+                    if message.contains("标识") && message.contains("不一致"))
+            }));
+        });
+    }
+
+    #[test]
+    fn pending_request_cleanup_is_visible_and_disables_user_interaction() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        let request_id = AgentServerRequestId::Number(212);
+        let control = Arc::new(RecordingPermissionsControl::default());
+        let responder = AgentPermissionsApprovalHandle::new(request_id.clone(), control);
+        app.update_entity(&composer, |composer, _| {
+            composer.apply_agent_event_batch(vec![AgentEvent::PermissionsApprovalRequested {
+                request: permissions_agent_request(request_id.clone()),
+                responder,
+            }]);
+            composer.apply_agent_event_batch(vec![AgentEvent::ServerRequestFailed {
+                request: AgentServerRequestMetadata {
+                    request_id: request_id.clone(),
+                    thread_id: "thr_1".into(),
+                    turn_id: "turn_1".into(),
+                    item_id: "permissions_1".into(),
+                    kind: AgentServerRequestKind::PermissionsApproval,
+                },
+                kind: AgentServerRequestFailureKind::Cancelled,
+                message: "turn cancelled".into(),
+            }]);
+            let model = composer
+                .conversation_activity
+                .iter()
+                .find_map(|activity| match activity {
+                    ConversationActivity::PermissionsApproval(model) => Some(model),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(model.status, PermissionApprovalStatus::Cancelled);
+            assert!(model.should_render());
+            assert!(!model.is_interactive());
         });
     }
 

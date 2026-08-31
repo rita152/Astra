@@ -1,15 +1,14 @@
 //! Native presentation for `item/permissions/requestApproval`.
 //!
 //! This module intentionally contains no app-server protocol types. It is
-//! exposed only by the deterministic capture/test surface; production
-//! app-server dispatch remains gated. Geometry, copy, colors, shadows, menu dimensions,
-//! and interaction states come from the real ChatGPT renderer captures in
+//! populated through protocol-neutral domain data by the production Composer.
+//! Geometry, copy, colors, shadows, menu dimensions, and interaction states come from
+//! the real ChatGPT renderer captures in
 //! `artifacts/chatgpt-permissions-request-cdp-audit-2026-08-30/R01..R23`.
 //!
-//! The real renderer removes the card after an approved, declined, or
-//! `serverRequest/resolved` outcome. It exposes no permission-card-specific
-//! loading, error, or timeout presentation, so this model deliberately does
-//! not invent those states.
+//! An approved or declined card remains in conversation state while awaiting
+//! `serverRequest/resolved`, but is no longer interactive. Cancellation and
+//! transport failures stay visible with an explicit terminal status.
 
 use std::{path::Path, rc::Rc};
 
@@ -84,6 +83,8 @@ pub enum PermissionApprovalStatus {
     Approved,
     Declined,
     Resolved,
+    Cancelled,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,7 +155,9 @@ pub struct PermissionApprovalPresentation {
     pub request_id: String,
     pub network_enabled: bool,
     pub file_system: Vec<PermissionPathRequest>,
+    pub cwd: Option<String>,
     pub reason: Option<String>,
+    pub failure_message: Option<String>,
     pub status: PermissionApprovalStatus,
     pub visual_state: PermissionApprovalVisualState,
     pub keyboard_focus: Option<PermissionApprovalKeyboardFocus>,
@@ -191,7 +194,9 @@ impl PermissionApprovalPresentation {
             request_id: request_id.into(),
             network_enabled,
             file_system,
+            cwd: None,
             reason,
+            failure_message: None,
             status: PermissionApprovalStatus::Pending,
             visual_state: PermissionApprovalVisualState::Default,
             keyboard_focus: None,
@@ -199,7 +204,20 @@ impl PermissionApprovalPresentation {
     }
 
     pub fn should_render(&self) -> bool {
+        (self.status == PermissionApprovalStatus::Pending && !self.actions().is_empty())
+            || matches!(
+                self.status,
+                PermissionApprovalStatus::Cancelled | PermissionApprovalStatus::Failed
+            )
+    }
+
+    pub fn is_interactive(&self) -> bool {
         self.status == PermissionApprovalStatus::Pending && !self.actions().is_empty()
+    }
+
+    pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
     }
 
     pub fn title(&self) -> &'static str {
@@ -217,12 +235,20 @@ impl PermissionApprovalPresentation {
             .filter(|reason| !reason.is_empty())
     }
 
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|cwd| !cwd.is_empty())
+    }
+
     pub fn header_height(&self) -> f32 {
-        if self.reason().is_some() {
+        let base = if self.reason().is_some() {
             PERMISSIONS_HEADER_WITH_REASON_HEIGHT
         } else {
             PERMISSIONS_HEADER_HEIGHT
-        }
+        };
+        base + if self.cwd().is_some() { 19.5 } else { 0.0 }
     }
 
     pub fn card_height(&self) -> f32 {
@@ -274,6 +300,11 @@ impl PermissionApprovalPresentation {
 
     pub fn question_parts(&self) -> Vec<PermissionQuestionPart> {
         let actions = self.actions();
+        if actions.is_empty() {
+            return vec![PermissionQuestionPart::text(
+                "Codex 未请求额外文件或网络权限，是否继续？",
+            )];
+        }
         if actions.len() == 1 {
             return single_action_question(&actions[0]);
         }
@@ -617,9 +648,9 @@ impl PermissionPalette {
     }
 }
 
-/// Renders only the pending permission surface. Approved, declined, and
-/// server-resolved presentations return `None`, matching R06/R08/R09 and
-/// R18/R20/R21.
+/// Renders the interactive pending surface plus explicit cancellation/failure
+/// outcomes. Approved, declined, and server-resolved presentations stay in
+/// conversation state but return `None`.
 pub fn render_permissions_approval(
     model: &PermissionApprovalPresentation,
     theme: Theme,
@@ -627,6 +658,9 @@ pub fn render_permissions_approval(
 ) -> Option<Stateful<Div>> {
     if !model.should_render() {
         return None;
+    }
+    if !model.is_interactive() {
+        return Some(render_permissions_status(model, theme));
     }
 
     let palette = PermissionPalette::for_theme(theme);
@@ -678,6 +712,17 @@ pub fn render_permissions_approval(
                             .font_weight(FontWeight::NORMAL)
                             .text_color(palette.description)
                             .child(reason),
+                    )
+                })
+                .when_some(model.cwd().map(ToOwned::to_owned), |content, cwd| {
+                    content.child(
+                        div()
+                            .h(px(19.5))
+                            .text_size(px(12.0))
+                            .line_height(px(19.5))
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(palette.description)
+                            .child(format!("工作目录：{cwd}")),
                     )
                 }),
         );
@@ -891,6 +936,52 @@ pub fn render_permissions_approval(
     Some(result)
 }
 
+fn render_permissions_status(
+    model: &PermissionApprovalPresentation,
+    theme: Theme,
+) -> Stateful<Div> {
+    let palette = PermissionPalette::for_theme(theme);
+    let status = match model.status {
+        PermissionApprovalStatus::Cancelled => "权限请求已取消",
+        PermissionApprovalStatus::Failed => "权限请求失败",
+        PermissionApprovalStatus::Pending => "等待审批",
+        PermissionApprovalStatus::Approved => "已允许",
+        PermissionApprovalStatus::Declined => "已拒绝",
+        PermissionApprovalStatus::Resolved => "已完成",
+    };
+    div()
+        .id(element_id("permissions-card", &model.request_id))
+        .role(Role::Alert)
+        .aria_label(status)
+        .min_h(px(104.0))
+        .w_full()
+        .px(px(16.0))
+        .py(px(16.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .rounded(px(PERMISSIONS_CARD_RADIUS))
+        .bg(palette.card)
+        .shadow(palette.card_shadows())
+        .text_color(palette.text)
+        .child(
+            div()
+                .text_size(px(14.0))
+                .line_height(px(20.0))
+                .font_weight(FontWeight::MEDIUM)
+                .child(status),
+        )
+        .when_some(model.failure_message.clone(), |card, message| {
+            card.child(
+                div()
+                    .text_size(px(12.0))
+                    .line_height(px(18.0))
+                    .text_color(palette.description)
+                    .child(message),
+            )
+        })
+}
+
 fn render_question(model: &PermissionApprovalPresentation, palette: PermissionPalette) -> Div {
     let mut line = div()
         .h(px(20.0))
@@ -1071,6 +1162,15 @@ mod tests {
             model.question_text(),
             "允许 ChatGPT 查看 Downloads 的内容吗？"
         );
+    }
+
+    #[test]
+    fn live_permission_context_keeps_cwd_visible_without_changing_capture_fixtures() {
+        let model = PermissionApprovalPresentation::network("network-cwd", None)
+            .with_cwd("/workspace/project");
+        assert_eq!(model.cwd(), Some("/workspace/project"));
+        assert_eq!(model.header_height(), PERMISSIONS_HEADER_HEIGHT + 19.5);
+        assert!(model.should_render());
     }
 
     #[test]

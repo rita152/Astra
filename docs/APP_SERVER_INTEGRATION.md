@@ -4,7 +4,7 @@
 
 客户端初始化时启用 experimental API。下表是当前协议的唯一维护来源，完整列出 250 个 JSON-RPC 方法：157 个客户端请求、11 个服务端请求、1 个客户端通知、81 个服务端通知。
 
-当前接入统计：已接入 21、后端已接入 1、部分接入 2、已知 passive 9、未接入 217。未接入的客户端方法不会发送；未接入的服务端请求按原 id 回复 `-32601` 后 fail-fast；未接入的服务端通知收到即 fail-fast。升级 Codex CLI 时直接核对并更新本表。
+当前接入统计：已接入 23、后端已接入 1、部分接入 2、已知 passive 9、未接入 215。未接入的客户端方法不会发送；未接入的服务端请求按原 id 回复 `-32601` 后 fail-fast；未接入的服务端通知收到即 fail-fast。升级 Codex CLI 时直接核对并更新本表。
 
 | 方法 | 方向与类型 | 协议范围 | 协议要点 | 运行时入口 | 领域映射 | UI／副作用 | 接入状态 | 兼容与测试 |
 |---|---|---|---|---|---|---|---|---|
@@ -170,11 +170,11 @@
 | `attestation/generate` | 服务端请求 | 默认 | attestation payload 当前不解析 | 同上 | 无 | 无 | 未接入 | `-32601` 后 fail-fast |
 | `currentTime/read` | 服务端请求 | 实验 | 时间读取 payload 当前不解析 | 同上 | 无 | 无 | 未接入 | `-32601` 后 fail-fast |
 | `execCommandApproval` | 服务端请求 | 默认 | legacy command 审批，不能与 v2 item 请求混用 | 同上 | 无 | 不进入当前命令审批卡 | 未接入 | `-32601` 后 fail-fast |
-| `item/commandExecution/requestApproval` | 服务端请求 | 默认 | 保留原始 id 类型；校验 `kind/threadId/turnId/itemId/startedAtMs/environmentId`；读取命令、原因、网络主机和 `availableDecisions` | `respond_to_server_request_on_session`、`parse_command_approval_request` | `AgentCommandApprovalRequest` + `AgentApprovalHandle` | 显示命令或网络审批卡；用户决定按同 id 精确回复一次 | 已接入 | pending registry 防重复响应；`command_approval_enters_live_ui_and_replies_exactly_once`、字符串 id 与 execpolicy decision 均有覆盖 |
-| `item/fileChange/requestApproval` | 服务端请求 | 默认 | 文件变更审批 payload 当前不解析 | 同上 | 无 | 文件审批组件仅有展示/测试能力，未接真实 RPC | 未接入 | `every_other_unsupported_p0_server_request_is_rejected` 验证 `-32601` |
-| `item/permissions/requestApproval` | 服务端请求 | 默认 | 权限请求 payload 当前不解析 | 同上 | 无 | 权限申请组件未接真实 RPC | 未接入 | 同上 |
+| `item/commandExecution/requestApproval` | 服务端请求 | 默认 | 保留原始 id 类型；校验 `kind/threadId/turnId/itemId/startedAtMs/environmentId`；读取命令、原因、网络主机和 `availableDecisions` | `respond_to_server_request_on_session`、`parse_command_approval_request`、统一 pending registry | `AgentCommandApprovalRequest` + `AgentApprovalHandle` | 显示命令或网络审批卡；用户决定按同 id 精确回复一次并等待 resolved | 已接入 | responder 防重复响应；字符串 id、execpolicy decision 与 response→resolved 顺序均有覆盖 |
+| `item/fileChange/requestApproval` | 服务端请求 | 默认 | 文件变更审批 payload 当前不解析 | 同上 | 无 | 文件审批组件仅有展示/测试能力，未接真实 RPC | 未接入 | `unsupported_file_change_server_request_is_rejected` 验证 `-32601` |
+| `item/permissions/requestApproval` | 服务端请求 | 默认 | 严格读取 `threadId/turnId/itemId/cwd/startedAtMs`、nullable `environmentId/reason` 与 `RequestPermissionProfile`；保留 read/write、entries、glob 深度、path/glob/special path 和 nullable network；允许时原样返回请求权限子集，scope 映射 `turn/session`，拒绝返回空权限，UI 未选择时不返回 `strictAutoReview` | `respond_to_server_request_on_session`、`parse_permissions_approval_request`、统一 pending registry | `AgentPermissionsApprovalRequest` + `AgentPermissionsApprovalHandle` | 现有权限卡展示 cwd、reason、文件和网络权限；Allow once/session/Decline 调用真实 responder，响应后禁用并等待 resolved | 已接入 | 文件、网络、混合权限及三种决定、越权防护、重复操作、错误参数、清理与 resolved 回归均覆盖 |
 | `item/tool/call` | 服务端请求 | 默认 | 动态工具调用 payload 当前不解析 | 同上 | 无 | 无 | 未接入 | `-32601` 后 fail-fast |
-| `item/tool/requestUserInput` | 服务端请求 | 默认 | 多问题/答案 payload 当前不解析 | 同上 | 无 | 用户问答组件未接真实 RPC | 未接入 | `every_other_unsupported_p0_server_request_is_rejected` 验证 `-32601` |
+| `item/tool/requestUserInput` | 服务端请求 | 默认 | 严格读取 `threadId/turnId/itemId/questions/isBlocking` 与 nullable `autoResolutionMs`；保留每题 `id/header/question/options/isOther/isSecret`；按 schema 返回 question id 到字符串数组的 `answers` map，0.151.0 无取消结果分支 | `respond_to_server_request_on_session`、`parse_user_input_request`、统一 pending registry | `AgentUserInputRequest` + `AgentUserInputHandle`；答案 Debug 全量脱敏 | 复用现有多问题/Other/secret UI；提交后显示 submitting、禁用重复提交并等待 resolved | 已接入 | 单选、多答案、Other、secret、多问题、原始 id、精确 JSON response、重复提交、错误参数和终止清理均覆盖 |
 | `mcpServer/elicitation/request` | 服务端请求 | 默认 | MCP elicitation payload 当前不解析 | 同上 | 无 | 无 | 未接入 | `-32601` 后 fail-fast |
 | `initialized` | 客户端通知 | 默认 | `params={}`，无 id | 同上 | 无 | 解锁业务请求 | 已接入 | `drives_one_complete_prompt_and_normalizes_stream_events` 覆盖完整顺序 |
 | `account/login/completed` | 服务端通知 | 默认 | `params: AccountLoginCompletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
@@ -220,7 +220,7 @@
 | `rawResponse/completed` | 服务端通知 | 默认 | 无 params；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `rawResponseItem/completed` | 服务端通知 | 默认 | 无 params；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `remoteControl/status/changed` | 服务端通知 | 默认 | payload 不读取 | `PASSIVE_SERVER_METHODS` | 无 | 无 | 已知 passive | 精确匹配；`every_captured_passive_method_is_explicitly_defined` |
-| `serverRequest/resolved` | 服务端通知 | 默认 | `threadId` 与保持原类型的 `requestId` | `handle_server_request_resolved` | `AgentEvent::CommandApprovalResolved` | 仅清除匹配的命令审批卡和 responder | 已接入 | 未匹配 id 不影响其他 pending；`server_request_resolved_clears_only_the_matching_pending_request` |
+| `serverRequest/resolved` | 服务端通知 | 默认 | `threadId` 与保持原类型的 `requestId`；由 registry 还原并核对 request 的 thread/turn/item/kind | `handle_server_request_resolved`、统一 pending/completed registry | `AgentEvent::ServerRequestResolved` | 最终结束并释放 command approval、user input、permissions approval 三类 responder 与等待状态 | 已接入 | 合法 response→resolved、三种请求、重复 resolved 幂等、错误 thread/turn/item、未知 request 和 turn 终止清理均覆盖 |
 | `skills/changed` | 服务端通知 | 默认 | `params: SkillsChangedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/archived` | 服务端通知 | 默认 | `params: ThreadArchivedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/closed` | 服务端通知 | 默认 | `params: ThreadClosedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
