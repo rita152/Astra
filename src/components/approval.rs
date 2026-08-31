@@ -191,6 +191,9 @@ pub struct ApprovalCardViewModel {
     pub allow_once: bool,
     /// Whether the server listed `decline` in `availableDecisions`.
     pub decline: bool,
+    /// Whether the server listed `cancel` in `availableDecisions`. ChatGPT uses
+    /// this to show Reject, while sending `decline` to keep the turn running.
+    pub cancel: bool,
     /// `None` renders a single Allow button. A value renders ChatGPT's split
     /// button and its two-row menu.
     pub scoped_approval: Option<ApprovalScope>,
@@ -212,6 +215,7 @@ impl ApprovalCardViewModel {
             status: ApprovalCardStatus::Pending,
             allow_once: true,
             decline: true,
+            cancel: false,
             scoped_approval,
             visual_state: ApprovalVisualState::Default,
             keyboard_focus: None,
@@ -226,11 +230,25 @@ impl ApprovalCardViewModel {
         &mut self,
         allow_once: bool,
         decline: bool,
+        cancel: bool,
         scoped_approval: Option<ApprovalScope>,
     ) {
         self.allow_once = allow_once;
         self.decline = decline;
+        self.cancel = cancel;
         self.scoped_approval = scoped_approval;
+    }
+
+    fn rejection_decision(&self) -> Option<ApprovalDecision> {
+        if self.decline || self.cancel {
+            Some(ApprovalDecision::Decline)
+        } else {
+            None
+        }
+    }
+
+    fn can_reject(&self) -> bool {
+        self.rejection_decision().is_some()
     }
 
     pub fn geometry(&self) -> ApprovalCardGeometry {
@@ -264,7 +282,7 @@ impl ApprovalCardViewModel {
                     }
                 } else {
                     let mut focus_order = Vec::with_capacity(3);
-                    if self.decline {
+                    if self.can_reject() {
                         focus_order.push(ApprovalKeyboardFocus::Decline);
                     }
                     if self.allow_once || self.scoped_approval.is_some() {
@@ -290,12 +308,12 @@ impl ApprovalCardViewModel {
                 Some(ApprovalCardEvent::KeyboardFocusChanged(Some(next)))
             }
             "escape" if self.visual_state.menu_open() => Some(ApprovalCardEvent::ToggleMenu),
-            "escape" if self.decline => {
-                Some(ApprovalCardEvent::Decision(ApprovalDecision::Decline))
+            "escape" if self.can_reject() => {
+                self.rejection_decision().map(ApprovalCardEvent::Decision)
             }
             "enter" | "space" => match self.keyboard_focus {
-                Some(ApprovalKeyboardFocus::Decline) if self.decline => {
-                    Some(ApprovalCardEvent::Decision(ApprovalDecision::Decline))
+                Some(ApprovalKeyboardFocus::Decline) if self.can_reject() => {
+                    self.rejection_decision().map(ApprovalCardEvent::Decision)
                 }
                 Some(ApprovalKeyboardFocus::MenuToggle) => Some(ApprovalCardEvent::ToggleMenu),
                 Some(ApprovalKeyboardFocus::MenuAllowOnce) => {
@@ -560,6 +578,9 @@ pub fn render_approval_card(
         );
 
     let decline_callback = callback.clone();
+    let rejection_decision = model
+        .rejection_decision()
+        .unwrap_or(ApprovalDecision::Decline);
     let decline = div()
         .id(approval_element_id("approval-decline", &model.request_id))
         .role(Role::Button)
@@ -586,11 +607,7 @@ pub fn render_approval_card(
         .cursor_pointer()
         .hover(move |button| button.bg(palette.decline_hover))
         .on_click(move |_, window, cx| {
-            decline_callback.emit(
-                ApprovalCardEvent::Decision(ApprovalDecision::Decline),
-                window,
-                cx,
-            );
+            decline_callback.emit(ApprovalCardEvent::Decision(rejection_decision), window, cx);
         })
         .child("拒绝")
         .child(keycap("Esc", palette.decline_text));
@@ -698,7 +715,7 @@ pub fn render_approval_card(
         .items_center()
         .gap(px(8.0))
         .child(div().flex_1())
-        .when(model.decline, |actions| actions.child(decline))
+        .when(model.can_reject(), |actions| actions.child(decline))
         .when(
             model.allow_once || model.scoped_approval.is_some(),
             |actions| actions.child(approve_group),
@@ -1001,6 +1018,30 @@ mod tests {
             Some(ApprovalCardEvent::KeyboardFocusChanged(Some(
                 ApprovalKeyboardFocus::AllowOnce
             )))
+        );
+    }
+
+    #[test]
+    fn cancel_advertisement_still_drives_chatgpt_style_decline() {
+        let mut model = command();
+        model.set_available_decisions(true, false, true, None);
+
+        assert!(model.can_reject());
+        assert_eq!(model.rejection_decision(), Some(ApprovalDecision::Decline));
+        assert_eq!(
+            model.keyboard_event("escape", false),
+            Some(ApprovalCardEvent::Decision(ApprovalDecision::Decline))
+        );
+        assert_eq!(
+            model.keyboard_event("tab", false),
+            Some(ApprovalCardEvent::KeyboardFocusChanged(Some(
+                ApprovalKeyboardFocus::Decline
+            )))
+        );
+        model.keyboard_focus = Some(ApprovalKeyboardFocus::Decline);
+        assert_eq!(
+            model.keyboard_event("enter", false),
+            Some(ApprovalCardEvent::Decision(ApprovalDecision::Decline))
         );
     }
 

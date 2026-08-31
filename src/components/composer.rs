@@ -1087,6 +1087,7 @@ impl ComposerView {
                     model.set_available_decisions(
                         request.allow_once,
                         request.decline,
+                        request.cancel,
                         request
                             .accept_with_execpolicy_amendment
                             .is_some()
@@ -4526,6 +4527,7 @@ mod tests {
                         network_host: None,
                         allow_once: false,
                         decline: true,
+                        cancel: false,
                         accept_with_execpolicy_amendment: Some(json!({
                             "acceptWithExecpolicyAmendment": {
                                 "execpolicy_amendment": ["git", "--version"]
@@ -4580,6 +4582,67 @@ mod tests {
                 |activity| matches!(activity, ConversationActivity::Approval(model) if model.request_id == ui_key)
             ));
             assert!(!composer.approval_responders.contains_key(&ui_key));
+        });
+    }
+
+    #[test]
+    fn live_command_approval_maps_cancel_to_decline_and_keeps_turn_running() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        let request_id = AgentServerRequestId::String("approval-cancel".into());
+        let control = Arc::new(RecordingApprovalControl::default());
+        let responder = AgentApprovalHandle::new(request_id.clone(), control.clone());
+
+        app.update_entity(&composer, |composer, _| {
+            composer.apply_agent_event_batch(vec![AgentEvent::CommandApprovalRequested {
+                request: AgentCommandApprovalRequest {
+                    request_id: request_id.clone(),
+                    command: "pwd".into(),
+                    reason: Some("仅显示当前目录".into()),
+                    network_host: None,
+                    allow_once: true,
+                    decline: false,
+                    cancel: true,
+                    accept_with_execpolicy_amendment: None,
+                },
+                responder,
+            }]);
+            let model = composer
+                .conversation_activity
+                .iter()
+                .find_map(|activity| match activity {
+                    ConversationActivity::Approval(model) => Some(model),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(!model.decline);
+            assert!(model.cancel);
+        });
+
+        let ui_key = request_id.ui_key();
+        app.update_entity(&composer, |composer, cx| {
+            composer.handle_approval_card_event(
+                &ui_key,
+                ApprovalCardEvent::Decision(ApprovalDecision::Decline),
+                cx,
+            );
+            assert_eq!(composer.conversation_phase, ConversationPhase::Streaming);
+        });
+        assert_eq!(
+            *control.responses.lock().unwrap(),
+            vec![(request_id.clone(), AgentCommandApprovalChoice::Decline)]
+        );
+
+        app.update_entity(&composer, |composer, _| {
+            composer.apply_agent_event_batch(vec![
+                AgentEvent::CommandApprovalResolved {
+                    request_id: request_id.clone(),
+                },
+                AgentEvent::TextDelta("命令未执行，继续当前回合".into()),
+                AgentEvent::Completed,
+            ]);
+            assert_eq!(composer.conversation_phase, ConversationPhase::Complete);
+            assert_eq!(composer.assistant_message, "命令未执行，继续当前回合");
         });
     }
 

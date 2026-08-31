@@ -770,6 +770,12 @@ fn home(
     first_suggestion: impl IntoElement,
     second_suggestion: impl IntoElement,
 ) -> Div {
+    let pending_command_approval = conversation_activity.iter().find_map(|activity| {
+        let ConversationActivity::Approval(model) = activity else {
+            return None;
+        };
+        model.should_render().then(|| model.clone())
+    });
     let pending_user_input = conversation_activity.iter().find_map(|activity| {
         let ConversationActivity::UserInput(model) = activity else {
             return None;
@@ -788,7 +794,8 @@ fn home(
         };
         model.should_render().then(|| model.clone())
     });
-    let blocking_request_pending = pending_user_input.is_some()
+    let blocking_request_pending = pending_command_approval.is_some()
+        || pending_user_input.is_some()
         || pending_file_approval.is_some()
         || pending_permissions_approval.is_some();
 
@@ -855,6 +862,21 @@ fn home(
                 command_scroll_handles,
             ))
         })
+        .when_some(pending_command_approval, |root, model| {
+            let card = command_approval_card(home_entity.clone(), model, theme);
+            root.when_some(card, |root, card| {
+                root.child(
+                    div()
+                        .id("command-approval-overlay")
+                        .debug_selector(|| "command-approval-overlay".to_owned())
+                        .absolute()
+                        .bottom(px(16.0))
+                        .w_full()
+                        .max_w(px(736.0))
+                        .child(card),
+                )
+            })
+        })
         .when_some(pending_user_input, |root, model| {
             let card = user_input_request_card(
                 home_entity.clone(),
@@ -905,6 +927,8 @@ fn home(
         })
         .child(
             div()
+                .id("composer-overlay")
+                .debug_selector(|| "composer-overlay".to_owned())
                 .absolute()
                 .bottom(px(15.0))
                 .w_full()
@@ -1198,21 +1222,7 @@ fn activity_stream(
                     theme,
                 ))
             }
-            ConversationActivity::Approval(model) => {
-                let request_id = model.request_id.clone();
-                let target = home_entity.clone();
-                let callback = ApprovalCardCallback::new(move |event, _, cx| {
-                    let request_id = request_id.clone();
-                    target.update(cx, move |home, cx| {
-                        home.handle_approval_card_event(&request_id, event, cx)
-                    });
-                });
-                if let Some(card) = render_approval_card(&model, theme, callback) {
-                    stream.child(card)
-                } else {
-                    stream
-                }
-            }
+            ConversationActivity::Approval(_) => stream,
             ConversationActivity::FileApproval(_) => stream,
             ConversationActivity::PermissionsApproval(_) => stream,
             ConversationActivity::FileChange(model) => {
@@ -1284,6 +1294,22 @@ fn activity_stream(
             _ => stream,
         },
     )
+}
+
+fn command_approval_card(
+    home_entity: Entity<HomeView>,
+    model: crate::components::approval::ApprovalCardViewModel,
+    theme: Theme,
+) -> Option<gpui::Stateful<Div>> {
+    let request_id = model.request_id.clone();
+    let target = home_entity;
+    let callback = ApprovalCardCallback::new(move |event, _, cx| {
+        let request_id = request_id.clone();
+        target.update(cx, move |home, cx| {
+            home.handle_approval_card_event(&request_id, event, cx)
+        });
+    });
+    render_approval_card(&model, theme, callback)
 }
 
 fn file_approval_card(
@@ -2161,6 +2187,37 @@ mod tests {
         window.draw();
         window.update(|home, window, _| {
             assert!(!home.approval_focus.is_focused(window));
+        });
+    }
+
+    #[test]
+    fn command_approval_replaces_the_bottom_composer_and_rejects_by_mouse() {
+        use crate::components::composer::ConversationActivity;
+
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+
+        window.update(|home, _, cx| home.set_approval_for_capture("command", "default", cx));
+        window.draw();
+
+        // The 736 px card is centered and pinned 16 px above the bottom.
+        // Its reject button occupies the actions row around y=654 here. This
+        // point was part of the Composer before the approval overlay moved.
+        window.simulate_click(point(px(643.0), px(654.0)), MouseButton::Left);
+
+        window.read(|home, cx| {
+            assert!(home.composer.read(cx).conversation_render_snapshot().5.iter().any(
+                |activity| matches!(activity, ConversationActivity::Approval(model) if !model.should_render())
+            ));
         });
     }
 

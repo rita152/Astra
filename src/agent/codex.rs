@@ -272,17 +272,23 @@ impl<W: Write + Send> CodexTurnSession<W> {
                 AgentCommandApprovalChoice::Accept => request
                     .available_decisions
                     .iter()
-                    .find(|decision| decision.as_str() == Some("accept")),
+                    .find(|decision| decision.as_str() == Some("accept"))
+                    .cloned(),
+                // ChatGPT Desktop treats the visible Reject action as
+                // `decline` even when app-server advertises only `cancel`.
+                // The two values are not synonyms: `decline` rejects the item
+                // and lets the turn continue, while `cancel` interrupts it.
                 AgentCommandApprovalChoice::Decline => request
                     .available_decisions
                     .iter()
-                    .find(|decision| decision.as_str() == Some("decline")),
+                    .any(|decision| matches!(decision.as_str(), Some("decline" | "cancel")))
+                    .then(|| Value::String("decline".to_owned())),
                 AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment => request
                     .available_decisions
                     .iter()
-                    .find(|decision| decision.get("acceptWithExecpolicyAmendment").is_some()),
+                    .find(|decision| decision.get("acceptWithExecpolicyAmendment").is_some())
+                    .cloned(),
             }
-            .cloned()
             .with_context(|| {
                 format!("command approval {request_id:?} 未提供所选 decision，拒绝越权回复")
             })?;
@@ -1854,6 +1860,9 @@ fn parse_command_approval_request(
     let decline = available_decisions
         .iter()
         .any(|decision| decision.as_str() == Some("decline"));
+    let cancel = available_decisions
+        .iter()
+        .any(|decision| decision.as_str() == Some("cancel"));
     let accept_with_execpolicy_amendment = available_decisions
         .iter()
         .find(|decision| decision.get("acceptWithExecpolicyAmendment").is_some())
@@ -1895,6 +1904,7 @@ fn parse_command_approval_request(
         network_host,
         allow_once,
         decline,
+        cancel,
         accept_with_execpolicy_amendment,
     };
     Ok((
@@ -1956,6 +1966,12 @@ mod tests {
 
     fn command_approval_request(id: Value) -> Value {
         command_approval_request_for(id, "thr_1", "turn_1")
+    }
+
+    fn current_command_approval_request(id: Value) -> Value {
+        let mut request = command_approval_request(id);
+        request["params"]["availableDecisions"][2] = json!("cancel");
+        request
     }
 
     fn command_approval_request_for(id: Value, thread_id: &str, turn_id: &str) -> Value {
@@ -3370,6 +3386,7 @@ mod tests {
         assert_eq!(request.command, "git --version");
         assert!(request.allow_once);
         assert!(request.decline);
+        assert!(!request.cancel);
         assert!(request.accept_with_execpolicy_amendment.is_some());
 
         responder
@@ -3382,6 +3399,28 @@ mod tests {
             .unwrap_err();
         assert!(duplicate.contains("拒绝重复 decision"));
         assert!(take_session_output(&session).is_empty());
+    }
+
+    #[test]
+    fn current_cancel_advertisement_uses_chatgpt_style_decline() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let message = current_command_approval_request(json!(78));
+
+        respond_to_server_request_on_session(&session, &message, &tx).unwrap();
+        let event = rx.try_recv().unwrap();
+        let AgentEvent::CommandApprovalRequested { request, responder } = event else {
+            panic!("expected command approval event");
+        };
+        assert!(request.allow_once);
+        assert!(!request.decline);
+        assert!(request.cancel);
+
+        responder
+            .respond(AgentCommandApprovalChoice::Decline)
+            .unwrap();
+        let response: Value = serde_json::from_slice(&take_session_output(&session)).unwrap();
+        assert_eq!(response, json!({"id":78,"result":{"decision":"decline"}}));
     }
 
     #[test]

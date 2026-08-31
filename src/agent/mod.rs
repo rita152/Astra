@@ -190,7 +190,12 @@ pub struct AgentCommandApprovalRequest {
     pub reason: Option<String>,
     pub network_host: Option<String>,
     pub allow_once: bool,
+    /// Whether the server listed the legacy `decline` decision.
     pub decline: bool,
+    /// Whether the server listed `cancel`. This enables the ChatGPT-compatible
+    /// Reject affordance, but that affordance still sends `decline` so the turn
+    /// can continue.
+    pub cancel: bool,
     /// The exact decision object supplied by `availableDecisions`.
     pub accept_with_execpolicy_amendment: Option<Value>,
 }
@@ -198,6 +203,7 @@ pub struct AgentCommandApprovalRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentCommandApprovalChoice {
     Accept,
+    /// Reject this command item while allowing the active turn to continue.
     Decline,
     AcceptWithExecpolicyAmendment,
 }
