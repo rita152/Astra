@@ -20,9 +20,7 @@ use crate::{
     theme::{Theme, ThemeMode, UI_FONT_FAMILY, UI_MONOSPACE_FONT_FAMILY},
 };
 
-pub const FILE_APPROVAL_CARD_HEIGHT: f32 = 177.0;
 pub const FILE_APPROVAL_HEADER_HEIGHT: f32 = 76.0;
-pub const FILE_APPROVAL_FILES_HEIGHT: f32 = 49.0;
 pub const FILE_APPROVAL_ACTIONS_HEIGHT: f32 = 52.0;
 pub const FILE_APPROVAL_BUTTON_HEIGHT: f32 = 28.0;
 pub const FILE_APPROVAL_MENU_TOP: f32 = 64.0;
@@ -42,7 +40,6 @@ pub const REVIEW_TAB_BAR_HEIGHT: f32 = 46.0;
 pub const REVIEW_TOOLBAR_HEIGHT: f32 = 40.0;
 pub const REVIEW_FILE_HEADER_HEIGHT: f32 = 32.0;
 pub const REVIEW_FILE_COLLAPSED_HEIGHT: f32 = 34.0;
-pub const REVIEW_FILE_EXPANDED_HEIGHT: f32 = 72.59375;
 pub const REVIEW_DIFF_TOP_PADDING: f32 = 2.0;
 pub const REVIEW_DIFF_LINE_HEIGHT: f32 = 21.59375;
 /// The real `diffs-container` reserves a 15px horizontal scrollbar and the
@@ -117,6 +114,7 @@ impl FileApprovalVisualState {
         matches!(self, Self::SplitMenu { .. })
     }
 
+    #[cfg(test)]
     pub fn focused_menu_item(self) -> Option<FileApprovalMenuItem> {
         match self {
             Self::SplitMenu { focused } => focused,
@@ -215,6 +213,7 @@ impl FileApprovalPresentation {
             .min(FILE_APPROVAL_FILES_MAX_HEIGHT)
     }
 
+    #[cfg(test)]
     pub fn file_list_scroll_handle(&self) -> ScrollHandle {
         self.file_list_scroll.clone()
     }
@@ -411,7 +410,6 @@ struct FilePalette {
     elevated: gpui::Rgba,
     card: gpui::Rgba,
     text: gpui::Rgba,
-    secondary: gpui::Rgba,
     tertiary: gpui::Rgba,
     approval_secondary: gpui::Rgba,
     approval_icon: gpui::Rgba,
@@ -427,7 +425,6 @@ struct FilePalette {
     menu: gpui::Rgba,
     added: gpui::Rgba,
     deleted: gpui::Rgba,
-    added_background: gpui::Rgba,
 }
 
 impl FilePalette {
@@ -442,7 +439,6 @@ impl FilePalette {
                 // the captured card up to #2d2d2d.
                 card: rgba(0x2c2c2cff),
                 text: rgba(0xdfdfdfff),
-                secondary: rgba(0xdfdfdfa6),
                 tertiary: rgba(0xffffff7f),
                 approval_secondary: rgba(0xdfdfdf80),
                 approval_icon: rgba(0xdfdfdfa6),
@@ -464,7 +460,6 @@ impl FilePalette {
                 // render the counters over-saturated.
                 added: rgba(0x6bc67fff),
                 deleted: rgba(0xe75248ff),
-                added_background: rgba(0x00a24026),
             }
         } else {
             Self {
@@ -473,7 +468,6 @@ impl FilePalette {
                 elevated: rgba(0xffffffff),
                 card: rgba(0xffffffff),
                 text: rgba(0x1a1c1fff),
-                secondary: rgba(0x1a1c1fa6),
                 tertiary: rgba(0x1a1c1f7e),
                 approval_secondary: rgba(0x1a1c1f74),
                 approval_icon: rgba(0x1a1c1fa6),
@@ -489,7 +483,6 @@ impl FilePalette {
                 menu: rgba(0xffffffff),
                 added: rgba(0x48a04dff),
                 deleted: rgba(0xab352cff),
-                added_background: rgba(0x00a24026),
             }
         }
     }
@@ -1442,12 +1435,9 @@ impl DiffReviewPresentation {
         self.files.iter().map(|file| file.deletions).sum()
     }
 
+    #[cfg(test)]
     pub fn review_scroll_handle(&self) -> ScrollHandle {
         self.review_scroll.clone()
-    }
-
-    pub fn scroll_review_to_bottom(&self) {
-        self.review_scroll.scroll_to_bottom();
     }
 
     pub fn set_review_scroll_top(&self, scroll_top: f32) {
@@ -2299,11 +2289,9 @@ mod tests {
 
     #[test]
     fn file_approval_geometry_matches_cdp() {
-        assert_eq!(
-            FILE_APPROVAL_HEADER_HEIGHT + FILE_APPROVAL_FILES_HEIGHT + FILE_APPROVAL_ACTIONS_HEIGHT,
-            FILE_APPROVAL_CARD_HEIGHT
-        );
-        assert_eq!(FILE_APPROVAL_CARD_HEIGHT, 177.0);
+        let model = approval();
+        assert_eq!(model.files_height(), 49.0);
+        assert_eq!(model.card_height(), 177.0);
         assert_eq!(FILE_APPROVAL_MENU_TOP, 64.0);
         assert_eq!(FILE_APPROVAL_MENU_WIDTH, 168.0);
         assert_eq!(FILE_APPROVAL_MENU_HEIGHT, 67.125);
@@ -2641,7 +2629,6 @@ mod tests {
         assert_eq!(dark.outline, rgba(0xffffff15));
         assert_eq!(light.menu, rgba(0xffffffff));
         assert_eq!(dark.menu, rgba(0x2d2d2dff));
-        assert_eq!(light.added_background, rgba(0x00a24026));
         assert_eq!(dark.surface, rgba(0x181818ff));
         assert_eq!(dark.mode, ThemeMode::Dark);
     }

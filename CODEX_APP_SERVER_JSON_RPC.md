@@ -47,6 +47,8 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 | 6（可选） | `turn/interrupt` | 在同一连接上携带当前 `threadId`、`turnId` 请求取消活动 turn |
 | 7 | `turn/completed` | 一次 turn 的最终状态通知；取消成功最终为 `status: "interrupted"` |
 
+当前 prompt 连接严格分成两条序列：新对话为 `initialize → initialized → thread/start → turn/start`；`AgentRequest.thread_id` 已存在的后续对话为 `initialize → initialized → thread/resume → turn/start`。每个 prompt 都使用新的 stdio app-server 连接，因此后续对话不能只把旧 `threadId` 直接交给 `turn/start`，必须先在该连接上恢复 thread。
+
 ## 已接入范围
 
 当前实现通过统一的 `AgentBackend` 接口隔离具体 coding agent：`load_model_catalog()` 返回 agent-neutral 的 `AgentModelCatalog`，`run_prompt(AgentRequest)` 返回包含 `AgentEvent` 流和 `AgentInterruptHandle` 的 `AgentRun`。Codex 适配器位于 `src/agent/codex.rs`；`model/list` 的分页、camelCase 字段、请求 id、通知 payload 和 JSON-RPC 错误都封装在该模块。UI 只依赖 agent-neutral 类型，不直接依赖 Codex JSON-RPC。流式事件仍由 `ComposerView::apply_agent_event_batch` 批量消费。
@@ -56,13 +58,15 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 | `initialize`、`initialized` | 客户端 → 服务端 | `initialize_connection` 连接生命周期（无 `AgentEvent`） | 为模型目录连接和 prompt 连接建立初始化握手；按本机 0.150.1 schema 显式声明 `capabilities.experimentalApi: true`、`requestAttestation: false` |
 | `model/list` | 客户端 → 服务端 | `CodexAppServerBackend::load_model_catalog` → `AgentModelCatalog` | 使用 `cursor`/`nextCursor` 拉取全部可见页；映射 model、`displayName`、默认模型、effort 与 service tier |
 | `thread/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session` → `AgentEvent::ThreadCreated` | 首回合创建可复用 thread，传入所选 `model`、`serviceTier`；不再发送固定权限字段 |
-| `turn/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 提交文本 prompt；新 thread 首回合同时携带 Composer 模式对应的完整权限字段，后续回合复用已生效的 thread 设置 |
+| `thread/resume` | 客户端 → 服务端 | `AgentRequest.thread_id` → `drive_session`（无 `AgentEvent::ThreadCreated`） | 后续回合只发送 schema 必需的 `threadId`，等待响应并严格校验 `result.thread.id` 与请求值一致；不会用 resume 响应替换 Composer 保存的 thread id |
+| `turn/start` | 客户端 → 服务端 | `AgentRequest` → `drive_session`（无 `AgentEvent`） | 新 thread 在 `thread/start` 成功后提交，已有 thread 在 `thread/resume` 成功后提交；继续携带所选 model、effort、service tier，新 thread 首回合才携带 Composer 模式对应的完整权限字段。start/resume 到该响应之间出现的已接入 turn-scoped 通知、item 和审批消息会按 wire 顺序暂存，待响应给出当前 turn id 后整批校验并重放 |
 | `turn/interrupt` | 客户端 → 服务端 | `AgentInterruptHandle::interrupt` → `CodexTurnSession` | 在原 stdio 连接上使用已保存的 `threadId`、`turnId` 发送一次中断；开始阶段的停止请求会排队，重复请求及已结束 turn 不会重复写入 |
-| `item/commandExecution/requestApproval` | 服务端 → 客户端反向请求 | `AgentEvent::CommandApprovalRequested` + `AgentApprovalHandle` | 保存原始 string/int64 request id、完整 params 与每请求的 `availableDecisions`；Composer 复用 `ApprovalCardViewModel`/`render_approval_card`。允许一次回 `accept`，拒绝回 `decline`，“允许类似命令”原样回传服务端的 `acceptWithExecpolicyAmendment`；未提供的选项不显示也不能回传 |
-| `serverRequest/resolved` | 服务端 → 客户端 | `AgentEvent::CommandApprovalResolved` | 按保留原始类型的 request id 清理 pending registry、responder 和对应审批卡片；数字 `7` 与字符串 `"7"` 独立管理 |
+| `item/commandExecution/requestApproval` | 服务端 → 客户端反向请求 | `AgentEvent::CommandApprovalRequested` + `AgentApprovalHandle` | 保存原始 string/int64 request id、完整 params 与每请求的 `availableDecisions`；Composer 复用 `ApprovalCardViewModel`/`render_approval_card`。允许一次回 `accept`，拒绝回 `decline`，“允许类似命令”原样回传服务端的 `acceptWithExecpolicyAmendment`；未提供的选项不显示也不能回传。若早于 `turn/start` 响应则先暂存，校验 thread/turn 后才注册和显示 |
+| `serverRequest/resolved` | 服务端 → 客户端 | `AgentEvent::CommandApprovalResolved` | 按保留原始类型的 request id 清理 pending registry、responder 和对应审批卡片；数字 `7` 与字符串 `"7"` 独立管理。与暂存审批保持 wire 顺序，registry 未命中的通用 resolved 不伪造 command approval 事件 |
 | `turn/started` | 服务端 → 客户端 | `AgentEvent::Started` | 将 `Starting` 推进到可见的 `Thinking` 运行态；保留停止按钮与活动状态，不结束事件流 |
 | `error` | 服务端 → 客户端 | `AgentEvent::Error { message, details, will_retry }` | `willRetry: true` 显示低强调重试活动行，`false` 显示错误 Notice；两者都保持非终止，等待 `turn/completed` 决定最终状态 |
 | `thread/settings/updated` | 服务端 → 客户端 | `AgentEvent::ThreadSettingsUpdated` | 静默同步模型、effort、service tier 与 effective 权限；当前状态由 Composer 控件直接呈现，不额外显示状态行 |
+| `thread/started`、`thread/goal/updated`、`thread/goal/cleared` | 服务端 → 客户端 | `PASSIVE_SERVER_METHODS`（无 `AgentEvent`） | 显式接收 start/resume 恢复阶段的线程与 goal 状态通知；不改变 Composer 的现有可见事件流 |
 | `warning` | 服务端 → 客户端 | `AgentEvent::Warning` | 显示带警告图标和可访问 alert 语义的 Notice；保持非终止 |
 | `configWarning` | 服务端 → 客户端 | `AgentEvent::ConfigWarning` | 显示 summary、details、文件与行列位置；存在 path 时提供“打开文件”按钮；保持非终止 |
 | `item/started` | 服务端 → 客户端 | `AgentEvent::AssistantMessageStarted { item_id }` / `AgentEvent::CommandStarted(CommandExecution)` | 建立 assistant message 或 command activity |
@@ -74,7 +78,7 @@ Codex App Server 使用双向 JSON-RPC 2.0 语义，但线上消息省略标准�
 | `model/safetyBuffering/updated` | 服务端 → 客户端 | `AgentEvent::ModelSafetyBufferingUpdated` | 更新实际模型和暂态安全检查提示，结束 buffering 时清除提示 |
 | `turn/completed` | 服务端 → 客户端 | `AgentEvent::Completed` / `AgentEvent::Interrupted` / `AgentEvent::Failed(String)` | 校验匹配的 `threadId`、`turnId`，按 `completed`、`interrupted`、`failed` 终态结束本轮；失败会合并 `error.message` 与 `additionalDetails`，终态后回收 stdin 与 app-server 子进程 |
 
-Prompt 会话的 stdin 由可并发写入的 `CodexTurnSession` 持续持有，当前 `threadId` 与 `turnId` 会保留到终态。同一个 session 还维护线程安全的多请求 command approval registry；decision 在写 stdin 前会再次校验该请求的 `availableDecisions` 并原子标记已回复，因此重复点击、resolved 后点击和跨请求 decision 都不会产生第二次写入。点击停止后 Composer 只进入 `Stopping`，不会截断事件流或伪造本地完成；只有收到匹配 turn 的 `turn/completed` 且状态为 `interrupted` 后才转为 `Stopped`。若任务先自然完成，则保留 `Complete`；若中断写入或连接失败，则进入 `Failed`。控制句柄丢弃、协议异常和正常终态都走幂等的关闭、kill、wait 路径，避免重复停止与退出竞态留下子进程。
+Prompt 会话的 stdin 由可并发写入的 `CodexTurnSession` 持续持有，当前 `threadId` 与 `turnId` 会保留到终态。同一个 session 还维护线程安全的多请求 command approval registry；decision 在写 stdin 前会再次校验该请求的 `availableDecisions` 并原子标记已回复，因此重复点击、resolved 后点击和跨请求 decision 都不会产生第二次写入。点击停止后 Composer 只进入 `Stopping`，不会截断事件流或伪造本地完成；只有收到匹配 turn 的 `turn/completed` 且状态为 `interrupted` 后才转为 `Stopped`。若任务先自然完成，则保留 `Complete`；若中断写入或连接失败，则进入 `Failed`。`thread/resume` 的 JSON-RPC error、缺少 `result.thread.id` 或返回不一致 id 都会 fail closed：不发送 `turn/start`，更不会静默回退到 `thread/start`；原 Composer thread id 保持不变，stdin 和 app-server 子进程仍按协议失败路径关闭、kill 并 wait。若恢复 active goal 时 app-server 在 `turn/start` 响应前自动发出旧 turn 消息，适配器不会提前污染当前事件流或审批 registry：整批暂存的 started/error/model、item、completion、command approval 与 resolved 只有在相关 `threadId`、`turnId` 与新响应一致时才按原顺序重放；响应失败或任一 id 不一致时直接失败并丢弃整批事件。活动阶段的同类消息也逐条校验当前 thread/turn。控制句柄丢弃、协议异常和正常终态都走同一幂等回收路径，避免重复停止与退出竞态留下子进程。
 
 真实 CLI smoke test 使用当前默认模型申请执行只读网络命令 `curl -I https://example.com`：app-server 发出数字 request id `0`，该次 `availableDecisions` 仅包含 `accept` 与 `acceptWithExecpolicyAmendment`（没有 `decline`）；客户端因此只暴露允许项，选择“允许一次”后精确回传 `{"decision":"accept"}`，随后收到同 id 的 `serverRequest/resolved` 并正常完成 turn。测试没有持久化 execpolicy amendment，也没有修改本地文件。
 
@@ -155,8 +159,8 @@ Assist 的三个值必须分层保存：菜单选择 request 发送 `guardian_su
 |---:|---|---|---|---|---|:---:|
 | 1 | `initialize` | 请求（有 `id`） | `InitializeParams` | 默认 | `initialize_connection`（`load_model_catalog` 与 `run_prompt` 共用） | 是 |
 | 2 | `server/diagnostics` | 请求（有 `id`） | `ServerDiagnosticsParams` | 实验性 | — | 否 |
-| 3 | `thread/start` | 请求（有 `id`） | `ThreadStartParams` | 默认 | `AgentRequest` → `drive_session`（首回合创建可复用 thread，仅发送 `cwd`、`model`、`serviceTier` 等 thread 字段） | 是 |
-| 4 | `thread/resume` | 请求（有 `id`） | `ThreadResumeParams` | 默认 | — | 否 |
+| 3 | `thread/start` | 请求（有 `id`） | `ThreadStartParams` | 默认 | `AgentRequest.thread_id = None` → `drive_session`（首回合创建可复用 thread，仅发送 `cwd`、`model`、`serviceTier` 等 thread 字段） | 是 |
+| 4 | `thread/resume` | 请求（有 `id`） | `ThreadResumeParams` | 默认 | `AgentRequest.thread_id = Some` → `drive_session`（后续回合恢复并校验同一 thread，失败不回退） | 是 |
 | 5 | `thread/fork` | 请求（有 `id`） | `ThreadForkParams` | 默认 | — | 否 |
 | 6 | `thread/archive` | 请求（有 `id`） | `ThreadArchiveParams` | 默认 | — | 否 |
 | 7 | `thread/delete` | 请求（有 `id`） | `ThreadDeleteParams` | 默认 | — | 否 |
@@ -237,7 +241,7 @@ Assist 的三个值必须分层保存：菜单选择 request 发送 `guardian_su
 | 82 | `skills/config/write` | 请求（有 `id`） | `SkillsConfigWriteParams` | 默认 | — | 否 |
 | 83 | `plugin/install` | 请求（有 `id`） | `PluginInstallParams` | 默认 | — | 否 |
 | 84 | `plugin/uninstall` | 请求（有 `id`） | `PluginUninstallParams` | 默认 | — | 否 |
-| 85 | `turn/start` | 请求（有 `id`） | `TurnStartParams` | 默认 | `AgentRequest` → `drive_session`（`model`、`effort`、`serviceTier`） | 是 |
+| 85 | `turn/start` | 请求（有 `id`） | `TurnStartParams` | 默认 | `AgentRequest` → `drive_session`（新 thread start 成功或已有 thread resume 成功后发送 `model`、`effort`、`serviceTier`） | 是 |
 | 86 | `turn/steer` | 请求（有 `id`） | `TurnSteerParams` | 默认 | — | 否 |
 | 87 | `turn/interrupt` | 请求（有 `id`） | `TurnInterruptParams` | 默认 | `AgentInterruptHandle` → `CodexTurnSession::request_interrupt_inner`（`threadId`、`turnId`） | 是 |
 | 88 | `thread/realtime/start` | 请求（有 `id`） | `ThreadRealtimeStartParams` | 实验性 | — | 否 |
@@ -346,8 +350,8 @@ Assist 的三个值必须分层保存：菜单选择 request 发送 `guardian_su
 | 8 | `thread/reverted` | 通知（无 `id`） | `ThreadRevertedNotification` | 默认 | — | 否 |
 | 9 | `skills/changed` | 通知（无 `id`） | `SkillsChangedNotification` | 默认 | — | 否 |
 | 10 | `thread/name/updated` | 通知（无 `id`） | `ThreadNameUpdatedNotification` | 默认 | — | 否 |
-| 11 | `thread/goal/updated` | 通知（无 `id`） | `ThreadGoalUpdatedNotification` | 默认 | — | 否 |
-| 12 | `thread/goal/cleared` | 通知（无 `id`） | `ThreadGoalClearedNotification` | 默认 | — | 否 |
+| 11 | `thread/goal/updated` | 通知（无 `id`） | `ThreadGoalUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（resume 恢复通知，不生成 `AgentEvent`） | 已知（no-op） |
+| 12 | `thread/goal/cleared` | 通知（无 `id`） | `ThreadGoalClearedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（resume 恢复通知，不生成 `AgentEvent`） | 已知（no-op） |
 | 13 | `thread/queue/changed` | 通知（无 `id`） | `ThreadQueueChangedNotification` | 默认 | — | 否 |
 | 14 | `project/changed` | 通知（无 `id`） | `ProjectChangedNotification` | 默认 | — | 否 |
 | 15 | `thread/project/updated` | 通知（无 `id`） | `ThreadProjectUpdatedNotification` | 默认 | — | 否 |
@@ -355,7 +359,7 @@ Assist 的三个值必须分层保存：菜单选择 request 发送 `guardian_su
 | 17 | `thread/environment/disconnected` | 通知（无 `id`） | `EnvironmentConnectionNotification` | 默认 | — | 否 |
 | 18 | `thread/settings/updated` | 通知（无 `id`） | `ThreadSettingsUpdatedNotification` | 默认 | `parse_agent_notification` → `AgentEvent::ThreadSettingsUpdated` → 静默同步有效模型与权限设置（非终止） | 是 |
 | 19 | `thread/tokenUsage/updated` | 通知（无 `id`） | `ThreadTokenUsageUpdatedNotification` | 默认 | `PASSIVE_SERVER_METHODS` → no-op（不生成 `AgentEvent`） | 已知（no-op） |
-| 20 | `turn/started` | 通知（无 `id`） | `TurnStartedNotification` | 默认 | `parse_agent_notification` → `AgentEvent::Started` → `ConversationPhase::Thinking`（非终止） | 是 |
+| 20 | `turn/started` | 通知（无 `id`） | `TurnStartedNotification` | 默认 | `parse_agent_notification`；若先于 `turn/start` 响应则暂存并校验响应中的 thread/turn id，再生成 `AgentEvent::Started` → `ConversationPhase::Thinking`（非终止） | 是 |
 | 21 | `hook/started` | 通知（无 `id`） | `HookStartedNotification` | 默认 | — | 否 |
 | 22 | `turn/completed` | 通知（无 `id`） | `TurnCompletedNotification` | 默认 | `drive_session` 校验 thread/turn → `AgentEvent::Completed` / `Interrupted` / `Failed(String)` → 终止状态 | 是 |
 | 23 | `hook/completed` | 通知（无 `id`） | `HookCompletedNotification` | 默认 | — | 否 |
@@ -423,12 +427,13 @@ Assist 的三个值必须分层保存：菜单选择 request 发送 `guardian_su
 - 本机版本：`codex-cli 0.150.1`。
 - 重新执行 `codex app-server generate-ts --experimental` 和默认 TypeScript schema 生成；实验输出为 156 个 ClientRequest、11 个 ServerRequest、1 个 ClientNotification、81 个 ServerNotification（合计 249），默认输出合计 190。
 - 同时重新执行 `codex app-server generate-json-schema --experimental` 和默认 JSON Schema 生成；实验输出仍为 153 个 ClientRequest、11 个 ServerRequest、1 个 ClientNotification、79 个 ServerNotification（合计 244），默认输出合计 185。
+- 本机 `ThreadResumeParams` 只有 `threadId` 为必填字段，`ThreadResumeResponse` 必含 `thread`。对 5 个未加载且无 goal 的持久 thread 做真实 resume 探针，均返回请求中的同一 id，并在响应后异步发出 `thread/tokenUsage/updated`、`thread/goal/cleared` 等通知；缺失 rollout 与已有 active writer 都返回 `-32600`，没有创建替代 thread。
 - 与上一版清单相比，TypeScript 方法联合新增 `getConversationSummary`、`gitDiffToRemote`、`getAuthStatus` 3 个 ClientRequest，以及 `rawResponseItem/completed`、`rawResponse/completed` 2 个 ServerNotification；这 5 个方法均未进入 JSON Schema 的顶层方法联合，`RawResponseCompletedNotification` 的生成注释明确标注为内部用途。
 - 对真实 app-server 以 `limit: 2` 调用 `model/list`：通过 4 页及连续 `nextCursor` 拉取到 7 个可见模型；响应包含 `displayName`、`isDefault`、`supportedReasoningEfforts`、`defaultReasoningEffort`、`serviceTiers`、`defaultServiceTier`，与本机生成 schema 一致。
 - `python3 scripts/verify_p0_ui_matrix.py --self-test`：通过；正式矩阵仍复算出 128 项，其中 14 个 ready 单项通过、114 个诊断 blocked。正式比较器按其严格规则返回 exit code 1，但用户已明确该阈值仅作尽量对齐的参考，不再据此隐藏 UI。
 - `cargo fmt --check`：通过。
-- `cargo test`：主 crate 194 个、隔离 permissions crate 14 个测试全部通过；新增覆盖纯 GPUI 审批/文件/Diff/问答模型、原生 Other 输入、多文件滚动、完整 Diff、多题状态、权限模式生产可见与鼠标/键盘交互、初始化 capabilities，以及尚未接入协议的反向请求不得静默成功。
-- `cargo test --features screenshot`：同一组 194 + 14 测试全部通过，截图构建路径可编译并保持生产权限映射关闭。
+- `cargo test`：主 crate 214 个测试中 213 个通过、1 个需真实模型请求的 smoke test 按既有标记 ignored；隔离 permissions crate 14 个全部通过。新增 resume 覆盖新旧 thread 的精确请求顺序、响应校验、RPC error 不回退、异步 goal 恢复通知、active-goal 旧 turn/审批整批隔离、item 相关性校验、响应前完成的超快 turn，以及失败后的 stdin/子进程回收。
+- `cargo test --features screenshot`：同一组主 crate 213 个通过、1 个既有 smoke test ignored，隔离 permissions crate 14 个通过；截图构建路径可编译并保持生产权限映射关闭。
 - `cargo check --all-targets`：通过。
 - `git diff --check`：通过。
 

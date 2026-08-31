@@ -35,6 +35,7 @@ pub const USER_INPUT_OTHER_ROW_HEIGHT: f32 = 40.0;
 pub const USER_INPUT_CONTENT_BOTTOM_PADDING: f32 = 8.0;
 pub const USER_INPUT_CONTROL_SIZE: f32 = 24.0;
 pub const USER_INPUT_SKIP_HEIGHT: f32 = 28.0;
+#[cfg(test)]
 pub const USER_INPUT_CAPTURED_TWO_OPTION_HEIGHT: f32 = 213.6875;
 
 fn element_id(prefix: &str, request_id: &str, suffix: impl std::fmt::Display) -> SharedString {
@@ -244,6 +245,7 @@ impl UserInputRequestPresentation {
         self.status == UserInputRequestStatus::Pending && self.current_question().is_some()
     }
 
+    #[cfg(test)]
     pub fn geometry(&self) -> Option<UserInputCardGeometry> {
         self.current_question()
             .map(UserInputCardGeometry::for_question)
@@ -355,6 +357,7 @@ impl UserInputRequestPresentation {
         true
     }
 
+    #[cfg(test)]
     pub fn response_answers(&self) -> Vec<(String, Vec<String>)> {
         self.questions
             .iter()

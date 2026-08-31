@@ -129,13 +129,6 @@ impl PermissionApprovalVisualState {
     pub fn menu_open(self) -> bool {
         matches!(self, Self::Menu { .. })
     }
-
-    pub fn focused_menu_item(self) -> Option<PermissionApprovalMenuItem> {
-        match self {
-            Self::Menu { focused } => focused,
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

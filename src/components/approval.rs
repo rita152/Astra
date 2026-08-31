@@ -122,7 +122,6 @@ fn approval_element_id(prefix: &str, request_id: &str) -> SharedString {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApprovalScope {
-    Conversation,
     SimilarCommands,
     InternetAccess,
 }
@@ -130,7 +129,6 @@ pub enum ApprovalScope {
 impl ApprovalScope {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Conversation => "在此对话中允许",
             Self::SimilarCommands => "允许类似命令",
             Self::InternetAccess => "互联网访问",
         }
@@ -175,7 +173,8 @@ impl ApprovalVisualState {
         matches!(self, Self::SplitMenu { .. })
     }
 
-    pub fn focused_menu_item(self) -> Option<ApprovalMenuItem> {
+    #[cfg(test)]
+    fn focused_menu_item(self) -> Option<ApprovalMenuItem> {
         match self {
             Self::SplitMenu { focused } => focused,
             _ => None,

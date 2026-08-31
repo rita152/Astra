@@ -106,6 +106,7 @@ impl PromptInput {
         &self.content
     }
 
+    #[cfg(test)]
     pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.set_text_inner(text.into(), true, cx);
     }
@@ -144,6 +145,7 @@ impl PromptInput {
         cx.notify();
     }
 
+    #[cfg(test)]
     pub fn is_secret(&self) -> bool {
         self.secret
     }
