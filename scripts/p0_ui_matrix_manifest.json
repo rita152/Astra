@@ -5,7 +5,6 @@
   "source_audits": [
     "artifacts/chatgpt-p0-ui-cdp-audit-2026-08-30/AUDIT.md",
     "artifacts/chatgpt-permissions-request-cdp-audit-2026-08-30/AUDIT.md",
-    "CODEX_APP_SERVER_JSON_RPC.md",
     "artifacts/chatgpt-multifile-diff-cdp-audit-2026-08-30/AUDIT.md",
     "artifacts/chatgpt-user-input-multi-cdp-audit-2026-08-30/AUDIT.md"
   ],

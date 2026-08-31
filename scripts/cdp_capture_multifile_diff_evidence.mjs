@@ -3,7 +3,6 @@
 import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
@@ -345,27 +344,6 @@ function generateOfflineEvidence() {
     const preloadFile = readAsarFile(asar, preloadPath);
     const preloadSource = preloadFile.buffer.toString("utf8");
 
-    const schemaDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-app-schema-"));
-    execFileSync(
-      CODEX_BIN,
-      ["app-server", "generate-json-schema", "--experimental", "--out", schemaDir],
-      { stdio: "pipe" },
-    );
-    const schemaFiles = [
-      "FileChangeRequestApprovalParams.json",
-      "FileChangeRequestApprovalResponse.json",
-      "v2/FileChangePatchUpdatedNotification.json",
-      "v2/TurnDiffUpdatedNotification.json",
-      "v2/ItemStartedNotification.json",
-      "v2/ItemCompletedNotification.json",
-    ];
-    const schemas = Object.fromEntries(
-      schemaFiles.map((relativePath) => [
-        relativePath,
-        JSON.parse(fs.readFileSync(path.join(schemaDir, relativePath), "utf8")),
-      ]),
-    );
-
     const rendererEvidence = [
       evidenceSnippet(appInitialSource, "onRequest(e){let{id:t,method:n,params:r}=e", 300, 5600),
       evidenceSnippet(
@@ -431,9 +409,6 @@ function generateOfflineEvidence() {
         ].filter(Boolean),
       },
       protocol: {
-        generatedWithExperimentalFlag: true,
-        schemaFiles,
-        schemas,
         inference: [
           "FileChangeRequestApprovalParams identifies the item but does not repeat its changes.",
           "Per-file paths and per-file diffs arrive on item/started or item/fileChange/patchUpdated.",
@@ -448,9 +423,8 @@ function generateOfflineEvidence() {
         ],
       },
     };
-    const output = path.join(artifactDir, "00-offline-bundle-schema-evidence.json");
+    const output = path.join(artifactDir, "00-offline-bundle-evidence.json");
     fs.writeFileSync(output, `${JSON.stringify(evidence, null, 2)}\n`);
-    fs.rmSync(schemaDir, { recursive: true, force: true });
     process.stdout.write(
       `${JSON.stringify(
         {
