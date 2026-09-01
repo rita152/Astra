@@ -41,6 +41,53 @@ const MODEL_LIST_FIRST_ID: u64 = 2;
 const MODEL_LIST_PAGE_SIZE: u32 = 50;
 const UNDEFINED_METHOD_PARAMS_LIMIT: usize = 2_000;
 
+#[derive(Default)]
+struct ThreadStartedCorrelation {
+    expected_thread_id: Option<String>,
+    observed_thread_id: Option<String>,
+}
+
+impl ThreadStartedCorrelation {
+    fn expect(&mut self, thread_id: &str) -> Result<()> {
+        if let Some(expected_thread_id) = &self.expected_thread_id
+            && expected_thread_id != thread_id
+        {
+            bail!(
+                "当前会话 thread id `{expected_thread_id}` 与新的 canonical thread id `{thread_id}` 不一致"
+            );
+        }
+        if let Some(observed_thread_id) = &self.observed_thread_id
+            && observed_thread_id != thread_id
+        {
+            bail!(
+                "thread/started 通知的 thread id `{observed_thread_id}` 与 canonical thread id `{thread_id}` 不一致"
+            );
+        }
+        self.expected_thread_id = Some(thread_id.to_owned());
+        Ok(())
+    }
+
+    fn observe(&mut self, message: &Value) -> Result<()> {
+        let thread_id = thread_started_id(message)?;
+        if let Some(observed_thread_id) = &self.observed_thread_id
+            && observed_thread_id != &thread_id
+        {
+            bail!(
+                "连续 thread/started 通知的 thread id 不一致：先收到 `{observed_thread_id}`，随后收到 `{thread_id}`"
+            );
+        }
+        if let Some(expected_thread_id) = &self.expected_thread_id
+            && expected_thread_id != &thread_id
+        {
+            bail!(
+                "thread/started 通知的 thread id `{thread_id}` 与当前会话的 canonical thread id `{expected_thread_id}` 不一致"
+            );
+        }
+        self.observed_thread_id = Some(thread_id);
+        Ok(())
+    }
+}
+
 const TURN_SCOPED_SERVER_METHODS: &[&str] = &[
     "item/commandExecution/requestApproval",
     "item/permissions/requestApproval",
@@ -1209,7 +1256,7 @@ fn initialize_turn_connection<R: BufRead, W: Write + Send + 'static>(
             }
         }
     }))?;
-    wait_for_session_response(reader, session, INITIALIZE_ID, events, None)?;
+    wait_for_session_response(reader, session, INITIALIZE_ID, events, None, None)?;
     session.send(json!({ "method": "initialized", "params": {} }))
 }
 
@@ -1501,8 +1548,12 @@ fn drive_session<R: BufRead, W: Write + Send + 'static>(
     initialize_turn_connection(reader, session, events)?;
     let is_new_thread = request.thread_id.is_none();
     let mut deferred_turn_notifications = Vec::new();
+    let mut thread_started_correlation = ThreadStartedCorrelation::default();
     let thread_id = match &request.thread_id {
         Some(expected_thread_id) => {
+            thread_started_correlation
+                .expect(expected_thread_id)
+                .context("无法建立 thread/resume 生命周期关联")?;
             session.send(json!({
                 "method": "thread/resume",
                 "id": THREAD_REQUEST_ID,
@@ -1513,6 +1564,7 @@ fn drive_session<R: BufRead, W: Write + Send + 'static>(
                 session,
                 THREAD_REQUEST_ID,
                 events,
+                Some(&mut thread_started_correlation),
                 Some(&mut deferred_turn_notifications),
             )
             .with_context(|| format!("thread/resume `{expected_thread_id}` 失败"))?;
@@ -1525,6 +1577,9 @@ fn drive_session<R: BufRead, W: Write + Send + 'static>(
                     "thread/resume 响应的 thread id `{resumed_thread_id}` 与请求的 `{expected_thread_id}` 不一致"
                 );
             }
+            thread_started_correlation
+                .expect(resumed_thread_id)
+                .context("thread/resume 通知与响应不一致")?;
             resumed_thread_id.to_owned()
         }
         None => {
@@ -1544,6 +1599,7 @@ fn drive_session<R: BufRead, W: Write + Send + 'static>(
                 session,
                 THREAD_REQUEST_ID,
                 events,
+                Some(&mut thread_started_correlation),
                 Some(&mut deferred_turn_notifications),
             )
             .context("thread/start 失败")?;
@@ -1552,6 +1608,9 @@ fn drive_session<R: BufRead, W: Write + Send + 'static>(
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .context("thread/start 响应缺少字符串 result.thread.id")?;
+            thread_started_correlation
+                .expect(&thread_id)
+                .context("thread/start 通知与响应不一致")?;
             events
                 .send_blocking(AgentEvent::ThreadCreated {
                     thread_id: thread_id.clone(),
@@ -1585,6 +1644,7 @@ fn drive_session<R: BufRead, W: Write + Send + 'static>(
         session,
         TURN_START_ID,
         events,
+        Some(&mut thread_started_correlation),
         Some(&mut deferred_turn_notifications),
     )
     .context("turn/start 失败")?;
@@ -1775,6 +1835,7 @@ fn process_turn_message<W: Write + Send + 'static>(
             | "item/tool/requestUserInput"
             | "serverRequest/resolved"
             | "remoteControl/status/changed"
+            | "thread/started"
             | "turn/started"
             | "error"
             | "thread/settings/updated"
@@ -1801,6 +1862,7 @@ fn is_defined_server_method(method: &str) -> bool {
             | "item/agentMessage/delta"
             | "item/commandExecution/outputDelta"
             | "item/completed"
+            | "thread/started"
             | "turn/started"
             | "turn/completed"
             | "error"
@@ -1889,6 +1951,10 @@ fn required_string_at(message: &Value, pointer: &str, field: &str) -> Result<Str
                 .unwrap_or("未知方法");
             format!("{method} 通知缺少字符串字段 {field}")
         })
+}
+
+fn thread_started_id(message: &Value) -> Result<String> {
+    required_string_at(message, "/params/thread/id", "params.thread.id")
 }
 
 fn optional_string_at(message: &Value, pointer: &str, field: &str) -> Result<Option<String>> {
@@ -2113,6 +2179,10 @@ fn ensure_server_method_is_defined(message: &Value) -> Result<()> {
         );
     };
     match method {
+        // The request response remains the canonical source of the thread id.
+        // This lifecycle notification is still schema-checked and correlated
+        // with that response by the active prompt session.
+        "thread/started" => thread_started_id(message).map(|_| ()),
         // app-server emits this connection-level status during initialization,
         // including on short-lived model catalog connections. It has no
         // Composer UI, but its protocol payload must remain schema-checked so
@@ -2383,6 +2453,7 @@ fn wait_for_session_response<R: BufRead, W: Write + Send + 'static>(
     session: &Arc<CodexTurnSession<W>>,
     expected_id: u64,
     events: &Sender<AgentEvent>,
+    mut thread_started_correlation: Option<&mut ThreadStartedCorrelation>,
     mut deferred_turn_notifications: Option<&mut Vec<Value>>,
 ) -> Result<Value> {
     loop {
@@ -2397,6 +2468,11 @@ fn wait_for_session_response<R: BufRead, W: Write + Send + 'static>(
         }
 
         let method = message.get("method").and_then(Value::as_str);
+        if method == Some("thread/started")
+            && let Some(correlation) = thread_started_correlation.as_deref_mut()
+        {
+            correlation.observe(&message)?;
+        }
         if method.is_some_and(|method| {
             TURN_SCOPED_SERVER_METHODS.contains(&method) || method == "serverRequest/resolved"
         }) && let Some(deferred) = deferred_turn_notifications.as_deref_mut()
@@ -2459,6 +2535,15 @@ fn ensure_session_message_matches(
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         return Ok(());
     };
+    if method == "thread/started" {
+        let thread_id = thread_started_id(message)?;
+        if thread_id != expected_thread_id {
+            bail!(
+                "收到属于其他 thread 的 `thread/started`：threadId=`{thread_id}`；当前 threadId=`{expected_thread_id}`"
+            );
+        }
+        return Ok(());
+    }
     if method == "serverRequest/resolved" {
         let thread_id = message
             .pointer("/params/threadId")
@@ -3754,6 +3839,7 @@ mod tests {
         let input = concat!(
             "{\"id\":1,\"result\":{}}\n",
             "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n",
+            "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"thr_1\",\"sessionId\":\"thr_1\",\"ephemeral\":false,\"turns\":[]}}}\n",
             "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"items\":[],\"status\":\"inProgress\"}}}\n",
             "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_1\"}}}\n",
             "{\"method\":\"item/started\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_1\",\"text\":\"\"}}}\n",
@@ -3930,6 +4016,7 @@ mod tests {
     fn existing_thread_resumes_before_turn_start() {
         let input = concat!(
             "{\"id\":1,\"result\":{}}\n",
+            "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"thr_existing\",\"turns\":[]}}}\n",
             "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_existing\",\"turns\":[]}}}\n",
             "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_existing\",\"turn\":{\"id\":\"turn_next\",\"items\":[],\"status\":\"inProgress\"}}}\n",
             "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thr_existing\",\"turnId\":\"turn_next\",\"itemId\":\"msg_next\",\"delta\":\"继续\"}}\n",
@@ -4017,6 +4104,53 @@ mod tests {
             "runtimeWorkspaceRoots",
         ] {
             assert!(turn_start.pointer(&format!("/params/{field}")).is_none());
+        }
+    }
+
+    #[test]
+    fn thread_started_must_match_the_canonical_thread_id_in_either_order() {
+        let cases = [
+            (
+                concat!(
+                    "{\"id\":1,\"result\":{}}\n",
+                    "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"thr_wrong\"}}}\n",
+                    "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_expected\"}}}\n"
+                ),
+                "thread/start 通知与响应不一致",
+            ),
+            (
+                concat!(
+                    "{\"id\":1,\"result\":{}}\n",
+                    "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_expected\"}}}\n",
+                    "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"thr_wrong\"}}}\n"
+                ),
+                "turn/start 失败",
+            ),
+        ];
+
+        for (input, expected_context) in cases {
+            let mut reader = Cursor::new(input.as_bytes());
+            let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+            let (tx, _rx) = async_channel::unbounded();
+            let error = drive_session(
+                &mut reader,
+                &session,
+                &AgentRequest {
+                    prompt: "检查生命周期关联".into(),
+                    cwd: PathBuf::from("/tmp/project"),
+                    thread_id: None,
+                    model: "gpt-test".into(),
+                    effort: "medium".into(),
+                    service_tier: None,
+                    permission_mode: AgentPermissionMode::Full,
+                },
+                &tx,
+            )
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains(expected_context), "{message}");
+            assert!(message.contains("thr_wrong"), "{message}");
+            assert!(message.contains("thr_expected"), "{message}");
         }
     }
 
@@ -4607,6 +4741,33 @@ mod tests {
     }
 
     #[test]
+    fn thread_started_is_a_validated_lifecycle_notification() {
+        ensure_server_method_is_defined(&json!({
+            "method": "thread/started",
+            "params": {
+                "thread": {
+                    "id": "thr_1",
+                    "sessionId": "thr_1",
+                    "ephemeral": false,
+                    "turns": []
+                }
+            }
+        }))
+        .unwrap();
+
+        for thread in [json!({}), json!({"id": null}), json!({"id": 7})] {
+            let error = ensure_server_method_is_defined(&json!({
+                "method": "thread/started",
+                "params": {"thread": thread}
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("thread/started"), "{error}");
+            assert!(error.contains("params.thread.id"), "{error}");
+        }
+    }
+
+    #[test]
     fn remote_control_status_changed_is_a_validated_connection_notification() {
         ensure_server_method_is_defined(&json!({
             "method": "remoteControl/status/changed",
@@ -4645,7 +4806,6 @@ mod tests {
     #[test]
     fn unsupported_formerly_passive_methods_are_all_undefined() {
         for method in [
-            "thread/started",
             "thread/goal/updated",
             "thread/goal/cleared",
             "mcpServer/startupStatus/updated",

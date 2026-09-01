@@ -4,7 +4,9 @@
 
 客户端初始化时启用 experimental API。下表是当前协议的唯一维护来源，完整列出 250 个 JSON-RPC 方法：157 个客户端请求、11 个服务端请求、1 个客户端通知、81 个服务端通知。
 
-当前接入统计：已接入 23、后端已接入 2、部分接入 2、未接入 223。未接入的客户端方法不会发送；未接入的服务端请求按原 id 回复 `-32601` 后 fail-fast；未接入的服务端通知收到即 fail-fast。升级 Codex CLI 时直接核对并更新本表。
+当前接入统计：已接入 23、后端已接入 2、部分接入 3、未接入 222。未接入的客户端方法不会发送；未接入的服务端请求按原 id 回复 `-32601` 后 fail-fast；未接入的服务端通知收到即 fail-fast。升级 Codex CLI 时直接核对并更新本表。
+
+状态口径：“已接入”表示本表声明的产品语义已形成真实协议收发、领域映射和必要 UI／副作用的完整闭环，不等于消费 schema 的每个可选字段；已知有效变体或安全相关字段尚未承接时标记为“部分接入”。
 
 | 方法 | 方向与类型 | 协议范围 | 协议要点 | 运行时入口 | 领域映射 | UI／副作用 | 接入状态 | 兼容与测试 |
 |---|---|---|---|---|---|---|---|---|
@@ -170,7 +172,7 @@
 | `attestation/generate` | 服务端请求 | 默认 | attestation payload 当前不解析 | 同上 | 无 | 无 | 未接入 | `-32601` 后 fail-fast |
 | `currentTime/read` | 服务端请求 | 实验 | 时间读取 payload 当前不解析 | 同上 | 无 | 无 | 未接入 | `-32601` 后 fail-fast |
 | `execCommandApproval` | 服务端请求 | 默认 | legacy command 审批，不能与 v2 item 请求混用 | 同上 | 无 | 不进入当前命令审批卡 | 未接入 | `-32601` 后 fail-fast |
-| `item/commandExecution/requestApproval` | 服务端请求 | 默认 | 保留原始 id 类型；校验 `kind/threadId/turnId/itemId/startedAtMs/environmentId`；读取命令、原因、网络主机和 `availableDecisions` | `respond_to_server_request_on_session`、`parse_command_approval_request`、统一 pending registry | `AgentCommandApprovalRequest` + `AgentApprovalHandle` | 显示命令或网络审批卡；用户决定按同 id 精确回复一次并等待 resolved | 已接入 | responder 防重复响应；字符串 id、execpolicy decision 与 response→resolved 顺序均有覆盖 |
+| `item/commandExecution/requestApproval` | 服务端请求 | 默认 | 保留原始 id 类型并校验基础关联字段；当前只映射命令、原因、`networkApprovalContext.host` 与 accept/decline/execpolicy 相关 decision；未承接 `kind=writeStdin`、`approvalId`、网络 `protocol`、`additionalPermissions`、`proposedNetworkPolicyAmendments` 以及 `acceptForSession`/`applyNetworkPolicyAmendment` 等有效变体 | `respond_to_server_request_on_session`、`parse_command_approval_request`、统一 pending registry | 窄化的 `AgentCommandApprovalRequest` + `AgentApprovalHandle` | 普通命令或仅展示 host 的网络审批卡；附加文件／网络权限与网络协议尚不可见 | 部分接入 | 已覆盖原始 id、单次回复、execpolicy 与 response→resolved；服务端仅声明 `cancel` 时当前回复语义不同的 `decline`，其余未承接变体也尚未 fail-fast |
 | `item/fileChange/requestApproval` | 服务端请求 | 默认 | 文件变更审批 payload 当前不解析 | 同上 | 无 | 文件审批组件仅有展示/测试能力，未接真实 RPC | 未接入 | `unsupported_file_change_server_request_is_rejected` 验证 `-32601` |
 | `item/permissions/requestApproval` | 服务端请求 | 默认 | 严格读取 `threadId/turnId/itemId/cwd/startedAtMs`、nullable `environmentId/reason` 与 `RequestPermissionProfile`；保留 read/write、entries、glob 深度、path/glob/special path 和 nullable network；允许时原样返回请求权限子集，scope 映射 `turn/session`，拒绝返回空权限，UI 未选择时不返回 `strictAutoReview` | `respond_to_server_request_on_session`、`parse_permissions_approval_request`、统一 pending registry | `AgentPermissionsApprovalRequest` + `AgentPermissionsApprovalHandle` | 现有权限卡展示 cwd、reason、文件和网络权限；Allow once/session/Decline 调用真实 responder，响应后禁用并等待 resolved | 已接入 | 文件、网络、混合权限及三种决定、越权防护、重复操作、错误参数、清理与 resolved 回归均覆盖 |
 | `item/tool/call` | 服务端请求 | 默认 | 动态工具调用 payload 当前不解析 | 同上 | 无 | 无 | 未接入 | `-32601` 后 fail-fast |
@@ -246,7 +248,7 @@
 | `thread/realtime/transcript/done` | 服务端通知 | 默认 | `params: ThreadRealtimeTranscriptDoneNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/reverted` | 服务端通知 | 默认 | `params: ThreadRevertedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/settings/updated` | 服务端通知 | 默认 | thread id；model、effort、serviceTier、cwd；可选有效权限字段 | `parse_agent_notification` | `AgentEvent::ThreadSettingsUpdated` | 同步模型、目录和有效权限状态 | 已接入 | 权限切换必须等到含有效 permissions 的匹配通知 |
-| `thread/started` | 服务端通知 | 默认 | payload 当前不读取；thread id 仍以请求响应为准 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
+| `thread/started` | 服务端通知 | 默认 | 严格读取 `params.thread.id`；允许 Thread 其余字段前向扩展；thread id 仍以请求响应为 canonical 来源 | `thread_started_id`、`ThreadStartedCorrelation`、`ensure_server_method_is_defined`、`ensure_session_message_matches` | 与 `thread/start`／`thread/resume` 响应关联；新 thread 继续映射既有 `AgentEvent::ThreadCreated` | 无新增视觉状态；Composer 的 `thread_id` 仍由请求响应只更新一次 | 已接入 | 通知先于或晚于响应均可；字段错误、通知间冲突、通知与 canonical id 不一致均 fail-fast；`drives_one_complete_prompt_and_normalizes_stream_events`、`existing_thread_resumes_before_turn_start`、`thread_started_must_match_the_canonical_thread_id_in_either_order`、`thread_started_is_a_validated_lifecycle_notification` |
 | `thread/status/changed` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
 | `thread/tokenUsage/updated` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
 | `thread/unarchived` | 服务端通知 | 默认 | `params: ThreadUnarchivedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
