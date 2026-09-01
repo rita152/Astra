@@ -1737,6 +1737,10 @@ fn process_turn_message<W: Write + Send + 'static>(
             let item = required_turn_item(message)?;
             let item_type = required_turn_item_type(message, item)?;
             match item_type {
+                "userMessage" => {
+                    validate_user_message(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
                 "agentMessage" => {
                     let (item_id, _text) = parse_agent_message(item)
                         .map_err(|error| turn_item_protocol_error(message, error))?;
@@ -2372,6 +2376,40 @@ fn required_item_string(
         .and_then(Value::as_str)
         .map(str::to_owned)
         .with_context(|| format!("{item_kind} item.{field} 必须是字符串"))
+}
+
+fn validate_user_message(item: &serde_json::Map<String, Value>) -> Result<()> {
+    let item_type = required_item_string(item, "userMessage", "type")?;
+    if item_type != "userMessage" {
+        bail!("userMessage item.type 必须是 `userMessage`，实际为 `{item_type}`");
+    }
+    let _id = required_item_string(item, "userMessage", "id")?;
+    match item.get("clientId") {
+        None | Some(Value::Null | Value::String(_)) => {}
+        Some(_) => bail!("userMessage item.clientId 必须是字符串或 null"),
+    }
+    let content = item
+        .get("content")
+        .and_then(Value::as_array)
+        .context("userMessage item.content 必须是数组")?;
+    for (index, input) in content.iter().enumerate() {
+        let input = input
+            .as_object()
+            .with_context(|| format!("userMessage item.content[{index}] 必须是对象"))?;
+        let input_kind = format!("userMessage content[{index}]");
+        let input_type = required_item_string(input, &input_kind, "type")?;
+        match input_type.as_str() {
+            "text" => {
+                let _text = required_item_string(input, &input_kind, "text")?;
+                match input.get("text_elements") {
+                    None | Some(Value::Array(_)) => {}
+                    Some(_) => bail!("userMessage item.content[{index}].text_elements 必须是数组"),
+                }
+            }
+            unsupported => bail!("userMessage item.content[{index}].type `{unsupported}` 尚未接入"),
+        }
+    }
+    Ok(())
 }
 
 fn parse_agent_message(item: &serde_json::Map<String, Value>) -> Result<(String, String)> {
@@ -6081,9 +6119,102 @@ mod tests {
     }
 
     #[test]
+    fn item_started_user_message_is_validated_without_duplicate_ui_event() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut streamed_text = false;
+        let message = json!({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "type": "userMessage",
+                    "id": "user_1",
+                    "clientId": null,
+                    "content": [{
+                        "type": "text",
+                        "text": "hello",
+                        "text_elements": []
+                    }]
+                },
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "startedAtMs": 1
+            },
+            "emittedAtMs": 1
+        });
+
+        let outcome = super::process_turn_message(
+            &session,
+            &message,
+            "thr_1",
+            "turn_1",
+            &tx,
+            &mut streamed_text,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, None);
+        assert!(!streamed_text);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn item_started_user_message_schema_errors_fail_fast() {
+        let cases = [
+            (json!({"type":"userMessage","content":[]}), "item.id"),
+            (json!({"type":"userMessage","id":"user_1"}), "item.content"),
+            (
+                json!({"type":"userMessage","id":"user_1","clientId":1,"content":[]}),
+                "item.clientId",
+            ),
+            (
+                json!({"type":"userMessage","id":"user_1","content":["hello"]}),
+                "content[0]",
+            ),
+            (
+                json!({"type":"userMessage","id":"user_1","content":[{"text":"hello"}]}),
+                "content[0] item.type",
+            ),
+            (
+                json!({"type":"userMessage","id":"user_1","content":[{"type":"text"}]}),
+                "content[0] item.text",
+            ),
+            (
+                json!({"type":"userMessage","id":"user_1","content":[{"type":"text","text":"hello","text_elements":1}]}),
+                "text_elements",
+            ),
+            (
+                json!({"type":"userMessage","id":"user_1","content":[{"type":"image","url":"https://example.com/image.png"}]}),
+                "type `image` 尚未接入",
+            ),
+        ];
+
+        for (item, expected) in cases {
+            let message = turn_item_message("item/started", item);
+            assert_turn_message_fails(&message, &["item/started", "userMessage", expected]);
+        }
+    }
+
+    #[test]
+    fn item_completed_user_message_remains_unsupported() {
+        let message = turn_item_message(
+            "item/completed",
+            json!({
+                "type": "userMessage",
+                "id": "user_1",
+                "clientId": null,
+                "content": [{"type":"text","text":"hello","text_elements":[]}]
+            }),
+        );
+        assert_turn_message_fails(
+            &message,
+            &["item/completed", "userMessage", "user_1", "未接入"],
+        );
+    }
+
+    #[test]
     fn every_unsupported_thread_item_type_fails_for_started_and_completed() {
         for item_type in [
-            "userMessage",
             "hookPrompt",
             "functionCallOutput",
             "plan",
