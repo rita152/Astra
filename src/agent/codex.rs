@@ -15,19 +15,20 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    AgentActivePermissionProfile, AgentAdditionalFileSystemPermissions,
+    AgentAccountRateLimits, AgentActivePermissionProfile, AgentAdditionalFileSystemPermissions,
     AgentAdditionalNetworkPermissions, AgentApprovalControl, AgentApprovalHandle, AgentBackend,
     AgentCommandApprovalChoice, AgentCommandApprovalRequest, AgentConfigWarning,
-    AgentEffectivePermissions, AgentEvent, AgentFileSystemAccess, AgentFileSystemPath,
-    AgentFileSystemPermissionEntry, AgentFileSystemSpecialPath, AgentInterruptControl,
-    AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
-    AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog,
-    AgentOptionalField, AgentPermissionMode, AgentPermissionProfile, AgentPermissionRequestProfile,
-    AgentPermissionsApprovalChoice, AgentPermissionsApprovalControl,
-    AgentPermissionsApprovalHandle, AgentPermissionsApprovalRequest, AgentReasoningEffort,
-    AgentRequest, AgentRun, AgentServerRequestFailureKind, AgentServerRequestId,
-    AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier, AgentThreadActiveFlag,
-    AgentThreadSettings, AgentThreadStatus, AgentThreadStatusState, AgentUserInputControl,
+    AgentCreditsSnapshot, AgentEffectivePermissions, AgentEvent, AgentFileSystemAccess,
+    AgentFileSystemPath, AgentFileSystemPermissionEntry, AgentFileSystemSpecialPath,
+    AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome,
+    AgentMcpServerStartupFailureReason, AgentMcpServerStartupState, AgentMcpServerStartupStatus,
+    AgentModel, AgentModelCatalog, AgentOptionalField, AgentPermissionMode, AgentPermissionProfile,
+    AgentPermissionRequestProfile, AgentPermissionsApprovalChoice, AgentPermissionsApprovalControl,
+    AgentPermissionsApprovalHandle, AgentPermissionsApprovalRequest, AgentRateLimitWindow,
+    AgentReasoningEffort, AgentRequest, AgentRun, AgentServerRequestFailureKind,
+    AgentServerRequestId, AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier,
+    AgentSpendControlLimit, AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus,
+    AgentThreadStatusState, AgentThreadTokenUsage, AgentTokenUsageBreakdown, AgentUserInputControl,
     AgentUserInputHandle, AgentUserInputOption, AgentUserInputQuestion, AgentUserInputRequest,
     AgentUserInputResponse, CommandExecution, CommandExecutionStatus,
 };
@@ -101,6 +102,7 @@ const TURN_SCOPED_SERVER_METHODS: &[&str] = &[
     "turn/started",
     "turn/completed",
     "error",
+    "thread/tokenUsage/updated",
     "model/rerouted",
     "model/verification",
     "model/safetyBuffering/updated",
@@ -162,6 +164,91 @@ struct ModelServiceTier {
     id: String,
     name: String,
     description: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadTokenUsageUpdatedNotification {
+    thread_id: String,
+    turn_id: String,
+    token_usage: ThreadTokenUsage,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadTokenUsage {
+    total: TokenUsageBreakdown,
+    last: TokenUsageBreakdown,
+    model_context_window: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenUsageBreakdown {
+    total_tokens: i64,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    #[serde(default)]
+    cache_write_input_tokens: i64,
+    output_tokens: i64,
+    reasoning_output_tokens: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountRateLimitsUpdatedNotification {
+    rate_limits: RateLimitSnapshot,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RateLimitSnapshot {
+    #[serde(default)]
+    limit_id: Option<String>,
+    #[serde(default)]
+    limit_name: Option<String>,
+    #[serde(default)]
+    primary: Option<RateLimitWindow>,
+    #[serde(default)]
+    secondary: Option<RateLimitWindow>,
+    #[serde(default)]
+    credits: Option<CreditsSnapshot>,
+    #[serde(default)]
+    individual_limit: Option<SpendControlLimitSnapshot>,
+    #[serde(default)]
+    spend_control_reached: Option<bool>,
+    #[serde(default)]
+    plan_type: Option<String>,
+    #[serde(default)]
+    rate_limit_reached_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RateLimitWindow {
+    used_percent: i32,
+    #[serde(default)]
+    window_duration_mins: Option<i64>,
+    #[serde(default)]
+    resets_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreditsSnapshot {
+    has_credits: bool,
+    unlimited: bool,
+    #[serde(default)]
+    balance: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpendControlLimitSnapshot {
+    limit: String,
+    used: String,
+    remaining_percent: i32,
+    resets_at: i64,
 }
 
 #[derive(Default)]
@@ -1792,6 +1879,10 @@ fn process_turn_message<W: Write + Send + 'static>(
             let item = required_turn_item(message)?;
             let item_type = required_turn_item_type(message, item)?;
             match item_type {
+                "userMessage" => {
+                    validate_user_message(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
                 "agentMessage" => {
                     let (_item_id, text) = parse_agent_message(item)
                         .map_err(|error| turn_item_protocol_error(message, error))?;
@@ -1843,6 +1934,8 @@ fn process_turn_message<W: Write + Send + 'static>(
             | "remoteControl/status/changed"
             | "mcpServer/startupStatus/updated"
             | "thread/status/changed"
+            | "thread/tokenUsage/updated"
+            | "account/rateLimits/updated"
             | "thread/started"
             | "turn/started"
             | "error"
@@ -1973,6 +2066,107 @@ fn parse_thread_status_changed(message: &Value) -> Result<AgentThreadStatus> {
         _ => bail!("thread/status/changed 通知字段 params.status.type 为未知状态 `{raw_state}`"),
     };
     Ok(AgentThreadStatus { thread_id, state })
+}
+
+fn parse_thread_token_usage_updated(message: &Value) -> Result<AgentThreadTokenUsage> {
+    let params = message
+        .get("params")
+        .context("thread/tokenUsage/updated 通知缺少 params")?;
+    let notification: ThreadTokenUsageUpdatedNotification = serde_json::from_value(params.clone())
+        .context("thread/tokenUsage/updated 通知 params 不符合协议 schema")?;
+    let map_breakdown = |usage: TokenUsageBreakdown| AgentTokenUsageBreakdown {
+        total_tokens: usage.total_tokens,
+        input_tokens: usage.input_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        cache_write_input_tokens: usage.cache_write_input_tokens,
+        output_tokens: usage.output_tokens,
+        reasoning_output_tokens: usage.reasoning_output_tokens,
+    };
+    Ok(AgentThreadTokenUsage {
+        thread_id: notification.thread_id,
+        turn_id: notification.turn_id,
+        total: map_breakdown(notification.token_usage.total),
+        last: map_breakdown(notification.token_usage.last),
+        model_context_window: notification.token_usage.model_context_window,
+    })
+}
+
+fn parse_account_rate_limits_updated(message: &Value) -> Result<AgentAccountRateLimits> {
+    let params = message
+        .get("params")
+        .context("account/rateLimits/updated 通知缺少 params")?;
+    let notification: AccountRateLimitsUpdatedNotification = serde_json::from_value(params.clone())
+        .context("account/rateLimits/updated 通知 params 不符合协议 schema")?;
+    let rate_limits = notification.rate_limits;
+
+    if let Some(plan_type) = rate_limits.plan_type.as_deref()
+        && !matches!(
+            plan_type,
+            "free"
+                | "go"
+                | "plus"
+                | "pro"
+                | "prolite"
+                | "team"
+                | "self_serve_business_prolite"
+                | "self_serve_business_usage_based"
+                | "business"
+                | "ent26"
+                | "enterprise_cbp_automation"
+                | "enterprise_cbp_usage_based"
+                | "enterprise"
+                | "edu"
+                | "edu_plus"
+                | "edu_pro"
+                | "unknown"
+        )
+    {
+        bail!(
+            "account/rateLimits/updated 通知字段 params.rateLimits.planType 为未知值 `{plan_type}`"
+        );
+    }
+    if let Some(reached_type) = rate_limits.rate_limit_reached_type.as_deref()
+        && !matches!(
+            reached_type,
+            "rate_limit_reached"
+                | "workspace_owner_credits_depleted"
+                | "workspace_member_credits_depleted"
+                | "workspace_owner_usage_limit_reached"
+                | "workspace_member_usage_limit_reached"
+        )
+    {
+        bail!(
+            "account/rateLimits/updated 通知字段 params.rateLimits.rateLimitReachedType 为未知值 `{reached_type}`"
+        );
+    }
+
+    let map_window = |window: RateLimitWindow| AgentRateLimitWindow {
+        used_percent: window.used_percent,
+        window_duration_mins: window.window_duration_mins,
+        resets_at: window.resets_at,
+    };
+    Ok(AgentAccountRateLimits {
+        limit_id: rate_limits.limit_id,
+        limit_name: rate_limits.limit_name,
+        primary: rate_limits.primary.map(map_window),
+        secondary: rate_limits.secondary.map(map_window),
+        credits: rate_limits.credits.map(|credits| AgentCreditsSnapshot {
+            has_credits: credits.has_credits,
+            unlimited: credits.unlimited,
+            balance: credits.balance,
+        }),
+        individual_limit: rate_limits
+            .individual_limit
+            .map(|limit| AgentSpendControlLimit {
+                limit: limit.limit,
+                used: limit.used,
+                remaining_percent: limit.remaining_percent,
+                resets_at: limit.resets_at,
+            }),
+        spend_control_reached: rate_limits.spend_control_reached,
+        plan_type: rate_limits.plan_type,
+        rate_limit_reached_type: rate_limits.rate_limit_reached_type,
+    })
 }
 
 fn required_notification_string(message: &Value, field: &str) -> Result<String> {
@@ -2159,6 +2353,12 @@ fn parse_agent_notification(message: &Value) -> Result<Option<AgentEvent>> {
         Some("thread/status/changed") => {
             AgentEvent::ThreadStatusChanged(parse_thread_status_changed(message)?)
         }
+        Some("thread/tokenUsage/updated") => {
+            AgentEvent::ThreadTokenUsageUpdated(parse_thread_token_usage_updated(message)?)
+        }
+        Some("account/rateLimits/updated") => {
+            AgentEvent::AccountRateLimitsUpdated(parse_account_rate_limits_updated(message)?)
+        }
         Some("warning") => {
             let _ = optional_string_at(message, "/params/threadId", "params.threadId")?;
             AgentEvent::Warning {
@@ -2284,6 +2484,8 @@ fn ensure_server_method_is_defined(message: &Value) -> Result<()> {
             parse_mcp_server_startup_status_updated(message).map(|_| ())
         }
         "thread/status/changed" => parse_thread_status_changed(message).map(|_| ()),
+        "thread/tokenUsage/updated" => parse_thread_token_usage_updated(message).map(|_| ()),
+        "account/rateLimits/updated" => parse_account_rate_limits_updated(message).map(|_| ()),
         method if is_defined_server_method(method) => Ok(()),
         method => Err(undefined_server_method_error(method, message)),
     }
@@ -2556,14 +2758,16 @@ fn wait_for_response(
     loop {
         let message = read_message(reader)?;
         respond_to_server_request(writer, &message)?;
-        // App-scoped MCP startup status can arrive on short-lived connections
-        // that have no Composer event stream. It is schema-checked below and
-        // only the thread prompt connection forwards it into GPUI state.
+        // App-scoped state notifications can arrive on short-lived connections
+        // that have no Composer event stream. They are schema-checked below and
+        // only the thread prompt connection forwards them into GPUI state.
         if let Some(events) = events {
             forward_agent_notification(&message, events)?;
         } else if parse_agent_notification(&message)?.is_some()
-            && message.get("method").and_then(Value::as_str)
-                != Some("mcpServer/startupStatus/updated")
+            && !matches!(
+                message.get("method").and_then(Value::as_str),
+                Some("mcpServer/startupStatus/updated" | "account/rateLimits/updated")
+            )
         {
             let method = message
                 .get("method")
@@ -3509,13 +3713,14 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        AgentBackend, AgentCommandApprovalChoice, AgentConfigWarning, AgentEvent,
-        AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome,
-        AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
+        AgentAccountRateLimits, AgentBackend, AgentCommandApprovalChoice, AgentConfigWarning,
+        AgentCreditsSnapshot, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
+        AgentInterruptOutcome, AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
         AgentMcpServerStartupStatus, AgentOptionalField, AgentPermissionMode,
-        AgentPermissionsApprovalChoice, AgentRequest, AgentServerRequestFailureKind,
-        AgentServerRequestId, AgentServerRequestKind, AgentServerRequestMetadata,
-        AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus, AgentThreadStatusState,
+        AgentPermissionsApprovalChoice, AgentRateLimitWindow, AgentRequest,
+        AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
+        AgentServerRequestMetadata, AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus,
+        AgentThreadStatusState, AgentThreadTokenUsage, AgentTokenUsageBreakdown,
         AgentUserInputResponse, AppServerProcess, CodexAppServerBackend, CodexTurnSession,
         INITIALIZE_ID, MODEL_LIST_PAGE_SIZE, TurnOutcome, UNDEFINED_METHOD_PARAMS_LIMIT,
         cleanup_pending_server_requests, drive_model_catalog, drive_permission_profiles,
@@ -3657,6 +3862,62 @@ mod tests {
                 "threadId": "thr_1",
                 "turnId": "turn_1",
                 "item": item
+            }
+        })
+    }
+
+    fn thread_token_usage_message(thread_id: &str, turn_id: &str) -> Value {
+        json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "tokenUsage": {
+                    "total": {
+                        "totalTokens": 16_221,
+                        "inputTokens": 16_207,
+                        "cachedInputTokens": 11_008,
+                        "cacheWriteInputTokens": 0,
+                        "outputTokens": 14,
+                        "reasoningOutputTokens": 0
+                    },
+                    "last": {
+                        "totalTokens": 16_221,
+                        "inputTokens": 16_207,
+                        "cachedInputTokens": 11_008,
+                        "cacheWriteInputTokens": 0,
+                        "outputTokens": 14,
+                        "reasoningOutputTokens": 0
+                    },
+                    "modelContextWindow": 258_400
+                }
+            }
+        })
+    }
+
+    fn account_rate_limits_message() -> Value {
+        json!({
+            "method": "account/rateLimits/updated",
+            "params": {
+                "rateLimits": {
+                    "limitId": "codex",
+                    "limitName": null,
+                    "primary": {
+                        "usedPercent": 15,
+                        "windowDurationMins": 10_080,
+                        "resetsAt": 1_788_752_152_i64
+                    },
+                    "secondary": null,
+                    "credits": {
+                        "hasCredits": false,
+                        "unlimited": false,
+                        "balance": "0"
+                    },
+                    "individualLimit": null,
+                    "spendControlReached": null,
+                    "planType": "pro",
+                    "rateLimitReachedType": null
+                }
             }
         })
     }
@@ -3983,12 +4244,16 @@ mod tests {
             "{\"method\":\"mcpServer/startupStatus/updated\",\"params\":{\"threadId\":\"thr_1\",\"name\":\"codex_apps\",\"status\":\"starting\",\"error\":null,\"failureReason\":null}}\n",
             "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"items\":[],\"status\":\"inProgress\"}}}\n",
             "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_1\"}}}\n",
+            "{\"method\":\"item/started\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"userMessage\",\"id\":\"user_1\",\"clientId\":null,\"content\":[{\"type\":\"text\",\"text\":\"打个招呼\",\"text_elements\":[]}]}}}\n",
+            "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"userMessage\",\"id\":\"user_1\",\"clientId\":null,\"content\":[{\"type\":\"text\",\"text\":\"打个招呼\",\"text_elements\":[]}]}}}\n",
             "{\"method\":\"item/started\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_1\",\"text\":\"\"}}}\n",
             "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"itemId\":\"msg_1\",\"delta\":\"你好\"}}\n",
             "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"itemId\":\"msg_1\",\"delta\":\"！\"}}\n",
             "{\"method\":\"item/started\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"commandExecution\",\"id\":\"exec_1\",\"command\":\"/bin/zsh -lc pwd\",\"cwd\":\"/tmp/project\",\"status\":\"inProgress\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"pwd\"}],\"aggregatedOutput\":null,\"exitCode\":null}}}\n",
             "{\"method\":\"item/commandExecution/outputDelta\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"itemId\":\"exec_1\",\"delta\":\"/tmp/project\\n\"}}\n",
             "{\"method\":\"item/completed\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"commandExecution\",\"id\":\"exec_1\",\"command\":\"/bin/zsh -lc pwd\",\"cwd\":\"/tmp/project\",\"status\":\"completed\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"pwd\"}],\"aggregatedOutput\":\"/tmp/project\\n\",\"exitCode\":0}}}\n",
+            "{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"tokenUsage\":{\"total\":{\"totalTokens\":16221,\"inputTokens\":16207,\"cachedInputTokens\":11008,\"cacheWriteInputTokens\":0,\"outputTokens\":14,\"reasoningOutputTokens\":0},\"last\":{\"totalTokens\":16221,\"inputTokens\":16207,\"cachedInputTokens\":11008,\"cacheWriteInputTokens\":0,\"outputTokens\":14,\"reasoningOutputTokens\":0},\"modelContextWindow\":258400}}}\n",
+            "{\"method\":\"account/rateLimits/updated\",\"params\":{\"rateLimits\":{\"limitId\":\"codex\",\"limitName\":null,\"primary\":{\"usedPercent\":15,\"windowDurationMins\":10080,\"resetsAt\":1788752152},\"secondary\":null,\"credits\":{\"hasCredits\":false,\"unlimited\":false,\"balance\":\"0\"},\"individualLimit\":null,\"spendControlReached\":null,\"planType\":\"pro\",\"rateLimitReachedType\":null}}}\n",
             "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"status\":\"completed\"}}}\n"
         );
         let mut reader = Cursor::new(input.as_bytes());
@@ -4061,6 +4326,46 @@ mod tests {
                     output: "/tmp/project\n".into(),
                     status: super::CommandExecutionStatus::Completed,
                     exit_code: Some(0),
+                }),
+                AgentEvent::ThreadTokenUsageUpdated(AgentThreadTokenUsage {
+                    thread_id: "thr_1".into(),
+                    turn_id: "turn_1".into(),
+                    total: AgentTokenUsageBreakdown {
+                        total_tokens: 16_221,
+                        input_tokens: 16_207,
+                        cached_input_tokens: 11_008,
+                        cache_write_input_tokens: 0,
+                        output_tokens: 14,
+                        reasoning_output_tokens: 0,
+                    },
+                    last: AgentTokenUsageBreakdown {
+                        total_tokens: 16_221,
+                        input_tokens: 16_207,
+                        cached_input_tokens: 11_008,
+                        cache_write_input_tokens: 0,
+                        output_tokens: 14,
+                        reasoning_output_tokens: 0,
+                    },
+                    model_context_window: Some(258_400),
+                }),
+                AgentEvent::AccountRateLimitsUpdated(AgentAccountRateLimits {
+                    limit_id: Some("codex".into()),
+                    limit_name: None,
+                    primary: Some(AgentRateLimitWindow {
+                        used_percent: 15,
+                        window_duration_mins: Some(10_080),
+                        resets_at: Some(1_788_752_152),
+                    }),
+                    secondary: None,
+                    credits: Some(AgentCreditsSnapshot {
+                        has_credits: false,
+                        unlimited: false,
+                        balance: Some("0".into()),
+                    }),
+                    individual_limit: None,
+                    spend_control_reached: None,
+                    plan_type: Some("pro".into()),
+                    rate_limit_reached_type: None,
                 }),
                 AgentEvent::Completed,
             ]
@@ -5141,13 +5446,261 @@ mod tests {
     }
 
     #[test]
+    fn thread_token_usage_updated_is_validated_and_normalized() {
+        let update = thread_token_usage_message("thr_1", "turn_1");
+        ensure_server_method_is_defined(&update).unwrap();
+        assert_eq!(
+            parse_agent_notification(&update).unwrap(),
+            Some(AgentEvent::ThreadTokenUsageUpdated(AgentThreadTokenUsage {
+                thread_id: "thr_1".into(),
+                turn_id: "turn_1".into(),
+                total: AgentTokenUsageBreakdown {
+                    total_tokens: 16_221,
+                    input_tokens: 16_207,
+                    cached_input_tokens: 11_008,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 14,
+                    reasoning_output_tokens: 0,
+                },
+                last: AgentTokenUsageBreakdown {
+                    total_tokens: 16_221,
+                    input_tokens: 16_207,
+                    cached_input_tokens: 11_008,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 14,
+                    reasoning_output_tokens: 0,
+                },
+                model_context_window: Some(258_400),
+            }))
+        );
+
+        let without_optional_fields = json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "tokenUsage": {
+                    "total": {
+                        "totalTokens": 10,
+                        "inputTokens": 8,
+                        "cachedInputTokens": 2,
+                        "outputTokens": 2,
+                        "reasoningOutputTokens": 1
+                    },
+                    "last": {
+                        "totalTokens": 4,
+                        "inputTokens": 3,
+                        "cachedInputTokens": 1,
+                        "outputTokens": 1,
+                        "reasoningOutputTokens": 0
+                    }
+                }
+            }
+        });
+        let Some(AgentEvent::ThreadTokenUsageUpdated(usage)) =
+            parse_agent_notification(&without_optional_fields).unwrap()
+        else {
+            panic!("expected token usage event");
+        };
+        assert_eq!(usage.total.cache_write_input_tokens, 0);
+        assert_eq!(usage.last.cache_write_input_tokens, 0);
+        assert_eq!(usage.model_context_window, None);
+
+        let mut explicit_null_context = without_optional_fields.clone();
+        explicit_null_context["params"]["tokenUsage"]["modelContextWindow"] = Value::Null;
+        let Some(AgentEvent::ThreadTokenUsageUpdated(usage)) =
+            parse_agent_notification(&explicit_null_context).unwrap()
+        else {
+            panic!("expected token usage event");
+        };
+        assert_eq!(usage.model_context_window, None);
+
+        for params in [
+            json!({
+                "threadId": 7,
+                "turnId": "turn_1",
+                "tokenUsage": update["params"]["tokenUsage"].clone()
+            }),
+            json!({
+                "threadId": "thr_1",
+                "tokenUsage": update["params"]["tokenUsage"].clone()
+            }),
+            json!({"threadId": "thr_1", "turnId": "turn_1", "tokenUsage": null}),
+            json!({
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "tokenUsage": {
+                    "total": {},
+                    "last": update["params"]["tokenUsage"]["last"].clone()
+                }
+            }),
+            json!({
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "tokenUsage": {
+                    "total": update["params"]["tokenUsage"]["total"].clone(),
+                    "last": {
+                        "totalTokens": 4,
+                        "inputTokens": 3,
+                        "cachedInputTokens": 1,
+                        "outputTokens": "1",
+                        "reasoningOutputTokens": 0
+                    }
+                }
+            }),
+            json!({
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "tokenUsage": {
+                    "total": update["params"]["tokenUsage"]["total"].clone(),
+                    "last": update["params"]["tokenUsage"]["last"].clone(),
+                    "modelContextWindow": "258400"
+                }
+            }),
+        ] {
+            let error = ensure_server_method_is_defined(&json!({
+                "method": "thread/tokenUsage/updated",
+                "params": params
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("thread/tokenUsage/updated"), "{error}");
+            assert!(error.contains("schema"), "{error}");
+        }
+    }
+
+    #[test]
+    fn thread_token_usage_update_must_match_the_active_turn() {
+        let message = thread_token_usage_message("thr_1", "turn_old");
+        assert_turn_message_fails(
+            &message,
+            &["thread/tokenUsage/updated", "thr_1", "turn_old", "turn_1"],
+        );
+    }
+
+    #[test]
+    fn account_rate_limits_updated_is_validated_and_normalized() {
+        let update = account_rate_limits_message();
+        ensure_server_method_is_defined(&update).unwrap();
+        assert_eq!(
+            parse_agent_notification(&update).unwrap(),
+            Some(AgentEvent::AccountRateLimitsUpdated(
+                AgentAccountRateLimits {
+                    limit_id: Some("codex".into()),
+                    limit_name: None,
+                    primary: Some(AgentRateLimitWindow {
+                        used_percent: 15,
+                        window_duration_mins: Some(10_080),
+                        resets_at: Some(1_788_752_152),
+                    }),
+                    secondary: None,
+                    credits: Some(AgentCreditsSnapshot {
+                        has_credits: false,
+                        unlimited: false,
+                        balance: Some("0".into()),
+                    }),
+                    individual_limit: None,
+                    spend_control_reached: None,
+                    plan_type: Some("pro".into()),
+                    rate_limit_reached_type: None,
+                }
+            ))
+        );
+
+        assert_eq!(
+            parse_agent_notification(&json!({
+                "method": "account/rateLimits/updated",
+                "params": {"rateLimits": {}}
+            }))
+            .unwrap(),
+            Some(AgentEvent::AccountRateLimitsUpdated(
+                AgentAccountRateLimits::default()
+            ))
+        );
+
+        for plan_type in [
+            "free",
+            "go",
+            "plus",
+            "pro",
+            "prolite",
+            "team",
+            "self_serve_business_prolite",
+            "self_serve_business_usage_based",
+            "business",
+            "ent26",
+            "enterprise_cbp_automation",
+            "enterprise_cbp_usage_based",
+            "enterprise",
+            "edu",
+            "edu_plus",
+            "edu_pro",
+            "unknown",
+        ] {
+            ensure_server_method_is_defined(&json!({
+                "method": "account/rateLimits/updated",
+                "params": {"rateLimits": {"planType": plan_type}}
+            }))
+            .unwrap();
+        }
+        for reached_type in [
+            "rate_limit_reached",
+            "workspace_owner_credits_depleted",
+            "workspace_member_credits_depleted",
+            "workspace_owner_usage_limit_reached",
+            "workspace_member_usage_limit_reached",
+        ] {
+            ensure_server_method_is_defined(&json!({
+                "method": "account/rateLimits/updated",
+                "params": {"rateLimits": {"rateLimitReachedType": reached_type}}
+            }))
+            .unwrap();
+        }
+
+        for params in [
+            json!({}),
+            json!({"rateLimits": null}),
+            json!({"rateLimits": {"primary": {}}}),
+            json!({"rateLimits": {"primary": {"usedPercent": 2_147_483_648_i64}}}),
+            json!({"rateLimits": {"primary": {"usedPercent": 15, "resetsAt": "soon"}}}),
+            json!({"rateLimits": {"credits": {"hasCredits": false}}}),
+            json!({"rateLimits": {"individualLimit": {
+                "limit": "100", "remainingPercent": 75, "resetsAt": 1_788_752_152_i64
+            }}}),
+            json!({"rateLimits": {"spendControlReached": "false"}}),
+        ] {
+            let error = ensure_server_method_is_defined(&json!({
+                "method": "account/rateLimits/updated",
+                "params": params
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("account/rateLimits/updated"), "{error}");
+            assert!(error.contains("schema"), "{error}");
+        }
+
+        for (field, value) in [
+            ("planType", "future-plan"),
+            ("rateLimitReachedType", "future-limit"),
+        ] {
+            let error = ensure_server_method_is_defined(&json!({
+                "method": "account/rateLimits/updated",
+                "params": {"rateLimits": {(field): value}}
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("account/rateLimits/updated"), "{error}");
+            assert!(error.contains(field), "{error}");
+            assert!(error.contains(value), "{error}");
+        }
+    }
+
+    #[test]
     fn unsupported_formerly_passive_methods_are_all_undefined() {
         for method in [
             "thread/goal/updated",
             "thread/goal/cleared",
             "turn/plan/updated",
-            "thread/tokenUsage/updated",
-            "account/rateLimits/updated",
         ] {
             let error = ensure_server_method_is_defined(&json!({
                 "method": method,
@@ -5315,6 +5868,20 @@ mod tests {
             .to_string();
         assert!(error.contains("需要可见 UI 承接"));
         assert!(error.contains("warning"));
+    }
+
+    #[test]
+    fn account_rate_limits_update_is_validated_on_an_app_scoped_connection() {
+        let input = format!(
+            "{}\n{{\"id\":1,\"result\":{{}}}}\n",
+            account_rate_limits_message()
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let mut output = Vec::new();
+
+        let response = wait_for_response(&mut reader, &mut output, INITIALIZE_ID, None).unwrap();
+        assert_eq!(response.pointer("/id"), Some(&json!(INITIALIZE_ID)));
+        assert!(output.is_empty());
     }
 
     #[test]
@@ -6159,7 +6726,7 @@ mod tests {
     }
 
     #[test]
-    fn item_started_user_message_schema_errors_fail_fast() {
+    fn user_message_item_lifecycle_schema_errors_fail_fast() {
         let cases = [
             (json!({"type":"userMessage","content":[]}), "item.id"),
             (json!({"type":"userMessage","id":"user_1"}), "item.content"),
@@ -6189,14 +6756,19 @@ mod tests {
             ),
         ];
 
-        for (item, expected) in cases {
-            let message = turn_item_message("item/started", item);
-            assert_turn_message_fails(&message, &["item/started", "userMessage", expected]);
+        for method in ["item/started", "item/completed"] {
+            for (item, expected) in &cases {
+                let message = turn_item_message(method, item.clone());
+                assert_turn_message_fails(&message, &[method, "userMessage", *expected]);
+            }
         }
     }
 
     #[test]
-    fn item_completed_user_message_remains_unsupported() {
+    fn item_completed_user_message_is_validated_without_duplicate_ui_event() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut streamed_text = false;
         let message = turn_item_message(
             "item/completed",
             json!({
@@ -6206,10 +6778,20 @@ mod tests {
                 "content": [{"type":"text","text":"hello","text_elements":[]}]
             }),
         );
-        assert_turn_message_fails(
+
+        let outcome = super::process_turn_message(
+            &session,
             &message,
-            &["item/completed", "userMessage", "user_1", "未接入"],
-        );
+            "thr_1",
+            "turn_1",
+            &tx,
+            &mut streamed_text,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, None);
+        assert!(!streamed_text);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

@@ -9,16 +9,17 @@ use gpui::{
 
 use crate::{
     agent::{
-        AgentApprovalHandle, AgentBackend, AgentCommandApprovalChoice, AgentConfigWarning,
-        AgentEffectivePermissions, AgentEvent, AgentFileSystemAccess, AgentFileSystemPath,
-        AgentFileSystemSpecialPath, AgentInterruptHandle, AgentInterruptOutcome,
-        AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
-        AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog, AgentOptionalField,
-        AgentPermissionMode, AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
-        AgentPermissionsApprovalHandle, AgentRequest, AgentServerRequestFailureKind,
-        AgentServerRequestKind, AgentServerRequestMetadata, AgentThreadStatus,
-        AgentUserInputAnswer, AgentUserInputHandle, AgentUserInputResponse, CodexAppServerBackend,
-        CommandExecution, CommandExecutionStatus,
+        AgentAccountRateLimits, AgentApprovalHandle, AgentBackend, AgentCommandApprovalChoice,
+        AgentConfigWarning, AgentCreditsSnapshot, AgentEffectivePermissions, AgentEvent,
+        AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemSpecialPath,
+        AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
+        AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog,
+        AgentOptionalField, AgentPermissionMode, AgentPermissionRequestProfile,
+        AgentPermissionsApprovalChoice, AgentPermissionsApprovalHandle, AgentRateLimitWindow,
+        AgentRequest, AgentServerRequestFailureKind, AgentServerRequestKind,
+        AgentServerRequestMetadata, AgentThreadStatus, AgentThreadTokenUsage, AgentUserInputAnswer,
+        AgentUserInputHandle, AgentUserInputResponse, CodexAppServerBackend, CommandExecution,
+        CommandExecutionStatus,
     },
     components::{
         approval::{
@@ -294,6 +295,69 @@ fn ensure_closed_batch_is_terminal(batch: &mut Vec<AgentEvent>) {
     }
 }
 
+fn merge_available<T>(current: &mut Option<T>, update: Option<T>) {
+    if let Some(update) = update {
+        *current = Some(update);
+    }
+}
+
+fn merge_rate_limit_window(
+    current: &mut Option<AgentRateLimitWindow>,
+    update: Option<AgentRateLimitWindow>,
+) {
+    let Some(update) = update else {
+        return;
+    };
+    if let Some(current) = current {
+        current.used_percent = update.used_percent;
+        merge_available(
+            &mut current.window_duration_mins,
+            update.window_duration_mins,
+        );
+        merge_available(&mut current.resets_at, update.resets_at);
+    } else {
+        *current = Some(update);
+    }
+}
+
+fn merge_credits_snapshot(
+    current: &mut Option<AgentCreditsSnapshot>,
+    update: Option<AgentCreditsSnapshot>,
+) {
+    let Some(update) = update else {
+        return;
+    };
+    if let Some(current) = current {
+        current.has_credits = update.has_credits;
+        current.unlimited = update.unlimited;
+        merge_available(&mut current.balance, update.balance);
+    } else {
+        *current = Some(update);
+    }
+}
+
+fn merge_account_rate_limits(
+    current: &mut Option<AgentAccountRateLimits>,
+    update: AgentAccountRateLimits,
+) {
+    let current = current.get_or_insert_with(AgentAccountRateLimits::default);
+    merge_available(&mut current.limit_id, update.limit_id);
+    merge_available(&mut current.limit_name, update.limit_name);
+    merge_rate_limit_window(&mut current.primary, update.primary);
+    merge_rate_limit_window(&mut current.secondary, update.secondary);
+    merge_credits_snapshot(&mut current.credits, update.credits);
+    merge_available(&mut current.individual_limit, update.individual_limit);
+    merge_available(
+        &mut current.spend_control_reached,
+        update.spend_control_reached,
+    );
+    merge_available(&mut current.plan_type, update.plan_type);
+    merge_available(
+        &mut current.rate_limit_reached_type,
+        update.rate_limit_reached_type,
+    );
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SubmenuLayout {
     open_left: bool,
@@ -404,6 +468,8 @@ pub struct ComposerView {
     thread_id: Option<String>,
     mcp_server_startup_statuses: HashMap<(Option<String>, String), AgentMcpServerStartupStatus>,
     thread_statuses: HashMap<String, AgentThreadStatus>,
+    thread_token_usages: HashMap<String, AgentThreadTokenUsage>,
+    account_rate_limits: Option<AgentAccountRateLimits>,
     model_menu_focus: FocusHandle,
     model_menu_focused_item: usize,
     model_menu_keyboard_focus: bool,
@@ -520,6 +586,8 @@ impl ComposerView {
             thread_id: None,
             mcp_server_startup_statuses: HashMap::new(),
             thread_statuses: HashMap::new(),
+            thread_token_usages: HashMap::new(),
+            account_rate_limits: None,
             model_menu_focus: cx.focus_handle(),
             model_menu_focused_item: 0,
             model_menu_keyboard_focus: false,
@@ -1112,6 +1180,13 @@ impl ComposerView {
                 AgentEvent::ThreadStatusChanged(status) => {
                     self.thread_statuses
                         .insert(status.thread_id.clone(), status);
+                }
+                AgentEvent::ThreadTokenUsageUpdated(usage) => {
+                    self.thread_token_usages
+                        .insert(usage.thread_id.clone(), usage);
+                }
+                AgentEvent::AccountRateLimitsUpdated(rate_limits) => {
+                    merge_account_rate_limits(&mut self.account_rate_limits, rate_limits);
                 }
                 AgentEvent::AssistantMessageStarted { item_id } => {
                     if !self.conversation_activity.iter().any(|activity| {
@@ -4961,19 +5036,21 @@ mod tests {
         push_coalesced_agent_event, submenu_layout, upsert_command_activity,
     };
     use crate::agent::{
-        AgentActivePermissionProfile, AgentAdditionalNetworkPermissions, AgentApprovalControl,
-        AgentApprovalHandle, AgentCommandApprovalChoice, AgentCommandApprovalRequest,
-        AgentConfigWarning, AgentEffectivePermissions, AgentEvent, AgentInterruptControl,
-        AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
-        AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog,
-        AgentOptionalField, AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
+        AgentAccountRateLimits, AgentActivePermissionProfile, AgentAdditionalNetworkPermissions,
+        AgentApprovalControl, AgentApprovalHandle, AgentCommandApprovalChoice,
+        AgentCommandApprovalRequest, AgentConfigWarning, AgentCreditsSnapshot,
+        AgentEffectivePermissions, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
+        AgentInterruptOutcome, AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
+        AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog, AgentOptionalField,
+        AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
         AgentPermissionsApprovalControl, AgentPermissionsApprovalHandle,
-        AgentPermissionsApprovalRequest, AgentReasoningEffort, AgentServerRequestFailureKind,
-        AgentServerRequestId, AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier,
+        AgentPermissionsApprovalRequest, AgentRateLimitWindow, AgentReasoningEffort,
+        AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
+        AgentServerRequestMetadata, AgentServiceTier, AgentSpendControlLimit,
         AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus, AgentThreadStatusState,
-        AgentUserInputAnswer, AgentUserInputControl, AgentUserInputHandle, AgentUserInputOption,
-        AgentUserInputQuestion, AgentUserInputRequest, AgentUserInputResponse, CommandExecution,
-        CommandExecutionStatus,
+        AgentThreadTokenUsage, AgentTokenUsageBreakdown, AgentUserInputAnswer,
+        AgentUserInputControl, AgentUserInputHandle, AgentUserInputOption, AgentUserInputQuestion,
+        AgentUserInputRequest, AgentUserInputResponse, CommandExecution, CommandExecutionStatus,
     };
     use crate::components::approval::{ApprovalCardEvent, ApprovalDecision, ApprovalScope};
     use crate::components::permissions_approval::{
@@ -6410,6 +6487,152 @@ mod tests {
                     .thread_statuses
                     .get("thr_1")
                     .is_some_and(|status| status.state == AgentThreadStatusState::Idle)
+        }));
+    }
+
+    #[test]
+    fn thread_token_usage_updates_gpui_state_without_ending_the_turn() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        let usage = AgentThreadTokenUsage {
+            thread_id: "thr_1".into(),
+            turn_id: "turn_1".into(),
+            total: AgentTokenUsageBreakdown {
+                total_tokens: 16_221,
+                input_tokens: 16_207,
+                cached_input_tokens: 11_008,
+                cache_write_input_tokens: 0,
+                output_tokens: 14,
+                reasoning_output_tokens: 0,
+            },
+            last: AgentTokenUsageBreakdown {
+                total_tokens: 16_221,
+                input_tokens: 16_207,
+                cached_input_tokens: 11_008,
+                cache_write_input_tokens: 0,
+                output_tokens: 14,
+                reasoning_output_tokens: 0,
+            },
+            model_context_window: Some(258_400),
+        };
+
+        app.update_entity(&composer, |composer, _| {
+            composer.conversation_phase = ConversationPhase::Thinking;
+            assert!(
+                !composer.apply_agent_event_batch(vec![AgentEvent::ThreadTokenUsageUpdated(
+                    usage.clone()
+                ),])
+            );
+        });
+        assert!(app.read_entity(&composer, |composer, _| {
+            composer.conversation_phase == ConversationPhase::Thinking
+                && composer.conversation_activity.is_empty()
+                && composer.thread_token_usages.get("thr_1") == Some(&usage)
+        }));
+
+        let mut next_usage = usage.clone();
+        next_usage.turn_id = "turn_2".into();
+        next_usage.total.total_tokens = 17_000;
+        app.update_entity(&composer, |composer, _| {
+            assert!(
+                !composer.apply_agent_event_batch(vec![AgentEvent::ThreadTokenUsageUpdated(
+                    next_usage.clone()
+                ),])
+            );
+        });
+        assert!(app.read_entity(&composer, |composer, _| {
+            composer.thread_token_usages.get("thr_1") == Some(&next_usage)
+                && composer.conversation_phase == ConversationPhase::Thinking
+        }));
+    }
+
+    #[test]
+    fn account_rate_limits_sparse_updates_merge_without_ending_the_turn() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        let initial = AgentAccountRateLimits {
+            limit_id: Some("codex".into()),
+            limit_name: None,
+            primary: Some(AgentRateLimitWindow {
+                used_percent: 15,
+                window_duration_mins: Some(10_080),
+                resets_at: Some(1_788_752_152),
+            }),
+            secondary: None,
+            credits: Some(AgentCreditsSnapshot {
+                has_credits: false,
+                unlimited: false,
+                balance: Some("0".into()),
+            }),
+            individual_limit: None,
+            spend_control_reached: None,
+            plan_type: Some("pro".into()),
+            rate_limit_reached_type: None,
+        };
+
+        app.update_entity(&composer, |composer, _| {
+            composer.conversation_phase = ConversationPhase::Thinking;
+            assert!(
+                !composer.apply_agent_event_batch(vec![AgentEvent::AccountRateLimitsUpdated(
+                    initial.clone()
+                )])
+            );
+        });
+        assert!(app.read_entity(&composer, |composer, _| {
+            composer.conversation_phase == ConversationPhase::Thinking
+                && composer.conversation_activity.is_empty()
+                && composer.account_rate_limits.as_ref() == Some(&initial)
+        }));
+
+        let sparse_update = AgentAccountRateLimits {
+            primary: Some(AgentRateLimitWindow {
+                used_percent: 23,
+                window_duration_mins: None,
+                resets_at: None,
+            }),
+            credits: Some(AgentCreditsSnapshot {
+                has_credits: true,
+                unlimited: false,
+                balance: None,
+            }),
+            individual_limit: Some(AgentSpendControlLimit {
+                limit: "100".into(),
+                used: "25".into(),
+                remaining_percent: 75,
+                resets_at: 1_788_752_152,
+            }),
+            spend_control_reached: Some(false),
+            ..AgentAccountRateLimits::default()
+        };
+        app.update_entity(&composer, |composer, _| {
+            assert!(
+                !composer.apply_agent_event_batch(vec![AgentEvent::AccountRateLimitsUpdated(
+                    sparse_update
+                )])
+            );
+        });
+        assert!(app.read_entity(&composer, |composer, _| {
+            let Some(rate_limits) = composer.account_rate_limits.as_ref() else {
+                return false;
+            };
+            rate_limits.limit_id.as_deref() == Some("codex")
+                && rate_limits.plan_type.as_deref() == Some("pro")
+                && rate_limits.primary.as_ref().is_some_and(|primary| {
+                    primary.used_percent == 23
+                        && primary.window_duration_mins == Some(10_080)
+                        && primary.resets_at == Some(1_788_752_152)
+                })
+                && rate_limits.credits.as_ref().is_some_and(|credits| {
+                    credits.has_credits
+                        && !credits.unlimited
+                        && credits.balance.as_deref() == Some("0")
+                })
+                && rate_limits.individual_limit.as_ref().is_some_and(|limit| {
+                    limit.limit == "100" && limit.used == "25" && limit.remaining_percent == 75
+                })
+                && rate_limits.spend_control_reached == Some(false)
+                && composer.conversation_phase == ConversationPhase::Thinking
+                && composer.conversation_activity.is_empty()
         }));
     }
 
