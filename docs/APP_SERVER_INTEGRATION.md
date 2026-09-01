@@ -4,7 +4,7 @@
 
 客户端初始化时启用 experimental API。下表是当前协议的唯一维护来源，完整列出 250 个 JSON-RPC 方法：157 个客户端请求、11 个服务端请求、1 个客户端通知、81 个服务端通知。
 
-当前接入统计：已接入 23、后端已接入 1、部分接入 2、未接入 224。未接入的客户端方法不会发送；未接入的服务端请求按原 id 回复 `-32601` 后 fail-fast；未接入的服务端通知收到即 fail-fast。升级 Codex CLI 时直接核对并更新本表。
+当前接入统计：已接入 23、后端已接入 2、部分接入 2、未接入 223。未接入的客户端方法不会发送；未接入的服务端请求按原 id 回复 `-32601` 后 fail-fast；未接入的服务端通知收到即 fail-fast。升级 Codex CLI 时直接核对并更新本表。
 
 | 方法 | 方向与类型 | 协议范围 | 协议要点 | 运行时入口 | 领域映射 | UI／副作用 | 接入状态 | 兼容与测试 |
 |---|---|---|---|---|---|---|---|---|
@@ -219,7 +219,7 @@
 | `project/changed` | 服务端通知 | 默认 | `params: ProjectChangedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `rawResponse/completed` | 服务端通知 | 默认 | 无 params；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `rawResponseItem/completed` | 服务端通知 | 默认 | 无 params；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `remoteControl/status/changed` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
+| `remoteControl/status/changed` | 服务端通知 | 默认 | 严格校验 `status`、`serverName`、`installationId` 与 nullable `environmentId` | `validate_remote_control_status_changed` | 连接生命周期兼容信号 | 无；不会阻断初始化后的 `model/list` 或 turn 握手 | 后端已接入 | 仅兼容 app-server 初始化时主动发送的连接状态，不建立 Composer UI；未知状态或错误字段仍 fail-fast；`model_catalog_accumulates_pages_and_maps_defaults_and_options`、`remote_control_status_changed_is_a_validated_connection_notification` |
 | `serverRequest/resolved` | 服务端通知 | 默认 | `threadId` 与保持原类型的 `requestId`；由 registry 还原并核对 request 的 thread/turn/item/kind | `handle_server_request_resolved`、统一 pending/completed registry | `AgentEvent::ServerRequestResolved` | 最终结束并释放 command approval、user input、permissions approval 三类 responder 与等待状态 | 已接入 | 合法 response→resolved、三种请求、重复 resolved 幂等、错误 thread/turn/item、未知 request 和 turn 终止清理均覆盖 |
 | `skills/changed` | 服务端通知 | 默认 | `params: SkillsChangedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/archived` | 服务端通知 | 默认 | `params: ThreadArchivedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |

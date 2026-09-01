@@ -1774,6 +1774,7 @@ fn process_turn_message<W: Write + Send + 'static>(
             | "item/permissions/requestApproval"
             | "item/tool/requestUserInput"
             | "serverRequest/resolved"
+            | "remoteControl/status/changed"
             | "turn/started"
             | "error"
             | "thread/settings/updated"
@@ -1810,6 +1811,20 @@ fn is_defined_server_method(method: &str) -> bool {
             | "model/verification"
             | "model/safetyBuffering/updated"
     )
+}
+
+fn validate_remote_control_status_changed(message: &Value) -> Result<()> {
+    let status = required_notification_string(message, "status")?;
+    if !matches!(
+        status.as_str(),
+        "disabled" | "connecting" | "connected" | "errored"
+    ) {
+        bail!("remoteControl/status/changed 通知字段 params.status 为未知状态 `{status}`");
+    }
+    let _server_name = required_notification_string(message, "serverName")?;
+    let _installation_id = required_notification_string(message, "installationId")?;
+    let _environment_id = required_nullable_notification_string(message, "environmentId")?;
+    Ok(())
 }
 
 fn required_notification_string(message: &Value, field: &str) -> Result<String> {
@@ -2097,10 +2112,14 @@ fn ensure_server_method_is_defined(message: &Value) -> Result<()> {
             summarize_json(method)
         );
     };
-    if is_defined_server_method(method) {
-        Ok(())
-    } else {
-        Err(undefined_server_method_error(method, message))
+    match method {
+        // app-server emits this connection-level status during initialization,
+        // including on short-lived model catalog connections. It has no
+        // Composer UI, but its protocol payload must remain schema-checked so
+        // future shape changes still fail loudly.
+        "remoteControl/status/changed" => validate_remote_control_status_changed(message),
+        method if is_defined_server_method(method) => Ok(()),
+        method => Err(undefined_server_method_error(method, message)),
     }
 }
 
@@ -4541,6 +4560,7 @@ mod tests {
     fn model_catalog_accumulates_pages_and_maps_defaults_and_options() {
         let input = concat!(
             "{\"id\":1,\"result\":{}}\n",
+            "{\"method\":\"remoteControl/status/changed\",\"params\":{\"status\":\"disabled\",\"serverName\":\"test-host\",\"installationId\":\"install-1\",\"environmentId\":null}}\n",
             "{\"id\":2,\"result\":{\"data\":[",
             "{\"id\":\"hidden\",\"model\":\"hidden\",\"displayName\":\"Hidden\",\"description\":\"hidden\",\"hidden\":true,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\",\"description\":\"Low\"}],\"defaultReasoningEffort\":\"low\",\"isDefault\":false},",
             "{\"id\":\"model-a\",\"model\":\"model-a-wire\",\"displayName\":\"Model A\",\"description\":\"First page\",\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\",\"description\":\"Low\"}],\"defaultReasoningEffort\":\"low\",\"serviceTiers\":[],\"defaultServiceTier\":null,\"isDefault\":false}],\"nextCursor\":\"page-2\"}}\n",
@@ -4587,9 +4607,44 @@ mod tests {
     }
 
     #[test]
-    fn formerly_passive_methods_are_all_undefined() {
+    fn remote_control_status_changed_is_a_validated_connection_notification() {
+        ensure_server_method_is_defined(&json!({
+            "method": "remoteControl/status/changed",
+            "params": {
+                "status": "connected",
+                "serverName": "test-host",
+                "installationId": "install-1",
+                "environmentId": "environment-1"
+            }
+        }))
+        .unwrap();
+
+        for params in [
+            json!({
+                "status": "future-status",
+                "serverName": "test-host",
+                "installationId": "install-1",
+                "environmentId": null
+            }),
+            json!({
+                "status": "disabled",
+                "serverName": "test-host",
+                "installationId": "install-1"
+            }),
+        ] {
+            let error = ensure_server_method_is_defined(&json!({
+                "method": "remoteControl/status/changed",
+                "params": params
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("remoteControl/status/changed"), "{error}");
+        }
+    }
+
+    #[test]
+    fn unsupported_formerly_passive_methods_are_all_undefined() {
         for method in [
-            "remoteControl/status/changed",
             "thread/started",
             "thread/goal/updated",
             "thread/goal/cleared",
