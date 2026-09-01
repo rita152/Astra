@@ -165,6 +165,50 @@ pub struct AgentConfigWarning {
     pub column: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMcpServerStartupState {
+    Starting,
+    Ready,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMcpServerStartupFailureReason {
+    ReauthenticationRequired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentMcpServerStartupStatus {
+    pub thread_id: Option<String>,
+    pub name: String,
+    pub state: AgentMcpServerStartupState,
+    pub error: Option<String>,
+    pub failure_reason: Option<AgentMcpServerStartupFailureReason>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentThreadActiveFlag {
+    WaitingOnApproval,
+    WaitingOnUserInput,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentThreadStatusState {
+    NotLoaded,
+    Idle,
+    SystemError,
+    Active {
+        active_flags: Vec<AgentThreadActiveFlag>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentThreadStatus {
+    pub thread_id: String,
+    pub state: AgentThreadStatusState,
+}
+
 /// JSON-RPC request ids are deliberately not normalized: a numeric `7` and a
 /// string `"7"` identify different server requests and must be echoed with
 /// their original type.
@@ -530,6 +574,8 @@ pub enum AgentEvent {
         message: String,
     },
     ConfigWarning(AgentConfigWarning),
+    McpServerStartupStatusUpdated(AgentMcpServerStartupStatus),
+    ThreadStatusChanged(AgentThreadStatus),
     AssistantMessageStarted {
         item_id: String,
     },

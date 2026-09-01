@@ -11,10 +11,12 @@ use crate::{
     agent::{
         AgentApprovalHandle, AgentBackend, AgentCommandApprovalChoice, AgentConfigWarning,
         AgentEffectivePermissions, AgentEvent, AgentFileSystemAccess, AgentFileSystemPath,
-        AgentFileSystemSpecialPath, AgentInterruptHandle, AgentInterruptOutcome, AgentModel,
-        AgentModelCatalog, AgentOptionalField, AgentPermissionMode, AgentPermissionRequestProfile,
-        AgentPermissionsApprovalChoice, AgentPermissionsApprovalHandle, AgentRequest,
-        AgentServerRequestFailureKind, AgentServerRequestKind, AgentServerRequestMetadata,
+        AgentFileSystemSpecialPath, AgentInterruptHandle, AgentInterruptOutcome,
+        AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
+        AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog, AgentOptionalField,
+        AgentPermissionMode, AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
+        AgentPermissionsApprovalHandle, AgentRequest, AgentServerRequestFailureKind,
+        AgentServerRequestKind, AgentServerRequestMetadata, AgentThreadStatus,
         AgentUserInputAnswer, AgentUserInputHandle, AgentUserInputResponse, CodexAppServerBackend,
         CommandExecution, CommandExecutionStatus,
     },
@@ -400,6 +402,8 @@ pub struct ComposerView {
     permissions_approval_responders: HashMap<String, AgentPermissionsApprovalHandle>,
     server_request_contexts: HashMap<String, AgentServerRequestMetadata>,
     thread_id: Option<String>,
+    mcp_server_startup_statuses: HashMap<(Option<String>, String), AgentMcpServerStartupStatus>,
+    thread_statuses: HashMap<String, AgentThreadStatus>,
     model_menu_focus: FocusHandle,
     model_menu_focused_item: usize,
     model_menu_keyboard_focus: bool,
@@ -514,6 +518,8 @@ impl ComposerView {
             permissions_approval_responders: HashMap::new(),
             server_request_contexts: HashMap::new(),
             thread_id: None,
+            mcp_server_startup_statuses: HashMap::new(),
+            thread_statuses: HashMap::new(),
             model_menu_focus: cx.focus_handle(),
             model_menu_focused_item: 0,
             model_menu_keyboard_focus: false,
@@ -929,6 +935,8 @@ impl ComposerView {
         self.user_input_responders.clear();
         self.permissions_approval_responders.clear();
         self.server_request_contexts.clear();
+        self.mcp_server_startup_statuses.clear();
+        self.thread_statuses.clear();
         self.assistant_message_time = None;
         self.conversation_phase = ConversationPhase::Starting;
         self.conversation_cycle = self.conversation_cycle.wrapping_add(1);
@@ -1082,6 +1090,28 @@ impl ComposerView {
                 AgentEvent::ConfigWarning(warning) => {
                     self.conversation_activity
                         .push(ConversationActivity::ConfigWarning(warning));
+                }
+                AgentEvent::McpServerStartupStatusUpdated(status) => {
+                    let key = (status.thread_id.clone(), status.name.clone());
+                    let changed = self.mcp_server_startup_statuses.get(&key) != Some(&status);
+                    self.mcp_server_startup_statuses.insert(key, status.clone());
+                    if changed && status.state == AgentMcpServerStartupState::Failed {
+                        let mut message = format!("MCP 服务 `{}` 启动失败", status.name);
+                        if let Some(error) = status.error.filter(|error| !error.trim().is_empty()) {
+                            message.push_str(&format!("：{error}"));
+                        }
+                        if status.failure_reason
+                            == Some(AgentMcpServerStartupFailureReason::ReauthenticationRequired)
+                        {
+                            message.push_str("；认证已失效，请重新连接该服务");
+                        }
+                        self.conversation_activity
+                            .push(ConversationActivity::Warning { message });
+                    }
+                }
+                AgentEvent::ThreadStatusChanged(status) => {
+                    self.thread_statuses
+                        .insert(status.thread_id.clone(), status);
                 }
                 AgentEvent::AssistantMessageStarted { item_id } => {
                     if !self.conversation_activity.iter().any(|activity| {
@@ -4934,14 +4964,16 @@ mod tests {
         AgentActivePermissionProfile, AgentAdditionalNetworkPermissions, AgentApprovalControl,
         AgentApprovalHandle, AgentCommandApprovalChoice, AgentCommandApprovalRequest,
         AgentConfigWarning, AgentEffectivePermissions, AgentEvent, AgentInterruptControl,
-        AgentInterruptHandle, AgentInterruptOutcome, AgentModel, AgentModelCatalog,
+        AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
+        AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog,
         AgentOptionalField, AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
         AgentPermissionsApprovalControl, AgentPermissionsApprovalHandle,
         AgentPermissionsApprovalRequest, AgentReasoningEffort, AgentServerRequestFailureKind,
         AgentServerRequestId, AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier,
-        AgentThreadSettings, AgentUserInputAnswer, AgentUserInputControl, AgentUserInputHandle,
-        AgentUserInputOption, AgentUserInputQuestion, AgentUserInputRequest,
-        AgentUserInputResponse, CommandExecution, CommandExecutionStatus,
+        AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus, AgentThreadStatusState,
+        AgentUserInputAnswer, AgentUserInputControl, AgentUserInputHandle, AgentUserInputOption,
+        AgentUserInputQuestion, AgentUserInputRequest, AgentUserInputResponse, CommandExecution,
+        CommandExecutionStatus,
     };
     use crate::components::approval::{ApprovalCardEvent, ApprovalDecision, ApprovalScope};
     use crate::components::permissions_approval::{
@@ -6262,6 +6294,123 @@ mod tests {
             app.read_entity(&composer, |composer, _| composer.conversation_snapshot());
         assert_eq!(phase, ConversationPhase::Failed);
         assert!(message.contains("trustedAccessForCyber"));
+    }
+
+    #[test]
+    fn mcp_server_startup_status_updates_gpui_state_without_ending_the_turn() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        let key = (Some("thr_1".to_owned()), "codex_apps".to_owned());
+
+        app.update_entity(&composer, |composer, _| {
+            composer.conversation_phase = ConversationPhase::Thinking;
+            assert!(!composer.apply_agent_event_batch(vec![
+                AgentEvent::McpServerStartupStatusUpdated(AgentMcpServerStartupStatus {
+                    thread_id: key.0.clone(),
+                    name: key.1.clone(),
+                    state: AgentMcpServerStartupState::Starting,
+                    error: None,
+                    failure_reason: None,
+                }),
+            ]));
+        });
+        assert!(app.read_entity(&composer, |composer, _| {
+            composer.conversation_phase == ConversationPhase::Thinking
+                && composer.conversation_activity.is_empty()
+                && composer
+                    .mcp_server_startup_statuses
+                    .get(&key)
+                    .is_some_and(|status| status.state == AgentMcpServerStartupState::Starting)
+        }));
+
+        let failed = AgentMcpServerStartupStatus {
+            thread_id: key.0.clone(),
+            name: key.1.clone(),
+            state: AgentMcpServerStartupState::Failed,
+            error: Some("OAuth token expired".into()),
+            failure_reason: Some(AgentMcpServerStartupFailureReason::ReauthenticationRequired),
+        };
+        app.update_entity(&composer, |composer, _| {
+            assert!(!composer.apply_agent_event_batch(vec![
+                AgentEvent::McpServerStartupStatusUpdated(failed.clone()),
+                AgentEvent::McpServerStartupStatusUpdated(failed),
+            ]));
+        });
+        assert!(app.read_entity(&composer, |composer, _| {
+            composer.conversation_phase == ConversationPhase::Thinking
+                && composer
+                    .mcp_server_startup_statuses
+                    .get(&key)
+                    .is_some_and(|status| status.state == AgentMcpServerStartupState::Failed)
+                && matches!(
+                    composer.conversation_activity.as_slice(),
+                    [ConversationActivity::Warning { message }]
+                        if message.contains("codex_apps")
+                            && message.contains("OAuth token expired")
+                            && message.contains("重新连接")
+                )
+        }));
+    }
+
+    #[test]
+    fn thread_status_changed_updates_gpui_state_without_ending_the_turn() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+
+        app.update_entity(&composer, |composer, _| {
+            composer.conversation_phase = ConversationPhase::Thinking;
+            assert!(!composer.apply_agent_event_batch(vec![
+                AgentEvent::ThreadStatusChanged(AgentThreadStatus {
+                    thread_id: "thr_1".into(),
+                    state: AgentThreadStatusState::Active {
+                        active_flags: vec![
+                            AgentThreadActiveFlag::WaitingOnApproval,
+                            AgentThreadActiveFlag::WaitingOnUserInput,
+                        ],
+                    },
+                }),
+                AgentEvent::ThreadStatusChanged(AgentThreadStatus {
+                    thread_id: "thr_2".into(),
+                    state: AgentThreadStatusState::SystemError,
+                }),
+            ]));
+        });
+        assert!(app.read_entity(&composer, |composer, _| {
+            composer.conversation_phase == ConversationPhase::Thinking
+                && composer.conversation_activity.is_empty()
+                && matches!(
+                    composer.thread_statuses.get("thr_1"),
+                    Some(AgentThreadStatus {
+                        state: AgentThreadStatusState::Active { active_flags },
+                        ..
+                    }) if active_flags == &vec![
+                        AgentThreadActiveFlag::WaitingOnApproval,
+                        AgentThreadActiveFlag::WaitingOnUserInput,
+                    ]
+                )
+                && composer
+                    .thread_statuses
+                    .get("thr_2")
+                    .is_some_and(|status| status.state == AgentThreadStatusState::SystemError)
+        }));
+
+        app.update_entity(&composer, |composer, _| {
+            assert!(
+                !composer.apply_agent_event_batch(vec![AgentEvent::ThreadStatusChanged(
+                    AgentThreadStatus {
+                        thread_id: "thr_1".into(),
+                        state: AgentThreadStatusState::Idle,
+                    }
+                ),])
+            );
+        });
+        assert!(app.read_entity(&composer, |composer, _| {
+            composer.conversation_phase == ConversationPhase::Thinking
+                && composer
+                    .thread_statuses
+                    .get("thr_1")
+                    .is_some_and(|status| status.state == AgentThreadStatusState::Idle)
+        }));
     }
 
     #[test]

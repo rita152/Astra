@@ -4,7 +4,7 @@
 
 客户端初始化时启用 experimental API。下表是当前协议的唯一维护来源，完整列出 250 个 JSON-RPC 方法：157 个客户端请求、11 个服务端请求、1 个客户端通知、81 个服务端通知。
 
-当前接入统计：已接入 23、后端已接入 2、部分接入 3、未接入 222。未接入的客户端方法不会发送；未接入的服务端请求按原 id 回复 `-32601` 后 fail-fast；未接入的服务端通知收到即 fail-fast。升级 Codex CLI 时直接核对并更新本表。
+当前接入统计：已接入 25、后端已接入 2、部分接入 3、未接入 220。未接入的客户端方法不会发送；未接入的服务端请求按原 id 回复 `-32601` 后 fail-fast；未接入的服务端通知收到即 fail-fast。升级 Codex CLI 时直接核对并更新本表。
 
 状态口径：“已接入”表示本表声明的产品语义已形成真实协议收发、领域映射和必要 UI／副作用的完整闭环，不等于消费 schema 的每个可选字段；已知有效变体或安全相关字段尚未承接时标记为“部分接入”。
 
@@ -212,7 +212,7 @@
 | `item/started` | 服务端通知 | 默认 | 校验当前 thread/turn；要求对象 `item` 及字符串 `type/id`；`agentMessage` 严格读取 `text`，`commandExecution` 严格读取命令、actions、cwd、已知状态及 nullable 输出/exit code | `process_turn_message` | `agentMessage` → `AssistantMessageStarted`；`commandExecution` → `CommandStarted` | 建立助手消息或命令活动行 | 部分接入 | 仅接入 `agentMessage`、`commandExecution`；其他 item.type、缺字段或错误类型立即 fail-fast，错误包含 method/type/itemId/threadId/turnId/摘要 |
 | `mcpServer/event/stream/notification` | 服务端通知 | 默认 | `params: McpServerEventStreamNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `mcpServer/oauthLogin/completed` | 服务端通知 | 默认 | `params: McpServerOauthLoginCompletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `mcpServer/startupStatus/updated` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
+| `mcpServer/startupStatus/updated` | 服务端通知 | 默认 | 严格读取 `name` 与 `starting/ready/failed/cancelled` 状态；`threadId/error/failureReason` 可缺省或为 null，仅接受 `reauthenticationRequired` 失败原因 | `parse_mcp_server_startup_status_updated`、`parse_agent_notification`、`ensure_server_method_is_defined` | `AgentEvent::McpServerStartupStatusUpdated` | 按 thread/server 保存最新 GPUI 状态；启动失败显示非终止警告，认证失效时提示重新连接；其他状态不打断 turn | 已接入 | app-scoped 状态允许 `threadId=null`；无 Composer 事件流的短连接（如模型目录）只校验不发 UI 事件；未知状态、失败原因及错误字段 fail-fast；`mcp_server_startup_status_is_validated_and_normalized`、`drives_one_complete_prompt_and_normalizes_stream_events`、`mcp_server_startup_status_updates_gpui_state_without_ending_the_turn` |
 | `model/rerouted` | 服务端通知 | 默认 | `fromModel`、`toModel`、`reason` 与 thread/turn | `parse_agent_notification` | `AgentEvent::ModelRerouted` | 更新实际模型和状态提示 | 已接入 | `model_notifications_are_normalized_into_agent_events` |
 | `model/safetyBuffering/updated` | 服务端通知 | 默认 | model、useCases、reasons、showBufferingUi、nullable fasterModel | `parse_agent_notification` | `AgentEvent::ModelSafetyBufferingUpdated` | 显示/清除安全检查状态并提示可选更快模型 | 已接入 | 字段类型严格校验；模型通知回归覆盖 |
 | `model/verification` | 服务端通知 | 默认 | `verifications[]` 与 thread/turn | `parse_agent_notification` | `AgentEvent::ModelVerificationRequired` | 显示需要账户验证并把 Composer 置为失败终态 | 已接入 | 模型通知解析和 UI 状态均有回归 |
@@ -249,7 +249,7 @@
 | `thread/reverted` | 服务端通知 | 默认 | `params: ThreadRevertedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/settings/updated` | 服务端通知 | 默认 | thread id；model、effort、serviceTier、cwd；可选有效权限字段 | `parse_agent_notification` | `AgentEvent::ThreadSettingsUpdated` | 同步模型、目录和有效权限状态 | 已接入 | 权限切换必须等到含有效 permissions 的匹配通知 |
 | `thread/started` | 服务端通知 | 默认 | 严格读取 `params.thread.id`；允许 Thread 其余字段前向扩展；thread id 仍以请求响应为 canonical 来源 | `thread_started_id`、`ThreadStartedCorrelation`、`ensure_server_method_is_defined`、`ensure_session_message_matches` | 与 `thread/start`／`thread/resume` 响应关联；新 thread 继续映射既有 `AgentEvent::ThreadCreated` | 无新增视觉状态；Composer 的 `thread_id` 仍由请求响应只更新一次 | 已接入 | 通知先于或晚于响应均可；字段错误、通知间冲突、通知与 canonical id 不一致均 fail-fast；`drives_one_complete_prompt_and_normalizes_stream_events`、`existing_thread_resumes_before_turn_start`、`thread_started_must_match_the_canonical_thread_id_in_either_order`、`thread_started_is_a_validated_lifecycle_notification` |
-| `thread/status/changed` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
+| `thread/status/changed` | 服务端通知 | 默认 | 严格读取 `threadId` 与 `notLoaded/idle/systemError/active`；`active` 必须携带数组 `activeFlags`，仅接受 `waitingOnApproval/waitingOnUserInput` | `parse_thread_status_changed`、`parse_agent_notification`、`ensure_server_method_is_defined` | `AgentEvent::ThreadStatusChanged` | 按 thread id 保存最新 GPUI 状态及 active flags | 已接入 | 线程状态不替代 `turn/started`／`turn/completed` 的 turn 生命周期终态；未知状态、flag、缺字段或错误类型 fail-fast；`thread_status_changed_is_validated_and_normalized`、`drives_one_complete_prompt_and_normalizes_stream_events`、`thread_status_changed_updates_gpui_state_without_ending_the_turn` |
 | `thread/tokenUsage/updated` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
 | `thread/unarchived` | 服务端通知 | 默认 | `params: ThreadUnarchivedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `turn/completed` | 服务端通知 | 默认 | `params.turn.status` 为 `completed`、`interrupted` 或 `failed`；失败读取 error message/details | `process_turn_message` | `Completed`、`Interrupted` 或 `Failed` | 设置完成、停止或失败终态并结束消费 | 已接入 | 未知终态 fail-fast；`failed_turn_completion_is_the_terminal_event_and_keeps_error_details` |

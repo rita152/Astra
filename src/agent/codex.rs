@@ -20,14 +20,16 @@ use super::{
     AgentCommandApprovalChoice, AgentCommandApprovalRequest, AgentConfigWarning,
     AgentEffectivePermissions, AgentEvent, AgentFileSystemAccess, AgentFileSystemPath,
     AgentFileSystemPermissionEntry, AgentFileSystemSpecialPath, AgentInterruptControl,
-    AgentInterruptHandle, AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentOptionalField,
-    AgentPermissionMode, AgentPermissionProfile, AgentPermissionRequestProfile,
+    AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
+    AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog,
+    AgentOptionalField, AgentPermissionMode, AgentPermissionProfile, AgentPermissionRequestProfile,
     AgentPermissionsApprovalChoice, AgentPermissionsApprovalControl,
     AgentPermissionsApprovalHandle, AgentPermissionsApprovalRequest, AgentReasoningEffort,
     AgentRequest, AgentRun, AgentServerRequestFailureKind, AgentServerRequestId,
-    AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier, AgentThreadSettings,
-    AgentUserInputControl, AgentUserInputHandle, AgentUserInputOption, AgentUserInputQuestion,
-    AgentUserInputRequest, AgentUserInputResponse, CommandExecution, CommandExecutionStatus,
+    AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier, AgentThreadActiveFlag,
+    AgentThreadSettings, AgentThreadStatus, AgentThreadStatusState, AgentUserInputControl,
+    AgentUserInputHandle, AgentUserInputOption, AgentUserInputQuestion, AgentUserInputRequest,
+    AgentUserInputResponse, CommandExecution, CommandExecutionStatus,
 };
 
 const INITIALIZE_ID: u64 = 1;
@@ -1835,6 +1837,8 @@ fn process_turn_message<W: Write + Send + 'static>(
             | "item/tool/requestUserInput"
             | "serverRequest/resolved"
             | "remoteControl/status/changed"
+            | "mcpServer/startupStatus/updated"
+            | "thread/status/changed"
             | "thread/started"
             | "turn/started"
             | "error"
@@ -1887,6 +1891,84 @@ fn validate_remote_control_status_changed(message: &Value) -> Result<()> {
     let _installation_id = required_notification_string(message, "installationId")?;
     let _environment_id = required_nullable_notification_string(message, "environmentId")?;
     Ok(())
+}
+
+fn parse_mcp_server_startup_status_updated(message: &Value) -> Result<AgentMcpServerStartupStatus> {
+    let thread_id = optional_string_at(message, "/params/threadId", "params.threadId")?;
+    let name = required_notification_string(message, "name")?;
+    let raw_state = required_notification_string(message, "status")?;
+    let state = match raw_state.as_str() {
+        "starting" => AgentMcpServerStartupState::Starting,
+        "ready" => AgentMcpServerStartupState::Ready,
+        "failed" => AgentMcpServerStartupState::Failed,
+        "cancelled" => AgentMcpServerStartupState::Cancelled,
+        _ => {
+            bail!("mcpServer/startupStatus/updated 通知字段 params.status 为未知状态 `{raw_state}`")
+        }
+    };
+    let error = optional_string_at(message, "/params/error", "params.error")?;
+    let failure_reason = match optional_string_at(
+        message,
+        "/params/failureReason",
+        "params.failureReason",
+    )? {
+        Some(reason) if reason == "reauthenticationRequired" => {
+            Some(AgentMcpServerStartupFailureReason::ReauthenticationRequired)
+        }
+        Some(reason) => bail!(
+            "mcpServer/startupStatus/updated 通知字段 params.failureReason 为未知原因 `{reason}`"
+        ),
+        None => None,
+    };
+    Ok(AgentMcpServerStartupStatus {
+        thread_id,
+        name,
+        state,
+        error,
+        failure_reason,
+    })
+}
+
+fn parse_thread_status_changed(message: &Value) -> Result<AgentThreadStatus> {
+    let thread_id = required_notification_string(message, "threadId")?;
+    let status = message
+        .pointer("/params/status")
+        .and_then(Value::as_object)
+        .context("thread/status/changed 通知缺少对象字段 params.status")?;
+    let raw_state = status
+        .get("type")
+        .and_then(Value::as_str)
+        .context("thread/status/changed 通知缺少字符串字段 params.status.type")?;
+    let state = match raw_state {
+        "notLoaded" => AgentThreadStatusState::NotLoaded,
+        "idle" => AgentThreadStatusState::Idle,
+        "systemError" => AgentThreadStatusState::SystemError,
+        "active" => {
+            let raw_flags = status
+                .get("activeFlags")
+                .and_then(Value::as_array)
+                .context(
+                    "thread/status/changed active 状态缺少数组字段 params.status.activeFlags",
+                )?;
+            let active_flags = raw_flags
+                .iter()
+                .enumerate()
+                .map(|(index, flag)| match flag.as_str() {
+                    Some("waitingOnApproval") => Ok(AgentThreadActiveFlag::WaitingOnApproval),
+                    Some("waitingOnUserInput") => Ok(AgentThreadActiveFlag::WaitingOnUserInput),
+                    Some(flag) => bail!(
+                        "thread/status/changed 通知字段 params.status.activeFlags[{index}] 为未知 flag `{flag}`"
+                    ),
+                    None => bail!(
+                        "thread/status/changed 通知字段 params.status.activeFlags[{index}] 必须是字符串"
+                    ),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            AgentThreadStatusState::Active { active_flags }
+        }
+        _ => bail!("thread/status/changed 通知字段 params.status.type 为未知状态 `{raw_state}`"),
+    };
+    Ok(AgentThreadStatus { thread_id, state })
 }
 
 fn required_notification_string(message: &Value, field: &str) -> Result<String> {
@@ -2067,6 +2149,12 @@ fn parse_agent_notification(message: &Value) -> Result<Option<AgentEvent>> {
                 permissions,
             })
         }
+        Some("mcpServer/startupStatus/updated") => AgentEvent::McpServerStartupStatusUpdated(
+            parse_mcp_server_startup_status_updated(message)?,
+        ),
+        Some("thread/status/changed") => {
+            AgentEvent::ThreadStatusChanged(parse_thread_status_changed(message)?)
+        }
         Some("warning") => {
             let _ = optional_string_at(message, "/params/threadId", "params.threadId")?;
             AgentEvent::Warning {
@@ -2188,6 +2276,10 @@ fn ensure_server_method_is_defined(message: &Value) -> Result<()> {
         // Composer UI, but its protocol payload must remain schema-checked so
         // future shape changes still fail loudly.
         "remoteControl/status/changed" => validate_remote_control_status_changed(message),
+        "mcpServer/startupStatus/updated" => {
+            parse_mcp_server_startup_status_updated(message).map(|_| ())
+        }
+        "thread/status/changed" => parse_thread_status_changed(message).map(|_| ()),
         method if is_defined_server_method(method) => Ok(()),
         method => Err(undefined_server_method_error(method, message)),
     }
@@ -2426,9 +2518,15 @@ fn wait_for_response(
     loop {
         let message = read_message(reader)?;
         respond_to_server_request(writer, &message)?;
+        // App-scoped MCP startup status can arrive on short-lived connections
+        // that have no Composer event stream. It is schema-checked below and
+        // only the thread prompt connection forwards it into GPUI state.
         if let Some(events) = events {
             forward_agent_notification(&message, events)?;
-        } else if parse_agent_notification(&message)?.is_some() {
+        } else if parse_agent_notification(&message)?.is_some()
+            && message.get("method").and_then(Value::as_str)
+                != Some("mcpServer/startupStatus/updated")
+        {
             let method = message
                 .get("method")
                 .and_then(Value::as_str)
@@ -3374,15 +3472,18 @@ mod tests {
 
     use super::{
         AgentBackend, AgentCommandApprovalChoice, AgentConfigWarning, AgentEvent,
-        AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome, AgentOptionalField,
-        AgentPermissionMode, AgentPermissionsApprovalChoice, AgentRequest,
-        AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
-        AgentServerRequestMetadata, AgentThreadSettings, AgentUserInputResponse, AppServerProcess,
-        CodexAppServerBackend, CodexTurnSession, INITIALIZE_ID, MODEL_LIST_PAGE_SIZE, TurnOutcome,
-        UNDEFINED_METHOD_PARAMS_LIMIT, cleanup_pending_server_requests, drive_model_catalog,
-        drive_permission_profiles, drive_session, drive_thread_settings_update,
-        ensure_server_method_is_defined, finish_prompt_session, handle_server_request_resolved,
-        parse_agent_notification, respond_to_server_request_on_session, run_model_catalog_process,
+        AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome,
+        AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
+        AgentMcpServerStartupStatus, AgentOptionalField, AgentPermissionMode,
+        AgentPermissionsApprovalChoice, AgentRequest, AgentServerRequestFailureKind,
+        AgentServerRequestId, AgentServerRequestKind, AgentServerRequestMetadata,
+        AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus, AgentThreadStatusState,
+        AgentUserInputResponse, AppServerProcess, CodexAppServerBackend, CodexTurnSession,
+        INITIALIZE_ID, MODEL_LIST_PAGE_SIZE, TurnOutcome, UNDEFINED_METHOD_PARAMS_LIMIT,
+        cleanup_pending_server_requests, drive_model_catalog, drive_permission_profiles,
+        drive_session, drive_thread_settings_update, ensure_server_method_is_defined,
+        finish_prompt_session, handle_server_request_resolved, parse_agent_notification,
+        respond_to_server_request_on_session, run_model_catalog_process,
         thread_settings_update_request, wait_for_response,
     };
     use crate::agent::AgentUserInputAnswer;
@@ -3838,8 +3939,10 @@ mod tests {
     fn drives_one_complete_prompt_and_normalizes_stream_events() {
         let input = concat!(
             "{\"id\":1,\"result\":{}}\n",
+            "{\"method\":\"thread/status/changed\",\"params\":{\"threadId\":\"thr_1\",\"status\":{\"type\":\"active\",\"activeFlags\":[]}}}\n",
             "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n",
             "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"thr_1\",\"sessionId\":\"thr_1\",\"ephemeral\":false,\"turns\":[]}}}\n",
+            "{\"method\":\"mcpServer/startupStatus/updated\",\"params\":{\"threadId\":\"thr_1\",\"name\":\"codex_apps\",\"status\":\"starting\",\"error\":null,\"failureReason\":null}}\n",
             "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_1\",\"turn\":{\"id\":\"turn_1\",\"items\":[],\"status\":\"inProgress\"}}}\n",
             "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_1\"}}}\n",
             "{\"method\":\"item/started\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"item\":{\"type\":\"agentMessage\",\"id\":\"msg_1\",\"text\":\"\"}}}\n",
@@ -3879,9 +3982,22 @@ mod tests {
         assert_eq!(
             received,
             vec![
+                AgentEvent::ThreadStatusChanged(AgentThreadStatus {
+                    thread_id: "thr_1".into(),
+                    state: AgentThreadStatusState::Active {
+                        active_flags: Vec::new(),
+                    },
+                }),
                 AgentEvent::ThreadCreated {
                     thread_id: "thr_1".into()
                 },
+                AgentEvent::McpServerStartupStatusUpdated(AgentMcpServerStartupStatus {
+                    thread_id: Some("thr_1".into()),
+                    name: "codex_apps".into(),
+                    state: AgentMcpServerStartupState::Starting,
+                    error: None,
+                    failure_reason: None,
+                }),
                 AgentEvent::Started,
                 AgentEvent::AssistantMessageStarted {
                     item_id: "msg_1".into(),
@@ -4695,6 +4811,7 @@ mod tests {
         let input = concat!(
             "{\"id\":1,\"result\":{}}\n",
             "{\"method\":\"remoteControl/status/changed\",\"params\":{\"status\":\"disabled\",\"serverName\":\"test-host\",\"installationId\":\"install-1\",\"environmentId\":null}}\n",
+            "{\"method\":\"mcpServer/startupStatus/updated\",\"params\":{\"threadId\":null,\"name\":\"codex_apps\",\"status\":\"ready\",\"error\":null,\"failureReason\":null}}\n",
             "{\"id\":2,\"result\":{\"data\":[",
             "{\"id\":\"hidden\",\"model\":\"hidden\",\"displayName\":\"Hidden\",\"description\":\"hidden\",\"hidden\":true,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\",\"description\":\"Low\"}],\"defaultReasoningEffort\":\"low\",\"isDefault\":false},",
             "{\"id\":\"model-a\",\"model\":\"model-a-wire\",\"displayName\":\"Model A\",\"description\":\"First page\",\"hidden\":false,\"supportedReasoningEfforts\":[{\"reasoningEffort\":\"low\",\"description\":\"Low\"}],\"defaultReasoningEffort\":\"low\",\"serviceTiers\":[],\"defaultServiceTier\":null,\"isDefault\":false}],\"nextCursor\":\"page-2\"}}\n",
@@ -4804,12 +4921,192 @@ mod tests {
     }
 
     #[test]
+    fn mcp_server_startup_status_is_validated_and_normalized() {
+        let starting = json!({
+            "method": "mcpServer/startupStatus/updated",
+            "params": {
+                "threadId": "thr_1",
+                "name": "codex_apps",
+                "status": "starting",
+                "error": null,
+                "failureReason": null
+            }
+        });
+        ensure_server_method_is_defined(&starting).unwrap();
+        assert_eq!(
+            parse_agent_notification(&starting).unwrap(),
+            Some(AgentEvent::McpServerStartupStatusUpdated(
+                AgentMcpServerStartupStatus {
+                    thread_id: Some("thr_1".into()),
+                    name: "codex_apps".into(),
+                    state: AgentMcpServerStartupState::Starting,
+                    error: None,
+                    failure_reason: None,
+                }
+            ))
+        );
+
+        for (status, state) in [
+            ("ready", AgentMcpServerStartupState::Ready),
+            ("cancelled", AgentMcpServerStartupState::Cancelled),
+        ] {
+            assert_eq!(
+                parse_agent_notification(&json!({
+                    "method": "mcpServer/startupStatus/updated",
+                    "params": {"name": "codex_apps", "status": status}
+                }))
+                .unwrap(),
+                Some(AgentEvent::McpServerStartupStatusUpdated(
+                    AgentMcpServerStartupStatus {
+                        thread_id: None,
+                        name: "codex_apps".into(),
+                        state,
+                        error: None,
+                        failure_reason: None,
+                    }
+                ))
+            );
+        }
+
+        let failed = json!({
+            "method": "mcpServer/startupStatus/updated",
+            "params": {
+                "threadId": null,
+                "name": "remote_tools",
+                "status": "failed",
+                "error": "OAuth token expired",
+                "failureReason": "reauthenticationRequired"
+            }
+        });
+        assert_eq!(
+            parse_agent_notification(&failed).unwrap(),
+            Some(AgentEvent::McpServerStartupStatusUpdated(
+                AgentMcpServerStartupStatus {
+                    thread_id: None,
+                    name: "remote_tools".into(),
+                    state: AgentMcpServerStartupState::Failed,
+                    error: Some("OAuth token expired".into()),
+                    failure_reason: Some(
+                        AgentMcpServerStartupFailureReason::ReauthenticationRequired
+                    ),
+                }
+            ))
+        );
+
+        for params in [
+            json!({
+                "threadId": "thr_1",
+                "name": "codex_apps",
+                "status": "future-status",
+                "error": null,
+                "failureReason": null
+            }),
+            json!({
+                "threadId": "thr_1",
+                "name": "codex_apps",
+                "status": "failed",
+                "error": null,
+                "failureReason": "future-reason"
+            }),
+            json!({
+                "threadId": 7,
+                "name": "codex_apps",
+                "status": "ready",
+                "error": null,
+                "failureReason": null
+            }),
+        ] {
+            let error = ensure_server_method_is_defined(&json!({
+                "method": "mcpServer/startupStatus/updated",
+                "params": params
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("mcpServer/startupStatus/updated"), "{error}");
+        }
+    }
+
+    #[test]
+    fn thread_status_changed_is_validated_and_normalized() {
+        let active = json!({
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": "thr_1",
+                "status": {
+                    "type": "active",
+                    "activeFlags": ["waitingOnApproval", "waitingOnUserInput"]
+                }
+            }
+        });
+        ensure_server_method_is_defined(&active).unwrap();
+        assert_eq!(
+            parse_agent_notification(&active).unwrap(),
+            Some(AgentEvent::ThreadStatusChanged(AgentThreadStatus {
+                thread_id: "thr_1".into(),
+                state: AgentThreadStatusState::Active {
+                    active_flags: vec![
+                        AgentThreadActiveFlag::WaitingOnApproval,
+                        AgentThreadActiveFlag::WaitingOnUserInput,
+                    ],
+                },
+            }))
+        );
+
+        for (raw_state, state) in [
+            ("notLoaded", AgentThreadStatusState::NotLoaded),
+            ("idle", AgentThreadStatusState::Idle),
+            ("systemError", AgentThreadStatusState::SystemError),
+        ] {
+            assert_eq!(
+                parse_agent_notification(&json!({
+                    "method": "thread/status/changed",
+                    "params": {
+                        "threadId": "thr_1",
+                        "status": {"type": raw_state}
+                    }
+                }))
+                .unwrap(),
+                Some(AgentEvent::ThreadStatusChanged(AgentThreadStatus {
+                    thread_id: "thr_1".into(),
+                    state,
+                }))
+            );
+        }
+
+        for params in [
+            json!({"threadId": 7, "status": {"type": "idle"}}),
+            json!({"threadId": "thr_1", "status": null}),
+            json!({"threadId": "thr_1", "status": {}}),
+            json!({"threadId": "thr_1", "status": {"type": "future-status"}}),
+            json!({"threadId": "thr_1", "status": {"type": "active"}}),
+            json!({
+                "threadId": "thr_1",
+                "status": {"type": "active", "activeFlags": "waitingOnApproval"}
+            }),
+            json!({
+                "threadId": "thr_1",
+                "status": {"type": "active", "activeFlags": ["future-flag"]}
+            }),
+            json!({
+                "threadId": "thr_1",
+                "status": {"type": "active", "activeFlags": [7]}
+            }),
+        ] {
+            let error = ensure_server_method_is_defined(&json!({
+                "method": "thread/status/changed",
+                "params": params
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("thread/status/changed"), "{error}");
+        }
+    }
+
+    #[test]
     fn unsupported_formerly_passive_methods_are_all_undefined() {
         for method in [
             "thread/goal/updated",
             "thread/goal/cleared",
-            "mcpServer/startupStatus/updated",
-            "thread/status/changed",
             "turn/plan/updated",
             "thread/tokenUsage/updated",
             "account/rateLimits/updated",
