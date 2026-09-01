@@ -1,23 +1,27 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use gpui::{
     App, Bounds, BoxShadow, ContentMask, Context, Div, Entity, FocusHandle, FontWeight,
-    KeyDownEvent, MouseButton, PathBuilder, Pixels, Render, Role, ScrollHandle, ShapedLine,
-    SharedString, TextAlign, TextRun, Transformation, Window, canvas, div, point, prelude::*, px,
-    radians, relative, rgba,
+    KeyDownEvent, MouseButton, PathBuilder, Pixels, Render, Role, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, ShapedLine, SharedString, TextAlign, TextRun, Transformation, Window, canvas,
+    div, linear_color_stop, linear_gradient, point, prelude::*, px, radians, relative, rgba,
 };
 
 use crate::{
-    agent::{CommandExecution, CommandExecutionStatus},
+    agent::{
+        AgentBackend, CodexAppServerBackend, CommandExecution, CommandExecutionAction,
+        CommandExecutionStatus,
+    },
     components::{
         approval::{ApprovalCardCallback, render_approval_card},
         composer::{
             ComposerView, ConversationActivity, ConversationChanged, ConversationPhase,
-            ModelCatalogLoadFinished, RequestFullAccessConfirmation,
+            ModelCatalogLoadFinished, ReasoningActivityPresentation, RequestFullAccessConfirmation,
         },
         file_change::{
             DiffReviewPresentation, FileApprovalCallback, FileApprovalEvent,
@@ -51,6 +55,16 @@ pub struct HomeView {
     thinking_shimmer_running: bool,
     response_feedback: i8,
     user_message_actions_visible_for_capture: bool,
+    conversation_scroll: ScrollHandle,
+    expanded_reasoning: HashSet<String>,
+    reasoning_disclosure_transitions: HashMap<String, ReasoningDisclosureTransition>,
+    reasoning_transition_running: bool,
+    reasoning_scroll_handles: HashMap<String, ScrollHandle>,
+    expanded_tool_groups: HashSet<String>,
+    collapsed_active_tool_groups: HashSet<String>,
+    tool_group_disclosure_transitions: HashMap<String, ToolGroupDisclosureTransition>,
+    tool_group_transition_running: bool,
+    tool_group_scroll_handles: HashMap<String, ScrollHandle>,
     expanded_commands: HashSet<String>,
     command_scroll_handles: HashMap<String, ScrollHandle>,
     approval_focus: FocusHandle,
@@ -70,6 +84,9 @@ const THINKING_SHIMMER_FRAME_INTERVAL: Duration = Duration::from_micros(20_833);
 const THINKING_SHIMMER_WIDTH: f32 = 56.0;
 const THINKING_SHIMMER_BAND_SCALE: f32 = 0.5;
 const THINKING_SHIMMER_ALPHA_LEVELS: usize = 32;
+const CONVERSATION_TOP_INSET: f32 = 78.0;
+const CONVERSATION_BOTTOM_INSET: f32 = 153.0;
+const CONVERSATION_BOTTOM_EPSILON: f32 = 0.5;
 const USER_MESSAGE_BUBBLE_RADIUS: f32 = 22.0;
 const USER_MESSAGE_BUBBLE_SUPERELLIPSE: f32 = 1.5;
 const USER_MESSAGE_FOOTER_OFFSET: f32 = 3.0;
@@ -86,6 +103,25 @@ const RESPONSE_ACTION_GAP: f32 = 2.0;
 const RESPONSE_TIME_MARGIN: f32 = 6.0;
 const RESPONSE_TIME_SIZE: f32 = 12.0;
 const RESPONSE_TIME_LINE_HEIGHT: f32 = 16.0;
+const REASONING_HEADER_HEIGHT: f32 = 21.0;
+const REASONING_TEXT_SIZE: f32 = 14.0;
+const REASONING_LINE_HEIGHT: f32 = 21.0;
+const REASONING_CHEVRON_SIZE: f32 = 14.0;
+const REASONING_BODY_MAX_HEIGHT: f32 = 140.0;
+const REASONING_BODY_TOP_GAP: f32 = 4.0;
+const REASONING_TRANSITION_DURATION: Duration = Duration::from_millis(300);
+const DISCLOSURE_FOCUS_PADDING: f32 = 2.0;
+const TOOL_GROUP_HEADER_HEIGHT: f32 = 21.0;
+const TOOL_GROUP_TEXT_SIZE: f32 = 14.0;
+const TOOL_GROUP_LINE_HEIGHT: f32 = 21.0;
+const TOOL_GROUP_ICON_SIZE: f32 = 16.0;
+const TOOL_GROUP_ICON_TEXT_GAP: f32 = 6.0;
+const TOOL_GROUP_HEADER_CHEVRON_GAP: f32 = 4.0;
+const TOOL_GROUP_CHEVRON_SIZE: f32 = 14.0;
+const TOOL_GROUP_ITEM_GAP: f32 = 4.0;
+const TOOL_GROUP_BODY_MAX_HEIGHT: f32 = 224.0;
+const TOOL_GROUP_EDGE_FADE_DISTANCE: f32 = 24.0;
+const TOOL_GROUP_TRANSITION_DURATION: Duration = Duration::from_millis(300);
 const COMMAND_ACTIVITY_ICON_SIZE: f32 = 16.0;
 const COMMAND_ACTIVITY_CONTENT_GAP: f32 = 6.0;
 const COMMAND_ACTIVITY_CHEVRON_SIZE: f32 = 14.0;
@@ -107,6 +143,332 @@ const NOTICE_WARNING_GAP: f32 = 16.0;
 const NOTICE_ERROR_CONTENT_GAP: f32 = 6.0;
 const NOTICE_WARNING_CONTENT_GAP: f32 = 8.0;
 const NOTICE_BUTTON_HEIGHT: f32 = 24.0;
+
+#[derive(Clone, Copy, Debug)]
+struct ReasoningDisclosureTransition {
+    progress: f32,
+    from: f32,
+    target: f32,
+    started_at: Option<Instant>,
+}
+
+impl ReasoningDisclosureTransition {
+    fn settled(expanded: bool) -> Self {
+        let progress = if expanded { 1.0 } else { 0.0 };
+        Self {
+            progress,
+            from: progress,
+            target: progress,
+            started_at: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ToolGroupDisclosureTransition {
+    progress: f32,
+    chevron_progress: f32,
+    from: f32,
+    chevron_from: f32,
+    target: f32,
+    started_at: Option<Instant>,
+}
+
+impl ToolGroupDisclosureTransition {
+    fn settled(expanded: bool) -> Self {
+        let progress = if expanded { 1.0 } else { 0.0 };
+        Self {
+            progress,
+            chevron_progress: progress,
+            from: progress,
+            chevron_from: progress,
+            target: progress,
+            started_at: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ToolActivityGroupPresentation {
+    id: String,
+    reasoning: Vec<ReasoningActivityPresentation>,
+    commands: Vec<CommandExecution>,
+}
+
+impl ToolActivityGroupPresentation {
+    fn is_active(&self) -> bool {
+        self.reasoning
+            .iter()
+            .any(ReasoningActivityPresentation::is_active)
+            || self
+                .commands
+                .iter()
+                .any(|command| command.status == CommandExecutionStatus::InProgress)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ActivityStreamUnit {
+    Standalone(ConversationActivity),
+    ToolGroup(ToolActivityGroupPresentation),
+}
+
+#[derive(Default)]
+struct PendingToolActivityGroup {
+    id: Option<String>,
+    reasoning: Vec<ReasoningActivityPresentation>,
+    commands: Vec<CommandExecution>,
+}
+
+fn flush_pending_tool_activity_group(
+    pending: &mut PendingToolActivityGroup,
+    units: &mut Vec<ActivityStreamUnit>,
+) {
+    if pending.commands.is_empty() {
+        // ChatGPT does not render completed reasoning as an independent
+        // "思考了 …" row. It is presentation context for an adjacent tool
+        // block and remains invisible when no command belongs to the group.
+        pending.reasoning.clear();
+        pending.id = None;
+        return;
+    }
+
+    let id = pending.id.take().expect("a populated tool group has an id");
+    units.push(ActivityStreamUnit::ToolGroup(
+        ToolActivityGroupPresentation {
+            id,
+            reasoning: std::mem::take(&mut pending.reasoning),
+            commands: std::mem::take(&mut pending.commands),
+        },
+    ));
+}
+
+fn activity_stream_units(activities: &[ConversationActivity]) -> Vec<ActivityStreamUnit> {
+    let mut units = Vec::new();
+    let mut pending = PendingToolActivityGroup::default();
+    let mut active_reasoning = Vec::new();
+
+    for activity in activities {
+        match activity {
+            ConversationActivity::Reasoning(reasoning) if reasoning.is_active() => {
+                // The desktop app treats the active reasoning row as a live
+                // cursor: it follows every newer JSON-RPC item instead of
+                // staying where reasoning/itemStarted first inserted it.
+                flush_pending_tool_activity_group(&mut pending, &mut units);
+                // Preserve the reasoning id as the stable disclosure key when
+                // the next protocol items are commands from the same group.
+                pending.id = Some(reasoning.item_id.clone());
+                active_reasoning.push(reasoning.clone());
+            }
+            ConversationActivity::Reasoning(reasoning) => {
+                pending.id.get_or_insert_with(|| reasoning.item_id.clone());
+                pending.reasoning.push(reasoning.clone());
+            }
+            ConversationActivity::Command(command) => {
+                pending.id.get_or_insert_with(|| command.id.clone());
+                pending.commands.push(command.clone());
+            }
+            standalone => {
+                flush_pending_tool_activity_group(&mut pending, &mut units);
+                units.push(ActivityStreamUnit::Standalone(standalone.clone()));
+            }
+        }
+    }
+    flush_pending_tool_activity_group(&mut pending, &mut units);
+    units.extend(active_reasoning.into_iter().map(|reasoning| {
+        ActivityStreamUnit::Standalone(ConversationActivity::Reasoning(reasoning))
+    }));
+    units
+}
+
+fn reasoning_activity_title(reasoning: &ReasoningActivityPresentation) -> Option<String> {
+    let candidate = reasoning
+        .summary
+        .iter()
+        .find(|part| !part.trim().is_empty())
+        .or_else(|| {
+            reasoning
+                .content
+                .iter()
+                .find(|part| !part.trim().is_empty())
+        })?
+        .trim();
+    let candidate = if let Some(after_opening) = candidate.strip_prefix("**") {
+        after_opening
+            .find("**")
+            .map(|closing| &after_opening[..closing])
+            .unwrap_or(after_opening)
+    } else {
+        candidate.lines().next().unwrap_or(candidate)
+    };
+    let candidate = candidate
+        .trim()
+        .trim_start_matches('#')
+        .trim_start_matches(['-', '*'])
+        .trim();
+    (!candidate.is_empty()).then(|| candidate.to_owned())
+}
+
+fn tool_group_reasoning_title(group: &ToolActivityGroupPresentation) -> Option<String> {
+    group
+        .reasoning
+        .iter()
+        .rev()
+        .find_map(reasoning_activity_title)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommandActivitySummary {
+    icon: &'static str,
+    text: String,
+    reads_files: bool,
+    runs_command: bool,
+}
+
+fn command_activity_summary(command: &CommandExecution) -> CommandActivitySummary {
+    command_activity_summaries(command)
+        .into_iter()
+        .next()
+        .expect("every command execution has at least one presentation row")
+}
+
+fn command_activity_summaries(command: &CommandExecution) -> Vec<CommandActivitySummary> {
+    if command.actions.is_empty() {
+        return vec![generic_command_activity_summary(command, &command.command)];
+    }
+    command
+        .actions
+        .iter()
+        .map(|action| command_action_summary(command, action))
+        .collect()
+}
+
+fn command_action_summary(
+    command: &CommandExecution,
+    action: &CommandExecutionAction,
+) -> CommandActivitySummary {
+    let completed = command.status == CommandExecutionStatus::Completed;
+    let failed = command.status == CommandExecutionStatus::Failed;
+
+    match action {
+        CommandExecutionAction::Read { name, path, .. } => {
+            let target = if name.trim().is_empty() { path } else { name };
+            let text = if failed {
+                format!("读取失败 {target}")
+            } else if completed {
+                format!("已读取 {target}")
+            } else {
+                format!("正在读取 {target}")
+            };
+            CommandActivitySummary {
+                icon: "activity-read",
+                text,
+                reads_files: true,
+                runs_command: false,
+            }
+        }
+        CommandExecutionAction::ListFiles { path, .. } => {
+            let target = path.as_deref().filter(|path| !path.trim().is_empty());
+            let text = match (failed, completed, target) {
+                (true, _, Some(path)) => format!("列出 {path} 中的文件失败"),
+                (true, _, None) => "列出文件失败".to_owned(),
+                (false, true, Some(path)) => format!("已列出 {path} 中的文件"),
+                (false, true, None) => "已列出文件".to_owned(),
+                (false, false, Some(path)) => format!("正在列出 {path} 中的文件"),
+                (false, false, None) => "正在列出文件".to_owned(),
+            };
+            CommandActivitySummary {
+                icon: "activity-read",
+                text,
+                reads_files: true,
+                runs_command: false,
+            }
+        }
+        CommandExecutionAction::Search { path, query, .. } => {
+            let path = path.as_deref().filter(|path| !path.trim().is_empty());
+            let query = query.as_deref().filter(|query| !query.trim().is_empty());
+            let text = match (failed, completed, path, query) {
+                (true, _, _, Some(query)) => format!("搜索“{query}”失败"),
+                (true, _, _, None) => "搜索文件失败".to_owned(),
+                (false, true, Some(path), Some(query)) => {
+                    format!("已在 {path} 中搜索“{query}”")
+                }
+                (false, true, _, Some(query)) => format!("已对“{query}”进行搜索"),
+                (false, true, _, None) => "已搜索文件".to_owned(),
+                (false, false, Some(path), Some(query)) => {
+                    format!("正在 {path} 中搜索“{query}”")
+                }
+                (false, false, _, Some(query)) => format!("正在搜索“{query}”"),
+                (false, false, _, None) => "正在搜索文件".to_owned(),
+            };
+            CommandActivitySummary {
+                icon: "search",
+                text,
+                reads_files: true,
+                runs_command: false,
+            }
+        }
+        CommandExecutionAction::Unknown {
+            command: action, ..
+        } => generic_command_activity_summary(command, action),
+    }
+}
+
+fn generic_command_activity_summary(
+    command: &CommandExecution,
+    display_command: &str,
+) -> CommandActivitySummary {
+    let display_command = if display_command.trim().is_empty() {
+        "命令"
+    } else {
+        display_command
+    };
+    let text = match command.status {
+        CommandExecutionStatus::InProgress => format!("正在运行 {display_command}"),
+        CommandExecutionStatus::Completed => format!("已运行 {display_command}"),
+        CommandExecutionStatus::Failed => format!("运行失败 {display_command}"),
+    };
+    CommandActivitySummary {
+        icon: "panel-terminal",
+        text,
+        reads_files: false,
+        runs_command: true,
+    }
+}
+
+fn completed_tool_group_summary(group: &ToolActivityGroupPresentation) -> CommandActivitySummary {
+    let command_summaries = group
+        .commands
+        .iter()
+        .flat_map(command_activity_summaries)
+        .collect::<Vec<_>>();
+    let reads_files = command_summaries.iter().any(|summary| summary.reads_files);
+    let runs_command = command_summaries.iter().any(|summary| summary.runs_command);
+    let text = match (reads_files, runs_command) {
+        (true, true) => "已读取文件运行了命令",
+        (true, false) => "已读取文件",
+        (false, true) => "运行了命令",
+        (false, false) => "已工作",
+    };
+    CommandActivitySummary {
+        icon: if reads_files {
+            "activity-read"
+        } else {
+            "panel-terminal"
+        },
+        text: text.to_owned(),
+        reads_files,
+        runs_command,
+    }
+}
+
+fn command_activity_row_count(command: &CommandExecution) -> usize {
+    command.actions.len().max(1)
+}
+
+fn tool_group_row_count(group: &ToolActivityGroupPresentation) -> usize {
+    group.commands.iter().map(command_activity_row_count).sum()
+}
 
 fn strip_terminal_line_ending(output: &str) -> &str {
     output
@@ -229,8 +591,18 @@ fn suggestion_transition_ease(progress: f32) -> f32 {
 }
 
 impl HomeView {
+    #[allow(dead_code)]
     pub fn new(mode: ThemeMode, cx: &mut Context<Self>) -> Self {
-        let composer = cx.new(|cx| ComposerView::new(mode, cx));
+        let backend: Arc<dyn AgentBackend> = Arc::new(CodexAppServerBackend::new());
+        Self::new_with_backend(mode, backend, cx)
+    }
+
+    pub fn new_with_backend(
+        mode: ThemeMode,
+        backend: Arc<dyn AgentBackend>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let composer = cx.new(|cx| ComposerView::new_with_backend(mode, backend, cx));
         cx.subscribe(&composer, |_, _, _: &RequestFullAccessConfirmation, cx| {
             cx.emit(RequestFullAccessConfirmation);
         })
@@ -259,6 +631,16 @@ impl HomeView {
             thinking_shimmer_running: false,
             response_feedback: 0,
             user_message_actions_visible_for_capture: false,
+            conversation_scroll: ScrollHandle::new(),
+            expanded_reasoning: HashSet::new(),
+            reasoning_disclosure_transitions: HashMap::new(),
+            reasoning_transition_running: false,
+            reasoning_scroll_handles: HashMap::new(),
+            expanded_tool_groups: HashSet::new(),
+            collapsed_active_tool_groups: HashSet::new(),
+            tool_group_disclosure_transitions: HashMap::new(),
+            tool_group_transition_running: false,
+            tool_group_scroll_handles: HashMap::new(),
             expanded_commands: HashSet::new(),
             command_scroll_handles: HashMap::new(),
             approval_focus: cx.focus_handle(),
@@ -423,12 +805,51 @@ impl HomeView {
         cx: &mut Context<Self>,
     ) {
         self.expanded_commands.clear();
+        self.expanded_tool_groups.clear();
         if expanded {
             self.expanded_commands
+                .insert("exec-command-ui-capture".to_owned());
+            self.expanded_tool_groups
                 .insert("exec-command-ui-capture".to_owned());
         }
         self.composer.update(cx, |composer, cx| {
             composer.set_command_tool_for_capture(running, cx)
+        });
+        cx.notify();
+    }
+
+    pub fn set_tool_group_for_capture(
+        &mut self,
+        running: bool,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.expanded_tool_groups.clear();
+        self.collapsed_active_tool_groups.clear();
+        self.expanded_commands.clear();
+        if expanded {
+            self.expanded_tool_groups
+                .insert("tool-group-ui-capture".to_owned());
+        }
+        self.composer.update(cx, |composer, cx| {
+            composer.set_tool_group_for_capture(running, cx)
+        });
+        cx.notify();
+    }
+
+    pub fn set_reasoning_for_capture(
+        &mut self,
+        state: &str,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.expanded_reasoning.clear();
+        if expanded {
+            self.expanded_reasoning
+                .insert("reasoning-ui-capture".to_owned());
+        }
+        self.composer.update(cx, |composer, cx| {
+            composer.set_reasoning_for_capture(state, cx)
         });
         cx.notify();
     }
@@ -608,6 +1029,202 @@ impl HomeView {
         }
     }
 
+    fn sync_reasoning_disclosure_transitions(
+        &mut self,
+        activities: &[ConversationActivity],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = cx.background_executor().now();
+        let mut present_items = HashSet::new();
+        let mut should_animate = false;
+
+        let visible_reasoning = activity_stream_units(activities)
+            .into_iter()
+            .filter_map(|unit| match unit {
+                ActivityStreamUnit::Standalone(ConversationActivity::Reasoning(reasoning)) => {
+                    Some(reasoning)
+                }
+                ActivityStreamUnit::Standalone(_) | ActivityStreamUnit::ToolGroup(_) => None,
+            });
+        for reasoning in visible_reasoning {
+            present_items.insert(reasoning.item_id.clone());
+            let has_content = !reasoning_body_text(&reasoning).trim().is_empty();
+            let expanded = has_content
+                && (reasoning.is_active() || self.expanded_reasoning.contains(&reasoning.item_id));
+            let target = if expanded { 1.0 } else { 0.0 };
+            let transition = self
+                .reasoning_disclosure_transitions
+                .entry(reasoning.item_id.clone())
+                .or_insert_with(|| ReasoningDisclosureTransition::settled(expanded));
+
+            if (transition.target - target).abs() > f32::EPSILON {
+                if cx.reduce_motion() {
+                    *transition = ReasoningDisclosureTransition::settled(expanded);
+                } else {
+                    transition.from = transition.progress;
+                    transition.target = target;
+                    transition.started_at = Some(now);
+                }
+            }
+            should_animate |= transition.started_at.is_some();
+        }
+
+        self.reasoning_disclosure_transitions
+            .retain(|item_id, _| present_items.contains(item_id));
+        if should_animate && !self.reasoning_transition_running {
+            self.reasoning_transition_running = true;
+            cx.on_next_frame(window, |this, window, cx| {
+                this.advance_reasoning_disclosure_transitions(window, cx)
+            });
+        }
+    }
+
+    fn advance_reasoning_disclosure_transitions(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.reasoning_transition_running {
+            return;
+        }
+
+        let now = cx.background_executor().now();
+        let mut still_running = false;
+        for transition in self.reasoning_disclosure_transitions.values_mut() {
+            let Some(started_at) = transition.started_at else {
+                continue;
+            };
+            let progress = (now.saturating_duration_since(started_at).as_secs_f32()
+                / REASONING_TRANSITION_DURATION.as_secs_f32())
+            .clamp(0.0, 1.0);
+            transition.progress = transition.from
+                + (transition.target - transition.from) * reasoning_transition_ease(progress);
+
+            if progress >= 1.0 || cx.reduce_motion() {
+                transition.progress = transition.target;
+                transition.started_at = None;
+            } else {
+                still_running = true;
+            }
+        }
+
+        self.reasoning_transition_running = still_running;
+        cx.notify();
+        if still_running {
+            cx.on_next_frame(window, |this, window, cx| {
+                this.advance_reasoning_disclosure_transitions(window, cx)
+            });
+        }
+    }
+
+    fn sync_tool_group_disclosure_transitions(
+        &mut self,
+        activities: &[ConversationActivity],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = cx.background_executor().now();
+        let groups = activity_stream_units(activities)
+            .into_iter()
+            .filter_map(|unit| match unit {
+                ActivityStreamUnit::ToolGroup(group) => Some(group),
+                ActivityStreamUnit::Standalone(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let present_groups = groups
+            .iter()
+            .map(|group| group.id.clone())
+            .collect::<HashSet<_>>();
+        let active_groups = groups
+            .iter()
+            .filter(|group| group.is_active())
+            .map(|group| group.id.clone())
+            .collect::<HashSet<_>>();
+        self.expanded_tool_groups
+            .retain(|group_id| present_groups.contains(group_id));
+        self.collapsed_active_tool_groups
+            .retain(|group_id| active_groups.contains(group_id));
+        self.tool_group_scroll_handles
+            .retain(|group_id, _| present_groups.contains(group_id));
+
+        let mut should_animate = false;
+        for group in groups {
+            let expanded = if group.is_active() {
+                !self.collapsed_active_tool_groups.contains(&group.id)
+            } else {
+                self.expanded_tool_groups.contains(&group.id)
+            };
+            let target = if expanded { 1.0 } else { 0.0 };
+            let transition = self
+                .tool_group_disclosure_transitions
+                .entry(group.id)
+                .or_insert_with(|| ToolGroupDisclosureTransition::settled(expanded));
+            if (transition.target - target).abs() > f32::EPSILON {
+                if cx.reduce_motion() {
+                    *transition = ToolGroupDisclosureTransition::settled(expanded);
+                } else {
+                    transition.from = transition.progress;
+                    transition.chevron_from = transition.chevron_progress;
+                    transition.target = target;
+                    transition.started_at = Some(now);
+                }
+            }
+            should_animate |= transition.started_at.is_some();
+        }
+
+        self.tool_group_disclosure_transitions
+            .retain(|group_id, _| present_groups.contains(group_id));
+        if should_animate && !self.tool_group_transition_running {
+            self.tool_group_transition_running = true;
+            cx.on_next_frame(window, |this, window, cx| {
+                this.advance_tool_group_disclosure_transitions(window, cx)
+            });
+        }
+    }
+
+    fn advance_tool_group_disclosure_transitions(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.tool_group_transition_running {
+            return;
+        }
+
+        let now = cx.background_executor().now();
+        let mut still_running = false;
+        for transition in self.tool_group_disclosure_transitions.values_mut() {
+            let Some(started_at) = transition.started_at else {
+                continue;
+            };
+            let progress = (now.saturating_duration_since(started_at).as_secs_f32()
+                / TOOL_GROUP_TRANSITION_DURATION.as_secs_f32())
+            .clamp(0.0, 1.0);
+            transition.progress = transition.from
+                + (transition.target - transition.from) * reasoning_transition_ease(progress);
+            transition.chevron_progress = transition.chevron_from
+                + (transition.target - transition.chevron_from)
+                    * tool_group_chevron_transition_ease(progress);
+
+            if progress >= 1.0 || cx.reduce_motion() {
+                transition.progress = transition.target;
+                transition.chevron_progress = transition.target;
+                transition.started_at = None;
+            } else {
+                still_running = true;
+            }
+        }
+
+        self.tool_group_transition_running = still_running;
+        cx.notify();
+        if still_running {
+            cx.on_next_frame(window, |this, window, cx| {
+                this.advance_tool_group_disclosure_transitions(window, cx)
+            });
+        }
+    }
+
     fn suggestion(
         &self,
         index: usize,
@@ -706,16 +1323,69 @@ impl Render for HomeView {
             let prompt_focus = self.composer.read(cx).prompt_focus_handle(cx);
             window.focus(&prompt_focus, cx);
         }
-        for activity in &conversation_activity {
-            if let ConversationActivity::Command(command) = activity {
-                let scroll_handle = self
-                    .command_scroll_handles
-                    .entry(command.id.clone())
-                    .or_insert_with(ScrollHandle::new);
-                if command.status == CommandExecutionStatus::InProgress {
-                    scroll_handle.scroll_to_bottom();
-                }
+        self.sync_reasoning_disclosure_transitions(&conversation_activity, window, cx);
+        self.sync_tool_group_disclosure_transitions(&conversation_activity, window, cx);
+        let reasoning_disclosure_progress = self
+            .reasoning_disclosure_transitions
+            .iter()
+            .map(|(item_id, transition)| (item_id.clone(), transition.progress))
+            .collect();
+        let tool_group_disclosure_progress = self
+            .tool_group_disclosure_transitions
+            .iter()
+            .map(|(group_id, transition)| {
+                (
+                    group_id.clone(),
+                    (transition.progress, transition.chevron_progress),
+                )
+            })
+            .collect();
+        for unit in activity_stream_units(&conversation_activity) {
+            let ActivityStreamUnit::ToolGroup(group) = unit else {
+                continue;
+            };
+            let expanded = if group.is_active() {
+                !self.collapsed_active_tool_groups.contains(&group.id)
+            } else {
+                self.expanded_tool_groups.contains(&group.id)
+            };
+            let scroll_handle = self
+                .tool_group_scroll_handles
+                .entry(group.id.clone())
+                .or_insert_with(ScrollHandle::new);
+            if group.is_active() && expanded && scroll_should_follow_output(scroll_handle) {
+                scroll_handle.scroll_to_bottom();
             }
+        }
+        for activity in &conversation_activity {
+            match activity {
+                ConversationActivity::Reasoning(reasoning) => {
+                    let scroll_handle = self
+                        .reasoning_scroll_handles
+                        .entry(reasoning.item_id.clone())
+                        .or_insert_with(ScrollHandle::new);
+                    if reasoning.is_active() && scroll_should_follow_output(scroll_handle) {
+                        scroll_handle.scroll_to_bottom();
+                    }
+                }
+                ConversationActivity::Command(command) => {
+                    let scroll_handle = self
+                        .command_scroll_handles
+                        .entry(command.id.clone())
+                        .or_insert_with(ScrollHandle::new);
+                    if command.status == CommandExecutionStatus::InProgress
+                        && scroll_should_follow_output(scroll_handle)
+                    {
+                        scroll_handle.scroll_to_bottom();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if phase == ConversationPhase::Empty {
+            self.conversation_scroll.set_offset(point(px(0.0), px(0.0)));
+        } else if scroll_should_follow_output(&self.conversation_scroll) {
+            self.conversation_scroll.scroll_to_bottom();
         }
         home(
             cx.entity(),
@@ -728,9 +1398,17 @@ impl Render for HomeView {
             assistant_message,
             assistant_message_time,
             conversation_activity,
+            self.conversation_scroll.clone(),
             self.thinking_shimmer_progress,
             self.response_feedback,
             self.user_message_actions_visible_for_capture,
+            self.expanded_reasoning.clone(),
+            reasoning_disclosure_progress,
+            self.reasoning_scroll_handles.clone(),
+            self.expanded_tool_groups.clone(),
+            self.collapsed_active_tool_groups.clone(),
+            tool_group_disclosure_progress,
+            self.tool_group_scroll_handles.clone(),
             self.expanded_commands.clone(),
             self.command_scroll_handles.clone(),
             self.suggestion(
@@ -762,9 +1440,17 @@ fn home(
     assistant_message: String,
     assistant_message_time: Option<String>,
     conversation_activity: Vec<ConversationActivity>,
+    conversation_scroll: ScrollHandle,
     thinking_shimmer_progress: f32,
     response_feedback: i8,
     user_message_actions_visible_for_capture: bool,
+    expanded_reasoning: HashSet<String>,
+    reasoning_disclosure_progress: HashMap<String, f32>,
+    reasoning_scroll_handles: HashMap<String, ScrollHandle>,
+    expanded_tool_groups: HashSet<String>,
+    collapsed_active_tool_groups: HashSet<String>,
+    tool_group_disclosure_progress: HashMap<String, (f32, f32)>,
+    tool_group_scroll_handles: HashMap<String, ScrollHandle>,
     expanded_commands: HashSet<String>,
     command_scroll_handles: HashMap<String, ScrollHandle>,
     first_suggestion: impl IntoElement,
@@ -855,9 +1541,17 @@ fn home(
                 assistant_message,
                 assistant_message_time,
                 conversation_activity,
+                conversation_scroll,
                 thinking_shimmer_progress,
                 response_feedback,
                 user_message_actions_visible_for_capture,
+                expanded_reasoning,
+                reasoning_disclosure_progress,
+                reasoning_scroll_handles,
+                expanded_tool_groups,
+                collapsed_active_tool_groups,
+                tool_group_disclosure_progress,
+                tool_group_scroll_handles,
                 expanded_commands,
                 command_scroll_handles,
             ))
@@ -968,13 +1662,24 @@ fn conversation(
     assistant_message: String,
     assistant_message_time: Option<String>,
     conversation_activity: Vec<ConversationActivity>,
+    conversation_scroll: ScrollHandle,
     thinking_shimmer_progress: f32,
     response_feedback: i8,
     user_message_actions_visible_for_capture: bool,
+    expanded_reasoning: HashSet<String>,
+    reasoning_disclosure_progress: HashMap<String, f32>,
+    reasoning_scroll_handles: HashMap<String, ScrollHandle>,
+    expanded_tool_groups: HashSet<String>,
+    collapsed_active_tool_groups: HashSet<String>,
+    tool_group_disclosure_progress: HashMap<String, (f32, f32)>,
+    tool_group_scroll_handles: HashMap<String, ScrollHandle>,
     expanded_commands: HashSet<String>,
     command_scroll_handles: HashMap<String, ScrollHandle>,
-) -> Div {
-    let status = conversation_status(phase);
+) -> impl IntoElement {
+    let has_active_reasoning = conversation_activity.iter().any(|activity| {
+        matches!(activity, ConversationActivity::Reasoning(reasoning) if reasoning.is_active())
+    });
+    let show_thinking_tail = conversation_status(phase).is_some() && !has_active_reasoning;
     let user_message_hover_group: SharedString = "user-message-hover".into();
     let assistant_message_hover_group: SharedString = "assistant-message-hover".into();
     let copied_user_message = user_message.clone();
@@ -983,11 +1688,12 @@ fn conversation(
         ConversationPhase::Complete | ConversationPhase::Failed
     );
 
-    div()
-        .absolute()
-        .top(px(78.0))
+    let conversation_body = div()
         .w_full()
         .max_w(px(736.0))
+        .mx_auto()
+        .pt(px(CONVERSATION_TOP_INSET))
+        .pb(px(CONVERSATION_BOTTOM_INSET))
         .flex()
         .flex_col()
         .child(
@@ -1096,18 +1802,42 @@ fn conversation(
                 .text_size(px(14.0))
                 .line_height(px(22.0))
                 .text_color(theme.text)
-                .when_some(status, |answer, _| {
-                    answer.child(thinking_shimmer(theme, thinking_shimmer_progress))
-                })
                 .when(
-                    !assistant_message.is_empty() || !conversation_activity.is_empty(),
+                    !assistant_message.is_empty()
+                        || !conversation_activity.is_empty()
+                        || show_thinking_tail,
                     |answer| {
                         if conversation_activity.is_empty() {
-                            answer.child(div().w_full().child(assistant_message.clone()))
+                            answer.child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(16.0))
+                                    .when(!assistant_message.is_empty(), |stream| {
+                                        stream
+                                            .child(div().w_full().child(assistant_message.clone()))
+                                    })
+                                    .when(show_thinking_tail, |stream| {
+                                        stream.child(thinking_shimmer(
+                                            theme,
+                                            thinking_shimmer_progress,
+                                        ))
+                                    }),
+                            )
                         } else {
                             answer.child(activity_stream(
                                 home_entity.clone(),
                                 conversation_activity,
+                                show_thinking_tail,
+                                thinking_shimmer_progress,
+                                expanded_reasoning,
+                                reasoning_disclosure_progress,
+                                reasoning_scroll_handles,
+                                expanded_tool_groups,
+                                collapsed_active_tool_groups,
+                                tool_group_disclosure_progress,
+                                tool_group_scroll_handles,
                                 expanded_commands,
                                 command_scroll_handles,
                                 theme,
@@ -1192,108 +1922,517 @@ fn conversation(
                             }),
                     )
                 }),
-        )
+        );
+
+    div()
+        .id("conversation-scroll")
+        .debug_selector(|| "conversation-scroll".to_owned())
+        .absolute()
+        .inset_0()
+        .overflow_y_scroll()
+        .restrict_scroll_to_axis()
+        .scrollbar_width(px(0.0))
+        .track_scroll(&conversation_scroll)
+        .child(conversation_body)
+}
+
+fn scroll_should_follow_output(scroll_handle: &ScrollHandle) -> bool {
+    let max_offset = f32::from(scroll_handle.max_offset().y).max(0.0);
+    let offset = f32::from(scroll_handle.offset().y);
+    max_offset <= CONVERSATION_BOTTOM_EPSILON || max_offset + offset <= CONVERSATION_BOTTOM_EPSILON
+}
+
+fn nested_scroll_consumed(
+    scroll_handle: &ScrollHandle,
+    event: &ScrollWheelEvent,
+    window: &Window,
+) -> bool {
+    let delta_y = match event.delta {
+        ScrollDelta::Pixels(delta) => f32::from(delta.y),
+        ScrollDelta::Lines(delta) => f32::from(window.line_height()) * delta.y,
+    };
+    if delta_y.abs() <= f32::EPSILON {
+        return false;
+    }
+
+    let max_offset = f32::from(scroll_handle.max_offset().y).max(0.0);
+    if max_offset <= CONVERSATION_BOTTOM_EPSILON {
+        return false;
+    }
+
+    // GPUI registers the built-in scroller after custom wheel listeners, so
+    // bubble dispatch runs the built-in listener first. Reconstruct the
+    // pre-gesture position to decide whether this nested viewport owned the
+    // gesture; at an edge the event keeps bubbling to the conversation.
+    let previous_offset = (f32::from(scroll_handle.offset().y) - delta_y).clamp(-max_offset, 0.0);
+    if delta_y < 0.0 {
+        previous_offset > -max_offset + CONVERSATION_BOTTOM_EPSILON
+    } else {
+        previous_offset < -CONVERSATION_BOTTOM_EPSILON
+    }
 }
 
 fn activity_stream(
     home_entity: Entity<HomeView>,
     activities: Vec<ConversationActivity>,
+    show_thinking_tail: bool,
+    thinking_shimmer_progress: f32,
+    expanded_reasoning: HashSet<String>,
+    reasoning_disclosure_progress: HashMap<String, f32>,
+    reasoning_scroll_handles: HashMap<String, ScrollHandle>,
+    expanded_tool_groups: HashSet<String>,
+    collapsed_active_tool_groups: HashSet<String>,
+    tool_group_disclosure_progress: HashMap<String, (f32, f32)>,
+    tool_group_scroll_handles: HashMap<String, ScrollHandle>,
     expanded_commands: HashSet<String>,
     command_scroll_handles: HashMap<String, ScrollHandle>,
     theme: Theme,
 ) -> Div {
-    activities.into_iter().enumerate().fold(
-        div().w_full().flex().flex_col().gap(px(16.0)),
-        |stream, (index, activity)| match activity {
-            ConversationActivity::AssistantMessage { text, .. } if !text.is_empty() => {
-                stream.child(div().w_full().child(text))
-            }
-            ConversationActivity::Command(command) => {
-                let expanded = expanded_commands.contains(&command.id);
-                let scroll_handle = command_scroll_handles
-                    .get(&command.id)
-                    .cloned()
-                    .unwrap_or_else(ScrollHandle::new);
-                stream.child(command_activity(
-                    home_entity.clone(),
-                    command,
-                    expanded,
-                    scroll_handle,
-                    theme,
-                ))
-            }
-            ConversationActivity::Approval(_) => stream,
-            ConversationActivity::FileApproval(_) => stream,
-            ConversationActivity::PermissionsApproval(_) => stream,
-            ConversationActivity::FileChange(model) => {
-                let target = home_entity.clone();
-                let callback = FileChangeActivityCallback::new(move |event, _, cx| {
-                    target.update(cx, move |home, cx| {
-                        home.handle_file_change_activity_event(event, cx)
-                    });
-                });
-                stream.child(render_file_change_activity(&model, theme, callback))
-            }
-            ConversationActivity::UserInput(_) => stream,
-            ConversationActivity::ProtocolError {
-                message,
-                details,
-                will_retry: true,
-            } => stream.child(retrying_error_activity(index, message, details, theme)),
-            ConversationActivity::ProtocolError {
-                message,
-                details,
-                will_retry: false,
-            } => stream.child(notice_activity(
-                message,
-                details,
-                None,
-                "Codex 错误",
-                NOTICE_ERROR_GAP,
-                NOTICE_ERROR_CONTENT_GAP,
-                index,
-                theme,
-            )),
-            ConversationActivity::Warning { message } => stream.child(notice_activity(
-                message,
-                None,
-                None,
-                "Codex 警告",
-                NOTICE_WARNING_GAP,
-                NOTICE_WARNING_CONTENT_GAP,
-                index,
-                theme,
-            )),
-            ConversationActivity::ConfigWarning(warning) => {
-                let file = warning.path.map(|path| ConfigWarningFile {
-                    path,
-                    line: warning.line,
-                    column: warning.column,
-                });
-                stream.child(notice_activity(
-                    warning.summary,
-                    warning.details,
-                    file,
-                    "Codex 配置警告",
-                    NOTICE_WARNING_GAP,
-                    NOTICE_WARNING_CONTENT_GAP,
-                    index,
-                    theme,
-                ))
-            }
-            ConversationActivity::Error { message } => stream.child(notice_activity(
-                message,
-                None,
-                None,
-                "Codex turn 失败",
-                NOTICE_ERROR_GAP,
-                NOTICE_ERROR_CONTENT_GAP,
-                index,
-                theme,
-            )),
-            _ => stream,
-        },
-    )
+    activity_stream_units(&activities)
+        .into_iter()
+        .enumerate()
+        .fold(
+            div().w_full().flex().flex_col().gap(px(16.0)),
+            |stream, (index, unit)| match unit {
+                ActivityStreamUnit::ToolGroup(group) => {
+                    let active = group.is_active();
+                    let expanded = if active {
+                        !collapsed_active_tool_groups.contains(&group.id)
+                    } else {
+                        expanded_tool_groups.contains(&group.id)
+                    };
+                    let settled_progress = if expanded { 1.0 } else { 0.0 };
+                    let (disclosure_progress, chevron_progress) = tool_group_disclosure_progress
+                        .get(&group.id)
+                        .copied()
+                        .unwrap_or((settled_progress, settled_progress));
+                    let scroll_handle = tool_group_scroll_handles
+                        .get(&group.id)
+                        .cloned()
+                        .unwrap_or_else(ScrollHandle::new);
+                    stream.child(tool_activity_group(
+                        home_entity.clone(),
+                        group,
+                        expanded,
+                        disclosure_progress,
+                        chevron_progress,
+                        scroll_handle,
+                        &expanded_commands,
+                        &command_scroll_handles,
+                        theme,
+                    ))
+                }
+                ActivityStreamUnit::Standalone(activity) => match activity {
+                    ConversationActivity::AssistantMessage { text, .. } if !text.is_empty() => {
+                        stream.child(div().w_full().child(text))
+                    }
+                    ConversationActivity::Reasoning(reasoning) => {
+                        let expanded = reasoning.is_active()
+                            || expanded_reasoning.contains(&reasoning.item_id);
+                        let disclosure_progress = reasoning_disclosure_progress
+                            .get(&reasoning.item_id)
+                            .copied()
+                            .unwrap_or(if expanded { 1.0 } else { 0.0 });
+                        let scroll_handle = reasoning_scroll_handles
+                            .get(&reasoning.item_id)
+                            .cloned()
+                            .unwrap_or_else(ScrollHandle::new);
+                        stream.child(reasoning_activity(
+                            home_entity.clone(),
+                            reasoning,
+                            expanded,
+                            disclosure_progress,
+                            scroll_handle,
+                            thinking_shimmer_progress,
+                            theme,
+                        ))
+                    }
+                    ConversationActivity::Command(command) => {
+                        stream.child(command_execution_activity(
+                            home_entity.clone(),
+                            command,
+                            &expanded_commands,
+                            &command_scroll_handles,
+                            theme,
+                        ))
+                    }
+                    ConversationActivity::Approval(_) => stream,
+                    ConversationActivity::FileApproval(_) => stream,
+                    ConversationActivity::PermissionsApproval(_) => stream,
+                    ConversationActivity::FileChange(model) => {
+                        let target = home_entity.clone();
+                        let callback = FileChangeActivityCallback::new(move |event, _, cx| {
+                            target.update(cx, move |home, cx| {
+                                home.handle_file_change_activity_event(event, cx)
+                            });
+                        });
+                        stream.child(render_file_change_activity(&model, theme, callback))
+                    }
+                    ConversationActivity::UserInput(_) => stream,
+                    ConversationActivity::ProtocolError {
+                        message,
+                        details,
+                        will_retry: true,
+                    } => stream.child(retrying_error_activity(index, message, details, theme)),
+                    ConversationActivity::ProtocolError {
+                        message,
+                        details,
+                        will_retry: false,
+                    } => stream.child(notice_activity(
+                        message,
+                        details,
+                        None,
+                        "Codex 错误",
+                        NOTICE_ERROR_GAP,
+                        NOTICE_ERROR_CONTENT_GAP,
+                        index,
+                        theme,
+                    )),
+                    ConversationActivity::Warning { message } => stream.child(notice_activity(
+                        message,
+                        None,
+                        None,
+                        "Codex 警告",
+                        NOTICE_WARNING_GAP,
+                        NOTICE_WARNING_CONTENT_GAP,
+                        index,
+                        theme,
+                    )),
+                    ConversationActivity::ConfigWarning(warning) => {
+                        let file = warning.path.map(|path| ConfigWarningFile {
+                            path,
+                            line: warning.line,
+                            column: warning.column,
+                        });
+                        stream.child(notice_activity(
+                            warning.summary,
+                            warning.details,
+                            file,
+                            "Codex 配置警告",
+                            NOTICE_WARNING_GAP,
+                            NOTICE_WARNING_CONTENT_GAP,
+                            index,
+                            theme,
+                        ))
+                    }
+                    ConversationActivity::Error { message } => stream.child(notice_activity(
+                        message,
+                        None,
+                        None,
+                        "Codex turn 失败",
+                        NOTICE_ERROR_GAP,
+                        NOTICE_ERROR_CONTENT_GAP,
+                        index,
+                        theme,
+                    )),
+                    _ => stream,
+                },
+            },
+        )
+        // Keep the generic waiting state in the same 16px activity stream so
+        // it always follows the latest rendered JSON-RPC item.
+        .when(show_thinking_tail, |stream| {
+            stream.child(thinking_shimmer(theme, thinking_shimmer_progress))
+        })
+}
+
+fn format_reasoning_elapsed(elapsed_ms: u64) -> String {
+    let total_seconds = elapsed_ms.div_ceil(1_000).max(1);
+    let hours = total_seconds / 3_600;
+    let minutes = total_seconds % 3_600 / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        if minutes > 0 {
+            format!("{hours}h {minutes}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else if minutes > 0 {
+        if seconds > 0 {
+            format!("{minutes}m {seconds}s")
+        } else {
+            format!("{minutes}m")
+        }
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn reasoning_header_label(reasoning: &ReasoningActivityPresentation) -> String {
+    if reasoning.is_active() {
+        "正在思考".to_owned()
+    } else if let Some(elapsed_ms) = reasoning.elapsed_ms() {
+        format!("思考了 {}", format_reasoning_elapsed(elapsed_ms))
+    } else {
+        "完成思考".to_owned()
+    }
+}
+
+fn active_reasoning_body(text: &str) -> String {
+    let trimmed = text.trim_start();
+    let Some(after_opening) = trimmed.strip_prefix("**") else {
+        return trimmed.to_owned();
+    };
+    let first_line = after_opening
+        .split_once('\n')
+        .map_or(after_opening, |(line, _)| line);
+    let Some(closing) = first_line.find("**") else {
+        return String::new();
+    };
+    after_opening[closing + 2..].trim_start().to_owned()
+}
+
+fn reasoning_body_text(reasoning: &ReasoningActivityPresentation) -> String {
+    let display_text = reasoning.display_text();
+    if reasoning.is_active() {
+        active_reasoning_body(&display_text)
+    } else {
+        display_text
+    }
+}
+
+fn completed_reasoning_body(text: &str) -> (Option<String>, String) {
+    let trimmed = text.trim_start();
+    let Some(after_opening) = trimmed.strip_prefix("**") else {
+        return (None, trimmed.to_owned());
+    };
+    let first_line = after_opening
+        .split_once('\n')
+        .map_or(after_opening, |(line, _)| line);
+    let Some(closing) = first_line.find("**") else {
+        return (None, trimmed.to_owned());
+    };
+    let title = after_opening[..closing].trim().to_owned();
+    let body = after_opening[closing + 2..].trim_start().to_owned();
+    ((!title.is_empty()).then_some(title), body)
+}
+
+fn completed_reasoning_body_element(text: String) -> Div {
+    let (title, body) = completed_reasoning_body(&text);
+    let has_title = title.is_some();
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .when_some(title, |content, title| {
+            content.child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+        })
+        .when(!body.is_empty(), |content| {
+            content.child(
+                div()
+                    .when(has_title, |body| body.mt(px(REASONING_BODY_TOP_GAP)))
+                    .font_weight(FontWeight::NORMAL)
+                    .child(body),
+            )
+        })
+}
+
+fn reasoning_transition_ease(progress: f32) -> f32 {
+    cubic_bezier_ease(progress, 0.19, 1.0, 0.22, 1.0)
+}
+
+fn tool_group_chevron_transition_ease(progress: f32) -> f32 {
+    cubic_bezier_ease(progress, 0.4, 0.0, 0.2, 1.0)
+}
+
+fn cubic_bezier_ease(progress: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
+    let progress = progress.clamp(0.0, 1.0);
+    if progress == 0.0 || progress == 1.0 {
+        return progress;
+    }
+
+    // Invert x for the reference cubic Bézier, then evaluate y.
+    let mut lower = 0.0;
+    let mut upper = 1.0;
+    for _ in 0..10 {
+        let parameter = (lower + upper) * 0.5;
+        let inverse = 1.0 - parameter;
+        let x = 3.0 * inverse * inverse * parameter * x1
+            + 3.0 * inverse * parameter * parameter * x2
+            + parameter * parameter * parameter;
+        if x < progress {
+            lower = parameter;
+        } else {
+            upper = parameter;
+        }
+    }
+    let parameter = (lower + upper) * 0.5;
+    let inverse = 1.0 - parameter;
+    3.0 * inverse * inverse * parameter * y1
+        + 3.0 * inverse * parameter * parameter * y2
+        + parameter * parameter * parameter
+}
+
+fn toggle_reasoning_item(
+    home_entity: &Entity<HomeView>,
+    item_id: &str,
+    scroll_handle: &ScrollHandle,
+    cx: &mut App,
+) {
+    let item_id = item_id.to_owned();
+    home_entity.update(cx, |home, cx| {
+        if !home.expanded_reasoning.remove(&item_id) {
+            home.expanded_reasoning.insert(item_id);
+            scroll_handle.scroll_to_bottom();
+        }
+        cx.notify();
+    });
+}
+
+fn reasoning_activity(
+    home_entity: Entity<HomeView>,
+    reasoning: ReasoningActivityPresentation,
+    expanded: bool,
+    disclosure_progress: f32,
+    scroll_handle: ScrollHandle,
+    thinking_shimmer_progress: f32,
+    theme: Theme,
+) -> Div {
+    let item_id = reasoning.item_id.clone();
+    let hover_group: SharedString = format!("reasoning-activity-{item_id}").into();
+    let active = reasoning.is_active();
+    let body_text = reasoning_body_text(&reasoning);
+    let has_content = !body_text.trim().is_empty();
+    let can_toggle = !active && has_content;
+    let header_label = reasoning_header_label(&reasoning);
+    let accessible_label = if expanded {
+        format!("{header_label}，折叠推理内容")
+    } else {
+        format!("{header_label}，展开推理内容")
+    };
+    let click_home_entity = home_entity.clone();
+    let click_item_id = item_id.clone();
+    let click_scroll_handle = scroll_handle.clone();
+    let key_item_id = item_id.clone();
+    let key_scroll_handle = scroll_handle.clone();
+    let nested_scroll_handle = scroll_handle.clone();
+
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .items_start()
+        .child(
+            div()
+                .id(SharedString::from(format!("reasoning-activity-{item_id}")))
+                .group(hover_group.clone())
+                .h(px(REASONING_HEADER_HEIGHT))
+                .max_w_full()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .rounded(px(6.0))
+                .when(can_toggle, |header| {
+                    header
+                        .focusable()
+                        .tab_stop(true)
+                        .role(Role::Button)
+                        .aria_expanded(expanded)
+                        .aria_label(accessible_label)
+                        .focus_visible(|style| {
+                            style.px(px(DISCLOSURE_FOCUS_PADDING)).shadow(vec![
+                                BoxShadow::new(px(0.0), px(0.0), rgba(0x3a83f7ff).into())
+                                    .spread_radius(px(2.0))
+                                    .inset(),
+                            ])
+                        })
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            toggle_reasoning_item(
+                                &click_home_entity,
+                                &click_item_id,
+                                &click_scroll_handle,
+                                cx,
+                            );
+                        })
+                        .on_key_down(move |event, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                toggle_reasoning_item(
+                                    &home_entity,
+                                    &key_item_id,
+                                    &key_scroll_handle,
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }
+                        })
+                })
+                .child(if active {
+                    div()
+                        .child(thinking_shimmer(theme, thinking_shimmer_progress))
+                        .into_any_element()
+                } else {
+                    div()
+                        .min_w(px(0.0))
+                        .max_w(px(718.0))
+                        .truncate()
+                        .text_size(px(REASONING_TEXT_SIZE))
+                        .line_height(px(REASONING_LINE_HEIGHT))
+                        .font_family(".SystemUIFont")
+                        .font_weight(FontWeight::NORMAL)
+                        .text_color(theme.text.alpha(0.30))
+                        .group_hover(hover_group.clone(), move |label| {
+                            label.text_color(theme.text)
+                        })
+                        .child(header_label)
+                        .into_any_element()
+                })
+                .when(can_toggle, |header| {
+                    header.child(
+                        icon("settings-chevron-right", theme.text.alpha(0.60).into())
+                            .size(px(REASONING_CHEVRON_SIZE))
+                            .flex_none()
+                            .opacity(disclosure_progress.clamp(0.0, 1.0))
+                            .group_hover(hover_group, |chevron| chevron.opacity(1.0))
+                            .with_transformation(Transformation::rotate(radians(
+                                std::f32::consts::FRAC_PI_2 * disclosure_progress.clamp(0.0, 1.0),
+                            ))),
+                    )
+                }),
+        )
+        .when(has_content, |activity| {
+            let visibility = disclosure_progress.clamp(0.0, 1.0);
+            activity.child(
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .max_h(px(
+                        (REASONING_BODY_MAX_HEIGHT + REASONING_BODY_TOP_GAP) * visibility
+                    ))
+                    .opacity(visibility)
+                    .when(visibility <= f32::EPSILON, |body| body.invisible())
+                    .child(
+                        div().w_full().pt(px(REASONING_BODY_TOP_GAP)).child(
+                            div()
+                                .id(SharedString::from(format!("reasoning-body-{item_id}")))
+                                .w_full()
+                                .max_h(px(REASONING_BODY_MAX_HEIGHT))
+                                .overflow_scroll()
+                                .restrict_scroll_to_axis()
+                                .scrollbar_width(px(0.0))
+                                .track_scroll(&scroll_handle)
+                                .on_scroll_wheel(move |event, window, cx| {
+                                    if nested_scroll_consumed(&nested_scroll_handle, event, window)
+                                    {
+                                        cx.stop_propagation();
+                                    }
+                                })
+                                .text_size(px(REASONING_TEXT_SIZE))
+                                .line_height(px(REASONING_LINE_HEIGHT))
+                                .font_family(".SystemUIFont")
+                                .font_weight(FontWeight::NORMAL)
+                                .text_color(theme.text.alpha(0.50))
+                                .child(if active {
+                                    div().child(body_text)
+                                } else {
+                                    completed_reasoning_body_element(body_text)
+                                }),
+                        ),
+                    ),
+            )
+        })
 }
 
 fn command_approval_card(
@@ -1520,6 +2659,460 @@ fn notice_activity(
         })
 }
 
+fn toggle_tool_activity_group(
+    home_entity: &Entity<HomeView>,
+    group_id: &str,
+    active: bool,
+    scroll_handle: &ScrollHandle,
+    cx: &mut App,
+) {
+    let group_id = group_id.to_owned();
+    home_entity.update(cx, |home, cx| {
+        let expanded = if active {
+            if home.collapsed_active_tool_groups.remove(&group_id) {
+                true
+            } else {
+                home.collapsed_active_tool_groups.insert(group_id.clone());
+                false
+            }
+        } else if home.expanded_tool_groups.remove(&group_id) {
+            false
+        } else {
+            home.expanded_tool_groups.insert(group_id);
+            true
+        };
+        if expanded {
+            scroll_handle.scroll_to_bottom();
+        }
+        cx.notify();
+    });
+}
+
+fn tool_activity_group(
+    home_entity: Entity<HomeView>,
+    group: ToolActivityGroupPresentation,
+    expanded: bool,
+    disclosure_progress: f32,
+    chevron_progress: f32,
+    scroll_handle: ScrollHandle,
+    expanded_commands: &HashSet<String>,
+    command_scroll_handles: &HashMap<String, ScrollHandle>,
+    theme: Theme,
+) -> Div {
+    let group_id = group.id.clone();
+    let active = group.is_active();
+    let reasoning_title = active.then(|| tool_group_reasoning_title(&group)).flatten();
+    let summary = if let Some(title) = reasoning_title {
+        CommandActivitySummary {
+            icon: "",
+            text: title,
+            reads_files: false,
+            runs_command: false,
+        }
+    } else if active {
+        group
+            .commands
+            .iter()
+            .rev()
+            .find(|command| command.status == CommandExecutionStatus::InProgress)
+            .or_else(|| group.commands.last())
+            .and_then(|command| command_activity_summaries(command).into_iter().last())
+            .unwrap_or_else(|| CommandActivitySummary {
+                icon: "panel-terminal",
+                text: "正在工作".to_owned(),
+                reads_files: false,
+                runs_command: true,
+            })
+    } else {
+        completed_tool_group_summary(&group)
+    };
+    let has_header_icon = !summary.icon.is_empty();
+    let accessible_label = if expanded {
+        format!("{}，折叠工具调用", summary.text)
+    } else {
+        format!("{}，展开工具调用", summary.text)
+    };
+    let hover_group: SharedString = format!("tool-activity-group-{group_id}").into();
+    let click_home = home_entity.clone();
+    let click_group_id = group_id.clone();
+    let click_scroll = scroll_handle.clone();
+    let key_group_id = group_id.clone();
+    let key_scroll = scroll_handle.clone();
+    let scroll_home = home_entity.clone();
+    let nested_scroll_handle = scroll_handle.clone();
+    let visibility = disclosure_progress.clamp(0.0, 1.0);
+    let chevron_visibility = chevron_progress.clamp(0.0, 1.0);
+    let scroll_top = -f32::from(scroll_handle.offset().y);
+    let max_scroll = f32::from(scroll_handle.max_offset().y);
+    let row_count = tool_group_row_count(&group);
+    let estimated_rows_height = TOOL_GROUP_ITEM_GAP
+        + row_count as f32 * TOOL_GROUP_HEADER_HEIGHT
+        + row_count.saturating_sub(1) as f32 * TOOL_GROUP_ITEM_GAP;
+    let has_overflow = max_scroll > 0.5 || estimated_rows_height > TOOL_GROUP_BODY_MAX_HEIGHT;
+    let show_top_fade = scroll_top > 0.5;
+    let show_bottom_fade = has_overflow && (max_scroll <= 0.5 || scroll_top + 0.5 < max_scroll);
+
+    let command_rows = group.commands.into_iter().fold(
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(TOOL_GROUP_ITEM_GAP)),
+        |rows, command| {
+            rows.child(command_execution_activity(
+                home_entity.clone(),
+                command,
+                expanded_commands,
+                command_scroll_handles,
+                theme,
+            ))
+        },
+    );
+
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .items_start()
+        .child(
+            div()
+                .id(SharedString::from(format!(
+                    "tool-activity-group-{group_id}"
+                )))
+                .group(hover_group.clone())
+                .h(px(TOOL_GROUP_HEADER_HEIGHT))
+                .max_w_full()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(TOOL_GROUP_HEADER_CHEVRON_GAP))
+                .rounded(px(6.0))
+                .focusable()
+                .tab_stop(true)
+                .role(Role::Button)
+                .aria_expanded(expanded)
+                .aria_label(accessible_label)
+                .focus_visible(|style| {
+                    style.px(px(DISCLOSURE_FOCUS_PADDING)).shadow(vec![
+                        BoxShadow::new(px(0.0), px(0.0), rgba(0x3a83f7ff).into())
+                            .spread_radius(px(2.0))
+                            .inset(),
+                    ])
+                })
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    toggle_tool_activity_group(
+                        &click_home,
+                        &click_group_id,
+                        active,
+                        &click_scroll,
+                        cx,
+                    );
+                })
+                .on_key_down(move |event, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        toggle_tool_activity_group(
+                            &home_entity,
+                            &key_group_id,
+                            active,
+                            &key_scroll,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    }
+                })
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .max_w(px(718.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(TOOL_GROUP_ICON_TEXT_GAP))
+                        .text_color(theme.text.alpha(0.60))
+                        .when(has_header_icon, |content| {
+                            content.child(
+                                icon(summary.icon, theme.text.alpha(0.60).into())
+                                    .size(px(TOOL_GROUP_ICON_SIZE))
+                                    .flex_none(),
+                            )
+                        })
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .max_w(px(if has_header_icon { 696.0 } else { 718.0 }))
+                                .truncate()
+                                .text_size(px(TOOL_GROUP_TEXT_SIZE))
+                                .line_height(px(TOOL_GROUP_LINE_HEIGHT))
+                                .font_family(".SystemUIFont")
+                                .font_weight(FontWeight::NORMAL)
+                                .child(summary.text),
+                        ),
+                )
+                .child(
+                    icon("settings-chevron-right", theme.text.alpha(0.60).into())
+                        .size(px(TOOL_GROUP_CHEVRON_SIZE))
+                        .flex_none()
+                        .opacity(if expanded || visibility > f32::EPSILON {
+                            1.0
+                        } else {
+                            0.0
+                        })
+                        .group_hover(hover_group, |chevron| chevron.opacity(1.0))
+                        .with_transformation(Transformation::rotate(radians(
+                            std::f32::consts::FRAC_PI_2 * chevron_visibility,
+                        ))),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .max_h(px(TOOL_GROUP_BODY_MAX_HEIGHT * visibility))
+                .overflow_hidden()
+                .opacity(visibility)
+                .when(visibility <= f32::EPSILON, |body| body.invisible())
+                .child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .max_h(px(TOOL_GROUP_BODY_MAX_HEIGHT))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("tool-activity-body-{group_id}")))
+                                .ml(px(-8.0))
+                                .pl(px(8.0))
+                                .w_full()
+                                .max_h(px(TOOL_GROUP_BODY_MAX_HEIGHT))
+                                .overflow_scroll()
+                                .restrict_scroll_to_axis()
+                                .scrollbar_width(px(0.0))
+                                .track_scroll(&scroll_handle)
+                                .pt(px(TOOL_GROUP_ITEM_GAP))
+                                .on_scroll_wheel(move |event, window, cx| {
+                                    if nested_scroll_consumed(&nested_scroll_handle, event, window)
+                                    {
+                                        cx.stop_propagation();
+                                    }
+                                    let home = scroll_home.clone();
+                                    window.on_next_frame(move |_, cx| {
+                                        home.update(cx, |_, cx| cx.notify());
+                                    });
+                                })
+                                .child(command_rows),
+                        )
+                        .when(show_top_fade, |body| {
+                            body.child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .w_full()
+                                    .h(px(TOOL_GROUP_EDGE_FADE_DISTANCE))
+                                    .bg(linear_gradient(
+                                        0.0,
+                                        linear_color_stop(theme.surface.alpha(0.0), 0.0),
+                                        linear_color_stop(theme.surface, 1.0),
+                                    )),
+                            )
+                        })
+                        .when(show_bottom_fade, |body| {
+                            body.child(
+                                div()
+                                    .absolute()
+                                    .bottom_0()
+                                    .left_0()
+                                    .w_full()
+                                    .h(px(TOOL_GROUP_EDGE_FADE_DISTANCE))
+                                    .bg(linear_gradient(
+                                        180.0,
+                                        linear_color_stop(theme.surface.alpha(0.0), 0.0),
+                                        linear_color_stop(theme.surface, 1.0),
+                                    )),
+                            )
+                        }),
+                ),
+        )
+}
+
+fn toggle_command_activity(
+    home_entity: &Entity<HomeView>,
+    item_id: &str,
+    scroll_handle: &ScrollHandle,
+    cx: &mut App,
+) {
+    let item_id = item_id.to_owned();
+    home_entity.update(cx, |home, cx| {
+        if !home.expanded_commands.remove(&item_id) {
+            home.expanded_commands.insert(item_id);
+            scroll_handle.scroll_to_bottom();
+        }
+        cx.notify();
+    });
+}
+
+fn static_command_action_activity(
+    row_id: String,
+    summary: CommandActivitySummary,
+    action: CommandExecutionAction,
+    cwd: String,
+    theme: Theme,
+) -> impl IntoElement {
+    let hover_group: SharedString = format!("command-action-{row_id}").into();
+    let read_link = match action {
+        CommandExecutionAction::Read { name, path, .. } => {
+            let label = if name.trim().is_empty() {
+                path.clone()
+            } else {
+                name
+            };
+            let path = PathBuf::from(path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                PathBuf::from(cwd).join(path)
+            };
+            Some((label, path))
+        }
+        _ => None,
+    };
+    let summary_text = summary.text.clone();
+    div()
+        .id(SharedString::from(format!("command-action-{row_id}")))
+        .group(hover_group.clone())
+        .h(px(TOOL_GROUP_HEADER_HEIGHT))
+        .max_w_full()
+        .min_w(px(0.0))
+        .flex()
+        .items_center()
+        .gap(px(COMMAND_ACTIVITY_CONTENT_GAP))
+        .text_color(theme.text.alpha(0.60))
+        .child(
+            icon(summary.icon, theme.text.alpha(0.60).into())
+                .size(px(COMMAND_ACTIVITY_ICON_SIZE))
+                .flex_none(),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .max_w(px(696.0))
+                .truncate()
+                .text_size(px(TOOL_GROUP_TEXT_SIZE))
+                .line_height(px(TOOL_GROUP_LINE_HEIGHT))
+                .font_family(".SystemUIFont")
+                .text_color(theme.text.alpha(0.60))
+                .group_hover(hover_group, move |label| label.text_color(theme.text))
+                .child(if let Some((label, path)) = read_link {
+                    let prefix = summary_text
+                        .strip_suffix(&label)
+                        .unwrap_or(&summary_text)
+                        .to_owned();
+                    let click_path = path.clone();
+                    let key_path = path.clone();
+                    div()
+                        .min_w(px(0.0))
+                        .flex()
+                        .items_center()
+                        .child(prefix)
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("command-read-link-{row_id}")))
+                                .role(Role::Link)
+                                .aria_label(format!("打开 {}", path.display()))
+                                .focusable()
+                                .tab_stop(true)
+                                .min_w(px(0.0))
+                                .max_w_full()
+                                .truncate()
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .underline()
+                                .focus_visible(|style| {
+                                    style.shadow(vec![
+                                        BoxShadow::new(px(0.0), px(0.0), rgba(0x3a83f7ff).into())
+                                            .spread_radius(px(2.0))
+                                            .inset(),
+                                    ])
+                                })
+                                .on_click(move |_, _, cx| cx.open_with_system(&click_path))
+                                .on_key_down(move |event, _, cx| {
+                                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                        cx.open_with_system(&key_path);
+                                        cx.stop_propagation();
+                                    }
+                                })
+                                .child(label),
+                        )
+                        .into_any_element()
+                } else {
+                    div().child(summary.text).into_any_element()
+                }),
+        )
+}
+
+fn command_execution_activity(
+    home_entity: Entity<HomeView>,
+    command: CommandExecution,
+    expanded_commands: &HashSet<String>,
+    command_scroll_handles: &HashMap<String, ScrollHandle>,
+    theme: Theme,
+) -> Div {
+    let execution_id = command.id.clone();
+    let actions = if command.actions.is_empty() {
+        vec![CommandExecutionAction::Unknown {
+            command: command.command.clone(),
+        }]
+    } else {
+        command.actions.clone()
+    };
+    let action_count = actions.len();
+    let scroll_handle = command_scroll_handles
+        .get(&execution_id)
+        .cloned()
+        .unwrap_or_else(ScrollHandle::new);
+
+    actions.into_iter().enumerate().fold(
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(TOOL_GROUP_ITEM_GAP)),
+        |rows, (index, action)| {
+            let row_id = if action_count == 1 {
+                execution_id.clone()
+            } else {
+                format!("{execution_id}-action-{index}")
+            };
+            let summary = command_action_summary(&command, &action);
+            match action {
+                CommandExecutionAction::Unknown {
+                    command: action_command,
+                } => {
+                    let mut row_command = command.clone();
+                    row_command.id = row_id.clone();
+                    row_command.command = action_command.clone();
+                    row_command.actions = vec![CommandExecutionAction::Unknown {
+                        command: action_command,
+                    }];
+                    rows.child(command_activity(
+                        home_entity.clone(),
+                        row_command,
+                        expanded_commands.contains(&row_id),
+                        scroll_handle.clone(),
+                        theme,
+                    ))
+                }
+                action => rows.child(static_command_action_activity(
+                    row_id,
+                    summary,
+                    action,
+                    command.cwd.clone(),
+                    theme,
+                )),
+            }
+        },
+    )
+}
+
 fn command_activity(
     home_entity: Entity<HomeView>,
     command: CommandExecution,
@@ -1530,11 +3123,7 @@ fn command_activity(
     let item_id = command.id.clone();
     let output_scroll_id: SharedString = format!("command-output-{item_id}").into();
     let hover_group: SharedString = format!("command-activity-{item_id}").into();
-    let command_label = match command.status {
-        CommandExecutionStatus::InProgress => "正在运行",
-        CommandExecutionStatus::Completed => "已运行",
-        CommandExecutionStatus::Failed => "运行失败",
-    };
+    let summary = command_activity_summary(&command);
     let status_label = match command.status {
         CommandExecutionStatus::InProgress => "运行中",
         CommandExecutionStatus::Completed => "成功",
@@ -1554,7 +3143,6 @@ fn command_activity(
     } else {
         command.command.clone()
     };
-    let header_text = format!("{command_label} {display_command}");
     let output = if command.output.is_empty() {
         if command.status == CommandExecutionStatus::InProgress {
             "等待输出…".to_owned()
@@ -1568,7 +3156,17 @@ fn command_activity(
         strip_terminal_line_ending(&command.output).to_owned()
     };
     let command_for_body = display_command.clone();
-    let scroll_handle_for_click = scroll_handle.clone();
+    let accessible_label = if expanded {
+        format!("{}，折叠详情", summary.text)
+    } else {
+        format!("{}，展开详情", summary.text)
+    };
+    let click_home = home_entity.clone();
+    let click_item_id = item_id.clone();
+    let click_scroll = scroll_handle.clone();
+    let key_item_id = item_id.clone();
+    let key_scroll = scroll_handle.clone();
+    let nested_scroll_handle = scroll_handle.clone();
 
     div()
         .w_full()
@@ -1587,15 +3185,27 @@ fn command_activity(
                 .items_center()
                 .gap(px(4.0))
                 .rounded(px(6.0))
+                .focusable()
+                .tab_stop(true)
+                .role(Role::Button)
+                .aria_expanded(expanded)
+                .aria_label(accessible_label)
+                .focus_visible(|style| {
+                    style.px(px(DISCLOSURE_FOCUS_PADDING)).shadow(vec![
+                        BoxShadow::new(px(0.0), px(0.0), rgba(0x3a83f7ff).into())
+                            .spread_radius(px(2.0))
+                            .inset(),
+                    ])
+                })
                 .cursor_pointer()
                 .on_click(move |_, _, cx| {
-                    home_entity.update(cx, |home, cx| {
-                        if !home.expanded_commands.remove(&item_id) {
-                            home.expanded_commands.insert(item_id.clone());
-                            scroll_handle_for_click.scroll_to_bottom();
-                        }
-                        cx.notify();
-                    });
+                    toggle_command_activity(&click_home, &click_item_id, &click_scroll, cx);
+                })
+                .on_key_down(move |event, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        toggle_command_activity(&home_entity, &key_item_id, &key_scroll, cx);
+                        cx.stop_propagation();
+                    }
                 })
                 .child(
                     div()
@@ -1606,7 +3216,7 @@ fn command_activity(
                         .gap(px(COMMAND_ACTIVITY_CONTENT_GAP))
                         .text_color(theme.text.alpha(0.60))
                         .child(
-                            icon("panel-terminal", theme.text.alpha(0.60).into())
+                            icon(summary.icon, theme.text.alpha(0.60).into())
                                 .size(px(COMMAND_ACTIVITY_ICON_SIZE))
                                 .flex_none(),
                         )
@@ -1618,7 +3228,7 @@ fn command_activity(
                                 .text_size(px(14.0))
                                 .line_height(px(21.0))
                                 .font_family(".SystemUIFont")
-                                .child(header_text),
+                                .child(summary.text),
                         ),
                 )
                 .child(
@@ -1695,6 +3305,12 @@ fn command_activity(
                                 .restrict_scroll_to_axis()
                                 .scrollbar_width(px(0.0))
                                 .track_scroll(&scroll_handle)
+                                .on_scroll_wheel(move |event, window, cx| {
+                                    if nested_scroll_consumed(&nested_scroll_handle, event, window)
+                                    {
+                                        cx.stop_propagation();
+                                    }
+                                })
                                 .p(px(8.0))
                                 .text_size(px(COMMAND_CARD_TEXT_SIZE))
                                 .line_height(px(COMMAND_CARD_LINE_HEIGHT))
@@ -1864,25 +3480,38 @@ mod tests {
     };
 
     use super::{
-        COMMAND_ACTIVITY_CHEVRON_SIZE, COMMAND_ACTIVITY_CONTENT_GAP, COMMAND_ACTIVITY_ICON_SIZE,
-        COMMAND_CARD_COMMAND_MAX_HEIGHT, COMMAND_CARD_HEADER_LINE_HEIGHT, COMMAND_CARD_HEADER_SIZE,
-        COMMAND_CARD_LINE_HEIGHT, COMMAND_CARD_OUTPUT_MAX_HEIGHT, COMMAND_CARD_RADIUS,
-        COMMAND_CARD_STATUS_HEIGHT, COMMAND_CARD_TEXT_SIZE, HomeView, NOTICE_BUTTON_HEIGHT,
-        NOTICE_ERROR_CONTENT_GAP, NOTICE_ERROR_GAP, NOTICE_ICON_SIZE, NOTICE_LINE_HEIGHT,
-        NOTICE_RADIUS, NOTICE_TEXT_SIZE, NOTICE_WARNING_CONTENT_GAP, NOTICE_WARNING_GAP,
-        RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT, RESPONSE_ACTION_FOOTER_HEIGHT,
-        RESPONSE_ACTION_FOOTER_OFFSET, RESPONSE_ACTION_GAP, RESPONSE_ACTION_ICON_SIZE,
-        RESPONSE_TIME_LINE_HEIGHT, RESPONSE_TIME_MARGIN, RESPONSE_TIME_SIZE,
-        SUGGESTION_PRESSED_SCALE, THINKING_SHIMMER_DURATION, THINKING_SHIMMER_FRAME_INTERVAL,
-        THINKING_SHIMMER_STEPS, THINKING_SHIMMER_WIDTH, USER_MESSAGE_BUBBLE_RADIUS,
+        ActivityStreamUnit, COMMAND_ACTIVITY_CHEVRON_SIZE, COMMAND_ACTIVITY_CONTENT_GAP,
+        COMMAND_ACTIVITY_ICON_SIZE, COMMAND_CARD_COMMAND_MAX_HEIGHT,
+        COMMAND_CARD_HEADER_LINE_HEIGHT, COMMAND_CARD_HEADER_SIZE, COMMAND_CARD_LINE_HEIGHT,
+        COMMAND_CARD_OUTPUT_MAX_HEIGHT, COMMAND_CARD_RADIUS, COMMAND_CARD_STATUS_HEIGHT,
+        COMMAND_CARD_TEXT_SIZE, CONVERSATION_BOTTOM_INSET, CONVERSATION_TOP_INSET,
+        DISCLOSURE_FOCUS_PADDING, HomeView, NOTICE_BUTTON_HEIGHT, NOTICE_ERROR_CONTENT_GAP,
+        NOTICE_ERROR_GAP, NOTICE_ICON_SIZE, NOTICE_LINE_HEIGHT, NOTICE_RADIUS, NOTICE_TEXT_SIZE,
+        NOTICE_WARNING_CONTENT_GAP, NOTICE_WARNING_GAP, REASONING_BODY_MAX_HEIGHT,
+        REASONING_CHEVRON_SIZE, REASONING_HEADER_HEIGHT, REASONING_LINE_HEIGHT,
+        REASONING_TEXT_SIZE, REASONING_TRANSITION_DURATION, RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT,
+        RESPONSE_ACTION_FOOTER_HEIGHT, RESPONSE_ACTION_FOOTER_OFFSET, RESPONSE_ACTION_GAP,
+        RESPONSE_ACTION_ICON_SIZE, RESPONSE_TIME_LINE_HEIGHT, RESPONSE_TIME_MARGIN,
+        RESPONSE_TIME_SIZE, SUGGESTION_PRESSED_SCALE, THINKING_SHIMMER_DURATION,
+        THINKING_SHIMMER_FRAME_INTERVAL, THINKING_SHIMMER_STEPS, THINKING_SHIMMER_WIDTH,
+        TOOL_GROUP_BODY_MAX_HEIGHT, TOOL_GROUP_CHEVRON_SIZE, TOOL_GROUP_EDGE_FADE_DISTANCE,
+        TOOL_GROUP_HEADER_CHEVRON_GAP, TOOL_GROUP_HEADER_HEIGHT, TOOL_GROUP_ICON_SIZE,
+        TOOL_GROUP_ICON_TEXT_GAP, TOOL_GROUP_ITEM_GAP, TOOL_GROUP_LINE_HEIGHT,
+        TOOL_GROUP_TEXT_SIZE, TOOL_GROUP_TRANSITION_DURATION, USER_MESSAGE_BUBBLE_RADIUS,
         USER_MESSAGE_BUBBLE_SUPERELLIPSE, USER_MESSAGE_FOOTER_GAP, USER_MESSAGE_FOOTER_HEIGHT,
         USER_MESSAGE_FOOTER_OFFSET, USER_MESSAGE_FOOTER_SIDE_MARGIN, USER_MESSAGE_TIME_LINE_HEIGHT,
-        USER_MESSAGE_TIME_SIZE, conversation_status, strip_terminal_line_ending,
+        USER_MESSAGE_TIME_SIZE, active_reasoning_body, activity_stream_units,
+        command_activity_row_count, command_activity_summaries, command_activity_summary,
+        completed_reasoning_body, completed_tool_group_summary, conversation_status,
+        format_reasoning_elapsed, reasoning_activity_title, reasoning_header_label,
+        reasoning_transition_ease, scroll_should_follow_output, strip_terminal_line_ending,
         thinking_shimmer_alpha, thinking_shimmer_band_left, thinking_shimmer_progress,
-        thinking_shimmer_step,
+        thinking_shimmer_step, toggle_reasoning_item, toggle_tool_activity_group,
+        tool_group_chevron_transition_ease, tool_group_reasoning_title,
     };
+    use crate::agent::{CommandExecution, CommandExecutionAction, CommandExecutionStatus};
     use crate::components::{
-        composer::{ConversationActivity, ConversationPhase},
+        composer::{ConversationActivity, ConversationPhase, ReasoningActivityPresentation},
         prompt_input::Submit,
         user_input_request::{UserInputKeyboardFocus, UserInputRequestStatus},
     };
@@ -1897,6 +3526,452 @@ mod tests {
             })
             .unwrap()
         });
+    }
+
+    fn reasoning(id: &str, title: &str, active: bool) -> ReasoningActivityPresentation {
+        ReasoningActivityPresentation {
+            item_id: id.to_owned(),
+            summary: vec![title.to_owned()],
+            content: Vec::new(),
+            started_at_ms: 1_000,
+            completed_at_ms: (!active).then_some(2_000),
+        }
+    }
+
+    fn command(
+        id: &str,
+        action: CommandExecutionAction,
+        status: CommandExecutionStatus,
+    ) -> CommandExecution {
+        let command = match &action {
+            CommandExecutionAction::Read { command, .. }
+            | CommandExecutionAction::ListFiles { command, .. }
+            | CommandExecutionAction::Search { command, .. }
+            | CommandExecutionAction::Unknown { command } => command.clone(),
+        };
+        CommandExecution {
+            id: id.to_owned(),
+            command,
+            actions: vec![action],
+            cwd: "/tmp/project".to_owned(),
+            output: String::new(),
+            status,
+            exit_code: (status == CommandExecutionStatus::Completed).then_some(0),
+        }
+    }
+
+    #[test]
+    fn consecutive_reasoning_and_commands_form_one_tool_activity_group() {
+        let activities = vec![
+            ConversationActivity::Reasoning(reasoning("reasoning_1", "Inspecting runtime", false)),
+            ConversationActivity::Command(command(
+                "read_1",
+                CommandExecutionAction::Read {
+                    command: "sed -n '1,20p' src/main.rs".into(),
+                    name: "main.rs".into(),
+                    path: "src/main.rs".into(),
+                },
+                CommandExecutionStatus::Completed,
+            )),
+            ConversationActivity::Reasoning(reasoning("reasoning_2", "Checking tests", false)),
+            ConversationActivity::Command(command(
+                "run_1",
+                CommandExecutionAction::Unknown {
+                    command: "cargo test".into(),
+                },
+                CommandExecutionStatus::Completed,
+            )),
+            ConversationActivity::AssistantMessage {
+                item_id: "message_1".into(),
+                text: "完成。".into(),
+            },
+        ];
+
+        let units = activity_stream_units(&activities);
+        assert_eq!(units.len(), 2);
+        let ActivityStreamUnit::ToolGroup(group) = &units[0] else {
+            panic!("expected grouped tool activity");
+        };
+        assert_eq!(group.id, "reasoning_1");
+        assert_eq!(group.reasoning.len(), 2);
+        assert_eq!(group.commands.len(), 2);
+        assert_eq!(
+            tool_group_reasoning_title(group).as_deref(),
+            Some("Checking tests")
+        );
+        assert_eq!(
+            completed_tool_group_summary(group).text,
+            "已读取文件运行了命令"
+        );
+        assert!(matches!(units[1], ActivityStreamUnit::Standalone(_)));
+
+        let separated = vec![
+            activities[1].clone(),
+            activities[4].clone(),
+            activities[3].clone(),
+        ];
+        let separated_units = activity_stream_units(&separated);
+        assert_eq!(separated_units.len(), 3);
+        assert!(matches!(
+            separated_units[0],
+            ActivityStreamUnit::ToolGroup(_)
+        ));
+        assert!(matches!(
+            separated_units[2],
+            ActivityStreamUnit::ToolGroup(_)
+        ));
+    }
+
+    #[test]
+    fn active_reasoning_follows_the_latest_json_rpc_item_until_it_completes() {
+        let later_items = || {
+            vec![
+                ConversationActivity::AssistantMessage {
+                    item_id: "message_1".into(),
+                    text: "先说明当前进度。".into(),
+                },
+                ConversationActivity::Command(command(
+                    "read_1",
+                    CommandExecutionAction::Read {
+                        command: "sed -n '1,20p' src/main.rs".into(),
+                        name: "main.rs".into(),
+                        path: "src/main.rs".into(),
+                    },
+                    CommandExecutionStatus::Completed,
+                )),
+                ConversationActivity::AssistantMessage {
+                    item_id: "message_2".into(),
+                    text: "继续分析读取结果。".into(),
+                },
+            ]
+        };
+
+        let mut active_activities = vec![ConversationActivity::Reasoning(reasoning(
+            "reasoning_1",
+            "Inspecting the implementation",
+            true,
+        ))];
+        active_activities.extend(later_items());
+        let active_units = activity_stream_units(&active_activities);
+
+        assert_eq!(active_units.len(), 4);
+        assert!(matches!(
+            &active_units[0],
+            ActivityStreamUnit::Standalone(ConversationActivity::AssistantMessage {
+                item_id,
+                ..
+            }) if item_id == "message_1"
+        ));
+        assert!(matches!(active_units[1], ActivityStreamUnit::ToolGroup(_)));
+        assert!(matches!(
+            &active_units[2],
+            ActivityStreamUnit::Standalone(ConversationActivity::AssistantMessage {
+                item_id,
+                ..
+            }) if item_id == "message_2"
+        ));
+        assert!(matches!(
+            &active_units[3],
+            ActivityStreamUnit::Standalone(ConversationActivity::Reasoning(reasoning))
+                if reasoning.item_id == "reasoning_1" && reasoning.is_active()
+        ));
+
+        let mut completed_activities = vec![ConversationActivity::Reasoning(reasoning(
+            "reasoning_1",
+            "Inspecting the implementation",
+            false,
+        ))];
+        completed_activities.extend(later_items());
+        let completed_units = activity_stream_units(&completed_activities);
+        assert_eq!(completed_units.len(), 3);
+        assert!(matches!(
+            &completed_units[0],
+            ActivityStreamUnit::Standalone(ConversationActivity::AssistantMessage {
+                item_id,
+                ..
+            }) if item_id == "message_1"
+        ));
+        assert!(!completed_units.iter().any(|unit| matches!(
+            unit,
+            ActivityStreamUnit::Standalone(ConversationActivity::Reasoning(_))
+        )));
+    }
+
+    #[test]
+    fn completed_reasoning_without_a_following_command_is_not_rendered() {
+        let activities = vec![
+            ConversationActivity::Reasoning(reasoning("reasoning_1", "Only reasoning", false)),
+            ConversationActivity::AssistantMessage {
+                item_id: "message_1".into(),
+                text: "结论。".into(),
+            },
+        ];
+        let units = activity_stream_units(&activities);
+        assert_eq!(units.len(), 1);
+        assert!(matches!(
+            &units[0],
+            ActivityStreamUnit::Standalone(ConversationActivity::AssistantMessage {
+                item_id,
+                ..
+            }) if item_id == "message_1"
+        ));
+
+        let titled = ReasoningActivityPresentation {
+            summary: vec!["**Header title**".into(), "Longer reasoning body".into()],
+            ..reasoning("reasoning_title", "unused", false)
+        };
+        assert_eq!(
+            reasoning_activity_title(&titled).as_deref(),
+            Some("Header title")
+        );
+    }
+
+    #[test]
+    fn command_rows_use_the_app_server_action_semantics() {
+        let read = command(
+            "read",
+            CommandExecutionAction::Read {
+                command: "sed -n '1,20p' src/main.rs".into(),
+                name: "main.rs".into(),
+                path: "src/main.rs".into(),
+            },
+            CommandExecutionStatus::Completed,
+        );
+        assert_eq!(command_activity_summary(&read).text, "已读取 main.rs");
+
+        let search = command(
+            "search",
+            CommandExecutionAction::Search {
+                command: "rg needle src".into(),
+                path: Some("src".into()),
+                query: Some("needle".into()),
+            },
+            CommandExecutionStatus::InProgress,
+        );
+        assert_eq!(
+            command_activity_summary(&search).text,
+            "正在 src 中搜索“needle”"
+        );
+
+        let shell = command(
+            "shell",
+            CommandExecutionAction::Unknown {
+                command: "cargo check".into(),
+            },
+            CommandExecutionStatus::Completed,
+        );
+        assert_eq!(command_activity_summary(&shell).text, "已运行 cargo check");
+    }
+
+    #[test]
+    fn one_command_execution_renders_every_structured_action_as_its_own_row() {
+        let command = CommandExecution {
+            id: "exec_many".into(),
+            command: "compound command".into(),
+            actions: vec![
+                CommandExecutionAction::Read {
+                    command: "sed main.rs".into(),
+                    name: "main.rs".into(),
+                    path: "src/main.rs".into(),
+                },
+                CommandExecutionAction::Search {
+                    command: "rg needle src".into(),
+                    path: Some("src".into()),
+                    query: Some("needle".into()),
+                },
+                CommandExecutionAction::Unknown {
+                    command: "cargo check".into(),
+                },
+            ],
+            cwd: "/tmp/project".into(),
+            output: String::new(),
+            status: CommandExecutionStatus::Completed,
+            exit_code: Some(0),
+        };
+
+        let summaries = command_activity_summaries(&command);
+        assert_eq!(command_activity_row_count(&command), 3);
+        assert_eq!(
+            summaries
+                .into_iter()
+                .map(|summary| summary.text)
+                .collect::<Vec<_>>(),
+            vec![
+                "已读取 main.rs",
+                "已在 src 中搜索“needle”",
+                "已运行 cargo check",
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_group_matches_the_live_cdp_geometry() {
+        assert_eq!(TOOL_GROUP_HEADER_HEIGHT, 21.0);
+        assert_eq!(TOOL_GROUP_TEXT_SIZE, 14.0);
+        assert_eq!(TOOL_GROUP_LINE_HEIGHT, 21.0);
+        assert_eq!(TOOL_GROUP_ICON_SIZE, 16.0);
+        assert_eq!(TOOL_GROUP_ICON_TEXT_GAP, 6.0);
+        assert_eq!(TOOL_GROUP_HEADER_CHEVRON_GAP, 4.0);
+        assert_eq!(TOOL_GROUP_CHEVRON_SIZE, 14.0);
+        assert_eq!(TOOL_GROUP_ITEM_GAP, 4.0);
+        assert_eq!(TOOL_GROUP_BODY_MAX_HEIGHT, 224.0);
+        assert_eq!(TOOL_GROUP_EDGE_FADE_DISTANCE, 24.0);
+        assert_eq!(DISCLOSURE_FOCUS_PADDING, 2.0);
+        assert_eq!(TOOL_GROUP_TRANSITION_DURATION, Duration::from_millis(300));
+        assert!(tool_group_chevron_transition_ease(0.5) > 0.7);
+        assert!(tool_group_chevron_transition_ease(0.5) < 0.9);
+    }
+
+    #[test]
+    fn conversation_viewport_scrolls_and_does_not_snap_back_after_user_scrolls_up() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(420.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+
+        window.update(|home, _, cx| home.set_tool_group_for_capture(true, false, cx));
+        window.draw();
+
+        let (initial_offset, max_offset) = window.read(|home, _| {
+            (
+                f32::from(home.conversation_scroll.offset().y),
+                f32::from(home.conversation_scroll.max_offset().y),
+            )
+        });
+        assert!(max_offset > 100.0, "long conversations must overflow");
+        assert!((initial_offset + max_offset).abs() < 0.01);
+        assert!(window.read(|home, _| { scroll_should_follow_output(&home.conversation_scroll) }));
+
+        // Use the empty gutter beside the centered 736px message column so
+        // only the main conversation viewport receives this gesture.
+        window.simulate_scroll(point(px(20.0), px(200.0)), point(px(0.0), px(96.0)));
+        let user_offset = window.read(|home, _| f32::from(home.conversation_scroll.offset().y));
+        assert!(user_offset > initial_offset);
+        assert!(!window.read(|home, _| { scroll_should_follow_output(&home.conversation_scroll) }));
+
+        // A streaming repaint must preserve the user's reading position.
+        window.update(|_, _, cx| cx.notify());
+        window.draw();
+        let repainted_offset =
+            window.read(|home, _| f32::from(home.conversation_scroll.offset().y));
+        assert!((repainted_offset - user_offset).abs() < 0.01);
+
+        window.simulate_scroll(point(px(20.0), px(200.0)), point(px(0.0), px(-10_000.0)));
+        window.draw();
+        window.read(|home, _| {
+            let offset = f32::from(home.conversation_scroll.offset().y);
+            let max = f32::from(home.conversation_scroll.max_offset().y);
+            assert!((offset + max).abs() < 0.01);
+            assert!(scroll_should_follow_output(&home.conversation_scroll));
+        });
+    }
+
+    #[test]
+    fn conversation_insets_preserve_the_original_top_and_clear_the_fixed_composer() {
+        assert_eq!(CONVERSATION_TOP_INSET, 78.0);
+        assert_eq!(CONVERSATION_BOTTOM_INSET, 153.0);
+        assert!(CONVERSATION_BOTTOM_INSET > 15.0 + 98.0);
+    }
+
+    #[test]
+    fn nested_tool_scroll_does_not_move_the_conversation_until_it_reaches_an_edge() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(420.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+
+        window.update(|home, _, cx| home.set_tool_group_for_capture(true, false, cx));
+        window.draw();
+        let (outer_before, inner_before, inner_max, inner_position) = window.read(|home, _| {
+            let inner = home
+                .tool_group_scroll_handles
+                .get("tool-group-ui-capture")
+                .expect("tool group scroll handle");
+            (
+                f32::from(home.conversation_scroll.offset().y),
+                f32::from(inner.offset().y),
+                f32::from(inner.max_offset().y),
+                inner.bounds().center(),
+            )
+        });
+        assert!(inner_max > 0.0);
+        assert!((inner_before + inner_max).abs() < 0.01);
+
+        window.simulate_scroll(inner_position, point(px(0.0), px(48.0)));
+        let (outer_after, inner_after) = window.read(|home, _| {
+            let inner = home
+                .tool_group_scroll_handles
+                .get("tool-group-ui-capture")
+                .expect("tool group scroll handle");
+            (
+                f32::from(home.conversation_scroll.offset().y),
+                f32::from(inner.offset().y),
+            )
+        });
+        assert!(
+            inner_after > inner_before,
+            "inner={inner_before}->{inner_after}, outer={outer_before}->{outer_after}, position={inner_position:?}"
+        );
+        assert!(
+            (outer_after - outer_before).abs() < 0.01,
+            "inner={inner_before}->{inner_after}, outer={outer_before}->{outer_after}, position={inner_position:?}"
+        );
+
+        window.simulate_scroll(inner_position, point(px(0.0), px(48.0)));
+        let (outer_at_edge, inner_at_edge) = window.read(|home, _| {
+            let inner = home
+                .tool_group_scroll_handles
+                .get("tool-group-ui-capture")
+                .expect("tool group scroll handle");
+            (
+                f32::from(home.conversation_scroll.offset().y),
+                f32::from(inner.offset().y),
+            )
+        });
+        assert!(outer_at_edge > outer_after);
+        assert!(inner_at_edge.abs() < 0.01);
+    }
+
+    #[test]
+    fn tool_group_disclosure_uses_one_toggle_path_for_pointer_and_keyboard_activation() {
+        let mut app = TestApp::new();
+        let home = app.new_entity(|cx| HomeView::new(ThemeMode::Dark, cx));
+        let scroll_handle = gpui::ScrollHandle::new();
+
+        app.update(|cx| {
+            toggle_tool_activity_group(&home, "group_1", false, &scroll_handle, cx);
+        });
+        assert!(app.read_entity(&home, |home, _| {
+            home.expanded_tool_groups.contains("group_1")
+        }));
+
+        app.update(|cx| {
+            toggle_tool_activity_group(&home, "group_1", false, &scroll_handle, cx);
+        });
+        assert!(!app.read_entity(&home, |home, _| {
+            home.expanded_tool_groups.contains("group_1")
+        }));
+
+        app.update(|cx| {
+            toggle_tool_activity_group(&home, "group_1", true, &scroll_handle, cx);
+        });
+        assert!(app.read_entity(&home, |home, _| {
+            home.collapsed_active_tool_groups.contains("group_1")
+        }));
     }
 
     #[test]
@@ -1976,6 +4051,252 @@ mod tests {
         assert_eq!(thinking_shimmer_alpha(0.4), 0.75);
         assert_eq!(thinking_shimmer_alpha(0.6), 0.75);
         assert_eq!(thinking_shimmer_alpha(1.0), 0.0);
+    }
+
+    #[test]
+    fn reasoning_item_matches_the_desktop_geometry_and_localized_labels() {
+        assert_eq!(REASONING_HEADER_HEIGHT, 21.0);
+        assert_eq!(REASONING_TEXT_SIZE, 14.0);
+        assert_eq!(REASONING_LINE_HEIGHT, 21.0);
+        assert_eq!(REASONING_CHEVRON_SIZE, 14.0);
+        assert_eq!(REASONING_BODY_MAX_HEIGHT, 140.0);
+        assert_eq!(REASONING_TRANSITION_DURATION, Duration::from_millis(300));
+        assert_eq!(reasoning_transition_ease(0.0), 0.0);
+        assert_eq!(reasoning_transition_ease(1.0), 1.0);
+        assert!(reasoning_transition_ease(0.5) > 0.9);
+        assert_eq!(format_reasoning_elapsed(1), "1s");
+        assert_eq!(format_reasoning_elapsed(29_000), "29s");
+        assert_eq!(format_reasoning_elapsed(82_000), "1m 22s");
+        assert_eq!(format_reasoning_elapsed(3_520_000), "58m 40s");
+
+        let active = ReasoningActivityPresentation {
+            item_id: "reasoning_1".into(),
+            summary: vec![],
+            content: vec![],
+            started_at_ms: 1_000,
+            completed_at_ms: None,
+        };
+        assert_eq!(reasoning_header_label(&active), "正在思考");
+
+        let complete = ReasoningActivityPresentation {
+            completed_at_ms: Some(30_000),
+            ..active.clone()
+        };
+        assert_eq!(reasoning_header_label(&complete), "思考了 29s");
+        let missing_elapsed = ReasoningActivityPresentation {
+            completed_at_ms: Some(1_000),
+            ..active
+        };
+        assert_eq!(reasoning_header_label(&missing_elapsed), "完成思考");
+    }
+
+    #[test]
+    fn active_reasoning_hides_the_streamed_summary_title_like_chatgpt() {
+        assert_eq!(active_reasoning_body("  普通正文"), "普通正文");
+        assert_eq!(
+            active_reasoning_body("**检查实现**\n\n正在阅读协议"),
+            "正在阅读协议"
+        );
+        assert_eq!(active_reasoning_body("**尚未闭合"), "");
+    }
+
+    #[test]
+    fn completed_reasoning_renders_the_summary_title_without_markdown_delimiters() {
+        assert_eq!(
+            completed_reasoning_body("**检查实现**\n\n正在阅读协议"),
+            (Some("检查实现".into()), "正在阅读协议".into())
+        );
+        assert_eq!(
+            completed_reasoning_body("普通正文"),
+            (None, "普通正文".into())
+        );
+        assert_eq!(
+            completed_reasoning_body("**尚未闭合"),
+            (None, "**尚未闭合".into())
+        );
+    }
+
+    #[test]
+    fn reasoning_disclosure_uses_one_toggle_path_for_pointer_and_keyboard_activation() {
+        let mut app = TestApp::new();
+        let home = app.new_entity(|cx| HomeView::new(ThemeMode::Dark, cx));
+        let scroll_handle = gpui::ScrollHandle::new();
+
+        app.update(|cx| {
+            toggle_reasoning_item(&home, "reasoning_1", &scroll_handle, cx);
+        });
+        assert!(app.read_entity(&home, |home, _| {
+            home.expanded_reasoning.contains("reasoning_1")
+        }));
+
+        app.update(|cx| {
+            toggle_reasoning_item(&home, "reasoning_1", &scroll_handle, cx);
+        });
+        assert!(!app.read_entity(&home, |home, _| {
+            home.expanded_reasoning.contains("reasoning_1")
+        }));
+    }
+
+    #[test]
+    fn completed_standalone_reasoning_exposes_no_disclosure_target() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+
+        window.update(|home, _, cx| home.set_reasoning_for_capture("completed-content", false, cx));
+        window.draw();
+        // This was the old standalone completed-reasoning hitbox. It must no
+        // longer mount an interactive disclosure row.
+        window.simulate_click(point(px(100.0), px(176.0)), MouseButton::Left);
+        window.simulate_keystrokes("space");
+        assert!(
+            !window.read(|home, _| { home.expanded_reasoning.contains("reasoning-ui-capture") })
+        );
+    }
+
+    #[test]
+    fn reasoning_disclosure_starts_settled_then_runs_the_reference_transition() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+
+        window.update(|home, _, cx| home.set_reasoning_for_capture("active", false, cx));
+        window.draw();
+        window.read(|home, _| {
+            let transition = home
+                .reasoning_disclosure_transitions
+                .get("reasoning-ui-capture")
+                .unwrap();
+            assert_eq!(transition.progress, 0.0);
+            assert!(transition.started_at.is_none());
+        });
+
+        window.update(|home, _, cx| home.set_reasoning_for_capture("active-content", false, cx));
+        window.draw();
+        simulate_next_frame(&mut app, &window, 150);
+        let midpoint = window.read(|home, _| {
+            home.reasoning_disclosure_transitions
+                .get("reasoning-ui-capture")
+                .unwrap()
+                .progress
+        });
+        assert!(midpoint > 0.9 && midpoint < 1.0);
+
+        simulate_next_frame(&mut app, &window, 150);
+        window.read(|home, _| {
+            let transition = home
+                .reasoning_disclosure_transitions
+                .get("reasoning-ui-capture")
+                .unwrap();
+            assert_eq!(transition.progress, 1.0);
+            assert!(transition.started_at.is_none());
+            assert!(!home.reasoning_transition_running);
+        });
+    }
+
+    #[test]
+    fn tool_group_disclosure_responds_to_real_pointer_and_keyboard_events() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+
+        window.update(|home, _, cx| home.set_tool_group_for_capture(false, false, cx));
+        window.draw();
+        // The preamble starts at y=166 and is 22px tall. The stream's 16px
+        // gap puts the 21px grouped-activity button at y=204..225.
+        window.simulate_click(point(px(100.0), px(214.0)), MouseButton::Left);
+        assert!(
+            window.read(|home, _| { home.expanded_tool_groups.contains("tool-group-ui-capture") })
+        );
+
+        window.simulate_keystrokes("space");
+        assert!(
+            !window.read(|home, _| { home.expanded_tool_groups.contains("tool-group-ui-capture") })
+        );
+    }
+
+    #[test]
+    fn tool_group_disclosure_starts_settled_then_runs_the_reference_transition() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+
+        window.update(|home, _, cx| home.set_tool_group_for_capture(false, false, cx));
+        window.draw();
+        window.read(|home, _| {
+            let transition = home
+                .tool_group_disclosure_transitions
+                .get("tool-group-ui-capture")
+                .unwrap();
+            assert_eq!(transition.progress, 0.0);
+            assert!(transition.started_at.is_none());
+        });
+
+        window.update(|home, _, cx| {
+            home.expanded_tool_groups
+                .insert("tool-group-ui-capture".to_owned());
+            cx.notify();
+        });
+        window.draw();
+        simulate_next_frame(&mut app, &window, 150);
+        let midpoint = window.read(|home, _| {
+            home.tool_group_disclosure_transitions
+                .get("tool-group-ui-capture")
+                .unwrap()
+                .progress
+        });
+        assert!(midpoint > 0.9 && midpoint < 1.0);
+        let chevron_midpoint = window.read(|home, _| {
+            home.tool_group_disclosure_transitions
+                .get("tool-group-ui-capture")
+                .unwrap()
+                .chevron_progress
+        });
+        assert!(chevron_midpoint > 0.7 && chevron_midpoint < 0.9);
+
+        simulate_next_frame(&mut app, &window, 150);
+        window.read(|home, _| {
+            let transition = home
+                .tool_group_disclosure_transitions
+                .get("tool-group-ui-capture")
+                .unwrap();
+            assert_eq!(transition.progress, 1.0);
+            assert_eq!(transition.chevron_progress, 1.0);
+            assert!(transition.started_at.is_none());
+            assert!(!home.tool_group_transition_running);
+        });
     }
 
     #[test]

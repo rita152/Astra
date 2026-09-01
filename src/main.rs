@@ -144,6 +144,16 @@ fn main() {
             .map(ToOwned::to_owned)
     });
     let command_tool_expanded = args.iter().any(|arg| arg == "--command-tool-expanded");
+    let tool_group_state = args.iter().find_map(|arg| {
+        arg.strip_prefix("--tool-group-state=")
+            .map(ToOwned::to_owned)
+    });
+    let tool_group_expanded = args.iter().any(|arg| arg == "--tool-group-expanded");
+    let reasoning_ui_state = args.iter().find_map(|arg| {
+        arg.strip_prefix("--reasoning-ui-state=")
+            .map(ToOwned::to_owned)
+    });
+    let reasoning_ui_expanded = args.iter().any(|arg| arg == "--reasoning-ui-expanded");
     let approval_ui_state = args.iter().find_map(|arg| {
         arg.strip_prefix("--approval-ui-state=")
             .map(ToOwned::to_owned)
@@ -346,6 +356,8 @@ fn main() {
                             app.enable_permission_ui_for_capture(cx);
                         }
                         if approval_ui_state.is_some()
+                            || tool_group_state.is_some()
+                            || reasoning_ui_state.is_some()
                             || user_input_ui_state.is_some()
                             || file_approval_ui_state.is_some()
                             || permissions_approval_ui_state.is_some()
@@ -431,6 +443,16 @@ fn main() {
                                 command_tool_expanded,
                                 cx,
                             );
+                        }
+                        if let Some(state) = tool_group_state.as_deref() {
+                            app.set_tool_group_for_capture(
+                                state.eq_ignore_ascii_case("running"),
+                                tool_group_expanded,
+                                cx,
+                            );
+                        }
+                        if let Some(state) = reasoning_ui_state.as_deref() {
+                            app.set_reasoning_for_capture(state, reasoning_ui_expanded, cx);
                         }
                         if let Some(state) = approval_ui_state.as_deref() {
                             app.set_approval_for_capture(&approval_ui_kind, state, cx);

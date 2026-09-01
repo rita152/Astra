@@ -1,5 +1,6 @@
 use std::{
     process::Command,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -13,6 +14,7 @@ use gpui::{
 gpui::actions!(permission_ui, [DismissPermissionUi]);
 
 use crate::{
+    agent::{AgentBackend, CodexAppServerBackend, CodexAppServerManager},
     components::{
         composer::{ModelCatalogLoadFinished, RequestFullAccessConfirmation},
         file_change::{
@@ -28,6 +30,8 @@ use crate::{
 };
 
 pub struct ChatApp {
+    codex_app_server: Arc<CodexAppServerManager>,
+    _agent_backend: Arc<dyn AgentBackend>,
     mode: ThemeMode,
     startup_model_catalog_resolved: bool,
     startup_minimum_duration_elapsed: bool,
@@ -70,6 +74,12 @@ pub struct ChatApp {
     project_creation_keyboard_focus: bool,
     project_creation_focus: FocusHandle,
     project_creation_focus_pending: bool,
+}
+
+impl Drop for ChatApp {
+    fn drop(&mut self) {
+        self.codex_app_server.shutdown();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,9 +268,13 @@ fn titlebar_icon_button(
 
 impl ChatApp {
     pub fn new(mode: ThemeMode, scroll_sidebar_to_bottom: bool, cx: &mut Context<Self>) -> Self {
+        let codex_app_server = Arc::new(CodexAppServerManager::new());
+        let agent_backend: Arc<dyn AgentBackend> = Arc::new(CodexAppServerBackend::with_manager(
+            codex_app_server.clone(),
+        ));
         let sidebar = cx.new(|_| SidebarView::new(mode, scroll_sidebar_to_bottom));
         let settings = cx.new(|_| SettingsView::new(mode));
-        let home = cx.new(|cx| HomeView::new(mode, cx));
+        let home = cx.new(|cx| HomeView::new_with_backend(mode, agent_backend.clone(), cx));
         cx.subscribe(&sidebar, |this, _, _: &OpenSettings, cx| {
             this.showing_settings = true;
             cx.notify();
@@ -315,6 +329,8 @@ impl ChatApp {
         })
         .detach();
         Self {
+            codex_app_server,
+            _agent_backend: agent_backend,
             mode,
             // Unit tests intentionally exercise the full shell without spawning
             // the external Codex model-catalog process.
@@ -444,8 +460,32 @@ impl ChatApp {
     }
 
     pub fn submit_prompt_for_capture(&mut self, prompt: &str, cx: &mut Context<Self>) {
-        self.home
-            .update(cx, |home, cx| home.submit_prompt_for_capture(prompt, cx));
+        if self.startup_model_catalog_resolved {
+            self.home
+                .update(cx, |home, cx| home.submit_prompt_for_capture(prompt, cx));
+            return;
+        }
+
+        let prompt = prompt.to_owned();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(25))
+                    .await;
+                match this.update(cx, |this, cx| {
+                    if !this.startup_model_catalog_resolved {
+                        return false;
+                    }
+                    this.home
+                        .update(cx, |home, cx| home.submit_prompt_for_capture(&prompt, cx));
+                    true
+                }) {
+                    Ok(true) | Err(_) => return,
+                    Ok(false) => {}
+                }
+            }
+        })
+        .detach();
     }
 
     pub fn show_user_message_actions_for_capture(&mut self, cx: &mut Context<Self>) {
@@ -462,6 +502,28 @@ impl ChatApp {
     ) {
         self.home.update(cx, |home, cx| {
             home.set_command_tool_for_capture(running, expanded, cx)
+        });
+    }
+
+    pub fn set_tool_group_for_capture(
+        &mut self,
+        running: bool,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.home.update(cx, |home, cx| {
+            home.set_tool_group_for_capture(running, expanded, cx)
+        });
+    }
+
+    pub fn set_reasoning_for_capture(
+        &mut self,
+        state: &str,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.home.update(cx, |home, cx| {
+            home.set_reasoning_for_capture(state, expanded, cx)
         });
     }
 

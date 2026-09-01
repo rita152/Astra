@@ -5,7 +5,7 @@ use std::{fmt, path::PathBuf, sync::Arc};
 use async_channel::Receiver;
 use serde_json::Value;
 
-pub use codex::CodexAppServerBackend;
+pub use codex::{CodexAppServerBackend, CodexAppServerManager};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentReasoningEffort {
@@ -138,13 +138,42 @@ pub enum CommandExecutionStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandExecutionAction {
+    Read {
+        command: String,
+        name: String,
+        path: String,
+    },
+    ListFiles {
+        command: String,
+        path: Option<String>,
+    },
+    Search {
+        command: String,
+        path: Option<String>,
+        query: Option<String>,
+    },
+    Unknown {
+        command: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandExecution {
     pub id: String,
     pub command: String,
+    pub actions: Vec<CommandExecutionAction>,
     pub cwd: String,
     pub output: String,
     pub status: CommandExecutionStatus,
     pub exit_code: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentReasoning {
+    pub id: String,
+    pub summary: Vec<String>,
+    pub content: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -261,6 +290,24 @@ pub struct AgentAccountRateLimits {
     pub spend_control_reached: Option<bool>,
     pub plan_type: Option<String>,
     pub rate_limit_reached_type: Option<String>,
+}
+
+/// Agent-neutral events whose lifetime belongs to a backend connection or a
+/// loaded thread rather than to one particular turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentConnectionEvent {
+    Warning {
+        thread_id: Option<String>,
+        message: String,
+    },
+    ConfigWarning(AgentConfigWarning),
+    McpServerStartupStatusUpdated(AgentMcpServerStartupStatus),
+    ThreadStatusChanged(AgentThreadStatus),
+    ThreadSettingsUpdated {
+        thread_id: String,
+        settings: AgentThreadSettings,
+    },
+    AccountRateLimitsUpdated(AgentAccountRateLimits),
 }
 
 /// JSON-RPC request ids are deliberately not normalized: a numeric `7` and a
@@ -636,6 +683,28 @@ pub enum AgentEvent {
         item_id: String,
     },
     TextDelta(String),
+    ReasoningStarted {
+        reasoning: AgentReasoning,
+        started_at_ms: i64,
+    },
+    ReasoningSummaryPartAdded {
+        item_id: String,
+        summary_index: usize,
+    },
+    ReasoningSummaryTextDelta {
+        item_id: String,
+        summary_index: usize,
+        delta: String,
+    },
+    ReasoningTextDelta {
+        item_id: String,
+        content_index: usize,
+        delta: String,
+    },
+    ReasoningCompleted {
+        reasoning: AgentReasoning,
+        completed_at_ms: i64,
+    },
     CommandStarted(CommandExecution),
     CommandOutputDelta {
         item_id: String,
@@ -684,6 +753,7 @@ pub enum AgentEvent {
 
 /// Boundary between the application and a concrete coding-agent protocol.
 pub trait AgentBackend: Send + Sync {
+    fn subscribe_connection_events(&self) -> Receiver<AgentConnectionEvent>;
     #[cfg_attr(test, allow(dead_code))]
     fn load_model_catalog(&self) -> Receiver<Result<AgentModelCatalog, String>>;
     #[allow(dead_code)]

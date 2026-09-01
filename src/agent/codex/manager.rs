@@ -1,0 +1,3190 @@
+use std::{
+    collections::{HashMap, HashSet},
+    io::{BufRead, BufReader, Error as IoError, ErrorKind, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{
+        Arc, Condvar, Mutex, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+};
+
+use anyhow::{Context as _, Result, anyhow, bail};
+use async_channel::{Receiver, Sender};
+use serde_json::{Value, json};
+
+use super::{
+    AppServerProcess, CodexTurnSession, MODEL_LIST_PAGE_SIZE, ModelListResponse,
+    PermissionProfileListResponse, TURN_SCOPED_SERVER_METHODS, TurnOutcome,
+    cleanup_pending_server_requests, ensure_server_method_is_defined,
+    ensure_session_message_matches, is_integrated_server_request_method, parse_agent_notification,
+    parse_mcp_server_startup_status_updated, parse_thread_status_changed, process_turn_message,
+    request_id_from_value, thread_settings_update_request, thread_started_id,
+    validate_remote_control_status_changed, validate_resume_goal_cleared,
+};
+use crate::agent::{
+    AgentConnectionEvent, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
+    AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentPermissionMode,
+    AgentPermissionProfile, AgentRequest, AgentRun, AgentServerRequestId, AgentThreadSettings,
+};
+
+trait ManagedProcess: Send + Sync {
+    fn terminate_and_wait(&self) -> Result<()>;
+}
+
+impl ManagedProcess for AppServerProcess {
+    fn terminate_and_wait(&self) -> Result<()> {
+        AppServerProcess::terminate_and_wait(self)
+    }
+}
+
+struct SpawnedAppServer {
+    reader: Box<dyn BufRead + Send>,
+    writer: Box<dyn Write + Send>,
+    process: Arc<dyn ManagedProcess>,
+}
+
+trait AppServerSpawner: Send + Sync {
+    fn spawn(&self) -> Result<SpawnedAppServer>;
+}
+
+struct RealAppServerSpawner;
+
+impl AppServerSpawner for RealAppServerSpawner {
+    fn spawn(&self) -> Result<SpawnedAppServer> {
+        let mut child = Command::new("codex")
+            .args(["app-server", "--stdio"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("无法启动 `codex app-server --stdio`；请确认 Codex CLI 已安装并完成登录")?;
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("无法读取 Codex app-server stdout");
+        };
+        let Some(stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("无法写入 Codex app-server stdin");
+        };
+        Ok(SpawnedAppServer {
+            reader: Box::new(BufReader::new(stdout)),
+            writer: Box::new(stdin),
+            process: Arc::new(AppServerProcess::new(child)),
+        })
+    }
+}
+
+#[derive(Default)]
+struct ConnectionEventHub {
+    subscribers: Vec<Sender<AgentConnectionEvent>>,
+    snapshots: HashMap<String, AgentConnectionEvent>,
+}
+
+impl ConnectionEventHub {
+    fn subscribe(&mut self) -> Receiver<AgentConnectionEvent> {
+        let (sender, receiver) = async_channel::unbounded();
+        for event in self.snapshots.values().cloned() {
+            let _ = sender.send_blocking(event);
+        }
+        self.subscribers.push(sender);
+        receiver
+    }
+
+    fn publish(&mut self, event: AgentConnectionEvent) {
+        self.snapshots
+            .insert(connection_event_key(&event), event.clone());
+        self.subscribers
+            .retain(|subscriber| subscriber.send_blocking(event.clone()).is_ok());
+    }
+}
+
+fn connection_event_key(event: &AgentConnectionEvent) -> String {
+    match event {
+        AgentConnectionEvent::Warning { thread_id, message } => {
+            format!("warning:{thread_id:?}:{message}")
+        }
+        AgentConnectionEvent::ConfigWarning(warning) => format!(
+            "config:{:?}:{:?}:{:?}:{}",
+            warning.path, warning.line, warning.column, warning.summary
+        ),
+        AgentConnectionEvent::McpServerStartupStatusUpdated(status) => {
+            format!("mcp:{:?}:{}", status.thread_id, status.name)
+        }
+        AgentConnectionEvent::ThreadStatusChanged(status) => {
+            format!("thread-status:{}", status.thread_id)
+        }
+        AgentConnectionEvent::ThreadSettingsUpdated { thread_id, .. } => {
+            format!("thread-settings:{thread_id}")
+        }
+        AgentConnectionEvent::AccountRateLimitsUpdated(_) => "rate-limits".to_owned(),
+    }
+}
+
+struct SharedWriterState {
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    manager: Weak<ManagerInner>,
+    generation: u64,
+}
+
+struct SharedJsonWriter {
+    state: Arc<SharedWriterState>,
+    buffer: Vec<u8>,
+}
+
+impl Clone for SharedJsonWriter {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            buffer: Vec::new(),
+        }
+    }
+}
+
+impl SharedJsonWriter {
+    fn new(writer: Box<dyn Write + Send>, manager: Weak<ManagerInner>, generation: u64) -> Self {
+        Self {
+            state: Arc::new(SharedWriterState {
+                writer: Mutex::new(Some(writer)),
+                manager,
+                generation,
+            }),
+            buffer: Vec::new(),
+        }
+    }
+
+    fn close(&self) {
+        if let Ok(mut writer) = self.state.writer.lock() {
+            writer.take();
+        }
+    }
+
+    fn transport_error(&self, error: &IoError) {
+        if let Some(manager) = self.state.manager.upgrade() {
+            manager.fail_generation(
+                self.state.generation,
+                format!("写入 Codex app-server transport 失败：{error}"),
+            );
+        }
+    }
+}
+
+impl Write for SharedJsonWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let result = match self.state.writer.lock() {
+            Ok(mut writer) => match writer.as_mut() {
+                Some(writer) => writer.write_all(&self.buffer).and_then(|()| writer.flush()),
+                None => Err(IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "Codex app-server 连接已经关闭",
+                )),
+            },
+            Err(_) => Err(IoError::other("Codex app-server stdin 锁已损坏")),
+        };
+        if let Err(error) = &result {
+            self.transport_error(error);
+        } else {
+            self.buffer.clear();
+        }
+        result
+    }
+}
+
+struct PendingRpc {
+    method: String,
+    sender: Sender<Result<Value, String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TurnKey {
+    thread_id: String,
+    turn_id: String,
+}
+
+enum ThreadLifecycleKind {
+    Start,
+    Resume(String),
+}
+
+struct PendingThreadLifecycle {
+    kind: ThreadLifecycleKind,
+    observed_thread_id: Option<String>,
+}
+
+#[derive(Default)]
+struct ConnectionState {
+    loaded_threads: HashSet<String>,
+    pending_thread_lifecycle: Option<PendingThreadLifecycle>,
+    resume_bootstrap_threads: HashSet<String>,
+    reserved_threads: HashSet<String>,
+    starting_turns: HashMap<String, Arc<ManagedTurn>>,
+    turns: HashMap<TurnKey, Arc<ManagedTurn>>,
+    server_request_owners: HashMap<AgentServerRequestId, TurnKey>,
+    settings_waiters: HashMap<String, Vec<Sender<Result<AgentThreadSettings, String>>>>,
+    remote_control_status: Option<Value>,
+}
+
+struct Connection {
+    generation: u64,
+    writer: SharedJsonWriter,
+    process: Arc<dyn ManagedProcess>,
+    next_request_id: AtomicU64,
+    pending_rpcs: Mutex<HashMap<u64, PendingRpc>>,
+    state: Mutex<ConnectionState>,
+    lifecycle_lock: Mutex<()>,
+    settings_lock: Mutex<()>,
+    failed: AtomicBool,
+    manager: Weak<ManagerInner>,
+}
+
+impl Connection {
+    fn send_message(&self, message: Value) -> Result<()> {
+        let mut writer = self.writer.clone();
+        super::send(&mut writer, message)
+    }
+
+    fn request(&self, method: &str, params: Value) -> Result<Value> {
+        if self.failed.load(Ordering::Acquire) {
+            bail!("Codex app-server connection generation 已失败");
+        }
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        if request_id == u64::MAX {
+            let message = "Codex JSON-RPC request id 已耗尽".to_owned();
+            self.fail_protocol(message.clone());
+            bail!(message);
+        }
+        let (sender, receiver) = async_channel::bounded(1);
+        self.pending_rpcs
+            .lock()
+            .map_err(|_| anyhow!("Codex pending request registry 锁已损坏"))?
+            .insert(
+                request_id,
+                PendingRpc {
+                    method: method.to_owned(),
+                    sender,
+                },
+            );
+        if let Err(error) = self.send_message(json!({
+            "method": method,
+            "id": request_id,
+            "params": params
+        })) {
+            if let Ok(mut pending) = self.pending_rpcs.lock() {
+                pending.remove(&request_id);
+            }
+            return Err(error).with_context(|| format!("写入 `{method}` 请求失败"));
+        }
+        receiver
+            .recv_blocking()
+            .map_err(|_| anyhow!("`{method}` response channel 在返回前关闭"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn handle_response(&self, message: Value) -> Result<()> {
+        let request_id = message
+            .get("id")
+            .and_then(Value::as_u64)
+            .context("Codex JSON-RPC response id 必须是 uint64")?;
+        let pending = self
+            .pending_rpcs
+            .lock()
+            .map_err(|_| anyhow!("Codex pending request registry 锁已损坏"))?
+            .remove(&request_id)
+            .with_context(|| format!("收到未知或重复的 JSON-RPC response id `{request_id}`"))?;
+        let (result, fatal_error) = match (message.get("result"), message.get("error")) {
+            (Some(_), None) => (Ok(message), None),
+            (None, Some(error)) => (
+                Err(format!(
+                    "Codex JSON-RPC `{}` 请求 {request_id} 失败：{error}",
+                    pending.method
+                )),
+                None,
+            ),
+            (Some(_), Some(_)) => {
+                let error =
+                    format!("Codex JSON-RPC response {request_id} 同时包含 result 与 error");
+                (Err(error.clone()), Some(error))
+            }
+            (None, None) => {
+                let error = format!("Codex JSON-RPC response {request_id} 缺少 result 或 error");
+                (Err(error.clone()), Some(error))
+            }
+        };
+        let _ = pending.sender.send_blocking(result);
+        if let Some(error) = fatal_error {
+            bail!(error);
+        }
+        Ok(())
+    }
+
+    fn fail_protocol(&self, message: String) {
+        if let Some(manager) = self.manager.upgrade() {
+            manager.fail_generation(self.generation, message);
+        }
+    }
+
+    fn reserve_thread(&self, thread_id: &str) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?;
+        if state.reserved_threads.contains(thread_id)
+            || state.starting_turns.contains_key(thread_id)
+            || state.turns.keys().any(|key| key.thread_id == thread_id)
+        {
+            bail!("thread `{thread_id}` 已有 active turn，不能并发启动新的 turn");
+        }
+        state.reserved_threads.insert(thread_id.to_owned());
+        Ok(())
+    }
+
+    fn release_reservation(&self, thread_id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.reserved_threads.remove(thread_id);
+        }
+    }
+
+    fn register_starting_turn(&self, turn: Arc<ManagedTurn>) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?;
+        state.reserved_threads.remove(&turn.thread_id);
+        if state.starting_turns.contains_key(&turn.thread_id)
+            || state
+                .turns
+                .keys()
+                .any(|key| key.thread_id == turn.thread_id)
+        {
+            bail!(
+                "thread `{}` 已有 active turn，不能覆盖 registry",
+                turn.thread_id
+            );
+        }
+        state.starting_turns.insert(turn.thread_id.clone(), turn);
+        Ok(())
+    }
+
+    fn bind_starting_turn(&self, thread_id: &str, turn_id: &str) -> Result<Arc<ManagedTurn>> {
+        let key = TurnKey {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+        };
+        let turn = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?;
+            if let Some(turn) = state.turns.get(&key) {
+                return Ok(turn.clone());
+            }
+            state
+                .starting_turns
+                .get(thread_id)
+                .cloned()
+                .with_context(|| {
+                    format!("收到未知 turn 的消息：threadId=`{thread_id}`，turnId=`{turn_id}`")
+                })?
+        };
+        turn.bind_turn_id(turn_id)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?;
+        if let Some(existing) = state.turns.get(&key) {
+            if Arc::ptr_eq(existing, &turn) {
+                return Ok(turn);
+            }
+            bail!("turn registry key `{thread_id}`/`{turn_id}` 已被其他 turn 占用");
+        }
+        if state
+            .starting_turns
+            .get(thread_id)
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, &turn))
+        {
+            state.starting_turns.remove(thread_id);
+        }
+        state.turns.insert(key, turn.clone());
+        Ok(turn)
+    }
+
+    fn turn_for_key(&self, key: &TurnKey) -> Result<Arc<ManagedTurn>> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?
+            .turns
+            .get(key)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "serverRequest/resolved 指向未知 turn：threadId=`{}`，turnId=`{}`",
+                    key.thread_id, key.turn_id
+                )
+            })
+    }
+
+    fn record_server_request_owner(
+        &self,
+        request_id: AgentServerRequestId,
+        key: TurnKey,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?;
+        if let Some(existing) = state.server_request_owners.get(&request_id)
+            && existing != &key
+        {
+            bail!(
+                "Codex server request id {request_id:?} 已属于其他 turn `{}`/`{}`",
+                existing.thread_id,
+                existing.turn_id
+            );
+        }
+        state.server_request_owners.insert(request_id, key);
+        Ok(())
+    }
+
+    fn server_request_owner(&self, request_id: &AgentServerRequestId) -> Result<TurnKey> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?
+            .server_request_owners
+            .get(request_id)
+            .cloned()
+            .with_context(|| format!("serverRequest/resolved 引用了未知 request {request_id:?}"))
+    }
+
+    fn finish_turn(&self, turn: &Arc<ManagedTurn>, result: Result<TurnOutcome>) {
+        turn.finish(result);
+        if let Ok(mut state) = self.state.lock() {
+            state.reserved_threads.remove(&turn.thread_id);
+            if state
+                .starting_turns
+                .get(&turn.thread_id)
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, turn))
+            {
+                state.starting_turns.remove(&turn.thread_id);
+            }
+            state
+                .turns
+                .retain(|_, candidate| !Arc::ptr_eq(candidate, turn));
+            let owned_keys = state
+                .server_request_owners
+                .iter()
+                .filter_map(|(request_id, key)| {
+                    (key.thread_id == turn.thread_id
+                        && turn
+                            .turn_id()
+                            .as_ref()
+                            .is_some_and(|turn_id| turn_id == &key.turn_id))
+                    .then_some(request_id.clone())
+                })
+                .collect::<Vec<_>>();
+            for request_id in owned_keys {
+                state.server_request_owners.remove(&request_id);
+            }
+        }
+    }
+
+    fn fail_all(&self, message: &str) {
+        let pending = self
+            .pending_rpcs
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default();
+        for (_, request) in pending {
+            let _ = request.sender.send_blocking(Err(message.to_owned()));
+        }
+
+        let (turns, settings_waiters) = self
+            .state
+            .lock()
+            .map(|mut state| {
+                let mut turns = state
+                    .starting_turns
+                    .drain()
+                    .map(|(_, turn)| turn)
+                    .collect::<Vec<_>>();
+                turns.extend(state.turns.drain().map(|(_, turn)| turn));
+                turns.sort_by_key(|turn| Arc::as_ptr(turn) as usize);
+                turns.dedup_by(|left, right| Arc::ptr_eq(left, right));
+                state.loaded_threads.clear();
+                state.pending_thread_lifecycle = None;
+                state.resume_bootstrap_threads.clear();
+                state.reserved_threads.clear();
+                state.server_request_owners.clear();
+                let settings_waiters = std::mem::take(&mut state.settings_waiters);
+                (turns, settings_waiters)
+            })
+            .unwrap_or_default();
+        for turn in turns {
+            turn.finish(Err(anyhow!(message.to_owned())));
+        }
+        for (_, waiters) in settings_waiters {
+            for waiter in waiters {
+                let _ = waiter.send_blocking(Err(message.to_owned()));
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct PromptControlState {
+    turn: Option<Weak<ManagedTurn>>,
+    interrupt_requested: bool,
+    abandoned: bool,
+    terminal: bool,
+}
+
+#[derive(Default)]
+struct PromptControl {
+    state: Mutex<PromptControlState>,
+}
+
+impl PromptControl {
+    fn attach(&self, turn: &Arc<ManagedTurn>) {
+        let (interrupt, abandoned) = match self.state.lock() {
+            Ok(mut state) => {
+                if state.terminal {
+                    return;
+                }
+                state.turn = Some(Arc::downgrade(turn));
+                (state.interrupt_requested, state.abandoned)
+            }
+            Err(_) => (true, true),
+        };
+        if interrupt || abandoned {
+            let _ = turn.request_interrupt();
+        }
+    }
+
+    fn mark_terminal(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.terminal = true;
+            state.turn = None;
+        }
+    }
+
+    fn is_abandoned(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.abandoned)
+            .unwrap_or(true)
+    }
+}
+
+impl AgentInterruptControl for PromptControl {
+    fn request_interrupt(&self) -> std::result::Result<AgentInterruptOutcome, String> {
+        let turn = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "Codex prompt interrupt 状态锁已损坏".to_owned())?;
+            if state.terminal {
+                return Ok(AgentInterruptOutcome::AlreadyFinished);
+            }
+            if state.interrupt_requested {
+                return Ok(AgentInterruptOutcome::AlreadyRequested);
+            }
+            state.interrupt_requested = true;
+            state.turn.as_ref().and_then(Weak::upgrade)
+        };
+        if let Some(turn) = turn {
+            turn.request_interrupt()
+                .map(|_| AgentInterruptOutcome::Requested)
+        } else {
+            Ok(AgentInterruptOutcome::Requested)
+        }
+    }
+
+    fn abandon(&self) {
+        let turn = self.state.lock().ok().and_then(|mut state| {
+            if state.terminal {
+                return None;
+            }
+            state.abandoned = true;
+            state.interrupt_requested = true;
+            state.turn.as_ref().and_then(Weak::upgrade)
+        });
+        if let Some(turn) = turn {
+            let _ = turn.request_interrupt();
+        }
+    }
+}
+
+struct TurnDispatchState {
+    accepted: bool,
+    buffered: Vec<Value>,
+    streamed_text: bool,
+}
+
+struct ManagedTurn {
+    thread_id: String,
+    turn_id: Mutex<Option<String>>,
+    session: Arc<CodexTurnSession<SharedJsonWriter>>,
+    events: Sender<AgentEvent>,
+    keepalive: Mutex<Option<Receiver<AgentEvent>>>,
+    dispatch: Mutex<TurnDispatchState>,
+    interrupt_requested: AtomicBool,
+    interrupt_sent: AtomicBool,
+    terminal: AtomicBool,
+    connection: Weak<Connection>,
+    control: Arc<PromptControl>,
+}
+
+impl ManagedTurn {
+    fn new(
+        thread_id: String,
+        connection: &Arc<Connection>,
+        events: Sender<AgentEvent>,
+        receiver_keepalive: Receiver<AgentEvent>,
+        control: Arc<PromptControl>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            thread_id,
+            turn_id: Mutex::new(None),
+            session: Arc::new(CodexTurnSession::new(connection.writer.clone(), None)),
+            events,
+            keepalive: Mutex::new(Some(receiver_keepalive)),
+            dispatch: Mutex::new(TurnDispatchState {
+                accepted: false,
+                buffered: Vec::new(),
+                streamed_text: false,
+            }),
+            interrupt_requested: AtomicBool::new(false),
+            interrupt_sent: AtomicBool::new(false),
+            terminal: AtomicBool::new(false),
+            connection: Arc::downgrade(connection),
+            control,
+        })
+    }
+
+    fn turn_id(&self) -> Option<String> {
+        self.turn_id.lock().ok().and_then(|turn_id| turn_id.clone())
+    }
+
+    fn bind_turn_id(self: &Arc<Self>, turn_id: &str) -> Result<()> {
+        {
+            let mut current = self
+                .turn_id
+                .lock()
+                .map_err(|_| anyhow!("Codex managed turn id 锁已损坏"))?;
+            if let Some(current) = current.as_deref() {
+                if current != turn_id {
+                    bail!("同一 turn/start 收到不一致的 turn id：`{current}` 与 `{turn_id}`");
+                }
+                return Ok(());
+            }
+            *current = Some(turn_id.to_owned());
+        }
+        self.session
+            .activate_turn(self.thread_id.clone(), turn_id.to_owned())?;
+        if self.interrupt_requested.load(Ordering::Acquire) {
+            self.send_interrupt()?;
+        }
+        Ok(())
+    }
+
+    fn request_interrupt(self: &Arc<Self>) -> std::result::Result<AgentInterruptOutcome, String> {
+        if self.terminal.load(Ordering::Acquire) {
+            return Ok(AgentInterruptOutcome::AlreadyFinished);
+        }
+        if self.interrupt_requested.swap(true, Ordering::AcqRel) {
+            return Ok(AgentInterruptOutcome::AlreadyRequested);
+        }
+        if self.turn_id().is_some() {
+            self.send_interrupt()
+                .map_err(|error| format!("{error:#}"))?;
+        }
+        Ok(AgentInterruptOutcome::Requested)
+    }
+
+    fn send_interrupt(self: &Arc<Self>) -> Result<()> {
+        if self.terminal.load(Ordering::Acquire) || self.interrupt_sent.swap(true, Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        let turn_id = self
+            .turn_id()
+            .context("turn/interrupt 在 turn id 建立前被发送")?;
+        let connection = self
+            .connection
+            .upgrade()
+            .context("turn/interrupt 的 connection 已释放")?;
+        let turn = Arc::clone(self);
+        std::thread::spawn(move || {
+            if let Err(error) = connection.request(
+                "turn/interrupt",
+                json!({ "threadId": turn.thread_id, "turnId": turn_id }),
+            ) && !connection.failed.load(Ordering::Acquire)
+            {
+                connection.finish_turn(&turn, Err(error.context("turn/interrupt 请求失败")));
+            }
+        });
+        Ok(())
+    }
+
+    fn ingest(self: &Arc<Self>, message: &Value) -> Result<Option<TurnOutcome>> {
+        let turn_id = turn_id_from_turn_message(message)?;
+        self.bind_turn_id(&turn_id)?;
+        let mut dispatch = self
+            .dispatch
+            .lock()
+            .map_err(|_| anyhow!("Codex managed turn dispatch 锁已损坏"))?;
+        ensure_session_message_matches(message, &self.thread_id, &turn_id)?;
+        if !dispatch.accepted {
+            dispatch.buffered.push(message.clone());
+            return Ok(None);
+        }
+        let result = process_turn_message(
+            &self.session,
+            message,
+            &self.thread_id,
+            &turn_id,
+            &self.events,
+            &mut dispatch.streamed_text,
+        )?;
+        Ok(result)
+    }
+
+    fn accept(self: &Arc<Self>, turn_id: &str) -> Result<Option<TurnOutcome>> {
+        self.bind_turn_id(turn_id)?;
+        let mut dispatch = self
+            .dispatch
+            .lock()
+            .map_err(|_| anyhow!("Codex managed turn dispatch 锁已损坏"))?;
+        for message in &dispatch.buffered {
+            ensure_session_message_matches(message, &self.thread_id, turn_id)?;
+        }
+        dispatch.accepted = true;
+        let buffered = std::mem::take(&mut dispatch.buffered);
+        let mut outcome = None;
+        for message in buffered {
+            if outcome.is_some() {
+                bail!("turn/completed 之后仍收到同一 turn 的缓存消息");
+            }
+            outcome = process_turn_message(
+                &self.session,
+                &message,
+                &self.thread_id,
+                turn_id,
+                &self.events,
+                &mut dispatch.streamed_text,
+            )?;
+        }
+        Ok(outcome)
+    }
+
+    fn finish(&self, mut result: Result<TurnOutcome>) {
+        if self.terminal.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.session.mark_terminal();
+        if let Err(cleanup_error) =
+            cleanup_pending_server_requests(&self.session, &result, &self.events)
+        {
+            result = match result {
+                Ok(_) => Err(cleanup_error),
+                Err(error) => Err(anyhow!(
+                    "{error:#}\n清理 pending server request 同时失败：{cleanup_error:#}"
+                )),
+            };
+        }
+        let event = match result {
+            Ok(outcome) => outcome.into_event(),
+            Err(error) => AgentEvent::Failed(format!("{error:#}")),
+        };
+        let _ = self.events.send_blocking(event);
+        self.control.mark_terminal();
+        if let Ok(mut keepalive) = self.keepalive.lock() {
+            keepalive.take();
+        }
+    }
+}
+
+fn turn_id_from_turn_message(message: &Value) -> Result<String> {
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .context("turn-scoped JSON-RPC 消息缺少字符串 method")?;
+    if !TURN_SCOPED_SERVER_METHODS.contains(&method) {
+        bail!("`{method}` 不是 turn-scoped 消息");
+    }
+    let pointer = if matches!(method, "turn/started" | "turn/completed") {
+        "/params/turn/id"
+    } else {
+        "/params/turnId"
+    };
+    message
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("{method} 消息缺少字符串 {pointer}"))
+}
+
+#[derive(Default)]
+struct ManagerState {
+    current: Option<Arc<Connection>>,
+    starting: bool,
+    reaping: bool,
+    start_attempt: u64,
+    last_start_error: Option<(u64, String)>,
+    shutdown: bool,
+}
+
+struct ManagerInner {
+    spawner: Arc<dyn AppServerSpawner>,
+    state: Mutex<ManagerState>,
+    connection_ready: Condvar,
+    connection_events: Mutex<ConnectionEventHub>,
+    shutdown_once: AtomicBool,
+}
+
+impl ManagerInner {
+    fn ensure_connection(self: &Arc<Self>) -> Result<Arc<Connection>> {
+        let mut waited_for = None;
+        let attempt = loop {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("Codex manager state 锁已损坏"))?;
+            if state.shutdown {
+                bail!("Codex app-server manager 已关闭");
+            }
+            if let Some(connection) = &state.current
+                && !state.starting
+                && !state.reaping
+                && !connection.failed.load(Ordering::Acquire)
+            {
+                return Ok(connection.clone());
+            }
+            if state.reaping {
+                state = self
+                    .connection_ready
+                    .wait(state)
+                    .map_err(|_| anyhow!("Codex manager state 锁已损坏"))?;
+                drop(state);
+                continue;
+            }
+            if let Some(waited_attempt) = waited_for
+                && let Some((failed_attempt, error)) = &state.last_start_error
+                && *failed_attempt == waited_attempt
+            {
+                bail!(error.clone());
+            }
+            if state.starting {
+                waited_for = Some(state.start_attempt);
+                state = self
+                    .connection_ready
+                    .wait(state)
+                    .map_err(|_| anyhow!("Codex manager state 锁已损坏"))?;
+                drop(state);
+                continue;
+            }
+            state.starting = true;
+            state.start_attempt = state.start_attempt.wrapping_add(1);
+            state.last_start_error = None;
+            break state.start_attempt;
+        };
+
+        let result = self.start_generation(attempt);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Codex manager state 锁已损坏"))?;
+        state.starting = false;
+        match &result {
+            Ok(connection) => {
+                if state
+                    .current
+                    .as_ref()
+                    .is_none_or(|current| current.generation != connection.generation)
+                {
+                    state.current = Some(connection.clone());
+                }
+                state.last_start_error = None;
+            }
+            Err(error) => {
+                state.last_start_error = Some((attempt, format!("{error:#}")));
+                if state
+                    .current
+                    .as_ref()
+                    .is_some_and(|connection| connection.generation == attempt)
+                {
+                    state.current = None;
+                }
+            }
+        }
+        self.connection_ready.notify_all();
+        result
+    }
+
+    fn start_generation(self: &Arc<Self>, generation: u64) -> Result<Arc<Connection>> {
+        let spawned = self.spawner.spawn()?;
+        let writer = SharedJsonWriter::new(spawned.writer, Arc::downgrade(self), generation);
+        let connection = Arc::new(Connection {
+            generation,
+            writer,
+            process: spawned.process,
+            next_request_id: AtomicU64::new(1),
+            pending_rpcs: Mutex::new(HashMap::new()),
+            state: Mutex::new(ConnectionState::default()),
+            lifecycle_lock: Mutex::new(()),
+            settings_lock: Mutex::new(()),
+            failed: AtomicBool::new(false),
+            manager: Arc::downgrade(self),
+        });
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("Codex manager state 锁已损坏"))?;
+            if state.shutdown {
+                drop(state);
+                connection.writer.close();
+                connection.process.terminate_and_wait()?;
+                bail!("Codex app-server manager 已关闭");
+            }
+            state.current = Some(connection.clone());
+        }
+
+        let manager = Arc::downgrade(self);
+        let reader_connection = connection.clone();
+        std::thread::spawn(move || {
+            ManagerInner::reader_loop(manager, reader_connection, spawned.reader);
+        });
+
+        if let Err(error) = connection.request(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "gpui_chat_clone",
+                    "title": "GPUI Chat Clone",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                    "requestAttestation": false
+                }
+            }),
+        ) {
+            self.fail_generation(generation, format!("initialize 失败：{error:#}"));
+            return Err(error).context("initialize 失败");
+        }
+        connection
+            .send_message(json!({ "method": "initialized", "params": {} }))
+            .context("发送 initialized 通知失败")?;
+        Ok(connection)
+    }
+
+    fn reader_loop(
+        manager: Weak<Self>,
+        connection: Arc<Connection>,
+        mut reader: Box<dyn BufRead + Send>,
+    ) {
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    if !connection.failed.load(Ordering::Acquire) {
+                        if let Some(manager) = manager.upgrade() {
+                            manager.fail_generation(
+                                connection.generation,
+                                "Codex app-server stdout EOF；connection generation 已失败"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    if let Some(manager) = manager.upgrade() {
+                        manager.fail_generation(
+                            connection.generation,
+                            format!("读取 Codex app-server stdout 失败：{error}"),
+                        );
+                    }
+                    return;
+                }
+            }
+            let message: Value = match serde_json::from_str(&line) {
+                Ok(message) => message,
+                Err(error) => {
+                    if let Some(manager) = manager.upgrade() {
+                        manager.fail_generation(
+                            connection.generation,
+                            format!("无法解析 Codex JSON-RPC 消息：{error}；payload={line}"),
+                        );
+                    }
+                    return;
+                }
+            };
+            let Some(manager) = manager.upgrade() else {
+                let _ = connection.process.terminate_and_wait();
+                return;
+            };
+            if let Err(error) = manager.handle_message(&connection, &message) {
+                manager.fail_generation(connection.generation, format!("{error:#}"));
+                return;
+            }
+        }
+    }
+
+    fn handle_message(&self, connection: &Arc<Connection>, message: &Value) -> Result<()> {
+        if connection.failed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if message.get("method").is_none() {
+            return connection.handle_response(message.clone());
+        }
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .context("Codex JSON-RPC method 必须是字符串")?;
+        if message.get("id").is_some() {
+            return self.handle_server_request(connection, method, message);
+        }
+        self.handle_notification(connection, method, message)
+    }
+
+    fn handle_server_request(
+        &self,
+        connection: &Arc<Connection>,
+        method: &str,
+        message: &Value,
+    ) -> Result<()> {
+        if !is_integrated_server_request_method(method) {
+            connection.send_message(json!({
+                "id": message.get("id").cloned().unwrap_or(Value::Null),
+                "error": {
+                    "code": -32601,
+                    "message": "This client does not implement this server-initiated request"
+                }
+            }))?;
+            return ensure_server_method_is_defined(message);
+        }
+        let thread_id = message
+            .pointer("/params/threadId")
+            .and_then(Value::as_str)
+            .context("server request 缺少字符串 params.threadId")?;
+        let turn_id = message
+            .pointer("/params/turnId")
+            .and_then(Value::as_str)
+            .context("server request 缺少字符串 params.turnId")?;
+        let turn = connection.bind_starting_turn(thread_id, turn_id)?;
+        let request_id = request_id_from_value(
+            message
+                .get("id")
+                .context("server request 缺少 JSON-RPC id")?,
+        )?;
+        let key = TurnKey {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+        };
+        connection.record_server_request_owner(request_id, key)?;
+        if let Some(outcome) = turn.ingest(message)? {
+            connection.finish_turn(&turn, Ok(outcome));
+        }
+        Ok(())
+    }
+
+    fn handle_notification(
+        &self,
+        connection: &Arc<Connection>,
+        method: &str,
+        message: &Value,
+    ) -> Result<()> {
+        match method {
+            "thread/started" => self.handle_thread_started(connection, message),
+            "thread/goal/cleared" => self.handle_resume_goal_cleared(connection, message),
+            "serverRequest/resolved" => {
+                let request_id = request_id_from_value(
+                    message
+                        .pointer("/params/requestId")
+                        .context("serverRequest/resolved 缺少 params.requestId")?,
+                )?;
+                let owner = connection.server_request_owner(&request_id)?;
+                let notification_thread = message
+                    .pointer("/params/threadId")
+                    .and_then(Value::as_str)
+                    .context("serverRequest/resolved 缺少字符串 params.threadId")?;
+                if notification_thread != owner.thread_id {
+                    bail!(
+                        "serverRequest/resolved threadId `{notification_thread}` 与 request owner `{}` 不一致",
+                        owner.thread_id
+                    );
+                }
+                let turn = connection.turn_for_key(&owner)?;
+                let mut dispatch = turn
+                    .dispatch
+                    .lock()
+                    .map_err(|_| anyhow!("Codex managed turn dispatch 锁已损坏"))?;
+                if !dispatch.accepted {
+                    dispatch.buffered.push(message.clone());
+                    return Ok(());
+                }
+                super::handle_server_request_resolved(&turn.session, message, &turn.events)
+            }
+            "thread/settings/updated" => {
+                let thread_id = message
+                    .pointer("/params/threadId")
+                    .and_then(Value::as_str)
+                    .context("thread/settings/updated 缺少字符串 params.threadId")?
+                    .to_owned();
+                let Some(AgentEvent::ThreadSettingsUpdated(settings)) =
+                    parse_agent_notification(message)?
+                else {
+                    bail!("thread/settings/updated 未映射为 AgentThreadSettings");
+                };
+                if settings.permissions.is_some() {
+                    let waiters = connection
+                        .state
+                        .lock()
+                        .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?
+                        .settings_waiters
+                        .remove(&thread_id)
+                        .unwrap_or_default();
+                    for waiter in waiters {
+                        let _ = waiter.send_blocking(Ok(settings.clone()));
+                    }
+                }
+                self.publish_connection_event(AgentConnectionEvent::ThreadSettingsUpdated {
+                    thread_id,
+                    settings,
+                });
+                Ok(())
+            }
+            "mcpServer/startupStatus/updated" => {
+                self.publish_connection_event(AgentConnectionEvent::McpServerStartupStatusUpdated(
+                    parse_mcp_server_startup_status_updated(message)?,
+                ));
+                Ok(())
+            }
+            "thread/status/changed" => {
+                self.publish_connection_event(AgentConnectionEvent::ThreadStatusChanged(
+                    parse_thread_status_changed(message)?,
+                ));
+                Ok(())
+            }
+            "account/rateLimits/updated" => {
+                let Some(AgentEvent::AccountRateLimitsUpdated(rate_limits)) =
+                    parse_agent_notification(message)?
+                else {
+                    bail!("account/rateLimits/updated 未映射为 AgentAccountRateLimits");
+                };
+                self.publish_connection_event(AgentConnectionEvent::AccountRateLimitsUpdated(
+                    rate_limits,
+                ));
+                Ok(())
+            }
+            "warning" => {
+                let thread_id = match message.pointer("/params/threadId") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(thread_id)) => Some(thread_id.clone()),
+                    Some(_) => bail!("warning params.threadId 必须是字符串或 null"),
+                };
+                let Some(AgentEvent::Warning { message }) = parse_agent_notification(message)?
+                else {
+                    bail!("warning 未映射为 Agent warning");
+                };
+                self.publish_connection_event(AgentConnectionEvent::Warning { thread_id, message });
+                Ok(())
+            }
+            "configWarning" => {
+                let Some(AgentEvent::ConfigWarning(warning)) = parse_agent_notification(message)?
+                else {
+                    bail!("configWarning 未映射为 AgentConfigWarning");
+                };
+                self.publish_connection_event(AgentConnectionEvent::ConfigWarning(warning));
+                Ok(())
+            }
+            "remoteControl/status/changed" => {
+                validate_remote_control_status_changed(message)?;
+                connection
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?
+                    .remote_control_status = message.get("params").cloned();
+                Ok(())
+            }
+            method if TURN_SCOPED_SERVER_METHODS.contains(&method) => {
+                let thread_id = message
+                    .pointer("/params/threadId")
+                    .and_then(Value::as_str)
+                    .with_context(|| format!("{method} 消息缺少字符串 params.threadId"))?;
+                let turn_id = turn_id_from_turn_message(message)?;
+                let turn = connection.bind_starting_turn(thread_id, &turn_id)?;
+                if let Some(outcome) = turn.ingest(message)? {
+                    connection.finish_turn(&turn, Ok(outcome));
+                }
+                Ok(())
+            }
+            _ => ensure_server_method_is_defined(message),
+        }
+    }
+
+    fn handle_thread_started(&self, connection: &Connection, message: &Value) -> Result<()> {
+        let thread_id = thread_started_id(message)?;
+        let mut state = connection
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?;
+        if state.loaded_threads.contains(&thread_id) {
+            return Ok(());
+        }
+        if let Some(pending) = state.pending_thread_lifecycle.as_mut() {
+            if let ThreadLifecycleKind::Resume(expected) = &pending.kind
+                && expected != &thread_id
+            {
+                bail!("thread/resume `{expected}` 收到其他 thread 的 thread/started `{thread_id}`");
+            }
+            if let Some(observed) = &pending.observed_thread_id
+                && observed != &thread_id
+            {
+                bail!(
+                    "同一 thread lifecycle 收到不一致的 thread/started：`{observed}` 与 `{thread_id}`"
+                );
+            }
+            pending.observed_thread_id = Some(thread_id);
+            return Ok(());
+        }
+        bail!("收到未关联 lifecycle 的 thread/started `{thread_id}`")
+    }
+
+    fn handle_resume_goal_cleared(&self, connection: &Connection, message: &Value) -> Result<()> {
+        let thread_id = message
+            .pointer("/params/threadId")
+            .and_then(Value::as_str)
+            .context("thread/goal/cleared 缺少字符串 params.threadId")?;
+        let state = connection
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?;
+        let expected = if state.resume_bootstrap_threads.contains(thread_id) {
+            thread_id.to_owned()
+        } else {
+            match state.pending_thread_lifecycle.as_ref() {
+                Some(PendingThreadLifecycle {
+                    kind: ThreadLifecycleKind::Resume(expected),
+                    ..
+                }) => expected.clone(),
+                _ => bail!("thread/goal/cleared 仅允许出现在 thread/resume bootstrap 阶段"),
+            }
+        };
+        drop(state);
+        validate_resume_goal_cleared(message, &expected)
+    }
+
+    fn publish_connection_event(&self, event: AgentConnectionEvent) {
+        if let Ok(mut hub) = self.connection_events.lock() {
+            hub.publish(event);
+        }
+    }
+
+    fn fail_generation(&self, generation: u64, message: String) {
+        let connection = {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            let Some(connection) = state.current.as_ref() else {
+                return;
+            };
+            if connection.generation != generation || connection.failed.swap(true, Ordering::AcqRel)
+            {
+                return;
+            }
+            let connection = connection.clone();
+            state.reaping = true;
+            connection
+        };
+        connection.writer.close();
+        let reap_error = connection.process.terminate_and_wait().err();
+        let message = match &reap_error {
+            Some(error) => {
+                format!("{message}；回收 Codex app-server generation {generation} 失败：{error:#}")
+            }
+            None => message,
+        };
+        connection.fail_all(&message);
+        if let Ok(mut state) = self.state.lock() {
+            if state
+                .current
+                .as_ref()
+                .is_some_and(|current| current.generation == generation)
+            {
+                state.current = None;
+            }
+            state.reaping = false;
+            if reap_error.is_some() {
+                state.shutdown = true;
+            }
+        }
+        self.connection_ready.notify_all();
+    }
+
+    fn shutdown(&self) {
+        if self.shutdown_once.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let generation = {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            state.shutdown = true;
+            state
+                .current
+                .as_ref()
+                .map(|connection| connection.generation)
+        };
+        self.connection_ready.notify_all();
+        if let Some(generation) = generation {
+            self.fail_generation(
+                generation,
+                "Codex app-server manager 正在关闭；active operation 已终止".to_owned(),
+            );
+        }
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        while state.starting || state.reaping {
+            state = match self.connection_ready.wait(state) {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+        }
+    }
+}
+
+impl Drop for ManagerInner {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Owns one long-lived Codex app-server transport for an application run.
+/// Clones share the same process, request registry, reader loop and generation.
+#[derive(Clone)]
+pub struct CodexAppServerManager {
+    inner: Arc<ManagerInner>,
+}
+
+impl Default for CodexAppServerManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CodexAppServerManager {
+    pub fn new() -> Self {
+        Self::with_spawner(Arc::new(RealAppServerSpawner))
+    }
+
+    fn with_spawner(spawner: Arc<dyn AppServerSpawner>) -> Self {
+        Self {
+            inner: Arc::new(ManagerInner {
+                spawner,
+                state: Mutex::new(ManagerState::default()),
+                connection_ready: Condvar::new(),
+                connection_events: Mutex::new(ConnectionEventHub::default()),
+                shutdown_once: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.inner.shutdown();
+    }
+
+    pub(super) fn subscribe_connection_events(&self) -> Receiver<AgentConnectionEvent> {
+        self.inner
+            .connection_events
+            .lock()
+            .map(|mut hub| hub.subscribe())
+            .unwrap_or_else(|_| async_channel::unbounded().1)
+    }
+
+    pub(super) fn load_model_catalog(&self) -> Receiver<Result<AgentModelCatalog, String>> {
+        let (sender, receiver) = async_channel::bounded(1);
+        let manager = self.clone();
+        std::thread::spawn(move || {
+            let result = manager
+                .load_model_catalog_blocking()
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send_blocking(result);
+        });
+        receiver
+    }
+
+    fn load_model_catalog_blocking(&self) -> Result<AgentModelCatalog> {
+        let connection = self.inner.ensure_connection()?;
+        let mut models = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        loop {
+            let response = connection.request(
+                "model/list",
+                json!({
+                    "cursor": cursor,
+                    "limit": MODEL_LIST_PAGE_SIZE,
+                    "includeHidden": false
+                }),
+            )?;
+            let result = response
+                .get("result")
+                .cloned()
+                .context("model/list 响应缺少 result")?;
+            let page: ModelListResponse = match serde_json::from_value(result) {
+                Ok(page) => page,
+                Err(error) => {
+                    let message =
+                        format!("无法解析 model/list 响应；0.151.0 schema 不匹配：{error}");
+                    connection.fail_protocol(message.clone());
+                    bail!(message);
+                }
+            };
+            models.extend(
+                page.data
+                    .into_iter()
+                    .filter(|entry| !entry.hidden)
+                    .map(AgentModel::from),
+            );
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                let message = format!("model/list 返回了重复分页 cursor `{next_cursor}`");
+                connection.fail_protocol(message.clone());
+                bail!(message);
+            }
+            cursor = Some(next_cursor);
+        }
+        if models.is_empty() {
+            bail!("model/list 未返回可显示的模型");
+        }
+        Ok(AgentModelCatalog { models })
+    }
+
+    pub(super) fn load_permission_profiles(
+        &self,
+        cwd: PathBuf,
+    ) -> Receiver<Result<Vec<AgentPermissionProfile>, String>> {
+        let (sender, receiver) = async_channel::bounded(1);
+        let manager = self.clone();
+        std::thread::spawn(move || {
+            let result = manager
+                .load_permission_profiles_blocking(&cwd)
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send_blocking(result);
+        });
+        receiver
+    }
+
+    fn load_permission_profiles_blocking(&self, cwd: &Path) -> Result<Vec<AgentPermissionProfile>> {
+        let connection = self.inner.ensure_connection()?;
+        let response = connection.request(
+            "permissionProfile/list",
+            json!({ "cursor": null, "limit": 100, "cwd": cwd }),
+        )?;
+        let result = response
+            .get("result")
+            .cloned()
+            .context("permissionProfile/list 响应缺少 result")?;
+        let page: PermissionProfileListResponse = match serde_json::from_value(result) {
+            Ok(page) => page,
+            Err(error) => {
+                let message = format!("无法解析 permissionProfile/list 响应：{error}");
+                connection.fail_protocol(message.clone());
+                bail!(message);
+            }
+        };
+        if page.next_cursor.is_some() {
+            bail!("permissionProfile/list 返回了超出 100 项的 profile；当前客户端不应静默截断");
+        }
+        Ok(page
+            .data
+            .into_iter()
+            .map(|profile| AgentPermissionProfile {
+                id: profile.id,
+                allowed: profile.allowed,
+                extends: profile.extends,
+            })
+            .collect())
+    }
+
+    pub(super) fn update_thread_permissions(
+        &self,
+        thread_id: String,
+        cwd: PathBuf,
+        mode: AgentPermissionMode,
+    ) -> Receiver<Result<AgentThreadSettings, String>> {
+        let (sender, receiver) = async_channel::bounded(1);
+        let manager = self.clone();
+        std::thread::spawn(move || {
+            let result = manager
+                .update_thread_permissions_blocking(&thread_id, &cwd, mode)
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send_blocking(result);
+        });
+        receiver
+    }
+
+    fn update_thread_permissions_blocking(
+        &self,
+        thread_id: &str,
+        cwd: &Path,
+        mode: AgentPermissionMode,
+    ) -> Result<AgentThreadSettings> {
+        let connection = self.inner.ensure_connection()?;
+        self.ensure_thread_loaded(&connection, Some(thread_id), None, false)?;
+        let _settings_guard = connection
+            .settings_lock
+            .lock()
+            .map_err(|_| anyhow!("Codex thread settings lifecycle 锁已损坏"))?;
+        let params = thread_settings_update_request(0, thread_id, cwd, mode)?
+            .get("params")
+            .cloned()
+            .context("thread/settings/update builder 缺少 params")?;
+        let (sender, receiver) = async_channel::bounded(1);
+        connection
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?
+            .settings_waiters
+            .entry(thread_id.to_owned())
+            .or_default()
+            .push(sender);
+        if let Err(error) = connection.request("thread/settings/update", params) {
+            if let Ok(mut state) = connection.state.lock() {
+                state.settings_waiters.remove(thread_id);
+            }
+            return Err(error);
+        }
+        receiver
+            .recv_blocking()
+            .map_err(|_| anyhow!("thread/settings/updated waiter 在返回前关闭"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub(super) fn run_prompt(&self, request: AgentRequest) -> AgentRun {
+        let (events, receiver) = async_channel::unbounded();
+        let keepalive = receiver.clone();
+        let control = Arc::new(PromptControl::default());
+        let interrupt_control: Arc<dyn AgentInterruptControl> = control.clone();
+        let interrupt = AgentInterruptHandle::new(interrupt_control);
+        let manager = self.clone();
+        let task_events = events.clone();
+        let task_control = control.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = manager.run_prompt_blocking(
+                request,
+                task_events.clone(),
+                keepalive,
+                task_control.clone(),
+            ) {
+                if !task_control
+                    .state
+                    .lock()
+                    .map(|state| state.terminal)
+                    .unwrap_or(false)
+                {
+                    let _ = task_events.send_blocking(AgentEvent::Failed(format!("{error:#}")));
+                    task_control.mark_terminal();
+                }
+            }
+        });
+        AgentRun::new(receiver, Some(interrupt))
+    }
+
+    fn run_prompt_blocking(
+        &self,
+        request: AgentRequest,
+        events: Sender<AgentEvent>,
+        keepalive: Receiver<AgentEvent>,
+        control: Arc<PromptControl>,
+    ) -> Result<()> {
+        if control.is_abandoned() {
+            let _ = events.send_blocking(AgentEvent::Interrupted);
+            control.mark_terminal();
+            return Ok(());
+        }
+        let connection = self.inner.ensure_connection()?;
+        let (thread_id, is_new_thread) = match request.thread_id.as_deref() {
+            Some(thread_id) => {
+                connection.reserve_thread(thread_id)?;
+                match self.ensure_thread_loaded(&connection, Some(thread_id), None, true) {
+                    Ok(thread_id) => (thread_id, false),
+                    Err(error) => {
+                        connection.release_reservation(thread_id);
+                        return Err(error);
+                    }
+                }
+            }
+            None => {
+                let thread_id =
+                    self.ensure_thread_loaded(&connection, None, Some(&request), false)?;
+                connection.reserve_thread(&thread_id)?;
+                if events
+                    .send_blocking(AgentEvent::ThreadCreated {
+                        thread_id: thread_id.clone(),
+                    })
+                    .is_err()
+                {
+                    connection.release_reservation(&thread_id);
+                    control.mark_terminal();
+                    return Ok(());
+                }
+                (thread_id, true)
+            }
+        };
+        if control.is_abandoned() {
+            connection.release_reservation(&thread_id);
+            self.finish_resume_bootstrap(&connection, &thread_id);
+            let _ = events.send_blocking(AgentEvent::Interrupted);
+            control.mark_terminal();
+            return Ok(());
+        }
+
+        let turn = ManagedTurn::new(
+            thread_id.clone(),
+            &connection,
+            events,
+            keepalive,
+            control.clone(),
+        );
+        if let Err(error) = connection.register_starting_turn(turn.clone()) {
+            self.finish_resume_bootstrap(&connection, &thread_id);
+            return Err(error);
+        }
+        control.attach(&turn);
+
+        let params = match build_turn_start_params(&request, &thread_id, is_new_thread) {
+            Ok(params) => params,
+            Err(error) => {
+                self.finish_resume_bootstrap(&connection, &thread_id);
+                connection.finish_turn(&turn, Err(error));
+                return Ok(());
+            }
+        };
+        let response = match connection.request("turn/start", params) {
+            Ok(response) => response,
+            Err(error) => {
+                self.finish_resume_bootstrap(&connection, &thread_id);
+                if !connection.failed.load(Ordering::Acquire) {
+                    connection.finish_turn(&turn, Err(error.context("turn/start 失败")));
+                }
+                return Ok(());
+            }
+        };
+        let Some(turn_id) = response
+            .pointer("/result/turn/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            let message = "turn/start 响应缺少 result.turn.id".to_owned();
+            connection.fail_protocol(message);
+            return Ok(());
+        };
+        let bound = match connection.bind_starting_turn(&thread_id, &turn_id) {
+            Ok(bound) => bound,
+            Err(error) => {
+                connection.fail_protocol(format!("turn/start response 关联失败：{error:#}"));
+                return Ok(());
+            }
+        };
+        if !Arc::ptr_eq(&bound, &turn) {
+            connection.fail_protocol("turn/start response 被路由到其他 logical turn".to_owned());
+            return Ok(());
+        }
+        let accepted = turn.accept(&turn_id);
+        self.finish_resume_bootstrap(&connection, &thread_id);
+        match accepted {
+            Ok(Some(outcome)) => connection.finish_turn(&turn, Ok(outcome)),
+            Ok(None) => {}
+            Err(error) => connection.fail_protocol(format!(
+                "turn/start 前缓存的 notification 校验失败：{error:#}"
+            )),
+        }
+        Ok(())
+    }
+
+    fn ensure_thread_loaded(
+        &self,
+        connection: &Arc<Connection>,
+        thread_id: Option<&str>,
+        new_thread_request: Option<&AgentRequest>,
+        keep_resume_bootstrap: bool,
+    ) -> Result<String> {
+        let _lifecycle_guard = connection
+            .lifecycle_lock
+            .lock()
+            .map_err(|_| anyhow!("Codex thread lifecycle 锁已损坏"))?;
+        if let Some(thread_id) = thread_id
+            && connection
+                .state
+                .lock()
+                .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?
+                .loaded_threads
+                .contains(thread_id)
+        {
+            return Ok(thread_id.to_owned());
+        }
+        let (method, params) = match thread_id {
+            Some(thread_id) => (
+                "thread/resume",
+                json!({ "threadId": thread_id, "excludeTurns": true }),
+            ),
+            None => {
+                let request = new_thread_request
+                    .context("thread/start 缺少新 conversation 的 AgentRequest")?;
+                (
+                    "thread/start",
+                    json!({
+                        "cwd": request.cwd,
+                        "ephemeral": false,
+                        "serviceName": "gpui-chat-clone",
+                        "model": request.model,
+                        "serviceTier": request.service_tier
+                    }),
+                )
+            }
+        };
+        {
+            let mut state = connection
+                .state
+                .lock()
+                .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?;
+            if state.pending_thread_lifecycle.is_some() {
+                bail!("Codex thread lifecycle registry 已被占用");
+            }
+            state.pending_thread_lifecycle = Some(PendingThreadLifecycle {
+                kind: match thread_id {
+                    Some(thread_id) => ThreadLifecycleKind::Resume(thread_id.to_owned()),
+                    None => ThreadLifecycleKind::Start,
+                },
+                observed_thread_id: None,
+            });
+        }
+        let response = match connection.request(method, params) {
+            Ok(response) => response,
+            Err(error) => {
+                if let Ok(mut state) = connection.state.lock() {
+                    state.pending_thread_lifecycle = None;
+                }
+                return Err(error).with_context(|| match thread_id {
+                    Some(thread_id) => format!("thread/resume `{thread_id}` 失败"),
+                    None => "thread/start 失败".to_owned(),
+                });
+            }
+        };
+        let Some(canonical) = response
+            .pointer("/result/thread/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            let message = format!("{method} 响应缺少字符串 result.thread.id");
+            connection.fail_protocol(message.clone());
+            bail!(message);
+        };
+        if let Some(expected) = thread_id
+            && canonical != expected
+        {
+            let message = format!(
+                "thread/resume 响应的 thread id `{canonical}` 与请求的 `{expected}` 不一致"
+            );
+            connection.fail_protocol(message.clone());
+            bail!(message);
+        }
+        let mut state = connection
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?;
+        let pending = state
+            .pending_thread_lifecycle
+            .take()
+            .context("thread lifecycle response 到达时 registry 为空")?;
+        if let Some(observed) = pending.observed_thread_id
+            && observed != canonical
+        {
+            let message = format!(
+                "thread/started `{observed}` 与 {method} canonical thread `{canonical}` 不一致"
+            );
+            drop(state);
+            connection.fail_protocol(message.clone());
+            bail!(message);
+        }
+        state.loaded_threads.insert(canonical.clone());
+        if thread_id.is_some() && keep_resume_bootstrap {
+            state.resume_bootstrap_threads.insert(canonical.clone());
+        }
+        Ok(canonical)
+    }
+
+    fn finish_resume_bootstrap(&self, connection: &Connection, thread_id: &str) {
+        if let Ok(mut state) = connection.state.lock() {
+            state.resume_bootstrap_threads.remove(thread_id);
+        }
+    }
+}
+
+fn build_turn_start_params(
+    request: &AgentRequest,
+    thread_id: &str,
+    is_new_thread: bool,
+) -> Result<Value> {
+    let mut params = serde_json::Map::new();
+    params.insert("threadId".into(), json!(thread_id));
+    params.insert(
+        "input".into(),
+        json!([{ "type": "text", "text": request.prompt }]),
+    );
+    params.insert("model".into(), json!(request.model));
+    params.insert("effort".into(), json!(request.effort));
+    params.insert("serviceTier".into(), json!(request.service_tier));
+    if is_new_thread {
+        let (approval_policy, approvals_reviewer, sandbox_policy, permissions, runtime_roots) =
+            super::permission_fields(request.permission_mode, &request.cwd, thread_id, false)?;
+        params.insert("approvalPolicy".into(), json!(approval_policy));
+        params.insert("approvalsReviewer".into(), json!(approvals_reviewer));
+        params.insert("sandboxPolicy".into(), json!(sandbox_policy));
+        params.insert("permissions".into(), json!(permissions));
+        params.insert("runtimeWorkspaceRoots".into(), json!(runtime_roots));
+    }
+    Ok(Value::Object(params))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{HashMap, HashSet},
+        io::Read,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        },
+        time::{Duration, Instant},
+    };
+
+    use async_channel::TryRecvError;
+    use serde_json::{Value, json};
+
+    use super::{AppServerSpawner, CodexAppServerManager, ManagedProcess, SpawnedAppServer};
+    use crate::agent::{
+        AgentCommandApprovalChoice, AgentEvent, AgentInterruptOutcome, AgentPermissionMode,
+        AgentPermissionsApprovalChoice, AgentRequest, AgentServerRequestId, AgentUserInputAnswer,
+        AgentUserInputResponse,
+    };
+
+    const WAIT: Duration = Duration::from_secs(3);
+
+    struct ChannelReader {
+        receiver: async_channel::Receiver<Vec<u8>>,
+        buffered: Vec<u8>,
+        offset: usize,
+    }
+
+    impl Read for ChannelReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.offset == self.buffered.len() {
+                match self.receiver.recv_blocking() {
+                    Ok(next) => {
+                        self.buffered = next;
+                        self.offset = 0;
+                    }
+                    Err(_) => return Ok(0),
+                }
+            }
+            let remaining = &self.buffered[self.offset..];
+            let count = remaining.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&remaining[..count]);
+            self.offset += count;
+            Ok(count)
+        }
+    }
+
+    struct ChannelWriter {
+        sender: mpsc::Sender<Vec<u8>>,
+    }
+
+    impl std::io::Write for ChannelWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.sender
+                .send(buffer.to_vec())
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "fake closed"))?;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FakeProcess {
+        stdout: async_channel::Sender<Vec<u8>>,
+        terminated: AtomicBool,
+        terminate_calls: AtomicUsize,
+        waited: AtomicBool,
+    }
+
+    impl FakeProcess {
+        fn is_alive(&self) -> bool {
+            !self.terminated.load(Ordering::Acquire)
+        }
+    }
+
+    impl ManagedProcess for FakeProcess {
+        fn terminate_and_wait(&self) -> anyhow::Result<()> {
+            if !self.terminated.swap(true, Ordering::AcqRel) {
+                self.terminate_calls.fetch_add(1, Ordering::AcqRel);
+                self.stdout.close();
+            }
+            self.waited.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    struct FakeEndpoint {
+        from_client: mpsc::Receiver<Vec<u8>>,
+        to_client: async_channel::Sender<Vec<u8>>,
+        process: Arc<FakeProcess>,
+        received: Vec<Value>,
+    }
+
+    impl FakeEndpoint {
+        fn recv(&mut self) -> Value {
+            let bytes = self
+                .from_client
+                .recv_timeout(WAIT)
+                .expect("timed out waiting for client JSON-RPC message");
+            let message: Value = serde_json::from_slice(&bytes).unwrap();
+            self.received.push(message.clone());
+            message
+        }
+
+        fn send(&self, message: Value) {
+            let mut bytes = serde_json::to_vec(&message).unwrap();
+            bytes.push(b'\n');
+            self.to_client.send_blocking(bytes).unwrap();
+        }
+
+        fn send_raw(&self, line: &str) {
+            self.to_client
+                .send_blocking(format!("{line}\n").into_bytes())
+                .unwrap();
+        }
+
+        fn respond(&self, request: &Value, result: Value) {
+            self.send(json!({ "id": request["id"].clone(), "result": result }));
+        }
+
+        fn close_stdout(&self) {
+            self.to_client.close();
+        }
+
+        fn close_client_input(&mut self) {
+            let (_replacement_sender, replacement) = mpsc::channel();
+            self.from_client = replacement;
+        }
+
+        fn methods(&self) -> Vec<&str> {
+            self.received
+                .iter()
+                .filter_map(|message| message.get("method").and_then(Value::as_str))
+                .collect()
+        }
+    }
+
+    struct FakeSpawner {
+        spawn_count: AtomicUsize,
+        endpoints: mpsc::Sender<FakeEndpoint>,
+        endpoint_receiver: Mutex<mpsc::Receiver<FakeEndpoint>>,
+        processes: Mutex<Vec<Arc<FakeProcess>>>,
+    }
+
+    impl FakeSpawner {
+        fn new() -> Arc<Self> {
+            let (endpoints, endpoint_receiver) = mpsc::channel();
+            Arc::new(Self {
+                spawn_count: AtomicUsize::new(0),
+                endpoints,
+                endpoint_receiver: Mutex::new(endpoint_receiver),
+                processes: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn next_endpoint(&self) -> FakeEndpoint {
+            self.endpoint_receiver
+                .lock()
+                .unwrap()
+                .recv_timeout(WAIT)
+                .expect("manager did not spawn a fake app-server")
+        }
+
+        fn process(&self, index: usize) -> Arc<FakeProcess> {
+            self.processes.lock().unwrap()[index].clone()
+        }
+    }
+
+    impl AppServerSpawner for FakeSpawner {
+        fn spawn(&self) -> anyhow::Result<SpawnedAppServer> {
+            self.spawn_count.fetch_add(1, Ordering::AcqRel);
+            let (to_client, reader) = async_channel::unbounded();
+            let (writer, from_client) = mpsc::channel();
+            let process = Arc::new(FakeProcess {
+                stdout: to_client.clone(),
+                terminated: AtomicBool::new(false),
+                terminate_calls: AtomicUsize::new(0),
+                waited: AtomicBool::new(false),
+            });
+            self.processes.lock().unwrap().push(process.clone());
+            self.endpoints
+                .send(FakeEndpoint {
+                    from_client,
+                    to_client,
+                    process: process.clone(),
+                    received: Vec::new(),
+                })
+                .unwrap();
+            Ok(SpawnedAppServer {
+                reader: Box::new(std::io::BufReader::new(ChannelReader {
+                    receiver: reader,
+                    buffered: Vec::new(),
+                    offset: 0,
+                })),
+                writer: Box::new(ChannelWriter { sender: writer }),
+                process,
+            })
+        }
+    }
+
+    struct BlockingSpawner {
+        delegate: Arc<FakeSpawner>,
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl AppServerSpawner for BlockingSpawner {
+        fn spawn(&self) -> anyhow::Result<SpawnedAppServer> {
+            self.entered.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(WAIT)
+                .expect("test did not release the blocked app-server spawn");
+            self.delegate.spawn()
+        }
+    }
+
+    fn manager_with_fake() -> (CodexAppServerManager, Arc<FakeSpawner>) {
+        let spawner = FakeSpawner::new();
+        let manager = CodexAppServerManager::with_spawner(spawner.clone());
+        (manager, spawner)
+    }
+
+    fn request(prompt: &str, thread_id: Option<&str>) -> AgentRequest {
+        AgentRequest {
+            prompt: prompt.to_owned(),
+            cwd: "/tmp/project".into(),
+            thread_id: thread_id.map(str::to_owned),
+            model: "gpt-test".to_owned(),
+            effort: "medium".to_owned(),
+            service_tier: None,
+            permission_mode: AgentPermissionMode::Request,
+        }
+    }
+
+    fn handshake(endpoint: &mut FakeEndpoint) {
+        let initialize = endpoint.recv();
+        assert_eq!(initialize["method"], "initialize");
+        endpoint.respond(&initialize, json!({ "userAgent": "fake" }));
+        let initialized = endpoint.recv();
+        assert_eq!(initialized["method"], "initialized");
+        assert!(initialized.get("id").is_none());
+    }
+
+    fn start_known_turn(endpoint: &mut FakeEndpoint, thread_id: &str, turn_id: &str) -> Value {
+        loop {
+            let message = endpoint.recv();
+            match message["method"].as_str().unwrap() {
+                "thread/resume" => {
+                    assert_eq!(message["params"]["threadId"], thread_id);
+                    endpoint.respond(&message, json!({ "thread": { "id": thread_id } }));
+                }
+                "turn/start" => {
+                    assert_eq!(message["params"]["threadId"], thread_id);
+                    endpoint.respond(&message, json!({ "turn": { "id": turn_id } }));
+                    endpoint.send(json!({
+                        "method": "turn/started",
+                        "params": {
+                            "threadId": thread_id,
+                            "turn": { "id": turn_id, "items": [], "status": "inProgress" }
+                        }
+                    }));
+                    return message;
+                }
+                method => panic!("unexpected method while starting turn: {method}"),
+            }
+        }
+    }
+
+    fn complete(endpoint: &FakeEndpoint, thread_id: &str, turn_id: &str, status: &str) {
+        let mut turn = json!({ "id": turn_id, "status": status });
+        if status == "failed" {
+            turn["error"] = json!({
+                "message": "fixture turn failed",
+                "additionalDetails": "isolated failure"
+            });
+        }
+        endpoint.send(json!({
+            "method": "turn/completed",
+            "params": { "threadId": thread_id, "turn": turn }
+        }));
+    }
+
+    fn collect_terminal(receiver: &async_channel::Receiver<AgentEvent>) -> Vec<AgentEvent> {
+        let deadline = Instant::now() + WAIT;
+        let mut events = Vec::new();
+        loop {
+            match receiver.try_recv() {
+                Ok(event) => {
+                    let terminal = matches!(
+                        event,
+                        AgentEvent::Completed | AgentEvent::Interrupted | AgentEvent::Failed(_)
+                    );
+                    events.push(event);
+                    if terminal {
+                        return events;
+                    }
+                }
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("event stream did not reach a terminal event: {error:?}"),
+            }
+        }
+    }
+
+    fn wait_value<T>(receiver: &async_channel::Receiver<T>) -> T {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            match receiver.try_recv() {
+                Ok(value) => return value,
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("result channel did not produce a value: {error:?}"),
+            }
+        }
+    }
+
+    fn wait_for_process(process: &FakeProcess) {
+        let deadline = Instant::now() + WAIT;
+        while !process.waited.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(process.waited.load(Ordering::Acquire));
+    }
+
+    fn model_page() -> Value {
+        json!({
+            "data": [{
+                "id": "gpt-test",
+                "model": "gpt-test",
+                "displayName": "GPT Test",
+                "description": "fixture",
+                "hidden": false,
+                "supportedReasoningEfforts": [{
+                    "reasoningEffort": "medium",
+                    "description": "fixture"
+                }],
+                "defaultReasoningEffort": "medium",
+                "serviceTiers": [],
+                "defaultServiceTier": null,
+                "isDefault": true
+            }],
+            "nextCursor": null
+        })
+    }
+
+    #[test]
+    fn one_new_conversation_runs_two_turns_on_one_initialized_process() {
+        let (manager, spawner) = manager_with_fake();
+        let run = manager.run_prompt(request("first", None));
+        let (events, interrupt) = run.into_parts();
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+
+        let thread_start = endpoint.recv();
+        assert_eq!(thread_start["method"], "thread/start");
+        endpoint.send(json!({
+            "method": "thread/started",
+            "params": { "thread": { "id": "thr_shared" } }
+        }));
+        endpoint.respond(&thread_start, json!({ "thread": { "id": "thr_shared" } }));
+        let first_turn = endpoint.recv();
+        assert_eq!(first_turn["method"], "turn/start");
+        endpoint.send(json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "thr_shared",
+                "turn": { "id": "turn_1", "items": [], "status": "inProgress" }
+            }
+        }));
+        endpoint.send(json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thr_shared", "turnId": "turn_1",
+                "itemId": "msg_1", "delta": "one"
+            }
+        }));
+        endpoint.respond(&first_turn, json!({ "turn": { "id": "turn_1" } }));
+        complete(&endpoint, "thr_shared", "turn_1", "completed");
+        let first_events = collect_terminal(&events);
+        assert!(first_events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ThreadCreated { thread_id } if thread_id == "thr_shared"
+        )));
+        assert!(first_events.contains(&AgentEvent::TextDelta("one".to_owned())));
+        assert_eq!(first_events.last(), Some(&AgentEvent::Completed));
+        drop(interrupt);
+        assert!(endpoint.process.is_alive());
+
+        let second = manager.run_prompt(request("second", Some("thr_shared")));
+        let (second_events, second_interrupt) = second.into_parts();
+        let second_turn = endpoint.recv();
+        assert_eq!(second_turn["method"], "turn/start");
+        assert_eq!(second_turn["params"]["threadId"], "thr_shared");
+        endpoint.respond(&second_turn, json!({ "turn": { "id": "turn_2" } }));
+        endpoint.send(json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "thr_shared",
+                "turn": { "id": "turn_2", "items": [], "status": "inProgress" }
+            }
+        }));
+        complete(&endpoint, "thr_shared", "turn_2", "completed");
+        assert_eq!(
+            collect_terminal(&second_events).last(),
+            Some(&AgentEvent::Completed)
+        );
+        drop(second_interrupt);
+
+        let methods = endpoint.methods();
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "initialize")
+                .count(),
+            1
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "initialized")
+                .count(),
+            1
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "thread/start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "thread/resume")
+                .count(),
+            0
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "turn/start")
+                .count(),
+            2
+        );
+        assert_eq!(spawner.spawn_count.load(Ordering::Acquire), 1);
+        assert!(endpoint.process.is_alive());
+        manager.shutdown();
+        assert!(endpoint.process.waited.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn existing_thread_resumes_once_per_generation_then_starts_turns_directly() {
+        let (manager, spawner) = manager_with_fake();
+        let first = manager.run_prompt(request("resume first", Some("thr_existing")));
+        let (first_events, first_interrupt) = first.into_parts();
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+        let resume = endpoint.recv();
+        assert_eq!(resume["method"], "thread/resume");
+        endpoint.respond(&resume, json!({ "thread": { "id": "thr_existing" } }));
+        endpoint.send(json!({
+            "method": "thread/goal/cleared",
+            "params": { "threadId": "thr_existing" }
+        }));
+        let turn_a = endpoint.recv();
+        assert_eq!(turn_a["method"], "turn/start");
+        endpoint.send(json!({
+            "method": "thread/goal/cleared",
+            "params": { "threadId": "thr_existing" }
+        }));
+        endpoint.respond(&turn_a, json!({ "turn": { "id": "turn_a" } }));
+        complete(&endpoint, "thr_existing", "turn_a", "completed");
+        collect_terminal(&first_events);
+        drop(first_interrupt);
+
+        let second = manager.run_prompt(request("resume second", Some("thr_existing")));
+        let (second_events, second_interrupt) = second.into_parts();
+        let turn = endpoint.recv();
+        assert_eq!(turn["method"], "turn/start");
+        endpoint.respond(&turn, json!({ "turn": { "id": "turn_b" } }));
+        complete(&endpoint, "thr_existing", "turn_b", "completed");
+        collect_terminal(&second_events);
+        drop(second_interrupt);
+
+        assert_eq!(
+            endpoint
+                .methods()
+                .iter()
+                .filter(|method| **method == "thread/resume")
+                .count(),
+            1
+        );
+        assert_eq!(
+            endpoint
+                .methods()
+                .iter()
+                .filter(|method| **method == "turn/start")
+                .count(),
+            2
+        );
+        manager.shutdown();
+    }
+
+    #[test]
+    fn late_loaded_thread_notification_does_not_bind_the_next_lifecycle() {
+        let (manager, spawner) = manager_with_fake();
+        let first = manager.run_prompt(request("first conversation", None));
+        let (first_events, first_interrupt) = first.into_parts();
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+
+        let first_start = endpoint.recv();
+        assert_eq!(first_start["method"], "thread/start");
+        endpoint.respond(&first_start, json!({ "thread": { "id": "thr_late_a" } }));
+        let first_turn = endpoint.recv();
+        endpoint.respond(&first_turn, json!({ "turn": { "id": "turn_late_a" } }));
+        complete(&endpoint, "thr_late_a", "turn_late_a", "completed");
+        assert_eq!(
+            collect_terminal(&first_events).last(),
+            Some(&AgentEvent::Completed)
+        );
+        drop(first_interrupt);
+
+        let second = manager.run_prompt(request("second conversation", None));
+        let (second_events, second_interrupt) = second.into_parts();
+        let second_start = endpoint.recv();
+        assert_eq!(second_start["method"], "thread/start");
+        endpoint.send(json!({
+            "method": "thread/started",
+            "params": { "thread": { "id": "thr_late_a" } }
+        }));
+        endpoint.send(json!({
+            "method": "thread/started",
+            "params": { "thread": { "id": "thr_late_b" } }
+        }));
+        endpoint.respond(&second_start, json!({ "thread": { "id": "thr_late_b" } }));
+        let second_turn = endpoint.recv();
+        endpoint.respond(&second_turn, json!({ "turn": { "id": "turn_late_b" } }));
+        complete(&endpoint, "thr_late_b", "turn_late_b", "completed");
+        assert_eq!(
+            collect_terminal(&second_events).last(),
+            Some(&AgentEvent::Completed)
+        );
+        drop(second_interrupt);
+        assert!(endpoint.process.is_alive());
+        manager.shutdown();
+    }
+
+    #[test]
+    fn late_resume_bootstrap_notification_is_not_bound_to_another_resume() {
+        let (manager, spawner) = manager_with_fake();
+        let first = manager.run_prompt(request("resume a", Some("thr_resume_a")));
+        let (first_events, first_interrupt) = first.into_parts();
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+        let resume_a = endpoint.recv();
+        endpoint.respond(&resume_a, json!({ "thread": { "id": "thr_resume_a" } }));
+        let turn_a = endpoint.recv();
+        assert_eq!(turn_a["method"], "turn/start");
+
+        let second = manager.run_prompt(request("resume b", Some("thr_resume_b")));
+        let (second_events, second_interrupt) = second.into_parts();
+        let resume_b = endpoint.recv();
+        assert_eq!(resume_b["method"], "thread/resume");
+        assert_eq!(resume_b["params"]["threadId"], "thr_resume_b");
+        endpoint.send(json!({
+            "method": "thread/goal/cleared",
+            "params": { "threadId": "thr_resume_a" }
+        }));
+        endpoint.respond(&resume_b, json!({ "thread": { "id": "thr_resume_b" } }));
+        let turn_b = endpoint.recv();
+        assert_eq!(turn_b["method"], "turn/start");
+
+        endpoint.respond(&turn_a, json!({ "turn": { "id": "turn_resume_a" } }));
+        endpoint.respond(&turn_b, json!({ "turn": { "id": "turn_resume_b" } }));
+        complete(&endpoint, "thr_resume_a", "turn_resume_a", "completed");
+        complete(&endpoint, "thr_resume_b", "turn_resume_b", "completed");
+        assert_eq!(
+            collect_terminal(&first_events).last(),
+            Some(&AgentEvent::Completed)
+        );
+        assert_eq!(
+            collect_terminal(&second_events).last(),
+            Some(&AgentEvent::Completed)
+        );
+        drop(first_interrupt);
+        drop(second_interrupt);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn interleaved_threads_route_events_and_one_failed_turn_does_not_stop_the_other() {
+        let (manager, spawner) = manager_with_fake();
+        let first = manager.run_prompt(request("alpha", Some("thr_a")));
+        let second = manager.run_prompt(request("beta", Some("thr_b")));
+        let (events_a, interrupt_a) = first.into_parts();
+        let (events_b, interrupt_b) = second.into_parts();
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+
+        let mut turn_requests = HashMap::new();
+        while turn_requests.len() < 2 {
+            let message = endpoint.recv();
+            match message["method"].as_str().unwrap() {
+                "thread/resume" => {
+                    let thread_id = message["params"]["threadId"].as_str().unwrap();
+                    endpoint.respond(&message, json!({ "thread": { "id": thread_id } }));
+                }
+                "turn/start" => {
+                    let thread_id = message["params"]["threadId"].as_str().unwrap().to_owned();
+                    turn_requests.insert(thread_id, message);
+                }
+                method => panic!("unexpected method: {method}"),
+            }
+        }
+        for (thread_id, turn_id) in [("thr_a", "turn_a"), ("thr_b", "turn_b")] {
+            endpoint.respond(
+                turn_requests.get(thread_id).unwrap(),
+                json!({ "turn": { "id": turn_id } }),
+            );
+            endpoint.send(json!({
+                "method": "turn/started",
+                "params": {
+                    "threadId": thread_id,
+                    "turn": { "id": turn_id, "items": [], "status": "inProgress" }
+                }
+            }));
+        }
+        endpoint.send(json!({
+            "method": "item/agentMessage/delta",
+            "params": { "threadId": "thr_b", "turnId": "turn_b", "itemId": "b", "delta": "B" }
+        }));
+        endpoint.send(json!({
+            "method": "item/agentMessage/delta",
+            "params": { "threadId": "thr_a", "turnId": "turn_a", "itemId": "a", "delta": "A" }
+        }));
+        complete(&endpoint, "thr_b", "turn_b", "failed");
+        endpoint.send(json!({
+            "method": "item/agentMessage/delta",
+            "params": { "threadId": "thr_a", "turnId": "turn_a", "itemId": "a", "delta": "2" }
+        }));
+        complete(&endpoint, "thr_a", "turn_a", "completed");
+
+        let alpha = collect_terminal(&events_a);
+        let beta = collect_terminal(&events_b);
+        assert!(alpha.contains(&AgentEvent::TextDelta("A".to_owned())));
+        assert!(alpha.contains(&AgentEvent::TextDelta("2".to_owned())));
+        assert!(!alpha.contains(&AgentEvent::TextDelta("B".to_owned())));
+        assert_eq!(alpha.last(), Some(&AgentEvent::Completed));
+        assert!(beta.contains(&AgentEvent::TextDelta("B".to_owned())));
+        assert!(
+            matches!(beta.last(), Some(AgentEvent::Failed(message)) if message.contains("fixture turn failed"))
+        );
+        drop(interrupt_a);
+        drop(interrupt_b);
+        assert!(endpoint.process.is_alive());
+        assert_eq!(spawner.spawn_count.load(Ordering::Acquire), 1);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn all_rpc_families_share_unique_connection_ids_and_out_of_order_responses() {
+        let (manager, spawner) = manager_with_fake();
+        let models = manager.load_model_catalog();
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+        let model_request = endpoint.recv();
+        assert_eq!(model_request["method"], "model/list");
+
+        let profiles = manager.load_permission_profiles("/tmp/project".into());
+        let settings = manager.update_thread_permissions(
+            "thr_settings".to_owned(),
+            "/tmp/project".into(),
+            AgentPermissionMode::Request,
+        );
+        let run = manager.run_prompt(request("rpc turn", Some("thr_turn")));
+        let (turn_events, turn_interrupt) = run.into_parts();
+
+        let mut requests = HashMap::new();
+        requests.insert("model/list".to_owned(), model_request);
+        while ![
+            "permissionProfile/list",
+            "thread/settings/update",
+            "turn/start",
+        ]
+        .iter()
+        .all(|method| requests.contains_key(*method))
+        {
+            let message = endpoint.recv();
+            let method = message["method"].as_str().unwrap();
+            if method == "thread/resume" {
+                let thread_id = message["params"]["threadId"].as_str().unwrap();
+                endpoint.respond(&message, json!({ "thread": { "id": thread_id } }));
+            } else {
+                requests.insert(method.to_owned(), message);
+            }
+        }
+        let ids = requests
+            .values()
+            .map(|message| message["id"].as_u64().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), requests.len());
+        let connection_ids = endpoint
+            .received
+            .iter()
+            .filter_map(|message| message.get("id").and_then(Value::as_u64))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            connection_ids.iter().copied().collect::<HashSet<_>>().len(),
+            connection_ids.len()
+        );
+
+        endpoint.send(json!({
+            "method": "thread/settings/updated",
+            "params": {
+                "threadId": "thr_settings",
+                "threadSettings": {
+                    "model": "gpt-test", "effort": "medium", "serviceTier": null,
+                    "cwd": "/tmp/project", "approvalPolicy": "on-request",
+                    "approvalsReviewer": "user", "sandboxPolicy": {"type":"workspaceWrite"},
+                    "activePermissionProfile": {"id":":workspace","extends":null}
+                }
+            }
+        }));
+        endpoint.respond(
+            requests.get("turn/start").unwrap(),
+            json!({ "turn": { "id": "turn_rpc" } }),
+        );
+        endpoint.respond(requests.get("thread/settings/update").unwrap(), json!({}));
+        endpoint.respond(
+            requests.get("permissionProfile/list").unwrap(),
+            json!({ "data": [{"id":":workspace","allowed":true,"extends":null}], "nextCursor": null }),
+        );
+        endpoint.respond(requests.get("model/list").unwrap(), model_page());
+        complete(&endpoint, "thr_turn", "turn_rpc", "completed");
+
+        assert_eq!(wait_value(&models).unwrap().models.len(), 1);
+        assert_eq!(wait_value(&profiles).unwrap().len(), 1);
+        assert_eq!(wait_value(&settings).unwrap().model, "gpt-test");
+        assert_eq!(
+            collect_terminal(&turn_events).last(),
+            Some(&AgentEvent::Completed)
+        );
+        drop(turn_interrupt);
+        assert_eq!(spawner.spawn_count.load(Ordering::Acquire), 1);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn interrupt_and_abandon_are_turn_scoped_and_keep_shared_process_alive() {
+        let (manager, spawner) = manager_with_fake();
+        let first = manager.run_prompt(request("interrupt", Some("thr_interrupt")));
+        let second = manager.run_prompt(request("other", Some("thr_other")));
+        let (first_events, first_interrupt) = first.into_parts();
+        let (second_events, second_interrupt) = second.into_parts();
+        let first_interrupt =
+            first_interrupt.expect("managed runs always have an interrupt handle");
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+
+        let mut turn_requests = HashMap::new();
+        while turn_requests.len() < 2 {
+            let message = endpoint.recv();
+            match message["method"].as_str().unwrap() {
+                "thread/resume" => {
+                    let thread_id = message["params"]["threadId"].as_str().unwrap();
+                    endpoint.respond(&message, json!({ "thread": { "id": thread_id } }));
+                }
+                "turn/start" => {
+                    turn_requests.insert(
+                        message["params"]["threadId"].as_str().unwrap().to_owned(),
+                        message,
+                    );
+                }
+                method => panic!("unexpected method: {method}"),
+            }
+        }
+        for (thread_id, turn_id) in [
+            ("thr_interrupt", "turn_interrupt"),
+            ("thr_other", "turn_other"),
+        ] {
+            endpoint.respond(
+                turn_requests.get(thread_id).unwrap(),
+                json!({ "turn": { "id": turn_id } }),
+            );
+        }
+
+        assert_eq!(
+            first_interrupt.interrupt().unwrap(),
+            AgentInterruptOutcome::Requested
+        );
+        assert_eq!(
+            first_interrupt.interrupt().unwrap(),
+            AgentInterruptOutcome::AlreadyRequested
+        );
+        let interrupt_request = endpoint.recv();
+        assert_eq!(interrupt_request["method"], "turn/interrupt");
+        assert_eq!(interrupt_request["params"]["threadId"], "thr_interrupt");
+        assert_eq!(interrupt_request["params"]["turnId"], "turn_interrupt");
+        endpoint.respond(&interrupt_request, json!({}));
+        complete(&endpoint, "thr_other", "turn_other", "completed");
+        complete(&endpoint, "thr_interrupt", "turn_interrupt", "interrupted");
+        assert_eq!(
+            collect_terminal(&first_events).last(),
+            Some(&AgentEvent::Interrupted)
+        );
+        assert_eq!(
+            collect_terminal(&second_events).last(),
+            Some(&AgentEvent::Completed)
+        );
+        drop(first_interrupt);
+        drop(second_interrupt);
+        assert_eq!(
+            endpoint
+                .methods()
+                .iter()
+                .filter(|method| **method == "turn/interrupt")
+                .count(),
+            1
+        );
+        assert!(endpoint.process.is_alive());
+
+        let abandoned = manager.run_prompt(request("abandon", Some("thr_abandon")));
+        let (abandoned_events, abandoned_handle) = abandoned.into_parts();
+        start_known_turn(&mut endpoint, "thr_abandon", "turn_abandon");
+        drop(abandoned_events);
+        drop(abandoned_handle);
+        let abandon_interrupt = endpoint.recv();
+        assert_eq!(abandon_interrupt["method"], "turn/interrupt");
+        assert_eq!(abandon_interrupt["params"]["threadId"], "thr_abandon");
+        endpoint.respond(&abandon_interrupt, json!({}));
+        complete(&endpoint, "thr_abandon", "turn_abandon", "interrupted");
+
+        let followup = manager.run_prompt(request("after abandon", Some("thr_after_abandon")));
+        let (followup_events, followup_interrupt) = followup.into_parts();
+        start_known_turn(&mut endpoint, "thr_after_abandon", "turn_after_abandon");
+        complete(
+            &endpoint,
+            "thr_after_abandon",
+            "turn_after_abandon",
+            "completed",
+        );
+        assert_eq!(
+            collect_terminal(&followup_events).last(),
+            Some(&AgentEvent::Completed)
+        );
+        drop(followup_interrupt);
+
+        let catalog = manager.load_model_catalog();
+        let model_request = endpoint.recv();
+        assert_eq!(model_request["method"], "model/list");
+        endpoint.respond(&model_request, model_page());
+        assert!(wait_value(&catalog).is_ok());
+        assert_eq!(spawner.spawn_count.load(Ordering::Acquire), 1);
+        assert!(endpoint.process.is_alive());
+        manager.shutdown();
+    }
+
+    fn command_approval(id: Value, thread_id: &str, turn_id: &str) -> Value {
+        json!({
+            "id": id,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "kind": "command", "threadId": thread_id, "turnId": turn_id,
+                "itemId": format!("cmd_{thread_id}"), "startedAtMs": 1_i64,
+                "environmentId": null, "reason": null, "command": "git status",
+                "cwd": "/tmp", "commandActions": [], "proposedExecpolicyAmendment": null,
+                "availableDecisions": ["accept", "decline"]
+            }
+        })
+    }
+
+    fn user_input(id: Value, thread_id: &str, turn_id: &str) -> Value {
+        json!({
+            "id": id,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": thread_id, "turnId": turn_id, "itemId": format!("input_{thread_id}"),
+                "questions": [{
+                    "id": "choice", "header": "Choice", "question": "Pick",
+                    "isOther": false, "isSecret": false,
+                    "options": [{"label":"yes","description":"continue"}]
+                }],
+                "isBlocking": true, "autoResolutionMs": null
+            }
+        })
+    }
+
+    fn permissions_approval(id: Value, thread_id: &str, turn_id: &str) -> Value {
+        json!({
+            "id": id,
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "threadId": thread_id, "turnId": turn_id,
+                "itemId": format!("permissions_{thread_id}"), "environmentId": null,
+                "startedAtMs": 1_i64, "cwd": "/tmp/project", "reason": "fixture",
+                "permissions": { "network": { "enabled": true } }
+            }
+        })
+    }
+
+    #[test]
+    fn interleaved_server_requests_route_by_original_id_and_resolve_once() {
+        let (manager, spawner) = manager_with_fake();
+        let first = manager.run_prompt(request("requests a", Some("thr_req_a")));
+        let second = manager.run_prompt(request("requests b", Some("thr_req_b")));
+        let (events_a, interrupt_a) = first.into_parts();
+        let (events_b, interrupt_b) = second.into_parts();
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+
+        let mut turn_requests = HashMap::new();
+        while turn_requests.len() < 2 {
+            let message = endpoint.recv();
+            match message["method"].as_str().unwrap() {
+                "thread/resume" => {
+                    let thread_id = message["params"]["threadId"].as_str().unwrap();
+                    endpoint.respond(&message, json!({ "thread": { "id": thread_id } }));
+                }
+                "turn/start" => {
+                    turn_requests.insert(
+                        message["params"]["threadId"].as_str().unwrap().to_owned(),
+                        message,
+                    );
+                }
+                method => panic!("unexpected method: {method}"),
+            }
+        }
+        endpoint.respond(
+            turn_requests.get("thr_req_a").unwrap(),
+            json!({ "turn": { "id": "turn_req_a" } }),
+        );
+        endpoint.respond(
+            turn_requests.get("thr_req_b").unwrap(),
+            json!({ "turn": { "id": "turn_req_b" } }),
+        );
+        endpoint.send(command_approval(json!(101), "thr_req_a", "turn_req_a"));
+        endpoint.send(permissions_approval(json!(202), "thr_req_b", "turn_req_b"));
+        endpoint.send(user_input(json!("input-a"), "thr_req_a", "turn_req_a"));
+
+        let mut command = None;
+        let mut input = None;
+        let mut permissions = None;
+        let deadline = Instant::now() + WAIT;
+        while (command.is_none() || input.is_none() || permissions.is_none())
+            && Instant::now() < deadline
+        {
+            for receiver in [&events_a, &events_b] {
+                if let Ok(event) = receiver.try_recv() {
+                    match event {
+                        AgentEvent::CommandApprovalRequested { responder, .. } => {
+                            command = Some(responder)
+                        }
+                        AgentEvent::UserInputRequested { responder, .. } => input = Some(responder),
+                        AgentEvent::PermissionsApprovalRequested { responder, .. } => {
+                            permissions = Some(responder)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let command = command.expect("missing command approval");
+        let input = input.expect("missing user input");
+        let permissions = permissions.expect("missing permissions approval");
+        command.respond(AgentCommandApprovalChoice::Accept).unwrap();
+        input
+            .respond(AgentUserInputResponse {
+                answers: vec![AgentUserInputAnswer {
+                    question_id: "choice".to_owned(),
+                    answers: vec!["yes".to_owned()],
+                }],
+            })
+            .unwrap();
+        permissions
+            .respond(AgentPermissionsApprovalChoice::AllowOnce)
+            .unwrap();
+        assert!(command.respond(AgentCommandApprovalChoice::Accept).is_err());
+        assert!(input.respond(AgentUserInputResponse::default()).is_err());
+
+        let mut response_ids = HashSet::new();
+        for _ in 0..3 {
+            let response = endpoint.recv();
+            assert!(response.get("method").is_none());
+            response_ids.insert(response["id"].clone());
+        }
+        assert_eq!(
+            response_ids,
+            HashSet::from([json!(101), json!(202), json!("input-a")])
+        );
+        for (thread_id, request_id) in [
+            ("thr_req_b", json!(202)),
+            ("thr_req_a", json!("input-a")),
+            ("thr_req_a", json!(101)),
+        ] {
+            endpoint.send(json!({
+                "method": "serverRequest/resolved",
+                "params": { "threadId": thread_id, "requestId": request_id }
+            }));
+        }
+        complete(&endpoint, "thr_req_a", "turn_req_a", "completed");
+        complete(&endpoint, "thr_req_b", "turn_req_b", "completed");
+
+        let mut terminal_a = collect_terminal(&events_a);
+        let mut terminal_b = collect_terminal(&events_b);
+        terminal_a.append(&mut terminal_b);
+        let resolved = terminal_a
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ServerRequestResolved { request } => Some(request.request_id.clone()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            resolved,
+            HashSet::from([
+                AgentServerRequestId::Number(101),
+                AgentServerRequestId::Number(202),
+                AgentServerRequestId::String("input-a".to_owned())
+            ])
+        );
+        assert!(command.respond(AgentCommandApprovalChoice::Accept).is_err());
+        drop(interrupt_a);
+        drop(interrupt_b);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn eof_fails_pending_work_once_and_next_operation_restarts_then_resumes() {
+        let (manager, spawner) = manager_with_fake();
+        let run = manager.run_prompt(request("do not replay", Some("thr_crash")));
+        let (events, interrupt) = run.into_parts();
+        let mut first_endpoint = spawner.next_endpoint();
+        handshake(&mut first_endpoint);
+        start_known_turn(&mut first_endpoint, "thr_crash", "turn_crash");
+        let catalog = manager.load_model_catalog();
+        let pending_model = first_endpoint.recv();
+        assert_eq!(pending_model["method"], "model/list");
+        first_endpoint.close_stdout();
+
+        assert!(matches!(
+            collect_terminal(&events).last(),
+            Some(AgentEvent::Failed(message)) if message.contains("EOF")
+        ));
+        assert!(wait_value(&catalog).is_err());
+        drop(interrupt);
+        wait_for_process(&first_endpoint.process);
+
+        let next = manager.run_prompt(request("explicit retry", Some("thr_crash")));
+        let (next_events, next_interrupt) = next.into_parts();
+        let mut second_endpoint = spawner.next_endpoint();
+        handshake(&mut second_endpoint);
+        let resume = second_endpoint.recv();
+        assert_eq!(resume["method"], "thread/resume");
+        second_endpoint.respond(&resume, json!({ "thread": { "id": "thr_crash" } }));
+        let turn = second_endpoint.recv();
+        assert_eq!(turn["method"], "turn/start");
+        assert_eq!(turn["params"]["input"][0]["text"], "explicit retry");
+        second_endpoint.respond(&turn, json!({ "turn": { "id": "turn_retry" } }));
+        complete(&second_endpoint, "thr_crash", "turn_retry", "completed");
+        assert_eq!(
+            collect_terminal(&next_events).last(),
+            Some(&AgentEvent::Completed)
+        );
+        drop(next_interrupt);
+        assert_eq!(spawner.spawn_count.load(Ordering::Acquire), 2);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn protocol_mismatch_fails_all_active_turns_without_deadlock() {
+        let (manager, spawner) = manager_with_fake();
+        let first = manager.run_prompt(request("one", Some("thr_one")));
+        let second = manager.run_prompt(request("two", Some("thr_two")));
+        let (events_one, interrupt_one) = first.into_parts();
+        let (events_two, interrupt_two) = second.into_parts();
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+
+        let mut requests = HashMap::new();
+        while requests.len() < 2 {
+            let message = endpoint.recv();
+            match message["method"].as_str().unwrap() {
+                "thread/resume" => {
+                    let thread_id = message["params"]["threadId"].as_str().unwrap();
+                    endpoint.respond(&message, json!({ "thread": { "id": thread_id } }));
+                }
+                "turn/start" => {
+                    requests.insert(
+                        message["params"]["threadId"].as_str().unwrap().to_owned(),
+                        message,
+                    );
+                }
+                method => panic!("unexpected method: {method}"),
+            }
+        }
+        endpoint.respond(
+            requests.get("thr_one").unwrap(),
+            json!({ "turn": { "id": "turn_one" } }),
+        );
+        endpoint.respond(
+            requests.get("thr_two").unwrap(),
+            json!({ "turn": { "id": "turn_two" } }),
+        );
+        endpoint.send(json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thr_one", "turnId": "wrong_turn",
+                "itemId": "bad", "delta": "must fail"
+            }
+        }));
+        let one = collect_terminal(&events_one);
+        let two = collect_terminal(&events_two);
+        assert!(
+            matches!(one.last(), Some(AgentEvent::Failed(message)) if message.contains("turn")),
+            "{one:?}"
+        );
+        assert!(
+            matches!(two.last(), Some(AgentEvent::Failed(message)) if message.contains("turn")),
+            "{two:?}"
+        );
+        drop(interrupt_one);
+        drop(interrupt_two);
+        wait_for_process(&endpoint.process);
+    }
+
+    #[test]
+    fn concurrent_first_calls_single_flight_initialize_and_shutdown_waits_once() {
+        let (manager, spawner) = manager_with_fake();
+        let first = manager.load_model_catalog();
+        let second = manager.load_model_catalog();
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+        let request_a = endpoint.recv();
+        let request_b = endpoint.recv();
+        assert_eq!(request_a["method"], "model/list");
+        assert_eq!(request_b["method"], "model/list");
+        assert_ne!(request_a["id"], request_b["id"]);
+        endpoint.respond(&request_b, model_page());
+        endpoint.respond(&request_a, model_page());
+        assert!(wait_value(&first).is_ok());
+        assert!(wait_value(&second).is_ok());
+        assert_eq!(spawner.spawn_count.load(Ordering::Acquire), 1);
+        assert_eq!(
+            endpoint
+                .methods()
+                .iter()
+                .filter(|method| **method == "initialize")
+                .count(),
+            1
+        );
+        manager.shutdown();
+        manager.shutdown();
+        let process = spawner.process(0);
+        assert_eq!(process.terminate_calls.load(Ordering::Acquire), 1);
+        assert!(process.waited.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn shutdown_waits_for_an_in_flight_spawn_and_reaps_the_process() {
+        let delegate = FakeSpawner::new();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let manager = CodexAppServerManager::with_spawner(Arc::new(BlockingSpawner {
+            delegate: delegate.clone(),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }));
+        let catalog = manager.load_model_catalog();
+        entered_rx
+            .recv_timeout(WAIT)
+            .expect("manager did not enter the fake spawn");
+
+        let shutdown_manager = manager.clone();
+        let shutdown = std::thread::spawn(move || shutdown_manager.shutdown());
+        let deadline = Instant::now() + WAIT;
+        while !manager.inner.state.lock().unwrap().shutdown && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(manager.inner.state.lock().unwrap().shutdown);
+        release_tx.send(()).unwrap();
+        let endpoint = delegate.next_endpoint();
+        shutdown.join().unwrap();
+
+        assert!(wait_value(&catalog).is_err());
+        assert_eq!(delegate.spawn_count.load(Ordering::Acquire), 1);
+        assert_eq!(endpoint.process.terminate_calls.load(Ordering::Acquire), 1);
+        wait_for_process(&endpoint.process);
+    }
+
+    #[test]
+    fn app_scoped_events_are_published_without_an_active_turn_and_replayed_as_snapshots() {
+        let (manager, spawner) = manager_with_fake();
+        let first_subscription = manager.subscribe_connection_events();
+        let catalog = manager.load_model_catalog();
+        let mut endpoint = spawner.next_endpoint();
+        let initialize = endpoint.recv();
+        endpoint.send(json!({
+            "method": "warning",
+            "params": { "threadId": null, "message": "connection warning" }
+        }));
+        endpoint.send(json!({
+            "method": "configWarning",
+            "params": {
+                "summary": "bad config", "details": null, "path": null, "range": null
+            }
+        }));
+        endpoint.respond(&initialize, json!({}));
+        assert_eq!(endpoint.recv()["method"], "initialized");
+        let model_request = endpoint.recv();
+        endpoint.respond(&model_request, model_page());
+        assert!(wait_value(&catalog).is_ok());
+
+        let first = wait_value(&first_subscription);
+        let second = wait_value(&first_subscription);
+        assert!(matches!(
+            (&first, &second),
+            (
+                crate::agent::AgentConnectionEvent::Warning { .. },
+                crate::agent::AgentConnectionEvent::ConfigWarning(_)
+            ) | (
+                crate::agent::AgentConnectionEvent::ConfigWarning(_),
+                crate::agent::AgentConnectionEvent::Warning { .. }
+            )
+        ));
+        let replay = manager.subscribe_connection_events();
+        let replayed = HashSet::from([
+            format!("{:?}", wait_value(&replay)),
+            format!("{:?}", wait_value(&replay)),
+        ]);
+        assert!(
+            replayed
+                .iter()
+                .any(|event| event.contains("connection warning"))
+        );
+        assert!(replayed.iter().any(|event| event.contains("bad config")));
+        manager.shutdown();
+    }
+
+    #[test]
+    fn malformed_json_fails_pending_receivers_and_reaps_process() {
+        let (manager, spawner) = manager_with_fake();
+        let catalog = manager.load_model_catalog();
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+        assert_eq!(endpoint.recv()["method"], "model/list");
+        endpoint.send_raw("{not-json");
+        let error = wait_value(&catalog).unwrap_err();
+        assert!(error.contains("无法解析 Codex JSON-RPC"));
+        wait_for_process(&endpoint.process);
+    }
+
+    #[test]
+    fn transport_write_failure_fails_the_rpc_and_reaps_the_generation() {
+        let (manager, spawner) = manager_with_fake();
+        let catalog = manager.load_model_catalog();
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+        let request = endpoint.recv();
+        endpoint.respond(&request, model_page());
+        assert!(wait_value(&catalog).is_ok());
+
+        endpoint.close_client_input();
+        let profiles = manager.load_permission_profiles("/tmp/project".into());
+        let error = wait_value(&profiles).unwrap_err();
+        assert!(error.contains("transport") || error.contains("写入"));
+        wait_for_process(&endpoint.process);
+    }
+
+    #[test]
+    fn unknown_server_request_replies_method_not_found_then_fails_generation() {
+        let (manager, spawner) = manager_with_fake();
+        let run = manager.run_prompt(request("unknown request", Some("thr_unknown")));
+        let (events, interrupt) = run.into_parts();
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+        start_known_turn(&mut endpoint, "thr_unknown", "turn_unknown");
+        endpoint.send(json!({
+            "id": 999,
+            "method": "item/fileChange/requestApproval",
+            "params": {
+                "threadId": "thr_unknown", "turnId": "turn_unknown", "itemId": "file"
+            }
+        }));
+        let response = endpoint.recv();
+        assert_eq!(response["id"], 999);
+        assert_eq!(response["error"]["code"], -32601);
+        assert!(matches!(
+            collect_terminal(&events).last(),
+            Some(AgentEvent::Failed(message)) if message.contains("item/fileChange/requestApproval")
+        ));
+        drop(interrupt);
+        wait_for_process(&endpoint.process);
+    }
+
+    #[test]
+    fn dropping_last_manager_owner_terminates_and_waits_for_process() {
+        let (manager, spawner) = manager_with_fake();
+        let catalog = manager.load_model_catalog();
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+        let request = endpoint.recv();
+        endpoint.respond(&request, model_page());
+        assert!(wait_value(&catalog).is_ok());
+        let process = endpoint.process.clone();
+        drop(manager);
+        let deadline = Instant::now() + WAIT;
+        while !process.waited.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(process.terminate_calls.load(Ordering::Acquire), 1);
+        assert!(process.waited.load(Ordering::Acquire));
+    }
+}

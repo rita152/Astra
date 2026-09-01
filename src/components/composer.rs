@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use chrono::Local;
 use gpui::{
@@ -10,16 +10,16 @@ use gpui::{
 use crate::{
     agent::{
         AgentAccountRateLimits, AgentApprovalHandle, AgentBackend, AgentCommandApprovalChoice,
-        AgentConfigWarning, AgentCreditsSnapshot, AgentEffectivePermissions, AgentEvent,
-        AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemSpecialPath,
+        AgentConfigWarning, AgentConnectionEvent, AgentCreditsSnapshot, AgentEffectivePermissions,
+        AgentEvent, AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemSpecialPath,
         AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
         AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog,
         AgentOptionalField, AgentPermissionMode, AgentPermissionRequestProfile,
         AgentPermissionsApprovalChoice, AgentPermissionsApprovalHandle, AgentRateLimitWindow,
-        AgentRequest, AgentServerRequestFailureKind, AgentServerRequestKind,
+        AgentReasoning, AgentRequest, AgentServerRequestFailureKind, AgentServerRequestKind,
         AgentServerRequestMetadata, AgentThreadStatus, AgentThreadTokenUsage, AgentUserInputAnswer,
         AgentUserInputHandle, AgentUserInputResponse, CodexAppServerBackend, CommandExecution,
-        CommandExecutionStatus,
+        CommandExecutionAction, CommandExecutionStatus,
     },
     components::{
         approval::{
@@ -120,11 +120,41 @@ pub enum ConversationPhase {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReasoningActivityPresentation {
+    pub item_id: String,
+    pub summary: Vec<String>,
+    pub content: Vec<String>,
+    pub started_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+}
+
+impl ReasoningActivityPresentation {
+    pub fn is_active(&self) -> bool {
+        self.completed_at_ms.is_none()
+    }
+
+    pub fn elapsed_ms(&self) -> Option<u64> {
+        let elapsed = self.completed_at_ms?.checked_sub(self.started_at_ms)?;
+        u64::try_from(elapsed).ok().filter(|elapsed| *elapsed > 0)
+    }
+
+    pub fn display_text(&self) -> String {
+        let parts = if self.summary.iter().any(|part| !part.is_empty()) {
+            &self.summary
+        } else {
+            &self.content
+        };
+        reasoning_parts_text(parts)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConversationActivity {
     AssistantMessage {
         item_id: String,
         text: String,
     },
+    Reasoning(ReasoningActivityPresentation),
     Command(CommandExecution),
     Approval(ApprovalCardViewModel),
     FileApproval(FileApprovalPresentation),
@@ -143,6 +173,17 @@ pub enum ConversationActivity {
     Error {
         message: String,
     },
+}
+
+fn reasoning_parts_text(parts: &[String]) -> String {
+    let Some((first, rest)) = parts.split_first() else {
+        return String::new();
+    };
+    if rest.is_empty() || first.is_empty() || first.starts_with("**") {
+        parts.join("\n\n")
+    } else {
+        format!("**{first}**\n\n{}", rest.join("\n\n"))
+    }
 }
 
 const MODEL_PICKER_WIDTH: f32 = 224.0;
@@ -258,6 +299,50 @@ fn push_coalesced_agent_event(batch: &mut Vec<AgentEvent>, event: AgentEvent) {
                 buffered.push_str(&delta);
             } else {
                 batch.push(AgentEvent::CommandOutputDelta { item_id, delta });
+            }
+        }
+        AgentEvent::ReasoningSummaryTextDelta {
+            item_id,
+            summary_index,
+            delta,
+        } => {
+            if let Some(AgentEvent::ReasoningSummaryTextDelta {
+                item_id: buffered_item_id,
+                summary_index: buffered_summary_index,
+                delta: buffered,
+            }) = batch.last_mut()
+                && buffered_item_id == &item_id
+                && *buffered_summary_index == summary_index
+            {
+                buffered.push_str(&delta);
+            } else {
+                batch.push(AgentEvent::ReasoningSummaryTextDelta {
+                    item_id,
+                    summary_index,
+                    delta,
+                });
+            }
+        }
+        AgentEvent::ReasoningTextDelta {
+            item_id,
+            content_index,
+            delta,
+        } => {
+            if let Some(AgentEvent::ReasoningTextDelta {
+                item_id: buffered_item_id,
+                content_index: buffered_content_index,
+                delta: buffered,
+            }) = batch.last_mut()
+                && buffered_item_id == &item_id
+                && *buffered_content_index == content_index
+            {
+                buffered.push_str(&delta);
+            } else {
+                batch.push(AgentEvent::ReasoningTextDelta {
+                    item_id,
+                    content_index,
+                    delta,
+                });
             }
         }
         event => batch.push(event),
@@ -450,6 +535,7 @@ fn particle_layers(ultra_mode: bool, accelerated: bool) -> (bool, bool) {
 }
 
 pub struct ComposerView {
+    backend: Arc<dyn AgentBackend>,
     mode: ThemeMode,
     prompt_input: Entity<PromptInput>,
     user_input_other_input: Entity<PromptInput>,
@@ -461,6 +547,7 @@ pub struct ComposerView {
     conversation_phase: ConversationPhase,
     conversation_cycle: u64,
     active_turn: Option<AgentInterruptHandle>,
+    pending_connection_events: HashMap<String, Vec<AgentConnectionEvent>>,
     approval_responders: HashMap<String, AgentApprovalHandle>,
     user_input_responders: HashMap<String, AgentUserInputHandle>,
     permissions_approval_responders: HashMap<String, AgentPermissionsApprovalHandle>,
@@ -507,7 +594,18 @@ pub struct ComposerView {
 }
 
 impl ComposerView {
+    #[allow(dead_code)]
     pub fn new(mode: ThemeMode, cx: &mut Context<Self>) -> Self {
+        let backend: Arc<dyn AgentBackend> = Arc::new(CodexAppServerBackend::new());
+        Self::new_with_backend(mode, backend, cx)
+    }
+
+    pub fn new_with_backend(
+        mode: ThemeMode,
+        backend: Arc<dyn AgentBackend>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let connection_events = backend.subscribe_connection_events();
         let prompt_input = cx.new(|cx| PromptInput::new(mode, cx));
         let user_input_other_input = cx.new(|cx| {
             PromptInput::inline_other(mode, "否，并告诉 ChatGPT 应该如何做得不同", false, cx)
@@ -567,7 +665,8 @@ impl ComposerView {
             },
         )
         .detach();
-        let view = Self {
+        let mut view = Self {
+            backend,
             mode,
             prompt_input,
             user_input_other_input,
@@ -579,6 +678,7 @@ impl ComposerView {
             conversation_phase: ConversationPhase::Empty,
             conversation_cycle: 0,
             active_turn: None,
+            pending_connection_events: HashMap::new(),
             approval_responders: HashMap::new(),
             user_input_responders: HashMap::new(),
             permissions_approval_responders: HashMap::new(),
@@ -619,8 +719,7 @@ impl ComposerView {
             permission_menu_open: false,
             approval_resolved_capture: false,
         };
-        #[cfg(not(test))]
-        let mut view = view;
+        view.consume_connection_events(connection_events, cx);
         #[cfg(not(test))]
         view.load_model_catalog(cx);
         view
@@ -628,7 +727,7 @@ impl ComposerView {
 
     #[cfg(not(test))]
     fn load_model_catalog(&mut self, cx: &mut Context<Self>) {
-        let receiver = CodexAppServerBackend::new().load_model_catalog();
+        let receiver = self.backend.load_model_catalog();
         cx.spawn(async move |this, cx| {
             let result = receiver
                 .recv()
@@ -1003,8 +1102,6 @@ impl ComposerView {
         self.user_input_responders.clear();
         self.permissions_approval_responders.clear();
         self.server_request_contexts.clear();
-        self.mcp_server_startup_statuses.clear();
-        self.thread_statuses.clear();
         self.assistant_message_time = None;
         self.conversation_phase = ConversationPhase::Starting;
         self.conversation_cycle = self.conversation_cycle.wrapping_add(1);
@@ -1034,7 +1131,7 @@ impl ComposerView {
         cx.emit(ConversationChanged);
         cx.notify();
 
-        let run = CodexAppServerBackend::new().run_prompt(AgentRequest {
+        let run = self.backend.run_prompt(AgentRequest {
             prompt,
             cwd: std::env::current_dir().unwrap_or_default(),
             thread_id: self.thread_id.clone(),
@@ -1104,12 +1201,79 @@ impl ComposerView {
         .detach();
     }
 
+    fn consume_connection_events(
+        &mut self,
+        receiver: async_channel::Receiver<AgentConnectionEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = receiver.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    if this.apply_connection_event(event) {
+                        cx.emit(ConversationChanged);
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn apply_connection_event(&mut self, event: AgentConnectionEvent) -> bool {
+        let scoped_thread_id = match &event {
+            AgentConnectionEvent::Warning { thread_id, .. } => thread_id.as_deref(),
+            AgentConnectionEvent::McpServerStartupStatusUpdated(status) => {
+                status.thread_id.as_deref()
+            }
+            AgentConnectionEvent::ThreadStatusChanged(status) => Some(status.thread_id.as_str()),
+            AgentConnectionEvent::ThreadSettingsUpdated { thread_id, .. } => {
+                Some(thread_id.as_str())
+            }
+            AgentConnectionEvent::ConfigWarning(_)
+            | AgentConnectionEvent::AccountRateLimitsUpdated(_) => None,
+        };
+        if let Some(thread_id) = scoped_thread_id
+            && self.thread_id.as_deref() != Some(thread_id)
+        {
+            if self.thread_id.is_none() {
+                self.pending_connection_events
+                    .entry(thread_id.to_owned())
+                    .or_default()
+                    .push(event);
+            }
+            return false;
+        }
+        let event = match event {
+            AgentConnectionEvent::Warning { message, .. } => AgentEvent::Warning { message },
+            AgentConnectionEvent::ConfigWarning(warning) => AgentEvent::ConfigWarning(warning),
+            AgentConnectionEvent::McpServerStartupStatusUpdated(status) => {
+                AgentEvent::McpServerStartupStatusUpdated(status)
+            }
+            AgentConnectionEvent::ThreadStatusChanged(status) => {
+                AgentEvent::ThreadStatusChanged(status)
+            }
+            AgentConnectionEvent::ThreadSettingsUpdated { settings, .. } => {
+                AgentEvent::ThreadSettingsUpdated(settings)
+            }
+            AgentConnectionEvent::AccountRateLimitsUpdated(rate_limits) => {
+                AgentEvent::AccountRateLimitsUpdated(rate_limits)
+            }
+        };
+        self.apply_agent_event_batch(vec![event]);
+        true
+    }
+
     fn apply_agent_event_batch(&mut self, events: Vec<AgentEvent>) -> bool {
         let mut finished = false;
         for event in events {
             match event {
                 AgentEvent::ThreadCreated { thread_id } => {
-                    self.thread_id = Some(thread_id);
+                    self.thread_id = Some(thread_id.clone());
+                    if let Some(pending) = self.pending_connection_events.remove(&thread_id) {
+                        for event in pending {
+                            self.apply_connection_event(event);
+                        }
+                    }
                 }
                 AgentEvent::Started => {
                     if self.conversation_phase != ConversationPhase::Stopping {
@@ -1221,6 +1385,66 @@ impl ComposerView {
                         self.conversation_phase = ConversationPhase::Streaming;
                     }
                 }
+                AgentEvent::ReasoningStarted {
+                    reasoning,
+                    started_at_ms,
+                } => {
+                    upsert_reasoning_started(
+                        &mut self.conversation_activity,
+                        reasoning,
+                        started_at_ms,
+                    );
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Thinking;
+                    }
+                }
+                AgentEvent::ReasoningSummaryPartAdded {
+                    item_id,
+                    summary_index,
+                } => {
+                    if let Some(reasoning) =
+                        find_reasoning_activity_mut(&mut self.conversation_activity, &item_id)
+                    {
+                        ensure_reasoning_part(&mut reasoning.summary, summary_index);
+                    }
+                }
+                AgentEvent::ReasoningSummaryTextDelta {
+                    item_id,
+                    summary_index,
+                    delta,
+                } => {
+                    if let Some(reasoning) =
+                        find_reasoning_activity_mut(&mut self.conversation_activity, &item_id)
+                    {
+                        ensure_reasoning_part(&mut reasoning.summary, summary_index)
+                            .push_str(&delta);
+                    }
+                }
+                AgentEvent::ReasoningTextDelta {
+                    item_id,
+                    content_index,
+                    delta,
+                } => {
+                    if let Some(reasoning) =
+                        find_reasoning_activity_mut(&mut self.conversation_activity, &item_id)
+                    {
+                        ensure_reasoning_part(&mut reasoning.content, content_index)
+                            .push_str(&delta);
+                    }
+                }
+                AgentEvent::ReasoningCompleted {
+                    reasoning,
+                    completed_at_ms,
+                } => {
+                    upsert_reasoning_completed(
+                        &mut self.conversation_activity,
+                        reasoning,
+                        completed_at_ms,
+                    );
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Thinking;
+                    }
+                }
                 AgentEvent::CommandStarted(command) => {
                     upsert_command_activity(&mut self.conversation_activity, command);
                     if self.conversation_phase != ConversationPhase::Stopping {
@@ -1237,6 +1461,7 @@ impl ComposerView {
                             .push(ConversationActivity::Command(CommandExecution {
                                 id: item_id,
                                 command: String::new(),
+                                actions: Vec::new(),
                                 cwd: String::new(),
                                 output: delta,
                                 status: CommandExecutionStatus::InProgress,
@@ -1862,11 +2087,9 @@ impl ComposerView {
         self.permission_update_cycle = self.permission_update_cycle.wrapping_add(1);
         let update_cycle = self.permission_update_cycle;
         let cwd = std::env::current_dir().unwrap_or_default();
-        let receiver = CodexAppServerBackend::new().update_thread_permissions(
-            thread_id,
-            cwd,
-            mode.agent_mode(),
-        );
+        let receiver = self
+            .backend
+            .update_thread_permissions(thread_id, cwd, mode.agent_mode());
         cx.spawn(async move |this, cx| {
             let result = receiver
                 .recv()
@@ -2092,6 +2315,7 @@ impl ComposerView {
             ConversationActivity::Command(CommandExecution {
                 id: item_id,
                 command,
+                actions: Vec::new(),
                 cwd: "/path/to/project".to_owned(),
                 output: "SHELLPIXEL20260830\n".to_owned(),
                 status: if running {
@@ -2107,6 +2331,223 @@ impl ComposerView {
                 .push(ConversationActivity::AssistantMessage {
                     item_id: "msg-command-final".to_owned(),
                     text: "输出为：\n\nSHELLPIXEL20260830".to_owned(),
+                });
+        }
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn set_tool_group_for_capture(&mut self, running: bool, cx: &mut Context<Self>) {
+        let completed_status = CommandExecutionStatus::Completed;
+        let final_status = if running {
+            CommandExecutionStatus::InProgress
+        } else {
+            completed_status
+        };
+        let completed_exit = Some(0);
+        let final_exit = (!running).then_some(0);
+        let commands = vec![
+            CommandExecution {
+                id: "tool-group-read-1".to_owned(),
+                command: "sed -n '1,240p' src/agent/codex/manager.rs".to_owned(),
+                actions: vec![CommandExecutionAction::Read {
+                    command: "sed -n '1,240p' src/agent/codex/manager.rs".to_owned(),
+                    name: "manager.rs".to_owned(),
+                    path: "src/agent/codex/manager.rs".to_owned(),
+                }],
+                cwd: "/Users/zp/Desktop/GPUI".to_owned(),
+                output: "use std::sync::Arc;\n".to_owned(),
+                status: completed_status,
+                exit_code: completed_exit,
+            },
+            CommandExecution {
+                id: "tool-group-read-2".to_owned(),
+                command: "sed -n '240,520p' src/agent/codex/manager.rs".to_owned(),
+                actions: vec![CommandExecutionAction::Read {
+                    command: "sed -n '240,520p' src/agent/codex/manager.rs".to_owned(),
+                    name: "manager.rs".to_owned(),
+                    path: "src/agent/codex/manager.rs".to_owned(),
+                }],
+                cwd: "/Users/zp/Desktop/GPUI".to_owned(),
+                output: "impl CodexAppServerManager {\n".to_owned(),
+                status: completed_status,
+                exit_code: completed_exit,
+            },
+            CommandExecution {
+                id: "tool-group-read-3".to_owned(),
+                command: "sed -n '520,780p' src/agent/codex/manager.rs".to_owned(),
+                actions: vec![CommandExecutionAction::Read {
+                    command: "sed -n '520,780p' src/agent/codex/manager.rs".to_owned(),
+                    name: "manager.rs".to_owned(),
+                    path: "src/agent/codex/manager.rs".to_owned(),
+                }],
+                cwd: "/Users/zp/Desktop/GPUI".to_owned(),
+                output: "}\n".to_owned(),
+                status: completed_status,
+                exit_code: completed_exit,
+            },
+            CommandExecution {
+                id: "tool-group-read-4".to_owned(),
+                command: "sed -n '780,1040p' src/agent/codex/manager.rs".to_owned(),
+                actions: vec![CommandExecutionAction::Read {
+                    command: "sed -n '780,1040p' src/agent/codex/manager.rs".to_owned(),
+                    name: "manager.rs".to_owned(),
+                    path: "src/agent/codex/manager.rs".to_owned(),
+                }],
+                cwd: "/Users/zp/Desktop/GPUI".to_owned(),
+                output: "impl Drop for AppServerProcess {\n".to_owned(),
+                status: completed_status,
+                exit_code: completed_exit,
+            },
+            CommandExecution {
+                id: "tool-group-read-5".to_owned(),
+                command: "sed -n '1040,1260p' src/agent/codex/manager.rs".to_owned(),
+                actions: vec![CommandExecutionAction::Read {
+                    command: "sed -n '1040,1260p' src/agent/codex/manager.rs".to_owned(),
+                    name: "manager.rs".to_owned(),
+                    path: "src/agent/codex/manager.rs".to_owned(),
+                }],
+                cwd: "/Users/zp/Desktop/GPUI".to_owned(),
+                output: "}\n".to_owned(),
+                status: completed_status,
+                exit_code: completed_exit,
+            },
+            CommandExecution {
+                id: "tool-group-search-1".to_owned(),
+                command: "rg -n 'Command::new' src".to_owned(),
+                actions: vec![CommandExecutionAction::Search {
+                    command: "rg -n 'Command::new' src".to_owned(),
+                    path: Some("src".to_owned()),
+                    query: Some("Command::new".to_owned()),
+                }],
+                cwd: "/Users/zp/Desktop/GPUI".to_owned(),
+                output: "src/agent/codex.rs:42\n".to_owned(),
+                status: completed_status,
+                exit_code: completed_exit,
+            },
+            CommandExecution {
+                id: "tool-group-search-2".to_owned(),
+                command: "rg -n 'thread/(list|read)' src".to_owned(),
+                actions: vec![CommandExecutionAction::Search {
+                    command: "rg -n 'thread/(list|read)' src".to_owned(),
+                    path: Some("src".to_owned()),
+                    query: Some("thread/(list|read)".to_owned()),
+                }],
+                cwd: "/Users/zp/Desktop/GPUI".to_owned(),
+                output: "src/agent/codex.rs:84\n".to_owned(),
+                status: completed_status,
+                exit_code: completed_exit,
+            },
+            CommandExecution {
+                id: "tool-group-search-3".to_owned(),
+                command: "rg -n 'spawn|current_dir|home' src".to_owned(),
+                actions: vec![CommandExecutionAction::Search {
+                    command: "rg -n 'spawn|current_dir|home' src".to_owned(),
+                    path: Some("src".to_owned()),
+                    query: Some("spawn|current_dir|home".to_owned()),
+                }],
+                cwd: "/Users/zp/Desktop/GPUI".to_owned(),
+                output: "src/agent/codex/manager.rs:118\n".to_owned(),
+                status: completed_status,
+                exit_code: completed_exit,
+            },
+            CommandExecution {
+                id: "tool-group-run-1".to_owned(),
+                command: "find . -maxdepth 2 -type d | sort".to_owned(),
+                actions: vec![CommandExecutionAction::Unknown {
+                    command: "find . -maxdepth 2 -type d | sort".to_owned(),
+                }],
+                cwd: "/Users/zp/Desktop/GPUI".to_owned(),
+                output: ".\n./src\n./tests\n".to_owned(),
+                status: completed_status,
+                exit_code: completed_exit,
+            },
+            CommandExecution {
+                id: "tool-group-run-2".to_owned(),
+                command: "cargo test --quiet".to_owned(),
+                actions: vec![CommandExecutionAction::Unknown {
+                    command: "cargo test --quiet".to_owned(),
+                }],
+                cwd: "/Users/zp/Desktop/GPUI".to_owned(),
+                output: "running 192 tests\n".to_owned(),
+                status: final_status,
+                exit_code: final_exit,
+            },
+        ];
+
+        self.user_message = Some("深入分析当前项目".to_owned());
+        self.user_message_time = Some("20:27".to_owned());
+        self.conversation_phase = if running {
+            ConversationPhase::Streaming
+        } else {
+            ConversationPhase::Complete
+        };
+        self.assistant_message = (!running)
+            .then(|| "分析完成，关键链路已经核对。".to_owned())
+            .unwrap_or_default();
+        self.assistant_message_time = (!running).then(|| "20:28".to_owned());
+        self.conversation_activity = vec![
+            ConversationActivity::AssistantMessage {
+                item_id: "tool-group-preamble".to_owned(),
+                text: "我会从仓库结构、核心运行链路和协议适配层逐项核对。".to_owned(),
+            },
+            ConversationActivity::Reasoning(ReasoningActivityPresentation {
+                item_id: "tool-group-ui-capture".to_owned(),
+                summary: vec!["Identifying concurrency and resource risks".to_owned()],
+                content: Vec::new(),
+                started_at_ms: 1_000,
+                completed_at_ms: (!running).then_some(3_000),
+            }),
+        ];
+        self.conversation_activity
+            .extend(commands.into_iter().map(ConversationActivity::Command));
+        if !running {
+            self.conversation_activity
+                .push(ConversationActivity::AssistantMessage {
+                    item_id: "tool-group-final".to_owned(),
+                    text: "分析完成，关键链路已经核对。".to_owned(),
+                });
+        }
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn set_reasoning_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        let active = state.starts_with("active");
+        let with_content = state.ends_with("content");
+        self.user_message = Some("请分析当前实现并给出结论。".to_owned());
+        self.user_message_time = Some("18:27".to_owned());
+        self.conversation_phase = if active {
+            ConversationPhase::Thinking
+        } else {
+            ConversationPhase::Complete
+        };
+        self.assistant_message = (!active)
+            .then(|| "实现已经核对完成。".to_owned())
+            .unwrap_or_default();
+        self.assistant_message_time = (!active).then(|| "18:28".to_owned());
+        let summary = if with_content {
+            vec![
+                "检查实现".to_owned(),
+                "正在比对桌面 ChatGPT 的推理组件与协议事件。".to_owned(),
+            ]
+        } else {
+            Vec::new()
+        };
+        self.conversation_activity = vec![ConversationActivity::Reasoning(
+            ReasoningActivityPresentation {
+                item_id: "reasoning-ui-capture".to_owned(),
+                summary,
+                content: Vec::new(),
+                started_at_ms: 1_000,
+                completed_at_ms: (!active).then_some(30_000),
+            },
+        )];
+        if !active {
+            self.conversation_activity
+                .push(ConversationActivity::AssistantMessage {
+                    item_id: "reasoning-capture-answer".to_owned(),
+                    text: self.assistant_message.clone(),
                 });
         }
         cx.emit(ConversationChanged);
@@ -3267,6 +3708,66 @@ fn find_command_activity_mut<'a>(
     })
 }
 
+fn find_reasoning_activity_mut<'a>(
+    activities: &'a mut [ConversationActivity],
+    item_id: &str,
+) -> Option<&'a mut ReasoningActivityPresentation> {
+    activities.iter_mut().find_map(|activity| match activity {
+        ConversationActivity::Reasoning(reasoning) if reasoning.item_id == item_id => {
+            Some(reasoning)
+        }
+        _ => None,
+    })
+}
+
+fn ensure_reasoning_part(parts: &mut Vec<String>, index: usize) -> &mut String {
+    if parts.len() <= index {
+        parts.resize(index + 1, String::new());
+    }
+    &mut parts[index]
+}
+
+fn upsert_reasoning_started(
+    activities: &mut Vec<ConversationActivity>,
+    reasoning: AgentReasoning,
+    started_at_ms: i64,
+) {
+    let presentation = ReasoningActivityPresentation {
+        item_id: reasoning.id,
+        summary: reasoning.summary,
+        content: reasoning.content,
+        started_at_ms,
+        completed_at_ms: None,
+    };
+    if let Some(existing) = find_reasoning_activity_mut(activities, &presentation.item_id) {
+        *existing = presentation;
+    } else {
+        activities.push(ConversationActivity::Reasoning(presentation));
+    }
+}
+
+fn upsert_reasoning_completed(
+    activities: &mut Vec<ConversationActivity>,
+    reasoning: AgentReasoning,
+    completed_at_ms: i64,
+) {
+    if let Some(existing) = find_reasoning_activity_mut(activities, &reasoning.id) {
+        existing.summary = reasoning.summary;
+        existing.content = reasoning.content;
+        existing.completed_at_ms = Some(completed_at_ms);
+    } else {
+        activities.push(ConversationActivity::Reasoning(
+            ReasoningActivityPresentation {
+                item_id: reasoning.id,
+                summary: reasoning.summary,
+                content: reasoning.content,
+                started_at_ms: completed_at_ms,
+                completed_at_ms: Some(completed_at_ms),
+            },
+        ));
+    }
+}
+
 fn upsert_command_activity(
     activities: &mut Vec<ConversationActivity>,
     mut incoming: CommandExecution,
@@ -3274,6 +3775,9 @@ fn upsert_command_activity(
     if let Some(existing) = find_command_activity_mut(activities, &incoming.id) {
         if incoming.output.is_empty() {
             incoming.output = std::mem::take(&mut existing.output);
+        }
+        if incoming.actions.is_empty() {
+            incoming.actions = std::mem::take(&mut existing.actions);
         }
         *existing = incoming;
     } else {
@@ -5033,24 +5537,25 @@ mod tests {
         STREAM_EVENTS_PER_UPDATE, STREAM_UPDATE_INTERVAL, SubmenuLayout,
         collect_ready_agent_events, current_local_time_label, ensure_closed_batch_is_terminal,
         find_command_activity_mut, max_particle_drift, particle_layers, particle_transition_ease,
-        push_coalesced_agent_event, submenu_layout, upsert_command_activity,
+        push_coalesced_agent_event, reasoning_parts_text, submenu_layout, upsert_command_activity,
     };
     use crate::agent::{
         AgentAccountRateLimits, AgentActivePermissionProfile, AgentAdditionalNetworkPermissions,
         AgentApprovalControl, AgentApprovalHandle, AgentCommandApprovalChoice,
-        AgentCommandApprovalRequest, AgentConfigWarning, AgentCreditsSnapshot,
-        AgentEffectivePermissions, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
-        AgentInterruptOutcome, AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
-        AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog, AgentOptionalField,
-        AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
+        AgentCommandApprovalRequest, AgentConfigWarning, AgentConnectionEvent,
+        AgentCreditsSnapshot, AgentEffectivePermissions, AgentEvent, AgentInterruptControl,
+        AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
+        AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog,
+        AgentOptionalField, AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
         AgentPermissionsApprovalControl, AgentPermissionsApprovalHandle,
-        AgentPermissionsApprovalRequest, AgentRateLimitWindow, AgentReasoningEffort,
-        AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
-        AgentServerRequestMetadata, AgentServiceTier, AgentSpendControlLimit,
-        AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus, AgentThreadStatusState,
-        AgentThreadTokenUsage, AgentTokenUsageBreakdown, AgentUserInputAnswer,
-        AgentUserInputControl, AgentUserInputHandle, AgentUserInputOption, AgentUserInputQuestion,
-        AgentUserInputRequest, AgentUserInputResponse, CommandExecution, CommandExecutionStatus,
+        AgentPermissionsApprovalRequest, AgentRateLimitWindow, AgentReasoning,
+        AgentReasoningEffort, AgentServerRequestFailureKind, AgentServerRequestId,
+        AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier,
+        AgentSpendControlLimit, AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus,
+        AgentThreadStatusState, AgentThreadTokenUsage, AgentTokenUsageBreakdown,
+        AgentUserInputAnswer, AgentUserInputControl, AgentUserInputHandle, AgentUserInputOption,
+        AgentUserInputQuestion, AgentUserInputRequest, AgentUserInputResponse, CommandExecution,
+        CommandExecutionAction, CommandExecutionStatus,
     };
     use crate::components::approval::{ApprovalCardEvent, ApprovalDecision, ApprovalScope};
     use crate::components::permissions_approval::{
@@ -5785,6 +6290,9 @@ mod tests {
         let mut activities = vec![ConversationActivity::Command(CommandExecution {
             id: "exec_1".into(),
             command: "printf hello".into(),
+            actions: vec![CommandExecutionAction::Unknown {
+                command: "printf hello".into(),
+            }],
             cwd: "/tmp".into(),
             output: String::new(),
             status: CommandExecutionStatus::InProgress,
@@ -5804,6 +6312,7 @@ mod tests {
             CommandExecution {
                 id: "exec_1".into(),
                 command: "printf hello".into(),
+                actions: Vec::new(),
                 cwd: "/tmp".into(),
                 output: "hello\n".into(),
                 status: CommandExecutionStatus::Completed,
@@ -5815,6 +6324,140 @@ mod tests {
         assert_eq!(command.output, "hello\n");
         assert_eq!(command.status, CommandExecutionStatus::Completed);
         assert_eq!(command.exit_code, Some(0));
+        assert_eq!(
+            command.actions,
+            vec![CommandExecutionAction::Unknown {
+                command: "printf hello".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_normalization_matches_the_desktop_item_model() {
+        assert_eq!(reasoning_parts_text(&[]), "");
+        assert_eq!(reasoning_parts_text(&["标题".into()]), "标题");
+        assert_eq!(
+            reasoning_parts_text(&["标题".into(), "正文".into()]),
+            "**标题**\n\n正文"
+        );
+        assert_eq!(
+            reasoning_parts_text(&["**标题**".into(), "正文".into()]),
+            "**标题**\n\n正文"
+        );
+    }
+
+    #[test]
+    fn reasoning_events_keep_indexed_stream_state_and_use_completion_as_authority() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+
+        app.update_entity(&composer, |composer, _| {
+            assert!(!composer.apply_agent_event_batch(vec![
+                AgentEvent::ReasoningStarted {
+                    reasoning: AgentReasoning {
+                        id: "reasoning_1".into(),
+                        summary: vec!["计划".into()],
+                        content: vec![],
+                    },
+                    started_at_ms: 1_000,
+                },
+                AgentEvent::ReasoningSummaryPartAdded {
+                    item_id: "reasoning_1".into(),
+                    summary_index: 2,
+                },
+                AgentEvent::ReasoningSummaryTextDelta {
+                    item_id: "reasoning_1".into(),
+                    summary_index: 2,
+                    delta: "检查仓库".into(),
+                },
+                AgentEvent::ReasoningTextDelta {
+                    item_id: "reasoning_1".into(),
+                    content_index: 1,
+                    delta: "原始推理".into(),
+                },
+            ]));
+            let ConversationActivity::Reasoning(reasoning) = &composer.conversation_activity[0]
+            else {
+                panic!("expected reasoning activity");
+            };
+            assert!(reasoning.is_active());
+            assert_eq!(reasoning.summary, vec!["计划", "", "检查仓库"]);
+            assert_eq!(reasoning.content, vec!["", "原始推理"]);
+            assert_eq!(composer.conversation_phase, ConversationPhase::Thinking);
+
+            assert!(
+                !composer.apply_agent_event_batch(vec![AgentEvent::ReasoningCompleted {
+                    reasoning: AgentReasoning {
+                        id: "reasoning_1".into(),
+                        summary: vec!["计划".into(), "检查仓库".into()],
+                        content: vec!["原始推理".into()],
+                    },
+                    completed_at_ms: 2_250,
+                },])
+            );
+            let ConversationActivity::Reasoning(reasoning) = &composer.conversation_activity[0]
+            else {
+                panic!("expected reasoning activity");
+            };
+            assert!(!reasoning.is_active());
+            assert_eq!(reasoning.elapsed_ms(), Some(1_250));
+            assert_eq!(reasoning.display_text(), "**计划**\n\n检查仓库");
+            assert_eq!(reasoning.content, vec!["原始推理"]);
+        });
+    }
+
+    #[test]
+    fn adjacent_reasoning_deltas_coalesce_only_for_the_same_item_and_index() {
+        let mut batch = Vec::new();
+        for event in [
+            AgentEvent::ReasoningSummaryTextDelta {
+                item_id: "reasoning_1".into(),
+                summary_index: 0,
+                delta: "检".into(),
+            },
+            AgentEvent::ReasoningSummaryTextDelta {
+                item_id: "reasoning_1".into(),
+                summary_index: 0,
+                delta: "查".into(),
+            },
+            AgentEvent::ReasoningSummaryTextDelta {
+                item_id: "reasoning_1".into(),
+                summary_index: 1,
+                delta: "代码".into(),
+            },
+            AgentEvent::ReasoningTextDelta {
+                item_id: "reasoning_1".into(),
+                content_index: 0,
+                delta: "raw ".into(),
+            },
+            AgentEvent::ReasoningTextDelta {
+                item_id: "reasoning_1".into(),
+                content_index: 0,
+                delta: "text".into(),
+            },
+        ] {
+            push_coalesced_agent_event(&mut batch, event);
+        }
+        assert_eq!(
+            batch,
+            vec![
+                AgentEvent::ReasoningSummaryTextDelta {
+                    item_id: "reasoning_1".into(),
+                    summary_index: 0,
+                    delta: "检查".into(),
+                },
+                AgentEvent::ReasoningSummaryTextDelta {
+                    item_id: "reasoning_1".into(),
+                    summary_index: 1,
+                    delta: "代码".into(),
+                },
+                AgentEvent::ReasoningTextDelta {
+                    item_id: "reasoning_1".into(),
+                    content_index: 0,
+                    delta: "raw text".into(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -6487,6 +7130,62 @@ mod tests {
                     .thread_statuses
                     .get("thr_1")
                     .is_some_and(|status| status.state == AgentThreadStatusState::Idle)
+        }));
+    }
+
+    #[test]
+    fn connection_events_are_scoped_and_buffered_until_the_canonical_thread_is_known() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+
+        app.update_entity(&composer, |composer, _| {
+            composer.thread_id = Some("thr_current".into());
+            assert!(
+                !composer.apply_connection_event(AgentConnectionEvent::ThreadStatusChanged(
+                    AgentThreadStatus {
+                        thread_id: "thr_other".into(),
+                        state: AgentThreadStatusState::Idle,
+                    }
+                ))
+            );
+            assert!(!composer.thread_statuses.contains_key("thr_other"));
+
+            composer.thread_id = None;
+            assert!(
+                !composer.apply_connection_event(AgentConnectionEvent::ThreadStatusChanged(
+                    AgentThreadStatus {
+                        thread_id: "thr_new".into(),
+                        state: AgentThreadStatusState::Active {
+                            active_flags: vec![AgentThreadActiveFlag::WaitingOnUserInput],
+                        },
+                    }
+                ))
+            );
+            assert!(composer.thread_statuses.get("thr_new").is_none());
+            assert_eq!(
+                composer
+                    .pending_connection_events
+                    .get("thr_new")
+                    .map(Vec::len),
+                Some(1)
+            );
+
+            assert!(
+                !composer.apply_agent_event_batch(vec![AgentEvent::ThreadCreated {
+                    thread_id: "thr_new".into(),
+                }])
+            );
+        });
+        assert!(app.read_entity(&composer, |composer, _| {
+            composer.thread_id.as_deref() == Some("thr_new")
+                && composer.pending_connection_events.get("thr_new").is_none()
+                && matches!(
+                    composer.thread_statuses.get("thr_new"),
+                    Some(AgentThreadStatus {
+                        state: AgentThreadStatusState::Active { active_flags },
+                        ..
+                    }) if active_flags == &vec![AgentThreadActiveFlag::WaitingOnUserInput]
+                )
         }));
     }
 

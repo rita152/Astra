@@ -1,12 +1,20 @@
+mod manager;
+
 use std::{
     collections::{HashMap, HashSet},
-    io::{BufRead, BufReader, Write},
+    io::Write,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::Child,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+};
+
+#[cfg(test)]
+use std::{
+    io::{BufRead, BufReader},
+    process::{ChildStdin, ChildStdout, Command, Stdio},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -18,38 +26,50 @@ use super::{
     AgentAccountRateLimits, AgentActivePermissionProfile, AgentAdditionalFileSystemPermissions,
     AgentAdditionalNetworkPermissions, AgentApprovalControl, AgentApprovalHandle, AgentBackend,
     AgentCommandApprovalChoice, AgentCommandApprovalRequest, AgentConfigWarning,
-    AgentCreditsSnapshot, AgentEffectivePermissions, AgentEvent, AgentFileSystemAccess,
-    AgentFileSystemPath, AgentFileSystemPermissionEntry, AgentFileSystemSpecialPath,
-    AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome,
+    AgentConnectionEvent, AgentCreditsSnapshot, AgentEffectivePermissions, AgentEvent,
+    AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemPermissionEntry,
+    AgentFileSystemSpecialPath, AgentInterruptControl, AgentInterruptOutcome,
     AgentMcpServerStartupFailureReason, AgentMcpServerStartupState, AgentMcpServerStartupStatus,
     AgentModel, AgentModelCatalog, AgentOptionalField, AgentPermissionMode, AgentPermissionProfile,
     AgentPermissionRequestProfile, AgentPermissionsApprovalChoice, AgentPermissionsApprovalControl,
     AgentPermissionsApprovalHandle, AgentPermissionsApprovalRequest, AgentRateLimitWindow,
-    AgentReasoningEffort, AgentRequest, AgentRun, AgentServerRequestFailureKind,
+    AgentReasoning, AgentReasoningEffort, AgentRequest, AgentRun, AgentServerRequestFailureKind,
     AgentServerRequestId, AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier,
     AgentSpendControlLimit, AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus,
     AgentThreadStatusState, AgentThreadTokenUsage, AgentTokenUsageBreakdown, AgentUserInputControl,
     AgentUserInputHandle, AgentUserInputOption, AgentUserInputQuestion, AgentUserInputRequest,
-    AgentUserInputResponse, CommandExecution, CommandExecutionStatus,
+    AgentUserInputResponse, CommandExecution, CommandExecutionAction, CommandExecutionStatus,
 };
 
+#[cfg(test)]
+use super::AgentInterruptHandle;
+
+pub use manager::CodexAppServerManager;
+
+#[cfg(test)]
 const INITIALIZE_ID: u64 = 1;
+#[cfg(test)]
 const THREAD_REQUEST_ID: u64 = 2;
+#[cfg(test)]
 const TURN_START_ID: u64 = 3;
 const TURN_INTERRUPT_ID: u64 = 4;
+#[cfg(test)]
 const THREAD_SETTINGS_UPDATE_ID: u64 = 2;
-#[allow(dead_code)]
+#[cfg(test)]
 const PERMISSION_PROFILE_LIST_ID: u64 = 2;
+#[cfg(test)]
 const MODEL_LIST_FIRST_ID: u64 = 2;
 const MODEL_LIST_PAGE_SIZE: u32 = 50;
 const UNDEFINED_METHOD_PARAMS_LIMIT: usize = 2_000;
 
+#[cfg(test)]
 #[derive(Default)]
 struct ThreadStartedCorrelation {
     expected_thread_id: Option<String>,
     observed_thread_id: Option<String>,
 }
 
+#[cfg(test)]
 impl ThreadStartedCorrelation {
     fn expect(&mut self, thread_id: &str) -> Result<()> {
         if let Some(expected_thread_id) = &self.expected_thread_id
@@ -98,6 +118,9 @@ const TURN_SCOPED_SERVER_METHODS: &[&str] = &[
     "item/started",
     "item/agentMessage/delta",
     "item/commandExecution/outputDelta",
+    "item/reasoning/summaryPartAdded",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/textDelta",
     "item/completed",
     "turn/started",
     "turn/completed",
@@ -729,6 +752,7 @@ impl<W: Write + Send> CodexTurnSession<W> {
         }
     }
 
+    #[cfg(test)]
     fn finish(&self) -> Result<()> {
         self.mark_terminal();
         self.close_writer();
@@ -1023,6 +1047,7 @@ impl TurnOutcome {
     }
 }
 
+#[cfg(test)]
 fn finish_prompt_session<W: Write + Send>(
     session: &CodexTurnSession<W>,
     result: Result<TurnOutcome>,
@@ -1130,35 +1155,43 @@ impl From<ModelListEntry> for AgentModel {
 }
 
 /// Codex CLI adapter. JSON-RPC details intentionally stay inside this module.
-#[derive(Default)]
-pub struct CodexAppServerBackend;
+#[derive(Clone)]
+pub struct CodexAppServerBackend {
+    manager: Arc<CodexAppServerManager>,
+}
 
 impl CodexAppServerBackend {
     pub fn new() -> Self {
-        Self
+        Self {
+            manager: Arc::new(CodexAppServerManager::new()),
+        }
+    }
+
+    pub fn with_manager(manager: Arc<CodexAppServerManager>) -> Self {
+        Self { manager }
+    }
+}
+
+impl Default for CodexAppServerBackend {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl AgentBackend for CodexAppServerBackend {
+    fn subscribe_connection_events(&self) -> Receiver<AgentConnectionEvent> {
+        self.manager.subscribe_connection_events()
+    }
+
     fn load_model_catalog(&self) -> Receiver<Result<AgentModelCatalog, String>> {
-        let (catalog_tx, catalog_rx) = async_channel::bounded(1);
-        std::thread::spawn(move || {
-            let result = run_model_catalog_process().map_err(|error| format!("{error:#}"));
-            let _ = catalog_tx.send_blocking(result);
-        });
-        catalog_rx
+        self.manager.load_model_catalog()
     }
 
     fn load_permission_profiles(
         &self,
         cwd: PathBuf,
     ) -> Receiver<Result<Vec<AgentPermissionProfile>, String>> {
-        let (tx, rx) = async_channel::bounded(1);
-        std::thread::spawn(move || {
-            let result = run_permission_profile_process(&cwd).map_err(|error| format!("{error:#}"));
-            let _ = tx.send_blocking(result);
-        });
-        rx
+        self.manager.load_permission_profiles(cwd)
     }
 
     fn update_thread_permissions(
@@ -1167,45 +1200,15 @@ impl AgentBackend for CodexAppServerBackend {
         cwd: PathBuf,
         mode: AgentPermissionMode,
     ) -> Receiver<Result<AgentThreadSettings, String>> {
-        let (tx, rx) = async_channel::bounded(1);
-        std::thread::spawn(move || {
-            let result = run_thread_settings_update_process(&thread_id, &cwd, mode)
-                .map_err(|error| format!("{error:#}"));
-            let _ = tx.send_blocking(result);
-        });
-        rx
+        self.manager.update_thread_permissions(thread_id, cwd, mode)
     }
 
     fn run_prompt(&self, request: AgentRequest) -> AgentRun {
-        let (events_tx, events_rx) = async_channel::unbounded();
-        let interrupt = match spawn_prompt_session() {
-            Ok((mut reader, session)) => {
-                let control: Arc<dyn AgentInterruptControl> = session.clone();
-                let interrupt = AgentInterruptHandle::new(control);
-                std::thread::spawn(move || {
-                    let result = drive_session(&mut reader, &session, &request, &events_tx);
-                    let cleanup = cleanup_pending_server_requests(&session, &result, &events_tx);
-                    let result = match (result, cleanup) {
-                        (result, Ok(())) => result,
-                        (Ok(_), Err(error)) => Err(error),
-                        (Err(error), Err(cleanup_error)) => Err(anyhow!(
-                            "{error:#}\n清理 pending server request 同时失败：{cleanup_error:#}"
-                        )),
-                    };
-                    let event = finish_prompt_session(&session, result);
-                    let _ = events_tx.send_blocking(event);
-                });
-                Some(interrupt)
-            }
-            Err(error) => {
-                let _ = events_tx.send_blocking(AgentEvent::Failed(format!("{error:#}")));
-                None
-            }
-        };
-        AgentRun::new(events_rx, interrupt)
+        self.manager.run_prompt(request)
     }
 }
 
+#[cfg(test)]
 fn with_app_server<T>(
     drive: impl FnOnce(&mut BufReader<ChildStdout>, &mut ChildStdin) -> Result<T>,
 ) -> Result<T> {
@@ -1232,11 +1235,14 @@ fn with_app_server<T>(
     result
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
 fn run_permission_profile_process(cwd: &Path) -> Result<Vec<AgentPermissionProfile>> {
     with_app_server(|reader, writer| drive_permission_profiles(reader, writer, cwd))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn run_thread_settings_update_process(
     thread_id: &str,
     cwd: &Path,
@@ -1247,7 +1253,8 @@ fn run_thread_settings_update_process(
     })
 }
 
-#[cfg_attr(test, allow(dead_code))]
+#[cfg(test)]
+#[allow(dead_code)]
 fn run_model_catalog_process() -> Result<AgentModelCatalog> {
     let mut child = Command::new("codex")
         .args(["app-server", "--stdio"])
@@ -1274,6 +1281,8 @@ fn run_model_catalog_process() -> Result<AgentModelCatalog> {
     result
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn spawn_prompt_session() -> Result<(BufReader<ChildStdout>, Arc<CodexTurnSession<ChildStdin>>)> {
     let mut child = Command::new("codex")
         .args(["app-server", "--stdio"])
@@ -1298,6 +1307,7 @@ fn spawn_prompt_session() -> Result<(BufReader<ChildStdout>, Arc<CodexTurnSessio
     Ok((BufReader::new(stdout), session))
 }
 
+#[cfg(test)]
 fn initialize_connection<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -1325,6 +1335,7 @@ fn initialize_connection<R: BufRead, W: Write>(
     send(writer, json!({ "method": "initialized", "params": {} }))
 }
 
+#[cfg(test)]
 fn initialize_turn_connection<R: BufRead, W: Write + Send + 'static>(
     reader: &mut R,
     session: &Arc<CodexTurnSession<W>>,
@@ -1349,6 +1360,7 @@ fn initialize_turn_connection<R: BufRead, W: Write + Send + 'static>(
     session.send(json!({ "method": "initialized", "params": {} }))
 }
 
+#[cfg(test)]
 fn drive_model_catalog<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -1404,6 +1416,7 @@ fn drive_model_catalog<R: BufRead, W: Write>(
     Ok(AgentModelCatalog { models })
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
 fn drive_permission_profiles<R: BufRead, W: Write>(
     reader: &mut R,
@@ -1587,6 +1600,7 @@ fn thread_settings_update_request(
     Ok(json!({ "method": "thread/settings/update", "id": id, "params": params }))
 }
 
+#[cfg(test)]
 fn drive_thread_settings_update<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -1628,6 +1642,7 @@ fn drive_thread_settings_update<R: BufRead, W: Write>(
     }
 }
 
+#[cfg(test)]
 fn drive_session<R: BufRead, W: Write + Send + 'static>(
     reader: &mut R,
     session: &Arc<CodexTurnSession<W>>,
@@ -1844,6 +1859,21 @@ fn process_turn_message<W: Write + Send + 'static>(
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
+                "reasoning" => {
+                    let reasoning = parse_reasoning(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    let started_at_ms = required_notification_i64(message, "startedAtMs")
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::ReasoningStarted {
+                            reasoning,
+                            started_at_ms,
+                        },
+                        "item/started reasoning",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
                 "commandExecution" => {
                     let command = parse_command_execution(item)
                         .map_err(|error| turn_item_protocol_error(message, error))?;
@@ -1881,6 +1911,46 @@ fn process_turn_message<W: Write + Send + 'static>(
                 "item/commandExecution/outputDelta",
             )?;
         }
+        Some("item/reasoning/summaryPartAdded") => {
+            let item_id = required_notification_string(message, "itemId")?;
+            let summary_index = required_notification_index(message, "summaryIndex")?;
+            send_turn_event(
+                events,
+                AgentEvent::ReasoningSummaryPartAdded {
+                    item_id,
+                    summary_index,
+                },
+                "item/reasoning/summaryPartAdded",
+            )?;
+        }
+        Some("item/reasoning/summaryTextDelta") => {
+            let item_id = required_notification_string(message, "itemId")?;
+            let summary_index = required_notification_index(message, "summaryIndex")?;
+            let delta = required_notification_string(message, "delta")?;
+            send_turn_event(
+                events,
+                AgentEvent::ReasoningSummaryTextDelta {
+                    item_id,
+                    summary_index,
+                    delta,
+                },
+                "item/reasoning/summaryTextDelta",
+            )?;
+        }
+        Some("item/reasoning/textDelta") => {
+            let item_id = required_notification_string(message, "itemId")?;
+            let content_index = required_notification_index(message, "contentIndex")?;
+            let delta = required_notification_string(message, "delta")?;
+            send_turn_event(
+                events,
+                AgentEvent::ReasoningTextDelta {
+                    item_id,
+                    content_index,
+                    delta,
+                },
+                "item/reasoning/textDelta",
+            )?;
+        }
         Some("item/completed") => {
             let item = required_turn_item(message)?;
             let item_type = required_turn_item_type(message, item)?;
@@ -1901,6 +1971,21 @@ fn process_turn_message<W: Write + Send + 'static>(
                         )
                         .map_err(|error| turn_item_protocol_error(message, error)),
                     }?;
+                }
+                "reasoning" => {
+                    let reasoning = parse_reasoning(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    let completed_at_ms = required_notification_i64(message, "completedAtMs")
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::ReasoningCompleted {
+                            reasoning,
+                            completed_at_ms,
+                        },
+                        "item/completed reasoning",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
                 "commandExecution" => {
                     let command = parse_command_execution(item)
@@ -1968,6 +2053,9 @@ fn is_defined_server_method(method: &str) -> bool {
             | "item/started"
             | "item/agentMessage/delta"
             | "item/commandExecution/outputDelta"
+            | "item/reasoning/summaryPartAdded"
+            | "item/reasoning/summaryTextDelta"
+            | "item/reasoning/textDelta"
             | "item/completed"
             | "thread/started"
             | "turn/started"
@@ -2188,6 +2276,33 @@ fn required_notification_string(message: &Value, field: &str) -> Result<String> 
             summarize_json(value)
         ),
     }
+}
+
+fn required_notification_i64(message: &Value, field: &str) -> Result<i64> {
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("未知方法");
+    match message.pointer(&format!("/params/{field}")) {
+        None => bail!("{method} 通知缺少整数字段 params.{field}"),
+        Some(value) => value.as_i64().with_context(|| {
+            format!(
+                "{method} 通知字段 params.{field} 必须是整数，实际为 {}",
+                summarize_json(value)
+            )
+        }),
+    }
+}
+
+fn required_notification_index(message: &Value, field: &str) -> Result<usize> {
+    let value = required_notification_i64(message, field)?;
+    usize::try_from(value).with_context(|| {
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("未知方法");
+        format!("{method} 通知字段 params.{field} 必须是非负索引，实际为 {value}")
+    })
 }
 
 fn required_notification_strings(message: &Value, field: &str) -> Result<Vec<String>> {
@@ -2644,13 +2759,49 @@ fn parse_agent_message(item: &serde_json::Map<String, Value>) -> Result<(String,
     ))
 }
 
-fn validate_nullable_command_action_string(
+fn optional_item_strings(
+    item: &serde_json::Map<String, Value>,
+    item_kind: &str,
+    field: &str,
+) -> Result<Vec<String>> {
+    let Some(value) = item.get(field) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .with_context(|| format!("{item_kind} item.{field} 必须是字符串数组"))?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .with_context(|| format!("{item_kind} item.{field}[{index}] 必须是字符串"))
+        })
+        .collect()
+}
+
+fn parse_reasoning(item: &serde_json::Map<String, Value>) -> Result<AgentReasoning> {
+    let item_type = required_item_string(item, "reasoning", "type")?;
+    if item_type != "reasoning" {
+        bail!("reasoning item.type 必须是 `reasoning`，实际为 `{item_type}`");
+    }
+    Ok(AgentReasoning {
+        id: required_item_string(item, "reasoning", "id")?,
+        summary: optional_item_strings(item, "reasoning", "summary")?,
+        content: optional_item_strings(item, "reasoning", "content")?,
+    })
+}
+
+fn optional_command_action_string(
     action: &serde_json::Map<String, Value>,
     index: usize,
     field: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     match action.get(field) {
-        None | Some(Value::Null | Value::String(_)) => Ok(()),
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(_) => {
             bail!("commandExecution item.commandActions[{index}].{field} 必须是字符串或 null")
         }
@@ -2670,51 +2821,40 @@ fn parse_command_execution(item: &serde_json::Map<String, Value>) -> Result<Comm
         .and_then(Value::as_array)
         .context("commandExecution item.commandActions 必须是数组")?;
     let mut first_action_command = None;
+    let mut parsed_actions = Vec::with_capacity(actions.len());
     for (index, action) in actions.iter().enumerate() {
         let action = action
             .as_object()
             .with_context(|| format!("commandExecution item.commandActions[{index}] 必须是对象"))?;
-        let action_type = required_item_string(
-            action,
-            &format!("commandExecution item.commandActions[{index}]"),
-            "type",
-        )?;
-        let action_command = required_item_string(
-            action,
-            &format!("commandExecution item.commandActions[{index}]"),
-            "command",
-        )?;
-        match action_type.as_str() {
-            "read" => {
-                let _name = required_item_string(
-                    action,
-                    &format!("commandExecution item.commandActions[{index}]"),
-                    "name",
-                )?;
-                let _path = required_item_string(
-                    action,
-                    &format!("commandExecution item.commandActions[{index}]"),
-                    "path",
-                )?;
-                Ok(())
+        let action_kind = format!("commandExecution item.commandActions[{index}]");
+        let action_type = required_item_string(action, &action_kind, "type")?;
+        let action_command = required_item_string(action, &action_kind, "command")?;
+        let parsed_action = match action_type.as_str() {
+            "read" => CommandExecutionAction::Read {
+                command: action_command.clone(),
+                name: required_item_string(action, &action_kind, "name")?,
+                path: required_item_string(action, &action_kind, "path")?,
+            },
+            "listFiles" => CommandExecutionAction::ListFiles {
+                command: action_command.clone(),
+                path: optional_command_action_string(action, index, "path")?,
+            },
+            "search" => CommandExecutionAction::Search {
+                command: action_command.clone(),
+                path: optional_command_action_string(action, index, "path")?,
+                query: optional_command_action_string(action, index, "query")?,
+            },
+            "unknown" => CommandExecutionAction::Unknown {
+                command: action_command.clone(),
+            },
+            other => {
+                bail!("commandExecution item.commandActions[{index}].type 包含未知值 `{other}`")
             }
-            "listFiles" => {
-                validate_nullable_command_action_string(action, index, "path")?;
-                Ok(())
-            }
-            "search" => {
-                validate_nullable_command_action_string(action, index, "path")?;
-                validate_nullable_command_action_string(action, index, "query")?;
-                Ok(())
-            }
-            "unknown" => Ok(()),
-            other => Err(anyhow!(
-                "commandExecution item.commandActions[{index}].type 包含未知值 `{other}`"
-            )),
-        }?;
+        };
         if index == 0 {
             first_action_command = Some(action_command);
         }
+        parsed_actions.push(parsed_action);
     }
     let output = match item.get("aggregatedOutput") {
         None | Some(Value::Null) => String::new(),
@@ -2745,6 +2885,7 @@ fn parse_command_execution(item: &serde_json::Map<String, Value>) -> Result<Comm
     Ok(CommandExecution {
         id,
         command: first_action_command.unwrap_or(raw_command),
+        actions: parsed_actions,
         cwd,
         output,
         status,
@@ -2753,12 +2894,14 @@ fn parse_command_execution(item: &serde_json::Map<String, Value>) -> Result<Comm
 }
 
 fn send(writer: &mut impl Write, message: Value) -> Result<()> {
-    serde_json::to_writer(&mut *writer, &message).context("序列化 Codex JSON-RPC 消息失败")?;
-    writer.write_all(b"\n")?;
+    let mut line = serde_json::to_vec(&message).context("序列化 Codex JSON-RPC 消息失败")?;
+    line.push(b'\n');
+    writer.write_all(&line)?;
     writer.flush()?;
     Ok(())
 }
 
+#[cfg(test)]
 fn read_message(reader: &mut impl BufRead) -> Result<Value> {
     let mut line = String::new();
     let bytes = reader.read_line(&mut line)?;
@@ -2768,6 +2911,7 @@ fn read_message(reader: &mut impl BufRead) -> Result<Value> {
     serde_json::from_str(&line).with_context(|| format!("无法解析 Codex JSON-RPC 消息：{line}"))
 }
 
+#[cfg(test)]
 fn wait_for_response(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
@@ -2807,6 +2951,7 @@ fn wait_for_response(
     }
 }
 
+#[cfg(test)]
 fn wait_for_session_response<R: BufRead, W: Write + Send + 'static>(
     reader: &mut R,
     session: &Arc<CodexTurnSession<W>>,
@@ -2854,6 +2999,7 @@ fn wait_for_session_response<R: BufRead, W: Write + Send + 'static>(
     }
 }
 
+#[cfg(test)]
 fn ensure_deferred_session_messages_match<W: Write + Send>(
     session: &CodexTurnSession<W>,
     messages: &[Value],
@@ -2948,6 +3094,7 @@ fn ensure_session_message_matches(
     Ok(())
 }
 
+#[cfg(test)]
 fn respond_to_server_request(writer: &mut impl Write, message: &Value) -> Result<()> {
     let Some(id) = message.get("id") else {
         return Ok(());
@@ -3743,7 +3890,7 @@ mod tests {
         AgentCreditsSnapshot, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
         AgentInterruptOutcome, AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
         AgentMcpServerStartupStatus, AgentOptionalField, AgentPermissionMode,
-        AgentPermissionsApprovalChoice, AgentRateLimitWindow, AgentRequest,
+        AgentPermissionsApprovalChoice, AgentRateLimitWindow, AgentReasoning, AgentRequest,
         AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
         AgentServerRequestMetadata, AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus,
         AgentThreadStatusState, AgentThreadTokenUsage, AgentTokenUsageBreakdown,
@@ -3882,14 +4029,20 @@ mod tests {
     }
 
     fn turn_item_message(method: &str, item: Value) -> Value {
-        json!({
+        let mut message = json!({
             "method": method,
             "params": {
                 "threadId": "thr_1",
                 "turnId": "turn_1",
                 "item": item
             }
-        })
+        });
+        match method {
+            "item/started" => message["params"]["startedAtMs"] = json!(1_000),
+            "item/completed" => message["params"]["completedAtMs"] = json!(2_250),
+            _ => {}
+        }
+        message
     }
 
     fn thread_token_usage_message(thread_id: &str, turn_id: &str) -> Value {
@@ -4336,6 +4489,9 @@ mod tests {
                 AgentEvent::CommandStarted(super::CommandExecution {
                     id: "exec_1".into(),
                     command: "pwd".into(),
+                    actions: vec![super::CommandExecutionAction::Unknown {
+                        command: "pwd".into(),
+                    }],
                     cwd: "/tmp/project".into(),
                     output: String::new(),
                     status: super::CommandExecutionStatus::InProgress,
@@ -4348,6 +4504,9 @@ mod tests {
                 AgentEvent::CommandCompleted(super::CommandExecution {
                     id: "exec_1".into(),
                     command: "pwd".into(),
+                    actions: vec![super::CommandExecutionAction::Unknown {
+                        command: "pwd".into(),
+                    }],
                     cwd: "/tmp/project".into(),
                     output: "/tmp/project\n".into(),
                     status: super::CommandExecutionStatus::Completed,
@@ -6918,12 +7077,172 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_item_lifecycle_and_all_deltas_map_to_agent_events() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut streamed_text = false;
+        let messages = [
+            turn_item_message(
+                "item/started",
+                json!({
+                    "type": "reasoning",
+                    "id": "reasoning_1",
+                    "summary": ["Plan"],
+                    "content": []
+                }),
+            ),
+            json!({
+                "method": "item/reasoning/summaryPartAdded",
+                "params": {
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "itemId": "reasoning_1",
+                    "summaryIndex": 1
+                }
+            }),
+            json!({
+                "method": "item/reasoning/summaryTextDelta",
+                "params": {
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "itemId": "reasoning_1",
+                    "summaryIndex": 1,
+                    "delta": "Inspect repo"
+                }
+            }),
+            json!({
+                "method": "item/reasoning/textDelta",
+                "params": {
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "itemId": "reasoning_1",
+                    "contentIndex": 0,
+                    "delta": "raw reasoning"
+                }
+            }),
+            turn_item_message(
+                "item/completed",
+                json!({
+                    "type": "reasoning",
+                    "id": "reasoning_1",
+                    "summary": ["Plan", "Inspect repo"],
+                    "content": ["raw reasoning"]
+                }),
+            ),
+        ];
+
+        for message in messages {
+            assert_eq!(
+                super::process_turn_message(
+                    &session,
+                    &message,
+                    "thr_1",
+                    "turn_1",
+                    &tx,
+                    &mut streamed_text,
+                )
+                .unwrap(),
+                None
+            );
+        }
+        drop(tx);
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::ReasoningStarted {
+                    reasoning: AgentReasoning {
+                        id: "reasoning_1".into(),
+                        summary: vec!["Plan".into()],
+                        content: vec![],
+                    },
+                    started_at_ms: 1_000,
+                },
+                AgentEvent::ReasoningSummaryPartAdded {
+                    item_id: "reasoning_1".into(),
+                    summary_index: 1,
+                },
+                AgentEvent::ReasoningSummaryTextDelta {
+                    item_id: "reasoning_1".into(),
+                    summary_index: 1,
+                    delta: "Inspect repo".into(),
+                },
+                AgentEvent::ReasoningTextDelta {
+                    item_id: "reasoning_1".into(),
+                    content_index: 0,
+                    delta: "raw reasoning".into(),
+                },
+                AgentEvent::ReasoningCompleted {
+                    reasoning: AgentReasoning {
+                        id: "reasoning_1".into(),
+                        summary: vec!["Plan".into(), "Inspect repo".into()],
+                        content: vec!["raw reasoning".into()],
+                    },
+                    completed_at_ms: 2_250,
+                },
+            ]
+        );
+        assert!(!streamed_text);
+    }
+
+    #[test]
+    fn reasoning_schema_errors_fail_fast() {
+        for (item, expected) in [
+            (json!({"type":"reasoning"}), "item.id"),
+            (
+                json!({"type":"reasoning","id":"reasoning_1","summary":{}}),
+                "item.summary",
+            ),
+            (
+                json!({"type":"reasoning","id":"reasoning_1","summary":[1]}),
+                "item.summary[0]",
+            ),
+            (
+                json!({"type":"reasoning","id":"reasoning_1","content":[1]}),
+                "item.content[0]",
+            ),
+        ] {
+            assert_turn_message_fails(
+                &turn_item_message("item/started", item),
+                &["item/started", "reasoning", expected],
+            );
+        }
+
+        let mut missing_timestamp = turn_item_message(
+            "item/started",
+            json!({"type":"reasoning","id":"reasoning_1"}),
+        );
+        missing_timestamp["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("startedAtMs");
+        assert_turn_message_fails(&missing_timestamp, &["startedAtMs"]);
+
+        for (message, expected) in [
+            (
+                json!({"method":"item/reasoning/summaryPartAdded","params":{"threadId":"thr_1","turnId":"turn_1","itemId":"reasoning_1","summaryIndex":-1}}),
+                "非负索引",
+            ),
+            (
+                json!({"method":"item/reasoning/summaryTextDelta","params":{"threadId":"thr_1","turnId":"turn_1","itemId":"reasoning_1","summaryIndex":0}}),
+                "params.delta",
+            ),
+            (
+                json!({"method":"item/reasoning/textDelta","params":{"threadId":"thr_1","turnId":"turn_1","itemId":"reasoning_1","contentIndex":"0","delta":"text"}}),
+                "params.contentIndex",
+            ),
+        ] {
+            assert_turn_message_fails(&message, &[expected]);
+        }
+    }
+
+    #[test]
     fn every_unsupported_thread_item_type_fails_for_started_and_completed() {
         for item_type in [
             "hookPrompt",
             "functionCallOutput",
             "plan",
-            "reasoning",
             "fileChange",
             "mcpToolCall",
             "dynamicToolCall",
@@ -7110,6 +7429,60 @@ mod tests {
             let message = turn_item_message("item/completed", item);
             assert_turn_message_fails(&message, &["commandExecution", field]);
         }
+    }
+
+    #[test]
+    fn command_execution_preserves_structured_actions_for_activity_rendering() {
+        let mut item = command_execution_item("completed");
+        item["commandActions"] = json!([
+            {
+                "type": "read",
+                "command": "sed -n '1,20p' src/main.rs",
+                "name": "main.rs",
+                "path": "src/main.rs"
+            },
+            {
+                "type": "listFiles",
+                "command": "find src -maxdepth 1 -type f",
+                "path": "src"
+            },
+            {
+                "type": "search",
+                "command": "rg -n app_server src",
+                "path": "src",
+                "query": "app_server"
+            },
+            {
+                "type": "unknown",
+                "command": "cargo check"
+            }
+        ]);
+        item["exitCode"] = json!(0);
+        let command = super::parse_command_execution(item.as_object().unwrap()).unwrap();
+
+        assert_eq!(command.command, "sed -n '1,20p' src/main.rs");
+        assert_eq!(
+            command.actions,
+            vec![
+                super::CommandExecutionAction::Read {
+                    command: "sed -n '1,20p' src/main.rs".into(),
+                    name: "main.rs".into(),
+                    path: "src/main.rs".into(),
+                },
+                super::CommandExecutionAction::ListFiles {
+                    command: "find src -maxdepth 1 -type f".into(),
+                    path: Some("src".into()),
+                },
+                super::CommandExecutionAction::Search {
+                    command: "rg -n app_server src".into(),
+                    path: Some("src".into()),
+                    query: Some("app_server".into()),
+                },
+                super::CommandExecutionAction::Unknown {
+                    command: "cargo check".into(),
+                },
+            ]
+        );
     }
 
     #[test]
