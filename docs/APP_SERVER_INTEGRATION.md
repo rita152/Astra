@@ -4,7 +4,7 @@
 
 客户端初始化时启用 experimental API。下表是当前协议的唯一维护来源，完整列出 250 个 JSON-RPC 方法：157 个客户端请求、11 个服务端请求、1 个客户端通知、81 个服务端通知。
 
-当前接入统计：已接入 27、后端已接入 2、部分接入 3、未接入 218。未接入的客户端方法不会发送；未接入的服务端请求按原 id 回复 `-32601` 后 fail-fast；未接入的服务端通知收到即 fail-fast。升级 Codex CLI 时直接核对并更新本表。
+当前接入统计：已接入 27、后端已接入 2、部分接入 4、未接入 217。未接入的客户端方法不会发送；未接入的服务端请求按原 id 回复 `-32601` 后 fail-fast；未接入的服务端通知收到即 fail-fast。升级 Codex CLI 时直接核对并更新本表。
 
 状态口径：“已接入”表示本表声明的产品语义已形成真实协议收发、领域映射和必要 UI／副作用的完整闭环，不等于消费 schema 的每个可选字段；已知有效变体或安全相关字段尚未承接时标记为“部分接入”。
 
@@ -144,7 +144,7 @@
 | `thread/realtime/listVoices` | 客户端请求 | 实验 | `params: ThreadRealtimeListVoicesParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/realtime/start` | 客户端请求 | 实验 | `params: ThreadRealtimeStartParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/realtime/stop` | 客户端请求 | 实验 | `params: ThreadRealtimeStopParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/resume` | 客户端请求 | 默认 | 发送 `threadId`；要求 `result.thread.id` 与请求完全一致 | `drive_session` | 复用现有 thread id | 在原会话继续 turn | 已接入 | 失败时不回退创建新 thread；`resume_rpc_error_fails_closed_without_starting_or_turning`、`resume_response_requires_the_requested_thread_id` |
+| `thread/resume` | 客户端请求 | 默认 | 发送 `threadId`、`excludeTurns=true`；当前客户端不读取 `thread.turns`，要求 `result.thread.id` 与请求完全一致 | `drive_session` | 复用现有 thread id | 在原会话继续 turn | 已接入 | 不请求历史分页，不接入 `thread/turns/list` 或 `thread/items/list`；失败时不回退创建新 thread；`existing_thread_resumes_before_turn_start`、`resume_rpc_error_fails_closed_without_starting_or_turning`、`resume_response_requires_the_requested_thread_id` |
 | `thread/revert` | 客户端请求 | 默认 | `params: ThreadRevertParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/rollback` | 客户端请求 | 默认 | `params: ThreadRollbackParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/search` | 客户端请求 | 实验 | `params: ThreadSearchParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
@@ -230,7 +230,7 @@
 | `thread/deleted` | 服务端通知 | 默认 | `params: ThreadDeletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/environment/connected` | 服务端通知 | 默认 | `params: EnvironmentConnectionNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/environment/disconnected` | 服务端通知 | 默认 | `params: EnvironmentConnectionNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/goal/cleared` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
+| `thread/goal/cleared` | 服务端通知 | 默认 | 仅在现有 thread 的 resume bootstrap 窗口接收：等待 `thread/resume` 响应及紧随其后的 `turn/start` 响应期间；严格要求 `params.threadId` 为字符串且等于当前 thread | `wait_for_session_response`、`validate_resume_goal_cleared` | resume 生命周期兼容信号 | 无；不新增 goal 状态或 UI | 部分接入 | 新 thread、`turn/start` 响应后的活跃 turn 及其他生命周期仍按未定义方法 fail-fast；响应前后真实顺序、字段错误、thread 不匹配与生命周期错误由 `existing_thread_resumes_before_turn_start`、`resume_goal_cleared_requires_a_matching_string_thread_id`、`goal_cleared_after_resumed_turn_start_fails_fast` 覆盖 |
 | `thread/goal/updated` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
 | `thread/name/updated` | 服务端通知 | 默认 | `params: ThreadNameUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/project/updated` | 服务端通知 | 默认 | `params: ThreadProjectUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |

@@ -1345,7 +1345,7 @@ fn initialize_turn_connection<R: BufRead, W: Write + Send + 'static>(
             }
         }
     }))?;
-    wait_for_session_response(reader, session, INITIALIZE_ID, events, None, None)?;
+    wait_for_session_response(reader, session, INITIALIZE_ID, events, None, None, None)?;
     session.send(json!({ "method": "initialized", "params": {} }))
 }
 
@@ -1646,7 +1646,10 @@ fn drive_session<R: BufRead, W: Write + Send + 'static>(
             session.send(json!({
                 "method": "thread/resume",
                 "id": THREAD_REQUEST_ID,
-                "params": { "threadId": expected_thread_id }
+                "params": {
+                    "threadId": expected_thread_id,
+                    "excludeTurns": true
+                }
             }))?;
             let thread_response = wait_for_session_response(
                 reader,
@@ -1655,6 +1658,7 @@ fn drive_session<R: BufRead, W: Write + Send + 'static>(
                 events,
                 Some(&mut thread_started_correlation),
                 Some(&mut deferred_turn_notifications),
+                Some(expected_thread_id),
             )
             .with_context(|| format!("thread/resume `{expected_thread_id}` 失败"))?;
             let resumed_thread_id = thread_response
@@ -1690,6 +1694,7 @@ fn drive_session<R: BufRead, W: Write + Send + 'static>(
                 events,
                 Some(&mut thread_started_correlation),
                 Some(&mut deferred_turn_notifications),
+                None,
             )
             .context("thread/start 失败")?;
             let thread_id = thread_response
@@ -1735,6 +1740,7 @@ fn drive_session<R: BufRead, W: Write + Send + 'static>(
         events,
         Some(&mut thread_started_correlation),
         Some(&mut deferred_turn_notifications),
+        (!is_new_thread).then_some(thread_id.as_str()),
     )
     .context("turn/start 失败")?;
     let turn_id = turn_response
@@ -2235,6 +2241,19 @@ fn required_string_at(message: &Value, pointer: &str, field: &str) -> Result<Str
 
 fn thread_started_id(message: &Value) -> Result<String> {
     required_string_at(message, "/params/thread/id", "params.thread.id")
+}
+
+fn validate_resume_goal_cleared(message: &Value, expected_thread_id: &str) -> Result<()> {
+    if message.get("id").is_some() {
+        bail!("thread/goal/cleared 在 resume bootstrap 阶段必须是通知，不能包含 id");
+    }
+    let thread_id = required_notification_string(message, "threadId")?;
+    if thread_id != expected_thread_id {
+        bail!(
+            "thread/goal/cleared 通知的 thread id `{thread_id}` 与当前 resume thread `{expected_thread_id}` 不一致"
+        );
+    }
+    Ok(())
 }
 
 fn optional_string_at(message: &Value, pointer: &str, field: &str) -> Result<Option<String>> {
@@ -2795,6 +2814,7 @@ fn wait_for_session_response<R: BufRead, W: Write + Send + 'static>(
     events: &Sender<AgentEvent>,
     mut thread_started_correlation: Option<&mut ThreadStartedCorrelation>,
     mut deferred_turn_notifications: Option<&mut Vec<Value>>,
+    resume_bootstrap_thread_id: Option<&str>,
 ) -> Result<Value> {
     loop {
         let message = read_message(reader)?;
@@ -2808,6 +2828,12 @@ fn wait_for_session_response<R: BufRead, W: Write + Send + 'static>(
         }
 
         let method = message.get("method").and_then(Value::as_str);
+        if method == Some("thread/goal/cleared")
+            && let Some(expected_thread_id) = resume_bootstrap_thread_id
+        {
+            validate_resume_goal_cleared(&message, expected_thread_id)?;
+            continue;
+        }
         if method == Some("thread/started")
             && let Some(correlation) = thread_started_correlation.as_deref_mut()
         {
@@ -4475,8 +4501,9 @@ mod tests {
     fn existing_thread_resumes_before_turn_start() {
         let input = concat!(
             "{\"id\":1,\"result\":{}}\n",
-            "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"thr_existing\",\"turns\":[]}}}\n",
-            "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_existing\",\"turns\":[]}}}\n",
+            "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"thr_existing\"}}}\n",
+            "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_existing\"}}}\n",
+            "{\"method\":\"thread/goal/cleared\",\"params\":{\"threadId\":\"thr_existing\"}}\n",
             "{\"method\":\"turn/started\",\"params\":{\"threadId\":\"thr_existing\",\"turn\":{\"id\":\"turn_next\",\"items\":[],\"status\":\"inProgress\"}}}\n",
             "{\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thr_existing\",\"turnId\":\"turn_next\",\"itemId\":\"msg_next\",\"delta\":\"继续\"}}\n",
             "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_next\"}}}\n",
@@ -4535,7 +4562,7 @@ mod tests {
         assert_eq!(resume.get("id"), Some(&json!(2)));
         assert_eq!(
             resume.get("params"),
-            Some(&json!({"threadId":"thr_existing"}))
+            Some(&json!({"threadId":"thr_existing","excludeTurns":true}))
         );
 
         let turn_start = sent_messages
@@ -4564,6 +4591,100 @@ mod tests {
         ] {
             assert!(turn_start.pointer(&format!("/params/{field}")).is_none());
         }
+    }
+
+    #[test]
+    fn resume_goal_cleared_requires_a_matching_string_thread_id() {
+        for (params, expected_error) in [
+            (json!({}), "缺少字符串字段 params.threadId"),
+            (json!({"threadId": 7}), "必须是字符串"),
+            (
+                json!({"threadId": "thr_other"}),
+                "与当前 resume thread `thr_existing` 不一致",
+            ),
+        ] {
+            let input = format!(
+                "{}\n{}\n{}\n",
+                json!({"id": 1, "result": {}}),
+                json!({"method": "thread/goal/cleared", "params": params}),
+                json!({"id": 2, "result": {"thread": {"id": "thr_existing"}}}),
+            );
+            let mut reader = Cursor::new(input.into_bytes());
+            let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+            let (tx, rx) = async_channel::unbounded();
+
+            let error = drive_session(
+                &mut reader,
+                &session,
+                &AgentRequest {
+                    prompt: "继续对话".into(),
+                    cwd: PathBuf::from("/tmp/project"),
+                    thread_id: Some("thr_existing".into()),
+                    model: "gpt-test".into(),
+                    effort: "medium".into(),
+                    service_tier: None,
+                    permission_mode: AgentPermissionMode::Full,
+                },
+                &tx,
+            )
+            .unwrap_err();
+            let error = format!("{error:#}");
+
+            assert!(error.contains("thread/goal/cleared"), "{error}");
+            assert!(error.contains(expected_error), "{error}");
+            let sent_methods: Vec<_> = String::from_utf8(take_session_output(&session))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter_map(|message| {
+                    message
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect();
+            assert_eq!(
+                sent_methods,
+                vec!["initialize", "initialized", "thread/resume"]
+            );
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn goal_cleared_after_resumed_turn_start_fails_fast() {
+        let input = concat!(
+            "{\"id\":1,\"result\":{}}\n",
+            "{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_existing\"}}}\n",
+            "{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn_next\"}}}\n",
+            "{\"method\":\"thread/goal/cleared\",\"params\":{\"threadId\":\"thr_existing\"}}\n"
+        );
+        let mut reader = Cursor::new(input.as_bytes());
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+
+        let error = drive_session(
+            &mut reader,
+            &session,
+            &AgentRequest {
+                prompt: "继续对话".into(),
+                cwd: PathBuf::from("/tmp/project"),
+                thread_id: Some("thr_existing".into()),
+                model: "gpt-test".into(),
+                effort: "medium".into(),
+                service_tier: None,
+                permission_mode: AgentPermissionMode::Full,
+            },
+            &tx,
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+
+        assert!(error.contains("未定义"), "{error}");
+        assert!(error.contains("thread/goal/cleared"), "{error}");
+        let sent = String::from_utf8(take_session_output(&session)).unwrap();
+        assert!(sent.contains("\"method\":\"turn/start\""));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -5696,11 +5817,13 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_formerly_passive_methods_are_all_undefined() {
+    fn unintegrated_notifications_remain_fail_fast() {
         for method in [
+            "deprecationNotice",
             "thread/goal/updated",
             "thread/goal/cleared",
             "turn/plan/updated",
+            "protocol/arbitraryFutureNotification",
         ] {
             let error = ensure_server_method_is_defined(&json!({
                 "method": method,
