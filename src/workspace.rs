@@ -499,32 +499,106 @@ impl WorkspaceStore {
             snapshot.loading.pinned = true;
             snapshot.error = None;
         });
+        let capabilities = self.snapshot().capabilities;
+        let supports_projects = capabilities.supports(AgentCapability::ProjectList);
+        let supports_threads = capabilities.supports(AgentCapability::ThreadList);
+        let supports_sections = capabilities.supports(AgentCapability::ThreadSectionList);
+
+        // These collections are independent app-server RPC families. Keep them
+        // in separate workers so the connection can pipeline the requests and
+        // route their out-of-order responses, instead of turning startup into a
+        // project -> recent -> archived -> pinned waterfall.
         let store = Arc::clone(self);
         std::thread::spawn(move || {
-            let capabilities = store.snapshot().capabilities;
-            let sections = if capabilities.supports(AgentCapability::ThreadSectionList) {
-                load_all_sections(store.backend.as_ref())
-            } else {
-                Ok(Vec::new())
-            };
-            let mut projects = if capabilities.supports(AgentCapability::ProjectList) {
+            let mut projects = if supports_projects {
                 load_all_projects(store.backend.as_ref())
             } else {
                 Ok(Vec::new())
             };
-            let (mut recent, mut archived) = if capabilities.supports(AgentCapability::ThreadList) {
-                (
-                    load_all_threads(store.backend.as_ref(), ThreadListRequest::default()),
-                    load_all_threads(
-                        store.backend.as_ref(),
-                        ThreadListRequest {
-                            archived: true,
-                            ..ThreadListRequest::default()
-                        },
-                    ),
+            let deleted_projects = store.deleted_projects();
+            if let Ok(projects) = &mut projects {
+                projects.retain(|project| !deleted_projects.contains(&project.project_id));
+            }
+            if store.projects_generation.load(Ordering::Acquire) != projects_generation {
+                return;
+            }
+            store.update(|snapshot| {
+                snapshot.loading.projects = false;
+                match projects {
+                    Ok(projects) => snapshot.projects = projects,
+                    Err(error) => append_error(&mut snapshot.error, error.user_message("加载项目")),
+                }
+            });
+        });
+
+        let store = Arc::clone(self);
+        std::thread::spawn(move || {
+            let mut recent = if supports_threads {
+                load_all_threads(store.backend.as_ref(), ThreadListRequest::default())
+            } else {
+                Ok(Vec::new())
+            };
+            if let Ok(threads) = &mut recent {
+                apply_thread_overlays(
+                    threads,
+                    &store.thread_overlays(),
+                    ThreadCollectionKind::Recent,
+                );
+            }
+            if store.recent_generation.load(Ordering::Acquire) != recent_generation {
+                return;
+            }
+            store.update(|snapshot| {
+                snapshot.loading.recent = false;
+                match recent {
+                    Ok(recent) => snapshot.recent_threads = recent,
+                    Err(error) => {
+                        append_error(&mut snapshot.error, error.user_message("加载最近聊天"))
+                    }
+                }
+            });
+        });
+
+        let store = Arc::clone(self);
+        std::thread::spawn(move || {
+            let mut archived = if supports_threads {
+                load_all_threads(
+                    store.backend.as_ref(),
+                    ThreadListRequest {
+                        archived: true,
+                        ..ThreadListRequest::default()
+                    },
                 )
             } else {
-                (Ok(Vec::new()), Ok(Vec::new()))
+                Ok(Vec::new())
+            };
+            if let Ok(threads) = &mut archived {
+                apply_thread_overlays(
+                    threads,
+                    &store.thread_overlays(),
+                    ThreadCollectionKind::Archived,
+                );
+            }
+            if store.archived_generation.load(Ordering::Acquire) != archived_generation {
+                return;
+            }
+            store.update(|snapshot| {
+                snapshot.loading.archived = false;
+                match archived {
+                    Ok(archived) => snapshot.archived_threads = archived,
+                    Err(error) => {
+                        append_error(&mut snapshot.error, error.user_message("加载已归档聊天"))
+                    }
+                }
+            });
+        });
+
+        let store = Arc::clone(self);
+        std::thread::spawn(move || {
+            let sections = if supports_sections {
+                load_all_sections(store.backend.as_ref())
+            } else {
+                Ok(Vec::new())
             };
             let previous_pinned_section_id = store.snapshot().preferences.pinned_section_id.clone();
             let pinned_section = sections.as_ref().ok().and_then(|sections| {
@@ -546,94 +620,45 @@ impl WorkspaceStore {
                     .as_ref()
                     .map(|section| section.section_id.clone());
             let mut pinned = match &pinned_section {
-                Some(section) if capabilities.supports(AgentCapability::ThreadList) => {
-                    load_all_threads(
-                        store.backend.as_ref(),
-                        ThreadListRequest {
-                            section: FilterValue::Value(section.section_id.clone()),
-                            sort_key: ThreadSortKey::SectionPosition,
-                            ..ThreadListRequest::default()
-                        },
-                    )
-                }
+                Some(section) if supports_threads => load_all_threads(
+                    store.backend.as_ref(),
+                    ThreadListRequest {
+                        section: FilterValue::Value(section.section_id.clone()),
+                        sort_key: ThreadSortKey::SectionPosition,
+                        ..ThreadListRequest::default()
+                    },
+                ),
                 None => Ok(Vec::new()),
                 Some(_) => Ok(Vec::new()),
             };
-            let overlays = store.thread_overlays();
-            let deleted_projects = store.deleted_projects();
-            if let Ok(projects) = &mut projects {
-                projects.retain(|project| !deleted_projects.contains(&project.project_id));
-            }
-            if let Ok(threads) = &mut recent {
-                apply_thread_overlays(threads, &overlays, ThreadCollectionKind::Recent);
-            }
-            if let Ok(threads) = &mut archived {
-                apply_thread_overlays(threads, &overlays, ThreadCollectionKind::Archived);
-            }
             if let Ok(threads) = &mut pinned {
-                apply_thread_overlays(threads, &overlays, ThreadCollectionKind::Pinned);
+                apply_thread_overlays(
+                    threads,
+                    &store.thread_overlays(),
+                    ThreadCollectionKind::Pinned,
+                );
             }
-            let projects_current =
-                store.projects_generation.load(Ordering::Acquire) == projects_generation;
-            let recent_current =
-                store.recent_generation.load(Ordering::Acquire) == recent_generation;
-            let archived_current =
-                store.archived_generation.load(Ordering::Acquire) == archived_generation;
-            let pinned_current =
-                store.pinned_generation.load(Ordering::Acquire) == pinned_generation;
-            let mut errors = Vec::new();
-            if projects_current && let Err(error) = &projects {
-                errors.push(error.user_message("加载项目"));
-            }
-            if recent_current && let Err(error) = &recent {
-                errors.push(error.user_message("加载最近聊天"));
-            }
-            if archived_current && let Err(error) = &archived {
-                errors.push(error.user_message("加载已归档聊天"));
-            }
-            if pinned_current {
-                if let Err(error) = &sections {
-                    errors.push(error.user_message("加载会话分区"));
-                }
-                if let Err(error) = &pinned {
-                    errors.push(error.user_message("加载置顶聊天"));
-                }
+            if store.pinned_generation.load(Ordering::Acquire) != pinned_generation {
+                return;
             }
             store.update(|snapshot| {
-                if projects_current {
-                    if let Ok(projects) = projects {
-                        snapshot.projects = projects;
+                match pinned {
+                    Ok(pinned) => snapshot.pinned_threads = pinned,
+                    Err(error) => {
+                        append_error(&mut snapshot.error, error.user_message("加载置顶聊天"))
                     }
-                    snapshot.loading.projects = false;
                 }
-                if recent_current {
-                    if let Ok(recent) = recent {
-                        snapshot.recent_threads = recent;
-                    }
-                    snapshot.loading.recent = false;
+                if let Some(section) = pinned_section {
+                    snapshot.preferences.pinned_section_id = Some(section.section_id);
+                } else if sections.is_ok() {
+                    snapshot.preferences.pinned_section_id = None;
                 }
-                if archived_current {
-                    if let Ok(archived) = archived {
-                        snapshot.archived_threads = archived;
-                    }
-                    snapshot.loading.archived = false;
-                }
-                if pinned_current {
-                    if let Ok(pinned) = pinned {
-                        snapshot.pinned_threads = pinned;
-                    }
-                    if let Some(section) = pinned_section {
-                        snapshot.preferences.pinned_section_id = Some(section.section_id);
-                    } else if sections.is_ok() {
-                        snapshot.preferences.pinned_section_id = None;
-                    }
-                    snapshot.loading.pinned = false;
-                }
-                if !errors.is_empty() {
-                    snapshot.error = Some(errors.join("\n"));
+                snapshot.loading.pinned = false;
+                if let Err(error) = sections {
+                    append_error(&mut snapshot.error, error.user_message("加载会话分区"));
                 }
             });
-            if pinned_current && preference_changed {
+            if preference_changed {
                 store.save_preferences();
             }
         });
@@ -1162,6 +1187,16 @@ impl WorkspaceStore {
             let _ = sender.send_blocking(result);
         });
         receiver
+    }
+}
+
+fn append_error(target: &mut Option<String>, message: String) {
+    match target {
+        Some(existing) => {
+            existing.push('\n');
+            existing.push_str(&message);
+        }
+        None => *target = Some(message),
     }
 }
 
@@ -1986,6 +2021,8 @@ mod tests {
             let snapshot = store.snapshot();
             !snapshot.loading.projects
                 && !snapshot.loading.recent
+                && !snapshot.loading.archived
+                && !snapshot.loading.pinned
                 && snapshot.projects.len() == 2
                 && snapshot.recent_threads.len() == 2
         });
@@ -2057,6 +2094,8 @@ mod tests {
         let store = WorkspaceStore::with_preferences_path(backend.clone(), path.clone());
         store.refresh_all();
         wait_until(|| backend.recent_requested.load(Ordering::Acquire) == 1);
+        wait_until(|| !store.snapshot().loading.archived);
+        assert!(store.snapshot().loading.recent);
 
         for event in [
             AgentConnectionEvent::ThreadNameUpdated {

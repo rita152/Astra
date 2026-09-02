@@ -35,6 +35,9 @@ use crate::{
     workspace::{WorkspaceStore, project_id_for_thread},
 };
 
+#[cfg(not(test))]
+use crate::workspace::WorkspaceSnapshot;
+
 pub struct ChatApp {
     codex_app_server: Arc<CodexAppServerManager>,
     _agent_backend: Arc<dyn AgentBackend>,
@@ -44,6 +47,7 @@ pub struct ChatApp {
     next_draft_id: u64,
     mode: ThemeMode,
     startup_model_catalog_resolved: bool,
+    startup_sidebar_resolved: bool,
     startup_minimum_duration_elapsed: bool,
     sidebar: Entity<SidebarView>,
     home: Entity<HomeView>,
@@ -228,6 +232,11 @@ fn startup_loading_logo_opacity(progress: f32) -> f32 {
     0.32 + blink * 0.68
 }
 
+#[cfg(not(test))]
+fn startup_sidebar_resolved(snapshot: &WorkspaceSnapshot) -> bool {
+    !snapshot.loading.projects && !snapshot.loading.recent && !snapshot.loading.pinned
+}
+
 fn startup_loading_view(theme: Theme) -> impl IntoElement {
     let logo = icon("home-mark", theme.home_mark.into())
         .size(px(STARTUP_LOADING_LOGO_SIZE))
@@ -303,6 +312,8 @@ impl ChatApp {
         });
         #[cfg(not(test))]
         workspace_store.refresh_all();
+        #[cfg(not(test))]
+        let workspace_receiver = workspace_store.subscribe();
         let settings = cx.new(|_| SettingsView::new(mode));
         let home = cx.new(|cx| HomeView::new_with_backend(mode, agent_backend.clone(), cx));
         let initial_composer = home.read(cx).composer_entity();
@@ -390,6 +401,19 @@ impl ChatApp {
             });
         })
         .detach();
+        #[cfg(not(test))]
+        cx.spawn(async move |this, cx| {
+            while let Ok(snapshot) = workspace_receiver.recv().await {
+                if startup_sidebar_resolved(&snapshot) {
+                    let _ = this.update(cx, |this, cx| {
+                        this.startup_sidebar_resolved = true;
+                        cx.notify();
+                    });
+                    break;
+                }
+            }
+        })
+        .detach();
         Self {
             codex_app_server,
             _agent_backend: agent_backend,
@@ -401,6 +425,7 @@ impl ChatApp {
             // Unit tests intentionally exercise the full shell without spawning
             // the external Codex model-catalog process.
             startup_model_catalog_resolved: cfg!(test),
+            startup_sidebar_resolved: cfg!(test),
             startup_minimum_duration_elapsed: cfg!(test),
             sidebar,
             home,
@@ -606,6 +631,7 @@ impl ChatApp {
 
     pub fn complete_startup_for_capture(&mut self, cx: &mut Context<Self>) {
         self.startup_model_catalog_resolved = true;
+        self.startup_sidebar_resolved = true;
         self.startup_minimum_duration_elapsed = true;
         cx.notify();
     }
@@ -2443,7 +2469,10 @@ impl ChatApp {
 impl Render for ChatApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_mode(self.mode);
-        if !(self.startup_model_catalog_resolved && self.startup_minimum_duration_elapsed) {
+        if !(self.startup_model_catalog_resolved
+            && self.startup_sidebar_resolved
+            && self.startup_minimum_duration_elapsed)
+        {
             return startup_loading_view(theme).into_any_element();
         }
         if self.project_creation_open && self.project_creation_focus_pending {
@@ -2855,7 +2884,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_loading_screen_waits_for_the_catalog_and_one_second_minimum() {
+    fn startup_loading_screen_waits_for_catalog_sidebar_and_one_second_minimum() {
         let mut app = TestApp::new();
         let mut window = app.open_window_with_options(
             WindowOptions {
@@ -2870,6 +2899,7 @@ mod tests {
 
         window.update(|chat, _, cx| {
             chat.startup_model_catalog_resolved = false;
+            chat.startup_sidebar_resolved = false;
             chat.startup_minimum_duration_elapsed = false;
             cx.notify();
         });
@@ -2892,6 +2922,14 @@ mod tests {
         app.run_until_parked();
         assert!(window.read(|chat, _| chat.startup_minimum_duration_elapsed));
 
+        window.draw();
+        window.simulate_click(sidebar_toggle_center, MouseButton::Left);
+        assert!(!window.read(|chat, _| chat.sidebar_collapsed));
+
+        window.update(|chat, _, cx| {
+            chat.startup_sidebar_resolved = true;
+            cx.notify();
+        });
         window.draw();
         window.simulate_click(sidebar_toggle_center, MouseButton::Left);
         assert!(window.read(|chat, _| chat.sidebar_collapsed));
