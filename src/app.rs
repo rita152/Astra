@@ -952,16 +952,15 @@ impl ChatApp {
                 });
                 #[cfg(not(test))]
                 {
-                    let sidebar = self.sidebar.clone();
-                    cx.spawn(async move |_, cx| {
+                    let workspace_store = self.workspace_store.clone();
+                    cx.spawn(async move |_, _cx| {
                         let Ok(Ok(Some(mut paths))) = paths.await else {
                             return;
                         };
                         let Some(path) = paths.pop() else {
                             return;
                         };
-                        let _ =
-                            sidebar.update(cx, |sidebar, cx| sidebar.add_local_project(&path, cx));
+                        workspace_store.create_project(path);
                     })
                     .detach();
                 }

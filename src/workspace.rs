@@ -2054,6 +2054,42 @@ mod tests {
     }
 
     #[test]
+    fn creating_a_project_uses_the_selected_directory_name_and_updates_the_snapshot() {
+        let backend = FakeWorkspaceBackend::new();
+        let path = test_preferences_path("create-project");
+        let store = WorkspaceStore::with_preferences_path(backend.clone(), path.clone());
+
+        store.create_project(PathBuf::from("/tmp/new-project"));
+
+        wait_until(|| {
+            !store
+                .snapshot()
+                .pending
+                .contains(&WorkspaceOperation::CreateProject(
+                    "/tmp/new-project".to_owned(),
+                ))
+        });
+        assert_eq!(
+            store
+                .snapshot()
+                .projects
+                .iter()
+                .map(|project| project.project_id.as_str())
+                .collect::<Vec<_>>(),
+            ["created-project"]
+        );
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .any(|call| call == "project/create:new-project")
+        );
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
     fn notifications_are_idempotent_and_may_arrive_before_operation_response() {
         let backend = FakeWorkspaceBackend::new();
         let path = test_preferences_path("notifications");

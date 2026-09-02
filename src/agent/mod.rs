@@ -81,10 +81,6 @@ impl AgentCapabilities {
     pub fn supports(&self, capability: AgentCapability) -> bool {
         self.supported.contains(&capability)
     }
-
-    pub fn iter(&self) -> impl Iterator<Item = AgentCapability> + '_ {
-        self.supported.iter().copied()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +152,7 @@ pub struct Page<T> {
 }
 
 impl<T> Page<T> {
+    #[cfg(test)]
     pub fn single(data: Vec<T>) -> Self {
         Self {
             data,
@@ -224,6 +221,9 @@ pub struct ThreadSummary {
     pub activity: ThreadActivity,
 }
 
+// The backend supports every protocol sort mode even though the current UI only
+// constructs recency and section-position requests.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadSortKey {
     CreatedAt,
@@ -232,12 +232,15 @@ pub enum ThreadSortKey {
     SectionPosition,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortDirection {
     Ascending,
     Descending,
 }
 
+// `None` is distinct from an omitted filter in the Codex app-server protocol.
+#[allow(dead_code)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum FilterValue<T> {
     #[default]

@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeSet, HashSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::Command,
     sync::Arc,
     time::{Duration, Instant},
@@ -372,25 +372,8 @@ impl SidebarView {
         cx.notify();
     }
 
-    pub fn set_projects_section_menu_open(
-        &mut self,
-        open: bool,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.projects_section_menu_open = open;
-        self.project_menu_id = None;
-        self.thread_menu_id = None;
-        cx.notify();
-    }
-
     pub fn open_projects_section_menu_for_capture(&mut self, cx: &mut Context<Self>) {
         self.projects_section_menu_open = true;
-        cx.notify();
-    }
-
-    pub fn add_local_project(&mut self, path: &Path, cx: &mut Context<Self>) {
-        self.store.create_project(path.to_path_buf());
         cx.notify();
     }
 
@@ -404,14 +387,17 @@ impl SidebarView {
         cx.notify();
     }
 
+    #[cfg(test)]
     pub fn projects_section_menu_is_open(&self) -> bool {
         self.projects_section_menu_open
     }
 
+    #[cfg(test)]
     pub fn project_menu_is_open(&self) -> bool {
         self.project_menu_id.is_some()
     }
 
+    #[cfg(test)]
     pub fn pinned_menu_is_open(&self) -> bool {
         self.pinned_menu_open
     }

@@ -53,8 +53,6 @@ pub struct Theme {
     pub sidebar_title_text: Rgba,
     /// Secondary sidebar foreground measured from the ChatGPT desktop app.
     pub sidebar_text_muted: Rgba,
-    pub sidebar_resize_hover: Rgba,
-    pub sidebar_resize_active: Rgba,
     pub text: Rgba,
     pub sidebar_text: Rgba,
     pub text_secondary: Rgba,
@@ -74,9 +72,6 @@ pub struct Theme {
     pub effort: Rgba,
     pub button: Rgba,
     pub button_text: Rgba,
-    pub scrollbar_thumb: Rgba,
-    pub profile_menu_surface: Rgba,
-    pub profile_menu_focus: Rgba,
     pub profile_menu_shadow: Rgba,
     pub settings_sidebar: Rgba,
     pub settings_panel: Rgba,
@@ -114,8 +109,6 @@ impl Theme {
                 sidebar_icon_muted: rgba(0x1a1c1f7f),
                 sidebar_title_text: rgba(0x1a1c1fd9),
                 sidebar_text_muted: rgba(0x1a1c1f7f),
-                sidebar_resize_hover: rgba(0x8b92994d),
-                sidebar_resize_active: rgba(0x8b929999),
                 text: rgba(0x1a1c1fff),
                 sidebar_text: rgba(0x1a1c1fd9),
                 text_secondary: rgba(0x5d5d5dff),
@@ -131,12 +124,6 @@ impl Theme {
                 effort: rgba(0x924ff7ff),
                 button: rgba(0x1a1c1fff),
                 button_text: rgba(0xffffffff),
-                scrollbar_thumb: rgba(0xeaeaeaff),
-                // The reference composes a 90% translucent elevated surface
-                // over the light sidebar. Use the resolved color because the
-                // GPUI surface is intentionally native and does not blur HTML.
-                profile_menu_surface: rgba(0xfafafaff),
-                profile_menu_focus: rgba(0xeeeeeeff),
                 // chat-reference: --shadow-xl, 0 8px 16px -4px #0000001f.
                 profile_menu_shadow: rgba(0x0000001f),
                 settings_sidebar: rgba(0xf6f6f6ff),
@@ -172,8 +159,6 @@ impl Theme {
                 sidebar_icon_muted: rgba(0xffffff7f),
                 sidebar_title_text: rgba(0xdfdfdfd9),
                 sidebar_text_muted: rgba(0xffffff7f),
-                sidebar_resize_hover: rgba(0x8b92994d),
-                sidebar_resize_active: rgba(0x8b929999),
                 text: rgba(0xdfdfdfff),
                 sidebar_text: rgba(0xdfdfdfd9),
                 text_secondary: rgba(0xc3c3c3ff),
@@ -190,11 +175,6 @@ impl Theme {
                 effort: rgba(0xad7bf9ff),
                 button: rgba(0xdfdfdfff),
                 button_text: rgba(0x2d2d2dff),
-                scrollbar_thumb: rgba(0x343434ff),
-                // The captured opaque result at the menu's unhighlighted
-                // edges is #181818. Keep the native GPUI surface identical.
-                profile_menu_surface: rgba(0x181818ff),
-                profile_menu_focus: rgba(0x2e2e2eff),
                 profile_menu_shadow: rgba(0x0000001f),
                 settings_sidebar: rgba(0x171717ff),
                 settings_panel: rgba(0x1f1f1fff),
