@@ -118,6 +118,7 @@ const TURN_SCOPED_SERVER_METHODS: &[&str] = &[
     "item/started",
     "item/agentMessage/delta",
     "item/commandExecution/outputDelta",
+    "item/commandExecution/terminalInteraction",
     "item/reasoning/summaryPartAdded",
     "item/reasoning/summaryTextDelta",
     "item/reasoning/textDelta",
@@ -1911,6 +1912,20 @@ fn process_turn_message<W: Write + Send + 'static>(
                 "item/commandExecution/outputDelta",
             )?;
         }
+        Some("item/commandExecution/terminalInteraction") => {
+            let item_id = required_notification_string(message, "itemId")?;
+            let process_id = required_notification_string(message, "processId")?;
+            let stdin = required_notification_string(message, "stdin")?;
+            send_turn_event(
+                events,
+                AgentEvent::CommandTerminalInteraction {
+                    item_id,
+                    process_id,
+                    wrote_stdin: !stdin.is_empty(),
+                },
+                "item/commandExecution/terminalInteraction",
+            )?;
+        }
         Some("item/reasoning/summaryPartAdded") => {
             let item_id = required_notification_string(message, "itemId")?;
             let summary_index = required_notification_index(message, "summaryIndex")?;
@@ -2053,6 +2068,7 @@ fn is_defined_server_method(method: &str) -> bool {
             | "item/started"
             | "item/agentMessage/delta"
             | "item/commandExecution/outputDelta"
+            | "item/commandExecution/terminalInteraction"
             | "item/reasoning/summaryPartAdded"
             | "item/reasoning/summaryTextDelta"
             | "item/reasoning/textDelta"
@@ -2888,6 +2904,7 @@ fn parse_command_execution(item: &serde_json::Map<String, Value>) -> Result<Comm
         actions: parsed_actions,
         cwd,
         output,
+        terminal_process_id: None,
         status,
         exit_code,
     })
@@ -4494,6 +4511,7 @@ mod tests {
                     }],
                     cwd: "/tmp/project".into(),
                     output: String::new(),
+                    terminal_process_id: None,
                     status: super::CommandExecutionStatus::InProgress,
                     exit_code: None,
                 }),
@@ -4509,6 +4527,7 @@ mod tests {
                     }],
                     cwd: "/tmp/project".into(),
                     output: "/tmp/project\n".into(),
+                    terminal_process_id: None,
                     status: super::CommandExecutionStatus::Completed,
                     exit_code: Some(0),
                 }),
@@ -7184,6 +7203,75 @@ mod tests {
             ]
         );
         assert!(!streamed_text);
+    }
+
+    #[test]
+    fn terminal_interaction_maps_poll_and_redacts_stdin_content() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut streamed_text = false;
+        for (process_id, stdin) in [("95225", ""), ("95225", "super-secret\n")] {
+            let message = json!({
+                "method": "item/commandExecution/terminalInteraction",
+                "params": {
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "itemId": "exec_1",
+                    "processId": process_id,
+                    "stdin": stdin
+                }
+            });
+            assert_eq!(
+                super::process_turn_message(
+                    &session,
+                    &message,
+                    "thr_1",
+                    "turn_1",
+                    &tx,
+                    &mut streamed_text,
+                )
+                .unwrap(),
+                None
+            );
+        }
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AgentEvent::CommandTerminalInteraction {
+                item_id: "exec_1".into(),
+                process_id: "95225".into(),
+                wrote_stdin: false,
+            }
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AgentEvent::CommandTerminalInteraction {
+                item_id: "exec_1".into(),
+                process_id: "95225".into(),
+                wrote_stdin: true,
+            }
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(!streamed_text);
+
+        for (field, invalid) in [
+            ("itemId", json!(1)),
+            ("processId", json!(null)),
+            ("stdin", json!([])),
+        ] {
+            let mut message = json!({
+                "method": "item/commandExecution/terminalInteraction",
+                "params": {
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "itemId": "exec_1",
+                    "processId": "95225",
+                    "stdin": ""
+                }
+            });
+            message["params"][field] = invalid;
+            assert_turn_message_fails(&message, &[field, "必须是字符串"]);
+        }
     }
 
     #[test]

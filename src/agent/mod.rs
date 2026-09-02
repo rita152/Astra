@@ -165,6 +165,9 @@ pub struct CommandExecution {
     pub actions: Vec<CommandExecutionAction>,
     pub cwd: String,
     pub output: String,
+    /// Set by a terminal-interaction notification while a background process
+    /// remains associated with this command item.
+    pub terminal_process_id: Option<String>,
     pub status: CommandExecutionStatus,
     pub exit_code: Option<i64>,
 }
@@ -709,6 +712,13 @@ pub enum AgentEvent {
     CommandOutputDelta {
         item_id: String,
         delta: String,
+    },
+    CommandTerminalInteraction {
+        item_id: String,
+        process_id: String,
+        /// Preserve the interaction semantic without retaining possibly
+        /// sensitive terminal input in the UI model.
+        wrote_stdin: bool,
     },
     CommandCompleted(CommandExecution),
     CommandApprovalRequested {

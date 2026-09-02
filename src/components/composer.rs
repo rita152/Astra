@@ -301,6 +301,7 @@ fn push_coalesced_agent_event(batch: &mut Vec<AgentEvent>, event: AgentEvent) {
                 batch.push(AgentEvent::CommandOutputDelta { item_id, delta });
             }
         }
+        AgentEvent::CommandTerminalInteraction { .. } => batch.push(event),
         AgentEvent::ReasoningSummaryTextDelta {
             item_id,
             summary_index,
@@ -1464,6 +1465,33 @@ impl ComposerView {
                                 actions: Vec::new(),
                                 cwd: String::new(),
                                 output: delta,
+                                terminal_process_id: None,
+                                status: CommandExecutionStatus::InProgress,
+                                exit_code: None,
+                            }));
+                    }
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Streaming;
+                    }
+                }
+                AgentEvent::CommandTerminalInteraction {
+                    item_id,
+                    process_id,
+                    wrote_stdin: _,
+                } => {
+                    if let Some(command) =
+                        find_command_activity_mut(&mut self.conversation_activity, &item_id)
+                    {
+                        command.terminal_process_id = Some(process_id);
+                    } else {
+                        self.conversation_activity
+                            .push(ConversationActivity::Command(CommandExecution {
+                                id: item_id,
+                                command: String::new(),
+                                actions: Vec::new(),
+                                cwd: String::new(),
+                                output: String::new(),
+                                terminal_process_id: Some(process_id),
                                 status: CommandExecutionStatus::InProgress,
                                 exit_code: None,
                             }));
@@ -2318,6 +2346,7 @@ impl ComposerView {
                 actions: Vec::new(),
                 cwd: "/path/to/project".to_owned(),
                 output: "SHELLPIXEL20260830\n".to_owned(),
+                terminal_process_id: None,
                 status: if running {
                     CommandExecutionStatus::InProgress
                 } else {
@@ -2357,6 +2386,7 @@ impl ComposerView {
                 }],
                 cwd: "/Users/zp/Desktop/GPUI".to_owned(),
                 output: "use std::sync::Arc;\n".to_owned(),
+                terminal_process_id: None,
                 status: completed_status,
                 exit_code: completed_exit,
             },
@@ -2370,6 +2400,7 @@ impl ComposerView {
                 }],
                 cwd: "/Users/zp/Desktop/GPUI".to_owned(),
                 output: "impl CodexAppServerManager {\n".to_owned(),
+                terminal_process_id: None,
                 status: completed_status,
                 exit_code: completed_exit,
             },
@@ -2383,6 +2414,7 @@ impl ComposerView {
                 }],
                 cwd: "/Users/zp/Desktop/GPUI".to_owned(),
                 output: "}\n".to_owned(),
+                terminal_process_id: None,
                 status: completed_status,
                 exit_code: completed_exit,
             },
@@ -2396,6 +2428,7 @@ impl ComposerView {
                 }],
                 cwd: "/Users/zp/Desktop/GPUI".to_owned(),
                 output: "impl Drop for AppServerProcess {\n".to_owned(),
+                terminal_process_id: None,
                 status: completed_status,
                 exit_code: completed_exit,
             },
@@ -2409,6 +2442,7 @@ impl ComposerView {
                 }],
                 cwd: "/Users/zp/Desktop/GPUI".to_owned(),
                 output: "}\n".to_owned(),
+                terminal_process_id: None,
                 status: completed_status,
                 exit_code: completed_exit,
             },
@@ -2422,6 +2456,7 @@ impl ComposerView {
                 }],
                 cwd: "/Users/zp/Desktop/GPUI".to_owned(),
                 output: "src/agent/codex.rs:42\n".to_owned(),
+                terminal_process_id: None,
                 status: completed_status,
                 exit_code: completed_exit,
             },
@@ -2435,6 +2470,7 @@ impl ComposerView {
                 }],
                 cwd: "/Users/zp/Desktop/GPUI".to_owned(),
                 output: "src/agent/codex.rs:84\n".to_owned(),
+                terminal_process_id: None,
                 status: completed_status,
                 exit_code: completed_exit,
             },
@@ -2448,6 +2484,7 @@ impl ComposerView {
                 }],
                 cwd: "/Users/zp/Desktop/GPUI".to_owned(),
                 output: "src/agent/codex/manager.rs:118\n".to_owned(),
+                terminal_process_id: None,
                 status: completed_status,
                 exit_code: completed_exit,
             },
@@ -2459,6 +2496,7 @@ impl ComposerView {
                 }],
                 cwd: "/Users/zp/Desktop/GPUI".to_owned(),
                 output: ".\n./src\n./tests\n".to_owned(),
+                terminal_process_id: None,
                 status: completed_status,
                 exit_code: completed_exit,
             },
@@ -2470,6 +2508,7 @@ impl ComposerView {
                 }],
                 cwd: "/Users/zp/Desktop/GPUI".to_owned(),
                 output: "running 192 tests\n".to_owned(),
+                terminal_process_id: None,
                 status: final_status,
                 exit_code: final_exit,
             },
@@ -3778,6 +3817,11 @@ fn upsert_command_activity(
         }
         if incoming.actions.is_empty() {
             incoming.actions = std::mem::take(&mut existing.actions);
+        }
+        if incoming.status == CommandExecutionStatus::InProgress
+            && incoming.terminal_process_id.is_none()
+        {
+            incoming.terminal_process_id = existing.terminal_process_id.take();
         }
         *existing = incoming;
     } else {
@@ -6295,6 +6339,7 @@ mod tests {
             }],
             cwd: "/tmp".into(),
             output: String::new(),
+            terminal_process_id: None,
             status: CommandExecutionStatus::InProgress,
             exit_code: None,
         })];
@@ -6315,6 +6360,7 @@ mod tests {
                 actions: Vec::new(),
                 cwd: "/tmp".into(),
                 output: "hello\n".into(),
+                terminal_process_id: None,
                 status: CommandExecutionStatus::Completed,
                 exit_code: Some(0),
             },
@@ -6330,6 +6376,44 @@ mod tests {
                 command: "printf hello".into()
             }]
         );
+    }
+
+    #[test]
+    fn terminal_interaction_reuses_the_running_command_activity() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+
+        app.update_entity(&composer, |composer, _| {
+            assert!(!composer.apply_agent_event_batch(vec![
+                AgentEvent::CommandStarted(CommandExecution {
+                    id: "exec_1".into(),
+                    command: "sleep 18".into(),
+                    actions: vec![CommandExecutionAction::Unknown {
+                        command: "sleep 18".into(),
+                    }],
+                    cwd: "/tmp".into(),
+                    output: String::new(),
+                    terminal_process_id: None,
+                    status: CommandExecutionStatus::InProgress,
+                    exit_code: None,
+                }),
+                AgentEvent::CommandTerminalInteraction {
+                    item_id: "exec_1".into(),
+                    process_id: "95225".into(),
+                    wrote_stdin: true,
+                },
+            ]));
+
+            assert_eq!(composer.conversation_activity.len(), 1);
+            let ConversationActivity::Command(command) = &composer.conversation_activity[0] else {
+                panic!("expected the existing command activity");
+            };
+            assert_eq!(command.command, "sleep 18");
+            assert_eq!(command.terminal_process_id.as_deref(), Some("95225"));
+            assert_eq!(command.status, CommandExecutionStatus::InProgress);
+            assert!(command.output.is_empty());
+            assert_eq!(composer.conversation_phase, ConversationPhase::Streaming);
+        });
     }
 
     #[test]

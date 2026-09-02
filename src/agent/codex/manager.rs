@@ -2731,6 +2731,77 @@ mod tests {
         manager.shutdown();
     }
 
+    #[test]
+    fn terminal_interaction_routes_to_its_owner_and_keeps_the_generation_alive() {
+        let (manager, spawner) = manager_with_fake();
+        let owner = manager.run_prompt(request("background command", Some("thr_terminal")));
+        let other = manager.run_prompt(request("unrelated command", Some("thr_other")));
+        let (owner_events, owner_interrupt) = owner.into_parts();
+        let (other_events, other_interrupt) = other.into_parts();
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+
+        let mut turn_requests = HashMap::new();
+        while turn_requests.len() < 2 {
+            let message = endpoint.recv();
+            match message["method"].as_str().unwrap() {
+                "thread/resume" => {
+                    let thread_id = message["params"]["threadId"].as_str().unwrap();
+                    endpoint.respond(&message, json!({ "thread": { "id": thread_id } }));
+                }
+                "turn/start" => {
+                    turn_requests.insert(
+                        message["params"]["threadId"].as_str().unwrap().to_owned(),
+                        message,
+                    );
+                }
+                method => panic!("unexpected method: {method}"),
+            }
+        }
+        endpoint.respond(
+            turn_requests.get("thr_terminal").unwrap(),
+            json!({ "turn": { "id": "turn_terminal" } }),
+        );
+        endpoint.respond(
+            turn_requests.get("thr_other").unwrap(),
+            json!({ "turn": { "id": "turn_other" } }),
+        );
+
+        endpoint.send(json!({
+            "method": "item/commandExecution/terminalInteraction",
+            "params": {
+                "threadId": "thr_terminal",
+                "turnId": "turn_terminal",
+                "itemId": "exec_terminal",
+                "processId": "95225",
+                "stdin": ""
+            }
+        }));
+        complete(&endpoint, "thr_terminal", "turn_terminal", "completed");
+        complete(&endpoint, "thr_other", "turn_other", "completed");
+
+        let owner_received = collect_terminal(&owner_events);
+        let other_received = collect_terminal(&other_events);
+        assert!(
+            owner_received.contains(&AgentEvent::CommandTerminalInteraction {
+                item_id: "exec_terminal".into(),
+                process_id: "95225".into(),
+                wrote_stdin: false,
+            })
+        );
+        assert!(
+            !other_received
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CommandTerminalInteraction { .. }))
+        );
+        assert_eq!(owner_received.last(), Some(&AgentEvent::Completed));
+        assert_eq!(other_received.last(), Some(&AgentEvent::Completed));
+        assert!(endpoint.process.is_alive());
+        drop(owner_interrupt);
+        drop(other_interrupt);
+        manager.shutdown();
+    }
+
     fn command_approval(id: Value, thread_id: &str, turn_id: &str) -> Value {
         json!({
             "id": id,

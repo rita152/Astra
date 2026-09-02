@@ -3555,6 +3555,7 @@ mod tests {
             actions: vec![action],
             cwd: "/tmp/project".to_owned(),
             output: String::new(),
+            terminal_process_id: None,
             status,
             exit_code: (status == CommandExecutionStatus::Completed).then_some(0),
         }
@@ -3785,6 +3786,7 @@ mod tests {
             ],
             cwd: "/tmp/project".into(),
             output: String::new(),
+            terminal_process_id: None,
             status: CommandExecutionStatus::Completed,
             exit_code: Some(0),
         };
