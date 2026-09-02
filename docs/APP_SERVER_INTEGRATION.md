@@ -1,20 +1,22 @@
 # Codex app-server 协议接入总表
 
-> 当前 Codex CLI 版本：`codex-cli 0.152.0`；运行时事实来源：`src/agent/codex.rs`、`src/agent/codex/manager.rs`、`src/agent/mod.rs`、`src/components/composer.rs`、`src/components/home.rs`、`src/app.rs`。
+> 当前 Codex CLI 版本：`codex-cli 0.152.1`；协议事实来源：本机执行 `codex app-server generate-json-schema --experimental` 生成的 schema；运行时事实来源：`src/agent/codex.rs`、`src/agent/codex/manager.rs`、`src/agent/mod.rs`、`src/workspace.rs`、`src/components/sidebar.rs`、`src/components/composer.rs`、`src/components/home.rs`、`src/app.rs`。
 
 客户端初始化时启用 experimental API。下表是当前协议的唯一维护来源，完整列出 247 个 JSON-RPC 方法：154 个客户端请求、11 个服务端请求、1 个客户端通知、81 个服务端通知。
 
-当前接入统计：已接入 30、后端已接入 2、部分接入 4、未接入 211。未接入的客户端方法不会发送；未接入的服务端请求按原 id 回复 `-32601` 后 fail-fast；未接入的服务端通知收到即 fail-fast。升级 Codex CLI 时直接核对并更新本表。
+当前接入统计：已接入 56、后端已接入 2、部分接入 4、未接入 185。未接入的客户端方法不会发送；未接入的服务端请求按原 id 回复 `-32601` 后 fail-fast；未接入的服务端通知收到即 fail-fast。升级 Codex CLI 时重新生成 experimental schema 并直接核对、更新本表。0.152.1 不存在 `isPinned`，置顶通过服务端返回的 `Pinned` thread section ID 实现。
 
 状态口径：“已接入”表示本表声明的产品语义已形成真实协议收发、领域映射和必要 UI／副作用的完整闭环，不等于消费 schema 的每个可选字段；已知有效变体或安全相关字段尚未承接时标记为“部分接入”。
 
 ## 运行时生命周期
 
-`ChatApp` 创建并持有一个应用级 `Arc<CodexAppServerManager>`，通过 agent-neutral `AgentBackend` 注入 `HomeView` 与 `ComposerView`。正常应用路径中的模型目录、权限 profile、thread settings 和 prompt/thread/turn RPC 全部复用该 manager；测试构造视图只会创建惰性 manager，不会启动真实进程。
+`ChatApp` 创建并持有一个应用级 `Arc<CodexAppServerManager>` 和 `Arc<WorkspaceStore>`，通过 agent-neutral `AgentBackend` 注入 UI。`Project`、`ThreadSummary`、`ThreadHistory`、分页、能力集和 `Unsupported` 均位于中立领域层，Codex JSON-RPC method、wire field 与原始错误不会进入 UI。`WorkspaceStore` 是 sidebar 唯一的项目／会话数据来源，所有选择和变更使用稳定 `project_id`／`thread_id`；本地只持久化版本化 UI 偏好（包括 pinned section id 与折叠状态），以同目录临时文件、flush/sync、原子 rename 写入，不保存项目或会话影子真相。
+
+`ChatApp` 按 `DraftId`／`ThreadId` 缓存 `ConversationHost`。选中既有会话时以 `thread/read(includeTurns=false)` 恢复上下文，再以 `thread/turns/list(itemsView=full)` 逐页读取完整历史并恢复多轮 transcript；服务端仍返回非 full item 视图时才按 turn 继续分页调用 `thread/items/list`。切换后后台会话及进行中的 turn 继续存活；新草稿第一次发送才执行 `thread/start`，携带对应 `cwd`、`projectId` 与 `historyMode=paginated`，收到 canonical `ThreadCreated` 后原 host 从 Draft key 原地重键为真实 thread key。sidebar 全程使用稳定 `ProjectId`／`ThreadId`／`SectionId`：线程先按显式 `projectId` 分组；缺省时规范化 `cwd`，按路径组件匹配最深 project root；仍未匹配才进入最近。真实搜索、最近、归档、活动、重命名、置顶、删除、移动与 Finder 操作都经由 store/backend，提供 loading、error、retry、empty 和 pending 状态；不扫描 `~/.codex`，也不建立本地线程数据库。PR、站点、已安排及插件入口保留已校准的视觉入口，但不伪造业务数据或协议行为。其布局与交互数值通过 CDP `127.0.0.1:9222` 读取桌面 ChatGPT App 的实际计算样式，不另行设计自定义 UI/UX。
 
 每个 connection generation 只 spawn 一个 `codex app-server --stdio`，只发送一次 `initialize` 和一次 `initialized`。一个长期 reader loop 独占 stdout，连接级单调 request id 与 pending registry 关联所有 response；共享 stdin 锁把每条完整 JSONL 与 flush 作为一次串行写事务。串行化的 thread lifecycle registry 关联 `thread/start`／`thread/resume` 与可能先到的 `thread/started`，每个 thread 在同一 generation 只 start 或 resume 一次。新 thread 的 RPC 顺序为 `thread/start` → `turn/start`；已加载 thread 的后续 prompt 直接 `turn/start`；仅在新 generation 或尚未加载时先 `thread/resume`，resume 失败不回退为 start。
 
-每个 thread 同时最多一个 active turn。manager 按 `threadId + turnId` 路由 turn notification，按原始 JSON-RPC id 路由 server request/resolved，并在 `turn/start` response 前缓存该 turn 的 started/item/request/completed 消息，确定 canonical turn id 后按 wire order 原子校验和回放。app-scoped 与 thread-scoped 状态通过 `AgentConnectionEvent` 快照订阅进入 UI，不会投递给碰巧活跃的 turn；turn-scoped 事件只进入对应 `AgentRun`。
+每个 thread 同时最多一个 active turn。manager 按 `threadId + turnId` 路由 turn notification，按原始 JSON-RPC id 路由 server request/resolved，并在 `turn/start` response 前缓存该 turn 的 started/item/request/completed 消息，确定 canonical turn id 后按 wire order 原子校验和回放。app-scoped 与 thread-scoped 状态通过 `AgentConnectionEvent` 快照订阅进入 UI，不会投递给碰巧活跃的 turn；turn-scoped 事件只进入对应 `AgentRun`。workspace 通知是连接级非致命事件，可早于对应 RPC response；store 以 server-derived 内存覆盖层压过随后到达的过期列表响应，避免归档、删除、重命名、项目移动等状态回滚，同时不把该覆盖层持久化为本地真相。
 
 reasoning item 以 `item.id` 独立建模，严格保存 `startedAtMs`／`completedAtMs`，并按 `summaryIndex`／`contentIndex` 承接稀疏数组及增量文本；同一 turn 内的多个 reasoning item 不会合并或串线。`commandExecution.commandActions` 不再只做 schema 校验后丢弃，而是以 `read`／`listFiles`／`search`／`unknown` 的 agent-neutral 结构保留；一个 commandExecution 的每个 action 分别渲染一行，读取行提供文件链接，只有 shell/unknown 行拥有二级详情折叠。UI 将相邻 reasoning 与 command item 折叠为一个桌面 ChatGPT 语义的工具调用组：运行态默认展开并以最新 reasoning 短标题作为 21 px 标题行，完成态默认折叠并汇总为“已读取文件”“运行了命令”等动作文案；组内行间距 4 px、滚动区最高 224 px、边缘渐隐 24 px，鼠标及 Enter／Space 共用折叠路径，300 ms `cubic-bezier(.19, 1, .22, 1)` 高度／透明度过渡遵循 reduced-motion；标题箭头另使用桌面端 300 ms `cubic-bezier(.4, 0, .2, 1)` 旋转。没有相邻命令的 reasoning 仍独立渲染，活动时自动展开并跟随最新内容，完成后显示“思考了 {elapsed}”或“完成思考”，正文最高 140 px。
 
@@ -101,13 +103,13 @@ reasoning item 以 `item.id` 独立建模，严格保存 `startedAtMs`／`comple
 | `process/resizePty` | 客户端请求 | 实验 | `params: ProcessResizePtyParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `process/spawn` | 客户端请求 | 实验 | `params: ProcessSpawnParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `process/writeStdin` | 客户端请求 | 实验 | `params: ProcessWriteStdinParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `project/create` | 客户端请求 | 实验 | `params: ProjectCreateParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `project/delete` | 客户端请求 | 实验 | `params: ProjectDeleteParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
+| `project/create` | 客户端请求 | 实验 | `idempotencyKey`、`name`、`roots[{path}]`；读取 `result.project` | `CodexAppServerManager::create_project_blocking` → `WorkspaceStore::create_project` | `CreateProject` → `Project` | Finder 选目录后创建；显示 pending／error 并刷新 sidebar | 已接入 | scripted server 精确断言 0.152.1 参数与结果；fake store 覆盖稳定 id 和 pending |
+| `project/delete` | 客户端请求 | 实验 | `projectId`；成功结果为空对象 | `CodexAppServerManager::delete_project` → `WorkspaceStore::delete_project` | 稳定 `ProjectId` | 项目菜单二次确认删除；pending／error 可见 | 已接入 | scripted server 验证参数；store 不以数组下标定位 |
 | `project/import` | 客户端请求 | 实验 | `params: ProjectImportParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `project/list` | 客户端请求 | 实验 | `params: ProjectListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `project/move` | 客户端请求 | 实验 | `params: ProjectMoveParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
+| `project/list` | 客户端请求 | 实验 | `cursor`、`limit`、`sortKey=position`、`sortDirection=asc`；读取 `nextCursor` | `CodexAppServerManager::list_projects_blocking` → `WorkspaceStore::refresh_projects` | `Page<Project>` | sidebar 项目 loading／error／retry／empty，逐页合并 | 已接入 | 重复 cursor 拒绝；scripted schema 测试、fake backend 多页测试 |
+| `project/move` | 客户端请求 | 实验 | `projectId`、nullable `beforeProjectId`；成功结果为空对象 | `CodexAppServerManager::move_project` → `WorkspaceStore::move_project` | 两个稳定 `ProjectId` | 项目菜单上移／下移，显示 pending／error | 已接入 | scripted server 断言 before id；UI 不发送数组下标 |
 | `project/read` | 客户端请求 | 实验 | `params: ProjectReadParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `project/update` | 客户端请求 | 实验 | `params: ProjectUpdateParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
+| `project/update` | 客户端请求 | 实验 | `projectId`，按需发送 `name`／`roots[{path}]`；读取 `result.project` | `CodexAppServerManager::update_project_blocking` → `WorkspaceStore::update_project` | `UpdateProject` → `Project` | sidebar 项目重命名；同一领域入口支持 roots 更新；pending／error 可见 | 已接入 | scripted server 覆盖 name/roots；响应按稳定 id upsert |
 | `remoteControl/client/list` | 客户端请求 | 实验 | `params: RemoteControlClientsListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `remoteControl/client/revoke` | 客户端请求 | 实验 | `params: RemoteControlClientsRevokeParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `remoteControl/disable` | 客户端请求 | 实验 | `params: RemoteControlDisableParams \| null`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
@@ -121,32 +123,32 @@ reasoning item 以 `item.id` 独立建模，严格保存 `startedAtMs`／`comple
 | `skills/extraRoots/set` | 客户端请求 | 默认 | `params: SkillsExtraRootsSetParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `skills/list` | 客户端请求 | 默认 | `params: SkillsListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/approveGuardianDeniedAction` | 客户端请求 | 默认 | `params: ThreadApproveGuardianDeniedActionParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/archive` | 客户端请求 | 默认 | `params: ThreadArchiveParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
+| `thread/archive` | 客户端请求 | 默认 | `threadId`；成功结果为空对象 | `CodexAppServerManager::archive_thread` → `WorkspaceStore::archive_thread` | 稳定 `ThreadId` | 行内 hover 与菜单归档；从活动列表移入归档，显示 pending／error | 已接入 | scripted 参数测试；fake store 验证 response 与通知幂等 |
 | `thread/backgroundTerminals/clean` | 客户端请求 | 实验 | `params: ThreadBackgroundTerminalsCleanParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/backgroundTerminals/list` | 客户端请求 | 实验 | `params: ThreadBackgroundTerminalsListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/backgroundTerminals/terminate` | 客户端请求 | 实验 | `params: ThreadBackgroundTerminalsTerminateParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/compact/start` | 客户端请求 | 默认 | `params: ThreadCompactStartParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/decrement_elicitation` | 客户端请求 | 实验 | `params: ThreadDecrementElicitationParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/delete` | 客户端请求 | 默认 | `params: ThreadDeleteParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
+| `thread/delete` | 客户端请求 | 默认 | `threadId`；成功结果为空对象 | `CodexAppServerManager::delete_thread` → `WorkspaceStore::delete_thread` | 稳定 `ThreadId` | 会话菜单二次确认删除；所有列表同步移除并显示 pending／error | 已接入 | scripted 参数测试；server-derived deleted overlay 防止迟到列表复活 |
 | `thread/fork` | 客户端请求 | 默认 | `params: ThreadForkParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/goal/clear` | 客户端请求 | 默认 | `params: ThreadGoalClearParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/goal/get` | 客户端请求 | 默认 | `params: ThreadGoalGetParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/goal/set` | 客户端请求 | 默认 | `params: ThreadGoalSetParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/increment_elicitation` | 客户端请求 | 实验 | `params: ThreadIncrementElicitationParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/inject_items` | 客户端请求 | 默认 | `params: ThreadInjectItemsParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/items/list` | 客户端请求 | 默认 | `params: ThreadItemsListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/list` | 客户端请求 | 默认 | `params: ThreadListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
+| `thread/items/list` | 客户端请求 | 默认 | `threadId`、nullable `turnId`、cursor/limit、`sortDirection=asc`；读取 item 分页 | `CodexAppServerManager::list_thread_items_blocking` → `WorkspaceStore::load_history` 的按需回退 | `Page<ThreadHistoryItemEntry>`，item 转为中立历史事件 | `thread/turns/list(itemsView=full)` 仍返回 summary／notLoaded 时，按 turn 逐页补齐 transcript | 已接入 | scripted server 覆盖 command item 与 cursor；fake backend 覆盖非 full turn 触发 item 分页且不重复加载 full turn |
+| `thread/list` | 客户端请求 | 默认 | cursor/limit、`archived`、nullable/省略的 `projectId` 与 `sectionId`、sort key/direction；读取双向 cursor | `CodexAppServerManager::list_threads_blocking` → `WorkspaceStore` 各 collection loader | `Page<ThreadSummary>`、`ThreadActivity` | 最近、项目、置顶、活动、归档列表均来自真实数据；显式 `projectId` 优先，缺省时按规范化 cwd 与最深 project root 组件匹配；loading／error／retry／empty | 已接入 | scripted 参数／映射测试；fake 多页、重复 cursor、稳定 id、迟到响应、cwd 嵌套 root 与相邻字符串前缀覆盖测试 |
 | `thread/loaded/list` | 客户端请求 | 默认 | `params: ThreadLoadedListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/memoryMode/set` | 客户端请求 | 实验 | `params: ThreadMemoryModeSetParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/metadata/update` | 客户端请求 | 默认 | `params: ThreadMetadataUpdateParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/name/set` | 客户端请求 | 默认 | `params: ThreadSetNameParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
+| `thread/metadata/update` | 客户端请求 | 默认 | `threadId`；省略 `projectId` 表示不变，空字符串表示取消项目，非空稳定 id 表示分配；读取 `result.thread` | `CodexAppServerManager::update_thread_metadata` → `WorkspaceStore::update_thread_metadata` | `AgentOptionalField<ProjectId>` → `ThreadSummary` | 会话菜单移至项目／移出项目，显示 pending／error | 已接入 | 严格遵循 0.152.1 schema 的空字符串清除语义；scripted 与通知覆盖测试 |
+| `thread/name/set` | 客户端请求 | 默认 | `threadId`、`name`；成功结果为空对象 | `CodexAppServerManager::set_thread_name` → `WorkspaceStore::rename_thread` | 稳定 `ThreadId` 与名称 | 会话菜单重命名，pending／error 可见 | 已接入 | scripted 参数测试；name notification 可先于 response 且不回滚 |
 | `thread/queue/add` | 客户端请求 | 实验 | `params: ThreadQueueAddParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/queue/delete` | 客户端请求 | 实验 | `params: ThreadQueueDeleteParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/queue/list` | 客户端请求 | 实验 | `params: ThreadQueueListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/queue/reorder` | 客户端请求 | 实验 | `params: ThreadQueueReorderParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/queue/start` | 客户端请求 | 实验 | `params: ThreadQueueStartParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/queue/update` | 客户端请求 | 实验 | `params: ThreadQueueUpdateParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/read` | 客户端请求 | 默认 | `params: ThreadReadParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
+| `thread/read` | 客户端请求 | 默认 | `threadId`、`includeTurns=false`；读取 `result.thread` | `CodexAppServerManager::read_thread_blocking` → `WorkspaceStore::load_history` | `ThreadSummary`，与后续 turn 页组成 `ThreadHistory` | 打开既有会话时恢复 cwd/project/title，并显示历史 loading／error／retry | 已接入 | scripted 映射测试；fake history 测试覆盖分页和上下文恢复 |
 | `thread/realtime/appendAudio` | 客户端请求 | 实验 | `params: ThreadRealtimeAppendAudioParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/realtime/appendSpeech` | 客户端请求 | 实验 | `params: ThreadRealtimeAppendSpeechParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/realtime/appendText` | 客户端请求 | 实验 | `params: ThreadRealtimeAppendTextParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
@@ -156,19 +158,19 @@ reasoning item 以 `item.id` 独立建模，严格保存 `startedAtMs`／`comple
 | `thread/resume` | 客户端请求 | 默认 | 发送 `threadId`、`excludeTurns=true`；要求 `result.thread.id` 与请求完全一致；只在 thread 尚未加载到当前 generation 时发送一次 | `CodexAppServerManager::ensure_thread_loaded`、串行 thread lifecycle registry | 将既有 thread 标记为当前 generation 已加载 | 在原会话继续 turn；后续 prompt 或 settings RPC 直接复用 loaded thread | 已接入 | 新 generation 首轮 resume、第二轮不重复；settings 更新也会先确保 thread 已加载；失败时 fail-closed，不回退 `thread/start`；保留 prompt resume bootstrap 的 `thread/goal/cleared` 窗口；`existing_thread_resumes_once_per_generation_then_starts_turns_directly`、`eof_fails_pending_work_once_and_next_operation_restarts_then_resumes`、`resume_rpc_error_fails_closed_without_starting_or_turning` |
 | `thread/revert` | 客户端请求 | 默认 | `params: ThreadRevertParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `thread/rollback` | 客户端请求 | 默认 | `params: ThreadRollbackParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/search` | 客户端请求 | 实验 | `params: ThreadSearchParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
+| `thread/search` | 客户端请求 | 实验 | 非空 `searchTerm`、`archived`、cursor/limit、sort key/direction；读取 thread 与 snippet | `CodexAppServerManager::search_threads_blocking` → `WorkspaceStore::search` | `Page<ThreadSearchResult>` | ChatGPT command-palette 样式真实搜索；loading／error／retry／empty／pending query | 已接入 | scripted server 验证搜索参数/snippet；旧请求结果以 generation 丢弃 |
 | `thread/searchOccurrences` | 客户端请求 | 实验 | `params: ThreadSearchOccurrencesParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/section/move` | 客户端请求 | 默认 | `params: ThreadSectionMoveParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
+| `thread/section/move` | 客户端请求 | 默认 | `threadId`、nullable `sectionId`／`beforeThreadId`；成功结果为空对象 | `CodexAppServerManager::move_thread_to_section` → `WorkspaceStore::set_thread_pinned` | 稳定 thread/section id | 置顶把会话移入服务端 `Pinned` section；取消置顶移至 null section；pending／error 可见 | 已接入 | 不使用 0.152.1 不存在的 `isPinned`；scripted 参数与 fake pin section 测试 |
 | `thread/settings/update` | 客户端请求 | 实验 | `threadId`、`approvalPolicy`、`approvalsReviewer`，以及 profile 或 `sandboxPolicy`；使用共享连接 request id | `CodexAppServerManager::update_thread_permissions_blocking`、loaded-thread set、thread settings waiter | `AgentThreadSettings`、`AgentConnectionEvent::ThreadSettingsUpdated` | 更新权限模式、有效 sandbox/profile 与错误提示 | 已接入 | 新 generation 会先 resume 目标 thread；waiter 在发送前注册，允许通知先于 response；必须同时等到成功 response 和匹配 thread 的有效权限通知；与其他 RPC 乱序不串线；`all_rpc_families_share_unique_connection_ids_and_out_of_order_responses` |
 | `thread/shellCommand` | 客户端请求 | 默认 | `params: ThreadShellCommandParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/start` | 客户端请求 | 默认 | 发送 `cwd`、`ephemeral=false`、`serviceName`、`model`、`serviceTier`；读取 canonical `result.thread.id`；一个新 conversation 在当前 generation 只调用一次 | `CodexAppServerManager::ensure_thread_loaded`、串行 thread lifecycle registry | `AgentEvent::ThreadCreated`；标记 generation 已加载 | Composer 保存新 thread id | 已接入 | `thread/started` 可先于 response 且必须匹配；同一 conversation 两轮只 start 一次、从不 resume；`one_new_conversation_runs_two_turns_on_one_initialized_process`、`drives_one_complete_prompt_and_normalizes_stream_events` |
+| `thread/start` | 客户端请求 | 默认 | 首次发送时发送对应 `cwd`、nullable `projectId`、`historyMode=paginated`、`ephemeral=false`、`serviceName`、`model`、`serviceTier`；读取 canonical `result.thread.id`；不发送 schema 中不存在的 `isPinned` | `CodexAppServerManager::ensure_thread_loaded`、串行 thread lifecycle registry | `AgentEvent::ThreadCreated`；标记 generation 已加载 | Composer 首次发送才创建；`ChatApp` 将同一 `ConversationHost` 从 DraftId 原地重键为 ThreadId | 已接入 | `thread/started` 可先于 response 且必须匹配；同一 conversation 两轮只 start 一次、从不 resume；scripted test 断言 historyMode/cwd/projectId/无 `isPinned`；rekey UI 回归保护 host 不被替换 |
 | `thread/timeline/list` | 客户端请求 | 实验 | `params: ThreadTimelineListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/turns/list` | 客户端请求 | 默认 | `params: ThreadTurnsListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/unarchive` | 客户端请求 | 默认 | `params: ThreadUnarchiveParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
+| `thread/turns/list` | 客户端请求 | 默认 | `threadId`、cursor/limit、`sortDirection=asc`、`itemsView=full`；读取 turn/item、实际 `itemsView` 与双向 cursor | `CodexAppServerManager::list_thread_turns_blocking` → `WorkspaceStore::load_history` | `Page<ThreadTurn>` → 多轮 `ThreadHistory` | 逐页恢复用户、助手、reasoning、命令等 transcript；若响应仍非 full，再按 turn 调用 `thread/items/list`；历史 loading／error／retry | 已接入 | scripted item/视图映射；fake backend 多页、items 回退与 Composer 历史＋实时多轮回归 |
+| `thread/unarchive` | 客户端请求 | 默认 | `threadId`；读取 `result.thread` | `CodexAppServerManager::unarchive_thread` → `WorkspaceStore::unarchive_thread` | `ThreadSummary` | 归档页恢复会话；pending／error 可见并刷新活动列表 | 已接入 | scripted 参数/结果测试；通知先于 response 幂等且不会 fail-fast |
 | `thread/unsubscribe` | 客户端请求 | 默认 | `params: ThreadUnsubscribeParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `threadSection/create` | 客户端请求 | 默认 | `params: ThreadSectionCreateParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
+| `threadSection/create` | 客户端请求 | 默认 | `name`、可选 `appearance{icon,color}`；读取 `result.section` | `CodexAppServerManager::create_thread_section` → `WorkspaceStore::ensure_pinned_section` | `ThreadSection` | `threadSection/list` 未返回专用 section 时按需创建服务端 canonical `Pinned` section，并只持久化其 id；sidebar 文案仍本地化显示“置顶” | 已接入 | scripted 参数/结果测试；已有 `Pinned` 时绝不重复 create；并发 ensure 由 store 串行化，偏好原子写入 |
 | `threadSection/delete` | 客户端请求 | 默认 | `params: ThreadSectionDeleteParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `threadSection/list` | 客户端请求 | 默认 | `params: ThreadSectionListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
+| `threadSection/list` | 客户端请求 | 默认 | cursor/limit；读取 section 与 `nextCursor` | `CodexAppServerManager::list_thread_sections` → `WorkspaceStore::refresh_all`／`ensure_pinned_section` | `Page<ThreadSection>` | 解析已保存 pinned id 或按 canonical 名称 `Pinned` 寻找专用 section，再加载置顶会话 | 已接入 | scripted 分页/appearance 映射；fake backend 验证本地不保存 pinned thread 列表且使用服务端返回 id |
 | `threadSection/update` | 客户端请求 | 默认 | `params: ThreadSectionUpdateParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
 | `turn/interrupt` | 客户端请求 | 默认 | 当前 `threadId`、`turnId`；使用连接级唯一 request id；同一 turn 只发送一次并继续等待 `turn/completed: interrupted` | `ManagedTurn::request_interrupt`、`ManagedTurn::send_interrupt`、`AgentInterruptHandle` | `AgentInterruptOutcome`；终态由对应 turn 决定 | Composer 进入 stopping，最终显示 stopped/failed | 已接入 | 只影响目标 turn；重复、已终止、response 失败和 abandon 均不关闭共享进程或影响其他 thread；`interrupt_and_abandon_are_turn_scoped_and_keep_shared_process_alive`、`pending_interrupt_uses_the_active_thread_and_turn_and_waits_for_terminal_status` |
 | `turn/settings/update` | 客户端请求 | 实验 | `params: TurnSettingsUpdateParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
@@ -189,7 +191,7 @@ reasoning item 以 `item.id` 独立建模，严格保存 `startedAtMs`／`comple
 | `mcpServer/elicitation/request` | 服务端请求 | 默认 | MCP elicitation payload 当前不解析 | 同上 | 无 | 无 | 未接入 | `-32601` 后 fail-fast |
 | `initialized` | 客户端通知 | 默认 | `params={}`，无 id；仅在当前 generation 的 `initialize` 成功后发送一次 | `CodexAppServerManager::start_generation` | 无 | 解锁该长期连接上的全部业务请求 | 已接入 | 同一应用两轮与并发首次调用都只有一次；`one_new_conversation_runs_two_turns_on_one_initialized_process`、`concurrent_first_calls_single_flight_initialize_and_shutdown_waits_once` |
 | `account/login/completed` | 服务端通知 | 默认 | `params: AccountLoginCompletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `account/rateLimits/updated` | 服务端通知 | 默认 | 严格读取必填 `rateLimits` 稀疏快照；覆盖 limit id/name、primary/secondary 窗口、credits、individual limit、spend-control、plan type 与 reached type；枚举仅接受 0.152.0 schema 值 | 单 reader 的 app-scoped 分支、`parse_account_rate_limits_updated`、connection event hub | `AgentConnectionEvent::AccountRateLimitsUpdated` | 即使没有 active turn 也保存并广播快照；Composer 合并可用字段且不结束 turn | 已接入 | 不会投递给任意 active turn；新订阅者可回放最新快照；严格 schema 回归与 `app_scoped_events_are_published_without_an_active_turn_and_replayed_as_snapshots` 覆盖 |
+| `account/rateLimits/updated` | 服务端通知 | 默认 | 严格读取必填 `rateLimits` 稀疏快照；覆盖 limit id/name、primary/secondary 窗口、credits、individual limit、spend-control、plan type 与 reached type；枚举仅接受 0.152.1 schema 值 | 单 reader 的 app-scoped 分支、`parse_account_rate_limits_updated`、connection event hub | `AgentConnectionEvent::AccountRateLimitsUpdated` | 即使没有 active turn 也保存并广播快照；Composer 合并可用字段且不结束 turn | 已接入 | 不会投递给任意 active turn；新订阅者可回放最新快照；严格 schema 回归与 `app_scoped_events_are_published_without_an_active_turn_and_replayed_as_snapshots` 覆盖 |
 | `account/updated` | 服务端通知 | 默认 | `params: AccountUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `app/list/updated` | 服务端通知 | 默认 | `params: AppListUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `autoApprovalReview/strictReviewRequired` | 服务端通知 | 默认 | `params: StrictReviewRequiredNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
@@ -229,20 +231,20 @@ reasoning item 以 `item.id` 独立建模，严格保存 `startedAtMs`／`comple
 | `modelProvider/authRecoveryStarted` | 服务端通知 | 默认 | `threadId`、`turnId`、`provider`、`message`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `process/exited` | 服务端通知 | 默认 | `params: ProcessExitedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `process/outputDelta` | 服务端通知 | 默认 | `params: ProcessOutputDeltaNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `project/changed` | 服务端通知 | 默认 | `params: ProjectChangedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
+| `project/changed` | 服务端通知 | 默认 | 严格读取 `projectId` 与 `changeType=created/updated/deleted` | 单 reader 的 workspace 分支、connection event hub → `WorkspaceStore` | `AgentConnectionEvent::ProjectChanged`／`ProjectChange` | 按稳定 id 刷新或移除项目及关联会话 | 已接入 | 可早于任意 RPC response，不触发 generation fail-fast；scripted 乱序与 store 迟到快照测试 |
 | `remoteControl/status/changed` | 服务端通知 | 默认 | 严格校验 `status`、`serverName`、`installationId` 与 nullable `environmentId` | 单 reader 的 connection-scoped 分支、`validate_remote_control_status_changed` | manager 内连接状态快照 | 无；不会阻断共享连接初始化或后续业务 RPC | 后端已接入 | 仅兼容 app-server 主动连接状态，不建立 Composer UI；未知状态或错误字段使 generation fail-fast |
 | `serverRequest/resolved` | 服务端通知 | 默认 | `threadId` 与保持原类型的 `requestId`；连接级 owner registry 先定位 logical turn，再由该 turn 的 pending/completed registry 还原并核对 thread/turn/item/kind | 单 reader → `server_request_owners` → `handle_server_request_resolved` | 只向 owner turn 发送 `AgentEvent::ServerRequestResolved` | 最终释放对应 command approval、user input 或 permissions approval responder | 已接入 | 多 thread 三类请求可交错且每个最多回复一次；一个 turn 结束只清理自身 request；错误 thread、未知 id 和过期 responder 确定性失败；`interleaved_server_requests_route_by_original_id_and_resolve_once` |
 | `skills/changed` | 服务端通知 | 默认 | `params: SkillsChangedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/archived` | 服务端通知 | 默认 | `params: ThreadArchivedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/closed` | 服务端通知 | 默认 | `params: ThreadClosedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
+| `thread/archived` | 服务端通知 | 默认 | 严格读取 `threadId` | 单 reader 的 workspace 分支、connection event hub → `WorkspaceStore` | `AgentConnectionEvent::ThreadArchived` | 从最近／项目／置顶移除并刷新归档 | 已接入 | 可先于 archive response；server-derived overlay 防止迟到列表回滚；连接保持存活 |
+| `thread/closed` | 服务端通知 | 默认 | 严格读取 `threadId`；同时从当前 generation loaded set 移除 | 单 reader 的 workspace 分支、connection event hub → `WorkspaceStore` | `AgentConnectionEvent::ThreadClosed`、`ThreadActivity::Closed` | 清除该会话活动标识；后台 host 不误收其他会话事件 | 已接入 | 可先于 response 且不 fail-fast；scripted 七类 workspace 通知测试 |
 | `thread/compacted` | 服务端通知 | 默认 | `params: ContextCompactedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/deleted` | 服务端通知 | 默认 | `params: ThreadDeletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
+| `thread/deleted` | 服务端通知 | 默认 | 严格读取 `threadId`；从当前 generation loaded set 移除 | 单 reader 的 workspace 分支、connection event hub → `WorkspaceStore` | `AgentConnectionEvent::ThreadDeleted` | 从所有 sidebar collection 移除 | 已接入 | deleted overlay 确保随后到达的旧 list response 不复活会话；scripted/fake backend 覆盖 |
 | `thread/environment/connected` | 服务端通知 | 默认 | `params: EnvironmentConnectionNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/environment/disconnected` | 服务端通知 | 默认 | `params: EnvironmentConnectionNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/goal/cleared` | 服务端通知 | 默认 | 仅在既有 thread 的 resume bootstrap 窗口接收：`thread/resume` 请求开始至紧随其后的 `turn/start` response 完成；严格要求匹配 `threadId` | 单 reader、`pending_thread_lifecycle`／`resume_bootstrap_threads`、`validate_resume_goal_cleared` | resume 生命周期兼容信号 | 无；不新增 goal 状态或 UI | 部分接入 | bootstrap 之外仍 fail-fast；多个 thread 的 resume 窗口与下一条 lifecycle 请求显式隔离；既有字段/错配测试、`existing_thread_resumes_once_per_generation_then_starts_turns_directly`、`late_resume_bootstrap_notification_is_not_bound_to_another_resume` 覆盖 |
 | `thread/goal/updated` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
-| `thread/name/updated` | 服务端通知 | 默认 | `params: ThreadNameUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/project/updated` | 服务端通知 | 默认 | `params: ThreadProjectUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
+| `thread/name/updated` | 服务端通知 | 默认 | 严格读取 `threadId`，`threadName` 可省略／null／字符串 | 单 reader 的 workspace 分支、connection event hub → `WorkspaceStore` | `AgentConnectionEvent::ThreadNameUpdated` | 即时更新所有列表中的会话名称 | 已接入 | 通知可先于 rename response；名称 overlay 覆盖随后旧 snapshot；严格字段测试 |
+| `thread/project/updated` | 服务端通知 | 默认 | 严格读取 `threadId` 与必需但 nullable 的 `projectId` | 单 reader 的 workspace 分支、connection event hub → `WorkspaceStore` | `AgentConnectionEvent::ThreadProjectUpdated` | 即时把会话移入／移出项目分组 | 已接入 | 通知可先于 metadata response；project overlay 防止迟到列表回滚；null 解析测试 |
 | `thread/queue/changed` | 服务端通知 | 默认 | `params: ThreadQueueChangedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/realtime/closed` | 服务端通知 | 默认 | `params: ThreadRealtimeClosedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `thread/realtime/error` | 服务端通知 | 默认 | `params: ThreadRealtimeErrorNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
@@ -260,7 +262,7 @@ reasoning item 以 `item.id` 独立建模，严格保存 `startedAtMs`／`comple
 | `thread/started` | 服务端通知 | 默认 | 严格读取 `params.thread.id`；thread id 仍以请求 response 为 canonical 来源 | 单 reader、串行 `pending_thread_lifecycle`、当前 generation 的 loaded-thread set | 与唯一进行中的 `thread/start`／`thread/resume` 关联；新 thread 映射 `AgentEvent::ThreadCreated` | Composer 的 `thread_id` 只由 canonical response 更新一次 | 已接入 | 通知先于 response 时缓存关联；已加载 thread 的迟到通知不会绑定到下一条 lifecycle 请求；未知、冲突或 canonical 不一致使 generation fail-fast；`one_new_conversation_runs_two_turns_on_one_initialized_process`、`late_loaded_thread_notification_does_not_bind_the_next_lifecycle`、既有严格解析测试 |
 | `thread/status/changed` | 服务端通知 | 默认 | 严格读取 `threadId` 与 `notLoaded/idle/systemError/active`；`active` 仅接受已知 flags | 单 reader 的 thread-scoped 分支、connection event hub | `AgentConnectionEvent::ThreadStatusChanged` | 只按目标 thread id 保存最新 GPUI 状态；不结束 turn | 已接入 | 不替代 turn 终态；可在没有 active turn 时保存，其他 thread 的 Composer 不消费；未知状态/flag fail-fast |
 | `thread/tokenUsage/updated` | 服务端通知 | 默认 | 严格读取 `threadId`、`turnId`、`tokenUsage.total/last` 与可选 context window | 单 reader 的 turn-scoped 分支、`threadId + turnId` registry、`parse_thread_token_usage_updated` | 只向 owner `AgentRun` 发送 `AgentEvent::ThreadTokenUsageUpdated` | 目标 Composer 保存用量；不生成活动、不结束 turn | 已接入 | 多 thread 交错按复合 id 隔离；未知或已完成 turn、错配 id、字段错误使 generation fail-fast |
-| `thread/unarchived` | 服务端通知 | 默认 | `params: ThreadUnarchivedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
+| `thread/unarchived` | 服务端通知 | 默认 | 严格读取 `threadId` | 单 reader 的 workspace 分支、connection event hub → `WorkspaceStore` | `AgentConnectionEvent::ThreadUnarchived` | 从归档移除并刷新最近／项目列表 | 已接入 | 可先于 unarchive response；与 archived 通知按最新 connection snapshot/overlay 生效，不触发 fail-fast |
 | `turn/completed` | 服务端通知 | 默认 | `params.turn.status` 为 `completed`、`interrupted` 或 `failed`；失败读取 error message/details | 单 reader → `threadId + turnId` registry → `process_turn_message`、`Connection::finish_turn` | 只向对应 `AgentRun` 发送一个 `Completed`、`Interrupted` 或 `Failed` | 结束该 turn、定向清理 responder；共享 app-server 与其他 thread 保持存活 | 已接入 | 未知终态 fail-fast；一个 thread 失败不影响另一个；完成后同一 thread 可直接新 `turn/start`；`interleaved_threads_route_events_and_one_failed_turn_does_not_stop_the_other`、`one_new_conversation_runs_two_turns_on_one_initialized_process` |
 | `turn/diff/updated` | 服务端通知 | 默认 | `params: TurnDiffUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
 | `turn/moderationMetadata` | 服务端通知 | 默认 | `params: TurnModerationMetadataNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |

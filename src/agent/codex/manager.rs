@@ -23,9 +23,15 @@ use super::{
     validate_remote_control_status_changed, validate_resume_goal_cleared,
 };
 use crate::agent::{
-    AgentConnectionEvent, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
-    AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentPermissionMode,
-    AgentPermissionProfile, AgentRequest, AgentRun, AgentServerRequestId, AgentThreadSettings,
+    AgentCapabilities, AgentCapability, AgentConnectionEvent, AgentEvent, AgentInterruptControl,
+    AgentInterruptHandle, AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentOptionalField,
+    AgentPermissionMode, AgentPermissionProfile, AgentRequest, AgentRun, AgentServerRequestId,
+    AgentThreadActiveFlag, AgentThreadSettings, CommandExecutionStatus, CreateProject, FilterValue,
+    HistoryItemDetail, HistoryTurnStatus, Page, PageRequest, Project, ProjectChange, ProjectId,
+    SortDirection, ThreadActivity, ThreadHistoryItem, ThreadHistoryItemEntry, ThreadId,
+    ThreadListRequest, ThreadMetadataUpdate, ThreadSearchResult, ThreadSection,
+    ThreadSectionAppearance, ThreadSectionId, ThreadSummary, ThreadTurn, UpdateProject,
+    WorkspaceError, WorkspaceResult,
 };
 
 trait ManagedProcess: Send + Sync {
@@ -118,6 +124,23 @@ fn connection_event_key(event: &AgentConnectionEvent) -> String {
         }
         AgentConnectionEvent::ThreadSettingsUpdated { thread_id, .. } => {
             format!("thread-settings:{thread_id}")
+        }
+        AgentConnectionEvent::ProjectChanged { project_id, .. } => {
+            format!("project:{project_id}")
+        }
+        AgentConnectionEvent::ThreadArchived { thread_id }
+        | AgentConnectionEvent::ThreadUnarchived { thread_id }
+        | AgentConnectionEvent::ThreadDeleted { thread_id } => {
+            format!("thread-membership:{thread_id}")
+        }
+        AgentConnectionEvent::ThreadNameUpdated { thread_id, .. } => {
+            format!("thread-name:{thread_id}")
+        }
+        AgentConnectionEvent::ThreadClosed { thread_id } => {
+            format!("thread-closed:{thread_id}")
+        }
+        AgentConnectionEvent::ThreadProjectUpdated { thread_id, .. } => {
+            format!("thread-project:{thread_id}")
         }
         AgentConnectionEvent::AccountRateLimitsUpdated(_) => "rate-limits".to_owned(),
     }
@@ -830,6 +853,393 @@ fn turn_id_from_turn_message(message: &Value) -> Result<String> {
         .with_context(|| format!("{method} 消息缺少字符串 {pointer}"))
 }
 
+fn required_param_string(message: &Value, field: &str, method: &str) -> Result<String> {
+    message
+        .get("params")
+        .and_then(|params| params.get(field))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("{method} 缺少字符串 params.{field}"))
+}
+
+fn optional_nullable_param_string(
+    message: &Value,
+    field: &str,
+    method: &str,
+) -> Result<Option<String>> {
+    match message.get("params").and_then(|params| params.get(field)) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => bail!("{method} 的 params.{field} 必须是字符串或 null"),
+        None => Ok(None),
+    }
+}
+
+fn required_nullable_param_string(
+    message: &Value,
+    field: &str,
+    method: &str,
+) -> Result<Option<String>> {
+    match message.get("params").and_then(|params| params.get(field)) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => bail!("{method} 的 params.{field} 必须是字符串或 null"),
+        None => bail!("{method} 缺少 params.{field}"),
+    }
+}
+
+fn object_field<'a>(value: &'a Value, field: &str, context: &str) -> Result<&'a Value> {
+    value
+        .as_object()
+        .and_then(|object| object.get(field))
+        .with_context(|| format!("{context} 缺少字段 `{field}`"))
+}
+
+fn string_field(value: &Value, field: &str, context: &str) -> Result<String> {
+    object_field(value, field, context)?
+        .as_str()
+        .map(str::to_owned)
+        .with_context(|| format!("{context}.{field} 必须是字符串"))
+}
+
+fn integer_field(value: &Value, field: &str, context: &str) -> Result<i64> {
+    object_field(value, field, context)?
+        .as_i64()
+        .with_context(|| format!("{context}.{field} 必须是整数"))
+}
+
+fn optional_nullable_integer_field(
+    value: &Value,
+    field: &str,
+    context: &str,
+) -> Result<Option<i64>> {
+    match value.as_object().and_then(|object| object.get(field)) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .map(Some)
+            .with_context(|| format!("{context}.{field} 必须是 int64 或 null")),
+        Some(_) => bail!("{context}.{field} 必须是 int64 或 null"),
+    }
+}
+
+fn nullable_string_field(value: &Value, field: &str, context: &str) -> Result<Option<String>> {
+    match object_field(value, field, context)? {
+        Value::Null => Ok(None),
+        Value::String(value) => Ok(Some(value.clone())),
+        _ => bail!("{context}.{field} 必须是字符串或 null"),
+    }
+}
+
+fn optional_nullable_string_field(
+    value: &Value,
+    field: &str,
+    context: &str,
+) -> Result<Option<String>> {
+    match value.as_object().and_then(|object| object.get(field)) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => bail!("{context}.{field} 必须是字符串或 null"),
+    }
+}
+
+fn parse_project(value: &Value) -> Result<Project> {
+    let roots = object_field(value, "roots", "project")?
+        .as_array()
+        .context("project.roots 必须是数组")?
+        .iter()
+        .map(|root| string_field(root, "path", "project root").map(PathBuf::from))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Project {
+        project_id: string_field(value, "id", "project")?,
+        name: string_field(value, "name", "project")?,
+        roots,
+        created_at: integer_field(value, "createdAt", "project")?,
+        updated_at: integer_field(value, "updatedAt", "project")?,
+        recency_at: optional_nullable_integer_field(value, "recencyAt", "project")?,
+        position: integer_field(value, "position", "project")?,
+    })
+}
+
+fn parse_thread_section(value: &Value) -> Result<ThreadSection> {
+    let appearance = match value
+        .as_object()
+        .and_then(|object| object.get("appearance"))
+    {
+        None | Some(Value::Null) => None,
+        Some(appearance @ Value::Object(_)) => Some(ThreadSectionAppearance {
+            icon: optional_nullable_string_field(appearance, "icon", "thread section appearance")?,
+            color: optional_nullable_string_field(
+                appearance,
+                "color",
+                "thread section appearance",
+            )?,
+        }),
+        Some(_) => bail!("thread section.appearance 必须是对象或 null"),
+    };
+    Ok(ThreadSection {
+        section_id: string_field(value, "id", "thread section")?,
+        name: string_field(value, "name", "thread section")?,
+        appearance,
+    })
+}
+
+fn parse_thread_activity(value: &Value) -> Result<ThreadActivity> {
+    let kind = string_field(value, "type", "thread status")?;
+    Ok(match kind.as_str() {
+        "notLoaded" => ThreadActivity::NotLoaded,
+        "idle" => ThreadActivity::Idle,
+        "systemError" => ThreadActivity::SystemError,
+        "active" => {
+            let flags = object_field(value, "activeFlags", "thread status")?
+                .as_array()
+                .context("thread status.activeFlags 必须是数组")?
+                .iter()
+                .map(|flag| {
+                    Ok(
+                        match flag
+                            .as_str()
+                            .context("thread status.activeFlags 项必须是字符串")?
+                        {
+                            "waitingOnApproval" => AgentThreadActiveFlag::WaitingOnApproval,
+                            "waitingOnUserInput" => AgentThreadActiveFlag::WaitingOnUserInput,
+                            flag => bail!("thread status.activeFlags 包含未知值 `{flag}`"),
+                        },
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ThreadActivity::Active { flags }
+        }
+        _ => bail!("thread status.type 包含未知值 `{kind}`"),
+    })
+}
+
+fn parse_thread_summary(value: &Value) -> Result<ThreadSummary> {
+    let preview = string_field(value, "preview", "thread")?;
+    let name = optional_nullable_string_field(value, "name", "thread")?;
+    let title = name
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            preview
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "新对话".to_owned());
+    let section = match value.as_object().and_then(|object| object.get("section")) {
+        None | Some(Value::Null) => None,
+        Some(section @ Value::Object(_)) => Some(parse_thread_section(section)?),
+        Some(_) => bail!("thread.section 必须是对象或 null"),
+    };
+    Ok(ThreadSummary {
+        thread_id: string_field(value, "id", "thread")?,
+        title,
+        preview,
+        cwd: PathBuf::from(string_field(value, "cwd", "thread")?),
+        project_id: nullable_string_field(value, "projectId", "thread")?,
+        section,
+        created_at: integer_field(value, "createdAt", "thread")?,
+        updated_at: integer_field(value, "updatedAt", "thread")?,
+        recency_at: optional_nullable_integer_field(value, "recencyAt", "thread")?,
+        activity: parse_thread_activity(object_field(value, "status", "thread")?)?,
+    })
+}
+
+fn parse_command_status(value: &str) -> Result<CommandExecutionStatus> {
+    match value {
+        "inProgress" => Ok(CommandExecutionStatus::InProgress),
+        "completed" => Ok(CommandExecutionStatus::Completed),
+        "failed" | "declined" => Ok(CommandExecutionStatus::Failed),
+        other => bail!("commandExecution.status 包含未知值 `{other}`"),
+    }
+}
+
+fn string_array_field(value: &Value, field: &str, context: &str) -> Result<Vec<String>> {
+    match value.as_object().and_then(|object| object.get(field)) {
+        None => Ok(Vec::new()),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .with_context(|| format!("{context}.{field} 项必须是字符串"))
+            })
+            .collect(),
+        Some(_) => bail!("{context}.{field} 必须是数组"),
+    }
+}
+
+fn parse_history_item(value: &Value) -> Result<ThreadHistoryItem> {
+    let kind = string_field(value, "type", "thread item")?;
+    let item_id = string_field(value, "id", "thread item")?;
+    match kind.as_str() {
+        "userMessage" => {
+            let content = object_field(value, "content", "userMessage item")?
+                .as_array()
+                .context("userMessage item.content 必须是数组")?;
+            let text = content
+                .iter()
+                .filter_map(|part| {
+                    (part.get("type").and_then(Value::as_str) == Some("text"))
+                        .then(|| part.get("text").and_then(Value::as_str))
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(ThreadHistoryItem::UserMessage { item_id, text })
+        }
+        "agentMessage" => Ok(ThreadHistoryItem::AssistantMessage {
+            item_id,
+            text: string_field(value, "text", "agentMessage item")?,
+        }),
+        "reasoning" => Ok(ThreadHistoryItem::Reasoning {
+            item_id,
+            summary: string_array_field(value, "summary", "reasoning item")?,
+            content: string_array_field(value, "content", "reasoning item")?,
+        }),
+        "commandExecution" => Ok(ThreadHistoryItem::Command {
+            item_id,
+            command: string_field(value, "command", "commandExecution item")?,
+            output: optional_nullable_string_field(
+                value,
+                "aggregatedOutput",
+                "commandExecution item",
+            )?
+            .unwrap_or_default(),
+            status: parse_command_status(&string_field(value, "status", "commandExecution item")?)?,
+        }),
+        _ => Ok(ThreadHistoryItem::Unsupported { item_id, kind }),
+    }
+}
+
+fn parse_history_turn(value: &Value) -> Result<ThreadTurn> {
+    let status = match string_field(value, "status", "turn")?.as_str() {
+        "inProgress" => HistoryTurnStatus::InProgress,
+        "completed" => HistoryTurnStatus::Completed,
+        "interrupted" => HistoryTurnStatus::Interrupted,
+        "failed" => HistoryTurnStatus::Failed,
+        value => bail!("turn.status 包含未知值 `{value}`"),
+    };
+    let items_view = match optional_nullable_string_field(value, "itemsView", "turn")?
+        .as_deref()
+        .unwrap_or("full")
+    {
+        "notLoaded" => HistoryItemDetail::NotLoaded,
+        "summary" => HistoryItemDetail::Summary,
+        "full" => HistoryItemDetail::Full,
+        value => bail!("turn.itemsView 包含未知值 `{value}`"),
+    };
+    let items = object_field(value, "items", "turn")?
+        .as_array()
+        .context("turn.items 必须是数组")?
+        .iter()
+        .map(parse_history_item)
+        .collect::<Result<Vec<_>>>()?;
+    let error = match value.as_object().and_then(|object| object.get("error")) {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(error)) => error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        Some(_) => bail!("turn.error 必须是对象或 null"),
+    };
+    Ok(ThreadTurn {
+        turn_id: string_field(value, "id", "turn")?,
+        status,
+        items_view,
+        items,
+        started_at: optional_nullable_integer_field(value, "startedAt", "turn")?,
+        completed_at: optional_nullable_integer_field(value, "completedAt", "turn")?,
+        duration_ms: optional_nullable_integer_field(value, "durationMs", "turn")?,
+        error,
+    })
+}
+
+fn response_result<'a>(response: &'a Value, method: &str) -> Result<&'a Value> {
+    response
+        .get("result")
+        .with_context(|| format!("{method} 响应缺少 result"))
+}
+
+fn page_cursors(result: &Value, method: &str) -> Result<(Option<String>, Option<String>)> {
+    let next = optional_nullable_string_field(result, "nextCursor", method)?;
+    let backwards = optional_nullable_string_field(result, "backwardsCursor", method)?;
+    Ok((next, backwards))
+}
+
+fn validate_workspace_response<T>(
+    connection: &Connection,
+    method: &str,
+    parsed: Result<T>,
+) -> Result<T> {
+    match parsed {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let message = format!("无法解析 {method} 响应；Codex 0.152.1 schema 不匹配：{error:#}");
+            connection.fail_protocol(message.clone());
+            bail!(message)
+        }
+    }
+}
+
+fn sort_direction(direction: SortDirection) -> &'static str {
+    match direction {
+        SortDirection::Ascending => "asc",
+        SortDirection::Descending => "desc",
+    }
+}
+
+fn thread_sort_key(sort_key: crate::agent::ThreadSortKey) -> &'static str {
+    match sort_key {
+        crate::agent::ThreadSortKey::CreatedAt => "created_at",
+        crate::agent::ThreadSortKey::UpdatedAt => "updated_at",
+        crate::agent::ThreadSortKey::RecencyAt => "recency_at",
+        crate::agent::ThreadSortKey::SectionPosition => "section_position",
+    }
+}
+
+fn insert_filter_value(
+    params: &mut serde_json::Map<String, Value>,
+    field: &str,
+    filter: &FilterValue<String>,
+) {
+    match filter {
+        FilterValue::Any => {}
+        FilterValue::None => {
+            params.insert(field.to_owned(), Value::Null);
+        }
+        FilterValue::Value(value) => {
+            params.insert(field.to_owned(), Value::String(value.clone()));
+        }
+    }
+}
+
+fn thread_list_params(request: &ThreadListRequest) -> Value {
+    let mut params = serde_json::Map::new();
+    params.insert("cursor".into(), json!(request.page.cursor));
+    params.insert("limit".into(), json!(request.page.limit));
+    params.insert("archived".into(), json!(request.archived));
+    params.insert(
+        "sortKey".into(),
+        Value::String(thread_sort_key(request.sort_key).to_owned()),
+    );
+    params.insert(
+        "sortDirection".into(),
+        Value::String(sort_direction(request.sort_direction).to_owned()),
+    );
+    if let Some(search_term) = request
+        .search_term
+        .as_deref()
+        .filter(|search_term| !search_term.trim().is_empty())
+    {
+        params.insert("searchTerm".into(), Value::String(search_term.to_owned()));
+    }
+    insert_filter_value(&mut params, "projectId", &request.project);
+    insert_filter_value(&mut params, "sectionId", &request.section);
+    Value::Object(params)
+}
+
 #[derive(Default)]
 struct ManagerState {
     current: Option<Arc<Connection>>,
@@ -1106,6 +1516,64 @@ impl ManagerInner {
         match method {
             "thread/started" => self.handle_thread_started(connection, message),
             "thread/goal/cleared" => self.handle_resume_goal_cleared(connection, message),
+            "project/changed" => {
+                let project_id = required_param_string(message, "projectId", method)?;
+                let change = match required_param_string(message, "changeType", method)?.as_str() {
+                    "created" => ProjectChange::Created,
+                    "updated" => ProjectChange::Updated,
+                    "deleted" => ProjectChange::Deleted,
+                    value => bail!("project/changed 的 changeType 为未知值 `{value}`"),
+                };
+                self.publish_connection_event(AgentConnectionEvent::ProjectChanged {
+                    project_id,
+                    change,
+                });
+                Ok(())
+            }
+            "thread/archived" => {
+                let thread_id = required_param_string(message, "threadId", method)?;
+                self.publish_connection_event(AgentConnectionEvent::ThreadArchived { thread_id });
+                Ok(())
+            }
+            "thread/unarchived" => {
+                let thread_id = required_param_string(message, "threadId", method)?;
+                self.publish_connection_event(AgentConnectionEvent::ThreadUnarchived { thread_id });
+                Ok(())
+            }
+            "thread/deleted" => {
+                let thread_id = required_param_string(message, "threadId", method)?;
+                if let Ok(mut state) = connection.state.lock() {
+                    state.loaded_threads.remove(&thread_id);
+                }
+                self.publish_connection_event(AgentConnectionEvent::ThreadDeleted { thread_id });
+                Ok(())
+            }
+            "thread/name/updated" => {
+                let thread_id = required_param_string(message, "threadId", method)?;
+                let name = optional_nullable_param_string(message, "threadName", method)?;
+                self.publish_connection_event(AgentConnectionEvent::ThreadNameUpdated {
+                    thread_id,
+                    name,
+                });
+                Ok(())
+            }
+            "thread/closed" => {
+                let thread_id = required_param_string(message, "threadId", method)?;
+                if let Ok(mut state) = connection.state.lock() {
+                    state.loaded_threads.remove(&thread_id);
+                }
+                self.publish_connection_event(AgentConnectionEvent::ThreadClosed { thread_id });
+                Ok(())
+            }
+            "thread/project/updated" => {
+                let thread_id = required_param_string(message, "threadId", method)?;
+                let project_id = required_nullable_param_string(message, "projectId", method)?;
+                self.publish_connection_event(AgentConnectionEvent::ThreadProjectUpdated {
+                    thread_id,
+                    project_id,
+                });
+                Ok(())
+            }
             "serverRequest/resolved" => {
                 let request_id = request_id_from_value(
                     message
@@ -1415,6 +1883,593 @@ impl CodexAppServerManager {
             .unwrap_or_else(|_| async_channel::unbounded().1)
     }
 
+    pub(super) fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities::new([
+            AgentCapability::ProjectList,
+            AgentCapability::ProjectCreate,
+            AgentCapability::ProjectUpdate,
+            AgentCapability::ProjectDelete,
+            AgentCapability::ProjectMove,
+            AgentCapability::ThreadList,
+            AgentCapability::ThreadSearch,
+            AgentCapability::ThreadRead,
+            AgentCapability::ThreadTurnsList,
+            AgentCapability::ThreadItemsList,
+            AgentCapability::ThreadRename,
+            AgentCapability::ThreadArchive,
+            AgentCapability::ThreadUnarchive,
+            AgentCapability::ThreadDelete,
+            AgentCapability::ThreadMetadataUpdate,
+            AgentCapability::ThreadSectionList,
+            AgentCapability::ThreadSectionCreate,
+            AgentCapability::ThreadSectionMove,
+        ])
+    }
+
+    fn workspace_call<T, F>(&self, operation: F) -> Receiver<WorkspaceResult<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(CodexAppServerManager) -> Result<T> + Send + 'static,
+    {
+        let (sender, receiver) = async_channel::bounded(1);
+        let manager = self.clone();
+        std::thread::spawn(move || {
+            let result =
+                operation(manager).map_err(|error| WorkspaceError::backend(format!("{error:#}")));
+            let _ = sender.send_blocking(result);
+        });
+        receiver
+    }
+
+    pub(super) fn list_projects(
+        &self,
+        page: PageRequest,
+    ) -> Receiver<WorkspaceResult<Page<Project>>> {
+        self.workspace_call(move |manager| manager.list_projects_blocking(page))
+    }
+
+    fn list_projects_blocking(&self, page: PageRequest) -> Result<Page<Project>> {
+        let connection = self.inner.ensure_connection()?;
+        let response = connection.request(
+            "project/list",
+            json!({
+                "cursor": page.cursor,
+                "limit": page.limit,
+                "sortKey": "position",
+                "sortDirection": "asc"
+            }),
+        )?;
+        validate_workspace_response(
+            &connection,
+            "project/list",
+            (|| {
+                let result = response_result(&response, "project/list")?;
+                let data = object_field(result, "data", "project/list result")?
+                    .as_array()
+                    .context("project/list result.data 必须是数组")?
+                    .iter()
+                    .map(parse_project)
+                    .collect::<Result<Vec<_>>>()?;
+                let (next_cursor, backwards_cursor) = page_cursors(result, "project/list result")?;
+                Ok(Page {
+                    data,
+                    next_cursor,
+                    backwards_cursor,
+                })
+            })(),
+        )
+    }
+
+    pub(super) fn create_project(
+        &self,
+        project: CreateProject,
+    ) -> Receiver<WorkspaceResult<Project>> {
+        self.workspace_call(move |manager| manager.create_project_blocking(project))
+    }
+
+    fn create_project_blocking(&self, project: CreateProject) -> Result<Project> {
+        static NEXT_IDEMPOTENCY_KEY: AtomicU64 = AtomicU64::new(1);
+        let connection = self.inner.ensure_connection()?;
+        let roots = project
+            .roots
+            .into_iter()
+            .map(|path| json!({ "path": path }))
+            .collect::<Vec<_>>();
+        let response = connection.request(
+            "project/create",
+            json!({
+                "idempotencyKey": format!(
+                    "gpui-{}-{}",
+                    std::process::id(),
+                    NEXT_IDEMPOTENCY_KEY.fetch_add(1, Ordering::Relaxed)
+                ),
+                "name": project.name,
+                "roots": roots
+            }),
+        )?;
+        validate_workspace_response(
+            &connection,
+            "project/create",
+            (|| {
+                parse_project(object_field(
+                    response_result(&response, "project/create")?,
+                    "project",
+                    "project/create result",
+                )?)
+            })(),
+        )
+    }
+
+    pub(super) fn update_project(
+        &self,
+        project_id: ProjectId,
+        update: UpdateProject,
+    ) -> Receiver<WorkspaceResult<Project>> {
+        self.workspace_call(move |manager| manager.update_project_blocking(project_id, update))
+    }
+
+    fn update_project_blocking(
+        &self,
+        project_id: ProjectId,
+        update: UpdateProject,
+    ) -> Result<Project> {
+        let connection = self.inner.ensure_connection()?;
+        let mut params = serde_json::Map::new();
+        params.insert("projectId".into(), json!(project_id));
+        if let Some(name) = update.name {
+            params.insert("name".into(), json!(name));
+        }
+        if let Some(roots) = update.roots {
+            params.insert(
+                "roots".into(),
+                Value::Array(
+                    roots
+                        .into_iter()
+                        .map(|path| json!({ "path": path }))
+                        .collect(),
+                ),
+            );
+        }
+        let response = connection.request("project/update", Value::Object(params))?;
+        validate_workspace_response(
+            &connection,
+            "project/update",
+            (|| {
+                parse_project(object_field(
+                    response_result(&response, "project/update")?,
+                    "project",
+                    "project/update result",
+                )?)
+            })(),
+        )
+    }
+
+    pub(super) fn delete_project(&self, project_id: ProjectId) -> Receiver<WorkspaceResult<()>> {
+        self.workspace_call(move |manager| {
+            manager.empty_workspace_request("project/delete", json!({ "projectId": project_id }))
+        })
+    }
+
+    pub(super) fn move_project(
+        &self,
+        project_id: ProjectId,
+        before_project_id: Option<ProjectId>,
+    ) -> Receiver<WorkspaceResult<()>> {
+        self.workspace_call(move |manager| {
+            manager.empty_workspace_request(
+                "project/move",
+                json!({ "projectId": project_id, "beforeProjectId": before_project_id }),
+            )
+        })
+    }
+
+    fn empty_workspace_request(&self, method: &str, params: Value) -> Result<()> {
+        let connection = self.inner.ensure_connection()?;
+        let response = connection.request(method, params)?;
+        validate_workspace_response(
+            &connection,
+            method,
+            (|| {
+                response_result(&response, method)?
+                    .as_object()
+                    .with_context(|| format!("{method} result 必须是对象"))?;
+                Ok(())
+            })(),
+        )
+    }
+
+    pub(super) fn list_threads(
+        &self,
+        request: ThreadListRequest,
+    ) -> Receiver<WorkspaceResult<Page<ThreadSummary>>> {
+        self.workspace_call(move |manager| manager.list_threads_blocking(request))
+    }
+
+    fn list_threads_blocking(&self, request: ThreadListRequest) -> Result<Page<ThreadSummary>> {
+        let connection = self.inner.ensure_connection()?;
+        let response = connection.request("thread/list", thread_list_params(&request))?;
+        validate_workspace_response(
+            &connection,
+            "thread/list",
+            (|| {
+                let result = response_result(&response, "thread/list")?;
+                let data = object_field(result, "data", "thread/list result")?
+                    .as_array()
+                    .context("thread/list result.data 必须是数组")?
+                    .iter()
+                    .map(parse_thread_summary)
+                    .collect::<Result<Vec<_>>>()?;
+                let (next_cursor, backwards_cursor) = page_cursors(result, "thread/list result")?;
+                Ok(Page {
+                    data,
+                    next_cursor,
+                    backwards_cursor,
+                })
+            })(),
+        )
+    }
+
+    pub(super) fn search_threads(
+        &self,
+        request: ThreadListRequest,
+    ) -> Receiver<WorkspaceResult<Page<ThreadSearchResult>>> {
+        self.workspace_call(move |manager| manager.search_threads_blocking(request))
+    }
+
+    fn search_threads_blocking(
+        &self,
+        request: ThreadListRequest,
+    ) -> Result<Page<ThreadSearchResult>> {
+        let search_term = request
+            .search_term
+            .as_deref()
+            .filter(|term| !term.trim().is_empty())
+            .context("thread search 需要非空搜索词")?;
+        let connection = self.inner.ensure_connection()?;
+        let response = connection.request(
+            "thread/search",
+            json!({
+                "searchTerm": search_term,
+                "archived": request.archived,
+                "cursor": request.page.cursor,
+                "limit": request.page.limit,
+                "sortKey": thread_sort_key(request.sort_key),
+                "sortDirection": sort_direction(request.sort_direction)
+            }),
+        )?;
+        validate_workspace_response(
+            &connection,
+            "thread/search",
+            (|| {
+                let result = response_result(&response, "thread/search")?;
+                let data = object_field(result, "data", "thread/search result")?
+                    .as_array()
+                    .context("thread/search result.data 必须是数组")?
+                    .iter()
+                    .map(|entry| {
+                        Ok(ThreadSearchResult {
+                            thread: parse_thread_summary(object_field(
+                                entry,
+                                "thread",
+                                "thread/search entry",
+                            )?)?,
+                            snippet: string_field(entry, "snippet", "thread/search entry")?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let (next_cursor, backwards_cursor) = page_cursors(result, "thread/search result")?;
+                Ok(Page {
+                    data,
+                    next_cursor,
+                    backwards_cursor,
+                })
+            })(),
+        )
+    }
+
+    pub(super) fn read_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> Receiver<WorkspaceResult<ThreadSummary>> {
+        self.workspace_call(move |manager| manager.read_thread_blocking(thread_id))
+    }
+
+    fn read_thread_blocking(&self, thread_id: ThreadId) -> Result<ThreadSummary> {
+        let connection = self.inner.ensure_connection()?;
+        let response = connection.request(
+            "thread/read",
+            json!({ "threadId": thread_id, "includeTurns": false }),
+        )?;
+        validate_workspace_response(
+            &connection,
+            "thread/read",
+            (|| {
+                parse_thread_summary(object_field(
+                    response_result(&response, "thread/read")?,
+                    "thread",
+                    "thread/read result",
+                )?)
+            })(),
+        )
+    }
+
+    pub(super) fn list_thread_turns(
+        &self,
+        thread_id: ThreadId,
+        page: PageRequest,
+        detail: HistoryItemDetail,
+    ) -> Receiver<WorkspaceResult<Page<ThreadTurn>>> {
+        self.workspace_call(move |manager| {
+            manager.list_thread_turns_blocking(thread_id, page, detail)
+        })
+    }
+
+    fn list_thread_turns_blocking(
+        &self,
+        thread_id: ThreadId,
+        page: PageRequest,
+        detail: HistoryItemDetail,
+    ) -> Result<Page<ThreadTurn>> {
+        let connection = self.inner.ensure_connection()?;
+        let response = connection.request(
+            "thread/turns/list",
+            json!({
+                "threadId": thread_id,
+                "cursor": page.cursor,
+                "limit": page.limit,
+                "sortDirection": "asc",
+                "itemsView": match detail {
+                    HistoryItemDetail::NotLoaded => "notLoaded",
+                    HistoryItemDetail::Summary => "summary",
+                    HistoryItemDetail::Full => "full",
+                }
+            }),
+        )?;
+        validate_workspace_response(
+            &connection,
+            "thread/turns/list",
+            (|| {
+                let result = response_result(&response, "thread/turns/list")?;
+                let data = object_field(result, "data", "thread/turns/list result")?
+                    .as_array()
+                    .context("thread/turns/list result.data 必须是数组")?
+                    .iter()
+                    .map(parse_history_turn)
+                    .collect::<Result<Vec<_>>>()?;
+                let (next_cursor, backwards_cursor) =
+                    page_cursors(result, "thread/turns/list result")?;
+                Ok(Page {
+                    data,
+                    next_cursor,
+                    backwards_cursor,
+                })
+            })(),
+        )
+    }
+
+    pub(super) fn list_thread_items(
+        &self,
+        thread_id: ThreadId,
+        turn_id: Option<String>,
+        page: PageRequest,
+    ) -> Receiver<WorkspaceResult<Page<ThreadHistoryItemEntry>>> {
+        self.workspace_call(move |manager| {
+            manager.list_thread_items_blocking(thread_id, turn_id, page)
+        })
+    }
+
+    fn list_thread_items_blocking(
+        &self,
+        thread_id: ThreadId,
+        turn_id: Option<String>,
+        page: PageRequest,
+    ) -> Result<Page<ThreadHistoryItemEntry>> {
+        let connection = self.inner.ensure_connection()?;
+        let response = connection.request(
+            "thread/items/list",
+            json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "cursor": page.cursor,
+                "limit": page.limit,
+                "sortDirection": "asc"
+            }),
+        )?;
+        validate_workspace_response(
+            &connection,
+            "thread/items/list",
+            (|| {
+                let result = response_result(&response, "thread/items/list")?;
+                let data = object_field(result, "data", "thread/items/list result")?
+                    .as_array()
+                    .context("thread/items/list result.data 必须是数组")?
+                    .iter()
+                    .map(|entry| {
+                        Ok(ThreadHistoryItemEntry {
+                            turn_id: string_field(entry, "turnId", "thread/items/list entry")?,
+                            item: parse_history_item(object_field(
+                                entry,
+                                "item",
+                                "thread/items/list entry",
+                            )?)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let (next_cursor, backwards_cursor) =
+                    page_cursors(result, "thread/items/list result")?;
+                Ok(Page {
+                    data,
+                    next_cursor,
+                    backwards_cursor,
+                })
+            })(),
+        )
+    }
+
+    pub(super) fn set_thread_name(
+        &self,
+        thread_id: ThreadId,
+        name: String,
+    ) -> Receiver<WorkspaceResult<()>> {
+        self.workspace_call(move |manager| {
+            manager.empty_workspace_request(
+                "thread/name/set",
+                json!({ "threadId": thread_id, "name": name }),
+            )
+        })
+    }
+
+    pub(super) fn archive_thread(&self, thread_id: ThreadId) -> Receiver<WorkspaceResult<()>> {
+        self.workspace_call(move |manager| {
+            manager.empty_workspace_request("thread/archive", json!({ "threadId": thread_id }))
+        })
+    }
+
+    pub(super) fn unarchive_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> Receiver<WorkspaceResult<ThreadSummary>> {
+        self.workspace_call(move |manager| {
+            let connection = manager.inner.ensure_connection()?;
+            let response =
+                connection.request("thread/unarchive", json!({ "threadId": thread_id }))?;
+            validate_workspace_response(
+                &connection,
+                "thread/unarchive",
+                (|| {
+                    parse_thread_summary(object_field(
+                        response_result(&response, "thread/unarchive")?,
+                        "thread",
+                        "thread/unarchive result",
+                    )?)
+                })(),
+            )
+        })
+    }
+
+    pub(super) fn delete_thread(&self, thread_id: ThreadId) -> Receiver<WorkspaceResult<()>> {
+        self.workspace_call(move |manager| {
+            manager.empty_workspace_request("thread/delete", json!({ "threadId": thread_id }))
+        })
+    }
+
+    pub(super) fn update_thread_metadata(
+        &self,
+        thread_id: ThreadId,
+        update: ThreadMetadataUpdate,
+    ) -> Receiver<WorkspaceResult<ThreadSummary>> {
+        self.workspace_call(move |manager| {
+            let connection = manager.inner.ensure_connection()?;
+            let mut params = serde_json::Map::new();
+            params.insert("threadId".into(), json!(thread_id));
+            match update.project {
+                AgentOptionalField::Unspecified => {}
+                AgentOptionalField::Null => {
+                    // Codex 0.152.1 uses an empty string as the explicit
+                    // project-unassignment sentinel; null only represents an
+                    // omitted optional field in the generated JSON schema.
+                    params.insert("projectId".into(), Value::String(String::new()));
+                }
+                AgentOptionalField::Value(project_id) => {
+                    params.insert("projectId".into(), Value::String(project_id));
+                }
+            }
+            let response = connection.request("thread/metadata/update", Value::Object(params))?;
+            validate_workspace_response(
+                &connection,
+                "thread/metadata/update",
+                (|| {
+                    parse_thread_summary(object_field(
+                        response_result(&response, "thread/metadata/update")?,
+                        "thread",
+                        "thread/metadata/update result",
+                    )?)
+                })(),
+            )
+        })
+    }
+
+    pub(super) fn list_thread_sections(
+        &self,
+        page: PageRequest,
+    ) -> Receiver<WorkspaceResult<Page<ThreadSection>>> {
+        self.workspace_call(move |manager| {
+            let connection = manager.inner.ensure_connection()?;
+            let response = connection.request(
+                "threadSection/list",
+                json!({ "cursor": page.cursor, "limit": page.limit }),
+            )?;
+            validate_workspace_response(
+                &connection,
+                "threadSection/list",
+                (|| {
+                    let result = response_result(&response, "threadSection/list")?;
+                    let data = object_field(result, "data", "threadSection/list result")?
+                        .as_array()
+                        .context("threadSection/list result.data 必须是数组")?
+                        .iter()
+                        .map(parse_thread_section)
+                        .collect::<Result<Vec<_>>>()?;
+                    let (next_cursor, backwards_cursor) =
+                        page_cursors(result, "threadSection/list result")?;
+                    Ok(Page {
+                        data,
+                        next_cursor,
+                        backwards_cursor,
+                    })
+                })(),
+            )
+        })
+    }
+
+    pub(super) fn create_thread_section(
+        &self,
+        name: String,
+        appearance: Option<ThreadSectionAppearance>,
+    ) -> Receiver<WorkspaceResult<ThreadSection>> {
+        self.workspace_call(move |manager| {
+            let connection = manager.inner.ensure_connection()?;
+            let mut params = serde_json::Map::new();
+            params.insert("name".into(), Value::String(name));
+            if let Some(appearance) = appearance {
+                params.insert(
+                    "appearance".into(),
+                    json!({ "icon": appearance.icon, "color": appearance.color }),
+                );
+            }
+            let response = connection.request("threadSection/create", Value::Object(params))?;
+            validate_workspace_response(
+                &connection,
+                "threadSection/create",
+                (|| {
+                    parse_thread_section(object_field(
+                        response_result(&response, "threadSection/create")?,
+                        "section",
+                        "threadSection/create result",
+                    )?)
+                })(),
+            )
+        })
+    }
+
+    pub(super) fn move_thread_to_section(
+        &self,
+        thread_id: ThreadId,
+        section_id: Option<ThreadSectionId>,
+        before_thread_id: Option<ThreadId>,
+    ) -> Receiver<WorkspaceResult<()>> {
+        self.workspace_call(move |manager| {
+            manager.empty_workspace_request(
+                "thread/section/move",
+                json!({
+                    "threadId": thread_id,
+                    "sectionId": section_id,
+                    "beforeThreadId": before_thread_id
+                }),
+            )
+        })
+    }
+
     pub(super) fn load_model_catalog(&self) -> Receiver<Result<AgentModelCatalog, String>> {
         let (sender, receiver) = async_channel::bounded(1);
         let manager = self.clone();
@@ -1449,7 +2504,7 @@ impl CodexAppServerManager {
                 Ok(page) => page,
                 Err(error) => {
                     let message =
-                        format!("无法解析 model/list 响应；0.151.0 schema 不匹配：{error}");
+                        format!("无法解析 model/list 响应；0.152.1 schema 不匹配：{error}");
                     connection.fail_protocol(message.clone());
                     bail!(message);
                 }
@@ -1753,9 +2808,11 @@ impl CodexAppServerManager {
                     json!({
                         "cwd": request.cwd,
                         "ephemeral": false,
+                        "historyMode": "paginated",
                         "serviceName": "gpui-chat-clone",
                         "model": request.model,
-                        "serviceTier": request.service_tier
+                        "serviceTier": request.service_tier,
+                        "projectId": request.project_id
                     }),
                 )
             }
@@ -1882,9 +2939,12 @@ mod tests {
 
     use super::{AppServerSpawner, CodexAppServerManager, ManagedProcess, SpawnedAppServer};
     use crate::agent::{
-        AgentCommandApprovalChoice, AgentEvent, AgentInterruptOutcome, AgentPermissionMode,
-        AgentPermissionsApprovalChoice, AgentRequest, AgentServerRequestId, AgentUserInputAnswer,
-        AgentUserInputResponse,
+        AgentCommandApprovalChoice, AgentConnectionEvent, AgentEvent, AgentInterruptOutcome,
+        AgentOptionalField, AgentPermissionMode, AgentPermissionsApprovalChoice, AgentRequest,
+        AgentServerRequestId, AgentUserInputAnswer, AgentUserInputResponse, CreateProject,
+        FilterValue, HistoryItemDetail, PageRequest, ProjectChange, SortDirection,
+        ThreadHistoryItem, ThreadListRequest, ThreadMetadataUpdate, ThreadSectionAppearance,
+        ThreadSortKey, UpdateProject,
     };
 
     const WAIT: Duration = Duration::from_secs(3);
@@ -2097,6 +3157,7 @@ mod tests {
         AgentRequest {
             prompt: prompt.to_owned(),
             cwd: "/tmp/project".into(),
+            project_id: None,
             thread_id: thread_id.map(str::to_owned),
             model: "gpt-test".to_owned(),
             effort: "medium".to_owned(),
@@ -2218,16 +3279,425 @@ mod tests {
         })
     }
 
+    fn workspace_project(id: &str, name: &str, position: i64) -> Value {
+        json!({
+            "id": id,
+            "name": name,
+            "roots": [{ "path": format!("/tmp/{id}") }],
+            "createdAt": 10,
+            "updatedAt": 20,
+            "recencyAt": 30,
+            "position": position,
+            "metadata": {}
+        })
+    }
+
+    fn workspace_thread(id: &str, project_id: Option<&str>) -> Value {
+        json!({
+            "id": id,
+            "preview": format!("preview for {id}"),
+            "name": format!("name for {id}"),
+            "cwd": "/tmp/workspace",
+            "projectId": project_id,
+            "section": null,
+            "createdAt": 10,
+            "updatedAt": 20,
+            "recencyAt": 30,
+            "status": { "type": "idle" },
+            "cliVersion": "0.152.1",
+            "ephemeral": false,
+            "modelProvider": "openai",
+            "sessionId": id,
+            "source": "cli",
+            "turns": []
+        })
+    }
+
+    fn assert_workspace_request(endpoint: &mut FakeEndpoint, method: &str) -> Value {
+        let request = endpoint.recv();
+        assert_eq!(request["method"], method);
+        assert!(request.get("id").is_some());
+        assert!(
+            !serde_json::to_string(&request)
+                .unwrap()
+                .contains("isPinned"),
+            "0.152.1 does not define isPinned: {request}"
+        );
+        request
+    }
+
+    #[test]
+    fn workspace_notifications_can_precede_their_response_without_failing_the_connection() {
+        let (manager, spawner) = manager_with_fake();
+        let events = manager.subscribe_connection_events();
+        let projects = manager.list_projects(PageRequest {
+            cursor: Some("project-cursor".to_owned()),
+            limit: 25,
+        });
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+        let request = assert_workspace_request(&mut endpoint, "project/list");
+        assert_eq!(request["params"]["cursor"], "project-cursor");
+        assert_eq!(request["params"]["limit"], 25);
+
+        for notification in [
+            json!({
+                "method": "thread/archived",
+                "params": { "threadId": "thr-before" }
+            }),
+            json!({
+                "method": "thread/unarchived",
+                "params": { "threadId": "thr-before" }
+            }),
+            json!({
+                "method": "thread/deleted",
+                "params": { "threadId": "thr-deleted" }
+            }),
+            json!({
+                "method": "thread/name/updated",
+                "params": { "threadId": "thr-before", "threadName": "renamed first" }
+            }),
+            json!({
+                "method": "thread/closed",
+                "params": { "threadId": "thr-before" }
+            }),
+            json!({
+                "method": "project/changed",
+                "params": { "projectId": "project-a", "changeType": "updated" }
+            }),
+            json!({
+                "method": "thread/project/updated",
+                "params": { "threadId": "thr-before", "projectId": null }
+            }),
+        ] {
+            endpoint.send(notification);
+        }
+        endpoint.respond(
+            &request,
+            json!({
+                "data": [workspace_project("project-a", "Project A", 0)],
+                "nextCursor": null
+            }),
+        );
+        assert_eq!(wait_value(&projects).unwrap().data.len(), 1);
+
+        let received = (0..7).map(|_| wait_value(&events)).collect::<Vec<_>>();
+        assert!(received.iter().any(|event| matches!(
+            event,
+            AgentConnectionEvent::ThreadArchived { thread_id } if thread_id == "thr-before"
+        )));
+        assert!(received.iter().any(|event| matches!(
+            event,
+            AgentConnectionEvent::ThreadNameUpdated { thread_id, name }
+                if thread_id == "thr-before" && name.as_deref() == Some("renamed first")
+        )));
+        assert!(received.iter().any(|event| matches!(
+            event,
+            AgentConnectionEvent::ProjectChanged { project_id, change: ProjectChange::Updated }
+                if project_id == "project-a"
+        )));
+        assert!(received.iter().any(|event| matches!(
+            event,
+            AgentConnectionEvent::ThreadProjectUpdated { thread_id, project_id }
+                if thread_id == "thr-before" && project_id.is_none()
+        )));
+
+        let threads = manager.list_threads(ThreadListRequest::default());
+        let thread_request = assert_workspace_request(&mut endpoint, "thread/list");
+        endpoint.respond(
+            &thread_request,
+            json!({ "data": [workspace_thread("thr-live", None)], "nextCursor": null }),
+        );
+        assert_eq!(wait_value(&threads).unwrap().data[0].thread_id, "thr-live");
+        assert!(endpoint.process.is_alive());
+        manager.shutdown();
+    }
+
+    #[test]
+    fn workspace_rpc_surface_matches_the_01521_experimental_schema() {
+        let (manager, spawner) = manager_with_fake();
+        let projects = manager.list_projects(PageRequest::default());
+        let mut endpoint = spawner.next_endpoint();
+        handshake(&mut endpoint);
+
+        let request = assert_workspace_request(&mut endpoint, "project/list");
+        endpoint.respond(
+            &request,
+            json!({
+                "data": [workspace_project("project-a", "Project A", 0)],
+                "nextCursor": "project-next"
+            }),
+        );
+        let page = wait_value(&projects).unwrap();
+        assert_eq!(page.next_cursor.as_deref(), Some("project-next"));
+
+        let created = manager.create_project(CreateProject {
+            name: "Created".to_owned(),
+            roots: vec!["/tmp/created".into()],
+        });
+        let request = assert_workspace_request(&mut endpoint, "project/create");
+        assert_eq!(request["params"]["name"], "Created");
+        assert_eq!(request["params"]["roots"][0]["path"], "/tmp/created");
+        assert!(request["params"]["idempotencyKey"].is_string());
+        endpoint.respond(
+            &request,
+            json!({ "project": workspace_project("project-created", "Created", 1) }),
+        );
+        assert_eq!(wait_value(&created).unwrap().project_id, "project-created");
+
+        let updated = manager.update_project(
+            "project-a".to_owned(),
+            UpdateProject {
+                name: Some("Updated".to_owned()),
+                roots: Some(vec!["/tmp/updated".into()]),
+            },
+        );
+        let request = assert_workspace_request(&mut endpoint, "project/update");
+        assert_eq!(request["params"]["projectId"], "project-a");
+        assert_eq!(request["params"]["name"], "Updated");
+        endpoint.respond(
+            &request,
+            json!({ "project": workspace_project("project-a", "Updated", 0) }),
+        );
+        assert_eq!(wait_value(&updated).unwrap().name, "Updated");
+
+        let moved = manager.move_project("project-a".to_owned(), Some("project-b".to_owned()));
+        let request = assert_workspace_request(&mut endpoint, "project/move");
+        assert_eq!(request["params"]["beforeProjectId"], "project-b");
+        endpoint.respond(&request, json!({}));
+        wait_value(&moved).unwrap();
+
+        let deleted = manager.delete_project("project-a".to_owned());
+        let request = assert_workspace_request(&mut endpoint, "project/delete");
+        assert_eq!(request["params"]["projectId"], "project-a");
+        endpoint.respond(&request, json!({}));
+        wait_value(&deleted).unwrap();
+
+        let listed = manager.list_threads(ThreadListRequest {
+            page: PageRequest {
+                cursor: Some("thread-cursor".to_owned()),
+                limit: 12,
+            },
+            archived: true,
+            project: FilterValue::Value("project-b".to_owned()),
+            section: FilterValue::None,
+            search_term: Some("ignored by list".to_owned()),
+            sort_key: ThreadSortKey::CreatedAt,
+            sort_direction: SortDirection::Ascending,
+        });
+        let request = assert_workspace_request(&mut endpoint, "thread/list");
+        assert_eq!(request["params"]["projectId"], "project-b");
+        assert!(request["params"]["sectionId"].is_null());
+        assert_eq!(request["params"]["sortKey"], "created_at");
+        assert_eq!(request["params"]["sortDirection"], "asc");
+        endpoint.respond(
+            &request,
+            json!({
+                "data": [workspace_thread("thread-a", Some("project-b"))],
+                "nextCursor": null,
+                "backwardsCursor": "thread-back"
+            }),
+        );
+        assert_eq!(
+            wait_value(&listed).unwrap().backwards_cursor.as_deref(),
+            Some("thread-back")
+        );
+
+        let searched = manager.search_threads(ThreadListRequest {
+            search_term: Some("needle".to_owned()),
+            ..ThreadListRequest::default()
+        });
+        let request = assert_workspace_request(&mut endpoint, "thread/search");
+        assert_eq!(request["params"]["searchTerm"], "needle");
+        endpoint.respond(
+            &request,
+            json!({
+                "data": [{
+                    "thread": workspace_thread("thread-search", None),
+                    "snippet": "needle in transcript"
+                }],
+                "nextCursor": null
+            }),
+        );
+        assert_eq!(
+            wait_value(&searched).unwrap().data[0].snippet,
+            "needle in transcript"
+        );
+
+        let read = manager.read_thread("thread-a".to_owned());
+        let request = assert_workspace_request(&mut endpoint, "thread/read");
+        assert_eq!(request["params"]["includeTurns"], false);
+        endpoint.respond(
+            &request,
+            json!({ "thread": workspace_thread("thread-a", Some("project-b")) }),
+        );
+        assert_eq!(wait_value(&read).unwrap().thread_id, "thread-a");
+
+        let turns = manager.list_thread_turns(
+            "thread-a".to_owned(),
+            PageRequest::default(),
+            HistoryItemDetail::Full,
+        );
+        let request = assert_workspace_request(&mut endpoint, "thread/turns/list");
+        assert_eq!(request["params"]["itemsView"], "full");
+        endpoint.respond(
+            &request,
+            json!({
+                "data": [{
+                    "id": "turn-a",
+                    "status": "completed",
+                    "items": [{ "type": "agentMessage", "id": "message-a", "text": "done" }],
+                    "startedAt": 1,
+                    "completedAt": 2,
+                    "durationMs": 1
+                }],
+                "nextCursor": null
+            }),
+        );
+        assert!(matches!(
+            wait_value(&turns).unwrap().data[0].items[0],
+            ThreadHistoryItem::AssistantMessage { .. }
+        ));
+
+        let items = manager.list_thread_items(
+            "thread-a".to_owned(),
+            Some("turn-a".to_owned()),
+            PageRequest::default(),
+        );
+        let request = assert_workspace_request(&mut endpoint, "thread/items/list");
+        assert_eq!(request["params"]["turnId"], "turn-a");
+        endpoint.respond(
+            &request,
+            json!({
+                "data": [{
+                    "turnId": "turn-a",
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "command-a",
+                        "command": "pwd",
+                        "commandActions": [],
+                        "cwd": "/tmp/workspace",
+                        "aggregatedOutput": "/tmp/workspace",
+                        "status": "completed"
+                    }
+                }],
+                "nextCursor": null
+            }),
+        );
+        assert!(matches!(
+            wait_value(&items).unwrap().data[0].item,
+            ThreadHistoryItem::Command { .. }
+        ));
+
+        let renamed = manager.set_thread_name("thread-a".to_owned(), "Renamed".to_owned());
+        let request = assert_workspace_request(&mut endpoint, "thread/name/set");
+        assert_eq!(request["params"]["threadId"], "thread-a");
+        assert_eq!(request["params"]["name"], "Renamed");
+        endpoint.respond(&request, json!({}));
+        wait_value(&renamed).unwrap();
+
+        let archived = manager.archive_thread("thread-a".to_owned());
+        let request = assert_workspace_request(&mut endpoint, "thread/archive");
+        assert_eq!(request["params"]["threadId"], "thread-a");
+        endpoint.respond(&request, json!({}));
+        wait_value(&archived).unwrap();
+
+        let deleted = manager.delete_thread("thread-a".to_owned());
+        let request = assert_workspace_request(&mut endpoint, "thread/delete");
+        assert_eq!(request["params"]["threadId"], "thread-a");
+        endpoint.respond(&request, json!({}));
+        wait_value(&deleted).unwrap();
+
+        let unarchived = manager.unarchive_thread("thread-a".to_owned());
+        let request = assert_workspace_request(&mut endpoint, "thread/unarchive");
+        endpoint.respond(
+            &request,
+            json!({ "thread": workspace_thread("thread-a", None) }),
+        );
+        assert_eq!(wait_value(&unarchived).unwrap().thread_id, "thread-a");
+
+        let metadata = manager.update_thread_metadata(
+            "thread-a".to_owned(),
+            ThreadMetadataUpdate {
+                project: AgentOptionalField::Null,
+            },
+        );
+        let request = assert_workspace_request(&mut endpoint, "thread/metadata/update");
+        assert_eq!(request["params"]["projectId"], "");
+        endpoint.respond(
+            &request,
+            json!({ "thread": workspace_thread("thread-a", None) }),
+        );
+        assert!(wait_value(&metadata).unwrap().project_id.is_none());
+
+        let sections = manager.list_thread_sections(PageRequest::default());
+        let request = assert_workspace_request(&mut endpoint, "threadSection/list");
+        endpoint.respond(
+            &request,
+            json!({
+                "data": [{
+                    "id": "section-pinned",
+                    "name": "Pinned",
+                    "appearance": { "icon": "pin", "color": null }
+                }],
+                "nextCursor": null
+            }),
+        );
+        assert_eq!(
+            wait_value(&sections).unwrap().data[0].section_id,
+            "section-pinned"
+        );
+
+        let section = manager.create_thread_section(
+            "Pinned".to_owned(),
+            Some(ThreadSectionAppearance {
+                icon: Some("pin".to_owned()),
+                color: None,
+            }),
+        );
+        let request = assert_workspace_request(&mut endpoint, "threadSection/create");
+        assert_eq!(request["params"]["appearance"]["icon"], "pin");
+        endpoint.respond(
+            &request,
+            json!({
+                "section": { "id": "section-pinned", "name": "Pinned", "appearance": null }
+            }),
+        );
+        assert_eq!(wait_value(&section).unwrap().section_id, "section-pinned");
+
+        let section_move = manager.move_thread_to_section(
+            "thread-a".to_owned(),
+            Some("section-pinned".to_owned()),
+            None,
+        );
+        let request = assert_workspace_request(&mut endpoint, "thread/section/move");
+        assert_eq!(request["params"]["sectionId"], "section-pinned");
+        assert!(request["params"]["beforeThreadId"].is_null());
+        endpoint.respond(&request, json!({}));
+        wait_value(&section_move).unwrap();
+
+        assert_eq!(spawner.spawn_count.load(Ordering::Acquire), 1);
+        assert!(endpoint.process.is_alive());
+        manager.shutdown();
+    }
+
     #[test]
     fn one_new_conversation_runs_two_turns_on_one_initialized_process() {
         let (manager, spawner) = manager_with_fake();
-        let run = manager.run_prompt(request("first", None));
+        let mut first_request = request("first", None);
+        first_request.cwd = "/tmp/project-with-stable-id".into();
+        first_request.project_id = Some("project-stable-id".to_owned());
+        let run = manager.run_prompt(first_request);
         let (events, interrupt) = run.into_parts();
         let mut endpoint = spawner.next_endpoint();
         handshake(&mut endpoint);
 
         let thread_start = endpoint.recv();
         assert_eq!(thread_start["method"], "thread/start");
+        assert_eq!(thread_start["params"]["cwd"], "/tmp/project-with-stable-id");
+        assert_eq!(thread_start["params"]["projectId"], "project-stable-id");
+        assert_eq!(thread_start["params"]["historyMode"], "paginated");
+        assert!(thread_start["params"].get("isPinned").is_none());
         endpoint.send(json!({
             "method": "thread/started",
             "params": { "thread": { "id": "thr_shared" } }

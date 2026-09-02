@@ -1,4 +1,6 @@
 use std::{
+    collections::HashMap,
+    path::PathBuf,
     process::Command,
     sync::Arc,
     time::{Duration, Instant},
@@ -14,24 +16,32 @@ use gpui::{
 gpui::actions!(permission_ui, [DismissPermissionUi]);
 
 use crate::{
-    agent::{AgentBackend, CodexAppServerBackend, CodexAppServerManager},
+    agent::{AgentBackend, CodexAppServerBackend, CodexAppServerManager, ProjectId, ThreadId},
     components::{
-        composer::{ModelCatalogLoadFinished, RequestFullAccessConfirmation},
+        composer::{
+            ComposerView, ConversationThreadCreated, ModelCatalogLoadFinished,
+            RequestFullAccessConfirmation,
+        },
         file_change::{
             DiffFileVisualState, DiffReviewCallback, DiffReviewEvent, DiffReviewPresentation,
             captured_diff_review_fixture, render_diff_review_panel,
         },
         home::{HomeView, OpenDiffReview},
         icons::icon,
-        sidebar::{OpenProjectCreation, OpenSettings, SidebarView},
+        sidebar::{NewConversation, OpenProjectCreation, OpenSettings, SelectThread, SidebarView},
     },
     settings::{ChangeTheme, CloseSettings, SettingsView},
     theme::{Theme, ThemeMode, UI_FONT_FAMILY, ui_font},
+    workspace::{WorkspaceStore, project_id_for_thread},
 };
 
 pub struct ChatApp {
     codex_app_server: Arc<CodexAppServerManager>,
     _agent_backend: Arc<dyn AgentBackend>,
+    workspace_store: Arc<WorkspaceStore>,
+    conversation_hosts: HashMap<ConversationKey, ConversationHost>,
+    active_conversation: ConversationKey,
+    next_draft_id: u64,
     mode: ThemeMode,
     startup_model_catalog_resolved: bool,
     startup_minimum_duration_elapsed: bool,
@@ -74,6 +84,21 @@ pub struct ChatApp {
     project_creation_keyboard_focus: bool,
     project_creation_focus: FocusHandle,
     project_creation_focus_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct DraftId(u64);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ConversationKey {
+    Draft(DraftId),
+    Thread(ThreadId),
+}
+
+struct ConversationHost {
+    composer: Entity<ComposerView>,
+    cwd: PathBuf,
+    project_id: Option<ProjectId>,
 }
 
 impl Drop for ChatApp {
@@ -272,9 +297,29 @@ impl ChatApp {
         let agent_backend: Arc<dyn AgentBackend> = Arc::new(CodexAppServerBackend::with_manager(
             codex_app_server.clone(),
         ));
-        let sidebar = cx.new(|_| SidebarView::new(mode, scroll_sidebar_to_bottom));
+        let workspace_store = WorkspaceStore::new(agent_backend.clone());
+        let sidebar = cx.new(|cx| {
+            SidebarView::new(mode, scroll_sidebar_to_bottom, workspace_store.clone(), cx)
+        });
+        #[cfg(not(test))]
+        workspace_store.refresh_all();
         let settings = cx.new(|_| SettingsView::new(mode));
         let home = cx.new(|cx| HomeView::new_with_backend(mode, agent_backend.clone(), cx));
+        let initial_composer = home.read(cx).composer_entity();
+        let initial_cwd = std::env::current_dir().unwrap_or_default();
+        initial_composer.update(cx, |composer, cx| {
+            composer.set_workspace_context(initial_cwd.clone(), None, None, cx);
+        });
+        let active_conversation = ConversationKey::Draft(DraftId(1));
+        let mut conversation_hosts = HashMap::new();
+        conversation_hosts.insert(
+            active_conversation.clone(),
+            ConversationHost {
+                composer: initial_composer,
+                cwd: initial_cwd,
+                project_id: None,
+            },
+        );
         cx.subscribe(&sidebar, |this, _, _: &OpenSettings, cx| {
             this.showing_settings = true;
             cx.notify();
@@ -282,6 +327,14 @@ impl ChatApp {
         .detach();
         cx.subscribe(&sidebar, |this, _, _: &OpenProjectCreation, cx| {
             this.open_project_creation(cx);
+        })
+        .detach();
+        cx.subscribe(&sidebar, |this, _, event: &SelectThread, cx| {
+            this.select_conversation(event.thread_id.clone(), cx);
+        })
+        .detach();
+        cx.subscribe(&sidebar, |this, _, event: &NewConversation, cx| {
+            this.start_draft(event.project_id.clone(), event.cwd.clone(), cx);
         })
         .detach();
         cx.subscribe(&settings, |this, _, _: &CloseSettings, cx| {
@@ -301,6 +354,11 @@ impl ChatApp {
             this.home.update(cx, |home, cx| {
                 home.set_mode(event.0, cx);
             });
+            for host in this.conversation_hosts.values() {
+                host.composer.update(cx, |composer, cx| {
+                    composer.set_mode(event.0, cx);
+                });
+            }
             cx.notify();
         })
         .detach();
@@ -318,6 +376,10 @@ impl ChatApp {
             this.open_diff_review(event.0.clone(), cx);
         })
         .detach();
+        cx.subscribe(&home, |this, _, event: &ConversationThreadCreated, cx| {
+            this.rekey_created_thread(event.thread_id.clone(), cx);
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(STARTUP_LOADING_MINIMUM_DURATION)
@@ -331,6 +393,10 @@ impl ChatApp {
         Self {
             codex_app_server,
             _agent_backend: agent_backend,
+            workspace_store,
+            conversation_hosts,
+            active_conversation,
+            next_draft_id: 2,
             mode,
             // Unit tests intentionally exercise the full shell without spawning
             // the external Codex model-catalog process.
@@ -378,6 +444,166 @@ impl ChatApp {
         }
     }
 
+    fn switch_home_to(&mut self, key: ConversationKey, cx: &mut Context<Self>) {
+        let Some(host) = self.conversation_hosts.get(&key) else {
+            return;
+        };
+        let composer = host.composer.clone();
+        let cwd = host.cwd.clone();
+        let project_id = host.project_id.clone();
+        let thread_id = match &key {
+            ConversationKey::Draft(_) => None,
+            ConversationKey::Thread(thread_id) => Some(thread_id.clone()),
+        };
+        composer.update(cx, |composer, cx| {
+            composer.set_workspace_context(cwd, project_id, thread_id, cx);
+        });
+        self.active_conversation = key;
+        self.home
+            .update(cx, |home, cx| home.set_composer(composer, cx));
+        cx.notify();
+    }
+
+    fn start_draft(&mut self, project_id: Option<ProjectId>, cwd: PathBuf, cx: &mut Context<Self>) {
+        let draft_id = DraftId(self.next_draft_id);
+        self.next_draft_id = self.next_draft_id.wrapping_add(1).max(1);
+        let backend = self._agent_backend.clone();
+        let composer = cx.new(|cx| ComposerView::new_with_backend(self.mode, backend, cx));
+        composer.update(cx, |composer, cx| {
+            composer.set_workspace_context(cwd.clone(), project_id.clone(), None, cx);
+        });
+        let key = ConversationKey::Draft(draft_id);
+        self.conversation_hosts.insert(
+            key.clone(),
+            ConversationHost {
+                composer,
+                cwd,
+                project_id,
+            },
+        );
+        self.switch_home_to(key, cx);
+    }
+
+    fn select_conversation(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        let key = ConversationKey::Thread(thread_id.clone());
+        if let Some(host) = self.conversation_hosts.get(&key) {
+            let composer = host.composer.clone();
+            let retry_history = composer.read(cx).history_needs_retry();
+            self.switch_home_to(key, cx);
+            if retry_history {
+                composer.update(cx, |composer, cx| composer.set_history_loading(true, cx));
+                self.load_conversation_history(
+                    ConversationKey::Thread(thread_id.clone()),
+                    thread_id,
+                    composer,
+                    cx,
+                );
+            }
+            return;
+        }
+
+        let snapshot = self.workspace_store.snapshot();
+        let summary = snapshot.thread(&thread_id).cloned().or_else(|| {
+            snapshot
+                .search_results
+                .iter()
+                .find(|result| result.thread.thread_id == thread_id)
+                .map(|result| result.thread.clone())
+        });
+        let cwd = summary
+            .as_ref()
+            .map(|thread| thread.cwd.clone())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        let project_id = summary
+            .as_ref()
+            .and_then(|thread| project_id_for_thread(thread, &snapshot.projects));
+        let backend = self._agent_backend.clone();
+        let composer = cx.new(|cx| ComposerView::new_with_backend(self.mode, backend, cx));
+        composer.update(cx, |composer, cx| {
+            composer.set_workspace_context(
+                cwd.clone(),
+                project_id.clone(),
+                Some(thread_id.clone()),
+                cx,
+            );
+            composer.set_history_loading(true, cx);
+        });
+        self.conversation_hosts.insert(
+            key.clone(),
+            ConversationHost {
+                composer: composer.clone(),
+                cwd,
+                project_id,
+            },
+        );
+        self.switch_home_to(key, cx);
+
+        self.load_conversation_history(
+            ConversationKey::Thread(thread_id.clone()),
+            thread_id,
+            composer,
+            cx,
+        );
+    }
+
+    fn load_conversation_history(
+        &mut self,
+        key: ConversationKey,
+        thread_id: ThreadId,
+        composer: Entity<ComposerView>,
+        cx: &mut Context<Self>,
+    ) {
+        let receiver = self.workspace_store.load_history(thread_id);
+        cx.spawn(async move |this, cx| {
+            let result = receiver.recv().await.unwrap_or_else(|_| {
+                Err(crate::agent::WorkspaceError::backend(
+                    "读取聊天历史的响应通道提前关闭",
+                ))
+            });
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(history) => {
+                    if let Some(host) = this.conversation_hosts.get_mut(&key)
+                        && host.composer == composer
+                    {
+                        host.cwd = history.thread.cwd.clone();
+                        host.project_id = history.thread.project_id.clone();
+                    }
+                    composer.update(cx, |composer, cx| composer.hydrate_history(history, cx));
+                }
+                Err(error) => composer.update(cx, |composer, cx| {
+                    composer.set_history_error(error.user_message("读取聊天历史"), cx)
+                }),
+            });
+        })
+        .detach();
+    }
+
+    fn rekey_created_thread(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        let draft_key = self.conversation_hosts.iter().find_map(|(key, host)| {
+            matches!(key, ConversationKey::Draft(_))
+                .then(|| {
+                    (host.composer.read(cx).thread_id() == Some(thread_id.as_str()))
+                        .then(|| key.clone())
+                })
+                .flatten()
+        });
+        let Some(draft_key) = draft_key else {
+            return;
+        };
+        let Some(host) = self.conversation_hosts.remove(&draft_key) else {
+            return;
+        };
+        let real_key = ConversationKey::Thread(thread_id);
+        if self.active_conversation == draft_key {
+            self.active_conversation = real_key.clone();
+        }
+        self.conversation_hosts.insert(real_key, host);
+        #[cfg(not(test))]
+        self.workspace_store.refresh_all();
+        cx.notify();
+    }
+
     pub fn complete_startup_for_capture(&mut self, cx: &mut Context<Self>) {
         self.startup_model_catalog_resolved = true;
         self.startup_minimum_duration_elapsed = true;
@@ -400,9 +626,9 @@ impl ChatApp {
         });
     }
 
-    pub fn open_project_menu_for_capture(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub fn open_project_menu_for_capture(&mut self, project_id: ProjectId, cx: &mut Context<Self>) {
         self.sidebar.update(cx, |sidebar, cx| {
-            sidebar.open_project_menu_for_capture(index, cx)
+            sidebar.open_project_menu_for_capture(project_id, cx)
         });
     }
 
@@ -412,13 +638,13 @@ impl ChatApp {
         });
     }
 
-    pub fn set_activity_hovered_recent_for_capture(
+    pub fn set_activity_hovered_thread_for_capture(
         &mut self,
-        index: usize,
+        thread_id: ThreadId,
         cx: &mut Context<Self>,
     ) {
         self.sidebar.update(cx, |sidebar, cx| {
-            sidebar.set_activity_hovered_recent_for_capture(index, cx)
+            sidebar.set_activity_hovered_thread_for_capture(thread_id, cx)
         });
     }
 
@@ -664,7 +890,6 @@ impl ChatApp {
         self.permission_confirmation_open = false;
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.close_transient_menus(cx);
-            sidebar.set_project_creation_trigger_open(true, cx);
         });
         cx.notify();
     }
@@ -680,9 +905,6 @@ impl ChatApp {
         self.project_creation_open = false;
         self.project_creation_keyboard_focus = false;
         self.project_creation_focus_pending = false;
-        self.sidebar.update(cx, |sidebar, cx| {
-            sidebar.set_project_creation_trigger_open(false, cx)
-        });
         cx.notify();
     }
 
@@ -2565,16 +2787,22 @@ impl Render for ChatApp {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{path::PathBuf, time::Duration};
 
     use gpui::{
         AppContext, Bounds, MouseButton, TestApp, TestAppWindow, WindowBounds, WindowOptions,
         point, px, size,
     };
 
-    use super::{ChatApp, finder_reveal_command, startup_loading_logo_opacity};
+    use super::{ChatApp, ConversationKey, finder_reveal_command, startup_loading_logo_opacity};
+    use crate::agent::{
+        HistoryItemDetail, HistoryTurnStatus, ThreadActivity, ThreadHistory, ThreadHistoryItem,
+        ThreadSummary, ThreadTurn,
+    };
     use crate::components::{
-        composer::ModelCatalogLoadFinished, file_change::DiffReviewEvent, sidebar::OpenSettings,
+        composer::{ConversationPhase, ModelCatalogLoadFinished},
+        file_change::DiffReviewEvent,
+        sidebar::OpenSettings,
     };
     use crate::theme::ThemeMode;
 
@@ -2934,7 +3162,8 @@ mod tests {
         window.simulate_mouse_down(point(px(1100.0), px(300.0)), MouseButton::Left);
         window.simulate_mouse_move(point(px(400.0), px(300.0)));
         window.simulate_mouse_up(point(px(400.0), px(300.0)), MouseButton::Left);
-        let expected_max = 1440.0 - 256.125 - super::RIGHT_PANEL_MAIN_MIN_WIDTH;
+        let sidebar_width = window.read(|chat, cx| chat.sidebar.read(cx).width());
+        let expected_max = 1440.0 - sidebar_width - super::RIGHT_PANEL_MAIN_MIN_WIDTH;
         assert!(
             (window.read(|chat, _| chat.right_panel_width.unwrap()) - expected_max).abs() < 0.2
         );
@@ -3011,7 +3240,9 @@ mod tests {
         window.draw();
         window.simulate_click(point(px(80.0), px(677.0)), MouseButton::Left);
         window.draw();
-        window.simulate_click(point(px(80.0), px(610.0)), MouseButton::Left);
+        // CDP: the single 30 px settings row is anchored 43 px above the
+        // bottom of the 700 px window, with the menu's four-pixel inset.
+        window.simulate_click(point(px(80.0), px(638.0)), MouseButton::Left);
         assert!(window.read(|app, _| app.showing_settings));
     }
 
@@ -3040,7 +3271,234 @@ mod tests {
     }
 
     #[test]
-    fn project_menu_closes_when_the_main_surface_is_clicked() {
+    fn switching_drafts_preserves_the_background_conversation_host() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
+        );
+        let (first_key, first_composer) = window.read(|chat, _| {
+            (
+                chat.active_conversation.clone(),
+                chat.conversation_hosts[&chat.active_conversation]
+                    .composer
+                    .clone(),
+            )
+        });
+        app.update(|cx| {
+            first_composer.update(cx, |composer, cx| {
+                composer.set_command_tool_for_capture(true, cx)
+            });
+        });
+
+        window.update(|chat, _, cx| {
+            chat.start_draft(
+                Some("project-stable-id".to_owned()),
+                PathBuf::from("/tmp/second-project"),
+                cx,
+            );
+        });
+        assert_ne!(
+            window.read(|chat, _| chat.active_conversation.clone()),
+            first_key
+        );
+        assert_eq!(window.read(|chat, _| chat.conversation_hosts.len()), 2);
+        assert_eq!(
+            app.read_entity(&first_composer, |composer, _| composer.conversation_phase()),
+            ConversationPhase::Streaming
+        );
+
+        window.update(|chat, _, cx| chat.switch_home_to(first_key.clone(), cx));
+        let active_composer = window.read(|chat, cx| chat.home.read(cx).composer_entity());
+        assert!(active_composer == first_composer);
+        assert_eq!(
+            window.read(|chat, _| chat.active_conversation.clone()),
+            first_key
+        );
+        assert!(matches!(first_key, ConversationKey::Draft(_)));
+        assert_eq!(
+            app.read_entity(&active_composer, |composer, _| composer
+                .conversation_phase()),
+            ConversationPhase::Streaming
+        );
+    }
+
+    #[test]
+    fn thread_created_rekeys_the_draft_without_replacing_its_host() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
+        );
+        let (draft_key, composer) = window.read(|chat, _| {
+            (
+                chat.active_conversation.clone(),
+                chat.conversation_hosts[&chat.active_conversation]
+                    .composer
+                    .clone(),
+            )
+        });
+        app.update(|cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_workspace_context(
+                    PathBuf::from("/tmp/project"),
+                    Some("project-stable-id".to_owned()),
+                    Some("thread-stable-id".to_owned()),
+                    cx,
+                );
+            });
+        });
+
+        window.update(|chat, _, cx| chat.rekey_created_thread("thread-stable-id".to_owned(), cx));
+        let thread_key = ConversationKey::Thread("thread-stable-id".to_owned());
+        assert!(!window.read(|chat, _| chat.conversation_hosts.contains_key(&draft_key)));
+        assert_eq!(
+            window.read(|chat, _| chat.active_conversation.clone()),
+            thread_key
+        );
+        let rekeyed = window.read(|chat, _| chat.conversation_hosts[&thread_key].composer.clone());
+        assert!(rekeyed == composer);
+    }
+
+    fn history_fixture(thread_id: &str, message: &str) -> ThreadHistory {
+        ThreadHistory {
+            thread: ThreadSummary {
+                thread_id: thread_id.to_owned(),
+                title: format!("Thread {thread_id}"),
+                preview: message.to_owned(),
+                cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
+                section: None,
+                created_at: 1,
+                updated_at: 2,
+                recency_at: Some(2),
+                activity: ThreadActivity::Idle,
+            },
+            turns: vec![ThreadTurn {
+                turn_id: format!("turn-{thread_id}"),
+                status: HistoryTurnStatus::Completed,
+                items_view: HistoryItemDetail::Full,
+                items: vec![
+                    ThreadHistoryItem::UserMessage {
+                        item_id: format!("user-{thread_id}"),
+                        text: message.to_owned(),
+                    },
+                    ThreadHistoryItem::AssistantMessage {
+                        item_id: format!("assistant-{thread_id}"),
+                        text: format!("answer {message}"),
+                    },
+                ],
+                started_at: Some(1),
+                completed_at: Some(2),
+                duration_ms: Some(1),
+                error: None,
+            }],
+            next_turn_cursor: None,
+            backwards_turn_cursor: None,
+        }
+    }
+
+    #[test]
+    fn rapid_thread_switch_keeps_late_history_scoped_to_its_original_host() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(WindowOptions::default(), |_, cx| {
+            ChatApp::new(ThemeMode::Dark, false, cx)
+        });
+        let thread_a = window.read(|chat, _| {
+            chat.conversation_hosts[&chat.active_conversation]
+                .composer
+                .clone()
+        });
+        app.update(|cx| {
+            thread_a.update(cx, |composer, cx| {
+                composer.set_workspace_context(
+                    PathBuf::from("/tmp/project-a"),
+                    None,
+                    Some("thread-a".to_owned()),
+                    cx,
+                );
+                composer.set_history_loading(true, cx);
+            });
+        });
+        window.update(|chat, _, cx| {
+            chat.rekey_created_thread("thread-a".to_owned(), cx);
+            chat.start_draft(None, PathBuf::from("/tmp/project-b"), cx);
+        });
+        let thread_b = window.read(|chat, _| {
+            chat.conversation_hosts[&chat.active_conversation]
+                .composer
+                .clone()
+        });
+
+        app.update(|cx| {
+            thread_a.update(cx, |composer, cx| {
+                composer.hydrate_history(history_fixture("thread-a", "old selection"), cx)
+            });
+        });
+
+        assert!(window.read(|chat, cx| chat.home.read(cx).composer_entity()) == thread_b);
+        assert_eq!(
+            app.read_entity(&thread_b, |composer, _| composer.conversation_phase()),
+            ConversationPhase::Empty
+        );
+        assert_eq!(
+            app.read_entity(&thread_a, |composer, _| composer.conversation_phase()),
+            ConversationPhase::Complete
+        );
+    }
+
+    #[test]
+    fn switching_from_a_running_thread_does_not_stop_its_background_turn() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(WindowOptions::default(), |_, cx| {
+            ChatApp::new(ThemeMode::Dark, false, cx)
+        });
+        let running = window.read(|chat, _| {
+            chat.conversation_hosts[&chat.active_conversation]
+                .composer
+                .clone()
+        });
+        app.update(|cx| {
+            running.update(cx, |composer, cx| {
+                composer.set_workspace_context(
+                    PathBuf::from("/tmp/running"),
+                    None,
+                    Some("thread-running".to_owned()),
+                    cx,
+                );
+                composer.set_command_tool_for_capture(true, cx);
+            });
+        });
+        window.update(|chat, _, cx| {
+            chat.rekey_created_thread("thread-running".to_owned(), cx);
+            chat.start_draft(None, PathBuf::from("/tmp/other"), cx);
+        });
+
+        assert_eq!(
+            app.read_entity(&running, |composer, _| composer.conversation_phase()),
+            ConversationPhase::Streaming
+        );
+        assert!(window.read(|chat, _| {
+            chat.conversation_hosts
+                .contains_key(&ConversationKey::Thread("thread-running".to_owned()))
+                && chat.conversation_hosts.len() == 2
+        }));
+    }
+
+    #[test]
+    fn an_empty_backend_does_not_expose_a_phantom_project_menu() {
         let mut app = TestApp::new();
         let mut window = app.open_window_with_options(
             WindowOptions {
@@ -3052,19 +3510,17 @@ mod tests {
             },
             |_, cx| {
                 let mut app = ChatApp::new(ThemeMode::Dark, false, cx);
-                app.open_project_menu_for_capture(0, cx);
+                app.open_project_menu_for_capture("missing-project".to_owned(), cx);
                 app
             },
         );
 
         window.draw();
-        assert!(window.read(|app, cx| app.sidebar.read(cx).project_menu_is_open()));
-        window.simulate_click(point(px(600.0), px(350.0)), MouseButton::Left);
         assert!(!window.read(|app, cx| app.sidebar.read(cx).project_menu_is_open()));
     }
 
     #[test]
-    fn pinned_menu_closes_when_the_main_surface_is_clicked() {
+    fn an_empty_backend_does_not_expose_a_phantom_pinned_menu() {
         let mut app = TestApp::new();
         let mut window = app.open_window_with_options(
             WindowOptions {
@@ -3078,15 +3534,6 @@ mod tests {
         );
 
         window.draw();
-        window.simulate_mouse_move(point(px(100.0), px(331.0)));
-        window.draw();
-        window.simulate_click(point(px(188.5), px(331.0)), MouseButton::Left);
-        window.draw();
-        window.simulate_mouse_move(point(px(219.0), px(267.0)));
-        window.draw();
-        window.simulate_click(point(px(219.0), px(267.0)), MouseButton::Left);
-        assert!(window.read(|app, cx| app.sidebar.read(cx).pinned_menu_is_open()));
-        window.simulate_click(point(px(600.0), px(350.0)), MouseButton::Left);
         assert!(!window.read(|app, cx| app.sidebar.read(cx).pinned_menu_is_open()));
     }
 
@@ -3222,7 +3669,9 @@ mod tests {
         );
 
         window.draw();
-        let trigger = point(px(219.0), px(267.0));
+        // CDP-derived layout: 46 px titlebar safe area, 38 px brand header,
+        // 31 px new-chat row, and the restored four-row navigation block.
+        let trigger = point(px(214.0), px(282.5));
         window.simulate_mouse_move(trigger);
         window.draw();
         window.simulate_click(trigger, MouseButton::Left);

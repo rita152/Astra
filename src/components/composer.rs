@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use chrono::Local;
 use gpui::{
@@ -19,7 +19,8 @@ use crate::{
         AgentReasoning, AgentRequest, AgentServerRequestFailureKind, AgentServerRequestKind,
         AgentServerRequestMetadata, AgentThreadStatus, AgentThreadTokenUsage, AgentUserInputAnswer,
         AgentUserInputHandle, AgentUserInputResponse, CodexAppServerBackend, CommandExecution,
-        CommandExecutionAction, CommandExecutionStatus,
+        CommandExecutionAction, CommandExecutionStatus, HistoryTurnStatus, ProjectId,
+        ThreadHistory, ThreadHistoryItem,
     },
     components::{
         approval::{
@@ -106,6 +107,12 @@ impl gpui::EventEmitter<ModelCatalogLoadFinished> for ComposerView {}
 pub struct ConversationChanged;
 impl gpui::EventEmitter<ConversationChanged> for ComposerView {}
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationThreadCreated {
+    pub thread_id: String,
+}
+impl gpui::EventEmitter<ConversationThreadCreated> for ComposerView {}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ConversationPhase {
     #[default]
@@ -117,6 +124,16 @@ pub enum ConversationPhase {
     Complete,
     Stopped,
     Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationTranscriptTurn {
+    pub phase: ConversationPhase,
+    pub user_message: String,
+    pub user_message_time: Option<String>,
+    pub assistant_message: String,
+    pub assistant_message_time: Option<String>,
+    pub activities: Vec<ConversationActivity>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -546,6 +563,11 @@ pub struct ComposerView {
     conversation_activity: Vec<ConversationActivity>,
     assistant_message_time: Option<String>,
     conversation_phase: ConversationPhase,
+    transcript: Vec<ConversationTranscriptTurn>,
+    cwd: PathBuf,
+    project_id: Option<ProjectId>,
+    history_loading: bool,
+    history_error: Option<String>,
     conversation_cycle: u64,
     active_turn: Option<AgentInterruptHandle>,
     pending_connection_events: HashMap<String, Vec<AgentConnectionEvent>>,
@@ -677,6 +699,11 @@ impl ComposerView {
             conversation_activity: Vec::new(),
             assistant_message_time: None,
             conversation_phase: ConversationPhase::Empty,
+            transcript: Vec::new(),
+            cwd: std::env::current_dir().unwrap_or_default(),
+            project_id: None,
+            history_loading: false,
+            history_error: None,
             conversation_cycle: 0,
             active_turn: None,
             pending_connection_events: HashMap::new(),
@@ -1033,6 +1060,172 @@ impl ComposerView {
         self.conversation_phase
     }
 
+    pub fn transcript_render_snapshot(&self) -> Vec<ConversationTranscriptTurn> {
+        self.transcript.clone()
+    }
+
+    pub fn thread_id(&self) -> Option<&str> {
+        self.thread_id.as_deref()
+    }
+
+    pub fn history_needs_retry(&self) -> bool {
+        self.history_error.is_some()
+    }
+
+    pub fn set_workspace_context(
+        &mut self,
+        cwd: PathBuf,
+        project_id: Option<ProjectId>,
+        thread_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.cwd = cwd;
+        self.project_id = project_id;
+        self.thread_id = thread_id;
+        cx.notify();
+    }
+
+    pub fn set_history_loading(&mut self, loading: bool, cx: &mut Context<Self>) {
+        self.history_loading = loading;
+        self.history_error = None;
+        if loading && self.user_message.is_none() && self.transcript.is_empty() {
+            self.conversation_phase = ConversationPhase::Starting;
+        }
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn set_history_error(&mut self, error: String, cx: &mut Context<Self>) {
+        self.history_loading = false;
+        self.history_error = Some(error.clone());
+        self.user_message = Some("无法加载聊天历史".to_owned());
+        self.user_message_time = None;
+        self.assistant_message = error.clone();
+        self.assistant_message_time = None;
+        self.conversation_activity = vec![ConversationActivity::Error { message: error }];
+        self.conversation_phase = ConversationPhase::Failed;
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn hydrate_history(&mut self, history: ThreadHistory, cx: &mut Context<Self>) {
+        self.thread_id = Some(history.thread.thread_id.clone());
+        self.cwd = history.thread.cwd.clone();
+        self.project_id = history.thread.project_id.clone();
+        self.history_loading = false;
+        self.history_error = None;
+        self.transcript = history
+            .turns
+            .iter()
+            .map(|turn| {
+                let mut user_messages = Vec::new();
+                let mut assistant_messages = Vec::new();
+                let mut activities = Vec::new();
+                for item in &turn.items {
+                    match item {
+                        ThreadHistoryItem::UserMessage { text, .. } => {
+                            user_messages.push(text.clone());
+                        }
+                        ThreadHistoryItem::AssistantMessage { item_id, text } => {
+                            assistant_messages.push(text.clone());
+                            activities.push(ConversationActivity::AssistantMessage {
+                                item_id: item_id.clone(),
+                                text: text.clone(),
+                            });
+                        }
+                        ThreadHistoryItem::Reasoning {
+                            item_id,
+                            summary,
+                            content,
+                        } => activities.push(ConversationActivity::Reasoning(
+                            ReasoningActivityPresentation {
+                                item_id: item_id.clone(),
+                                summary: summary.clone(),
+                                content: content.clone(),
+                                started_at_ms: turn.started_at.unwrap_or_default(),
+                                completed_at_ms: Some(
+                                    turn.completed_at
+                                        .unwrap_or_else(|| turn.started_at.unwrap_or_default()),
+                                ),
+                            },
+                        )),
+                        ThreadHistoryItem::Command {
+                            item_id,
+                            command,
+                            output,
+                            status,
+                        } => activities.push(ConversationActivity::Command(CommandExecution {
+                            id: item_id.clone(),
+                            command: command.clone(),
+                            actions: vec![CommandExecutionAction::Unknown {
+                                command: command.clone(),
+                            }],
+                            cwd: history.thread.cwd.display().to_string(),
+                            output: output.clone(),
+                            terminal_process_id: None,
+                            status: *status,
+                            exit_code: None,
+                        })),
+                        ThreadHistoryItem::Unsupported { kind, .. } => {
+                            activities.push(ConversationActivity::Warning {
+                                message: format!("历史包含当前 UI 尚未呈现的 {kind} 项"),
+                            });
+                        }
+                    }
+                }
+                if let Some(error) = &turn.error {
+                    activities.push(ConversationActivity::Error {
+                        message: error.clone(),
+                    });
+                }
+                ConversationTranscriptTurn {
+                    phase: match turn.status {
+                        HistoryTurnStatus::InProgress => ConversationPhase::Streaming,
+                        HistoryTurnStatus::Completed => ConversationPhase::Complete,
+                        HistoryTurnStatus::Interrupted => ConversationPhase::Stopped,
+                        HistoryTurnStatus::Failed => ConversationPhase::Failed,
+                    },
+                    user_message: user_messages.join("\n\n"),
+                    user_message_time: None,
+                    assistant_message: assistant_messages.join("\n\n"),
+                    assistant_message_time: None,
+                    activities,
+                }
+            })
+            .collect();
+        if let Some(last) = self.transcript.pop() {
+            self.conversation_phase = last.phase;
+            self.user_message = Some(last.user_message);
+            self.user_message_time = last.user_message_time;
+            self.assistant_message = last.assistant_message;
+            self.assistant_message_time = last.assistant_message_time;
+            self.conversation_activity = last.activities;
+        } else {
+            self.conversation_phase = ConversationPhase::Empty;
+            self.user_message = None;
+            self.user_message_time = None;
+            self.assistant_message.clear();
+            self.assistant_message_time = None;
+            self.conversation_activity.clear();
+        }
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    fn commit_current_turn(&mut self) {
+        let Some(user_message) = self.user_message.take() else {
+            return;
+        };
+        self.transcript.push(ConversationTranscriptTurn {
+            phase: self.conversation_phase,
+            user_message,
+            user_message_time: self.user_message_time.take(),
+            assistant_message: std::mem::take(&mut self.assistant_message),
+            assistant_message_time: self.assistant_message_time.take(),
+            activities: std::mem::take(&mut self.conversation_activity),
+        });
+    }
+
     pub fn conversation_render_snapshot(
         &self,
     ) -> (
@@ -1095,6 +1288,9 @@ impl ComposerView {
             ))
         };
 
+        self.commit_current_turn();
+        self.history_loading = false;
+        self.history_error = None;
         self.user_message = Some(prompt.clone());
         self.user_message_time = Some(current_local_time_label());
         self.assistant_message.clear();
@@ -1134,7 +1330,8 @@ impl ComposerView {
 
         let run = self.backend.run_prompt(AgentRequest {
             prompt,
-            cwd: std::env::current_dir().unwrap_or_default(),
+            cwd: self.cwd.clone(),
+            project_id: self.project_id.clone(),
             thread_id: self.thread_id.clone(),
             model,
             effort,
@@ -1189,7 +1386,14 @@ impl ComposerView {
                     if this.conversation_cycle != cycle {
                         return true;
                     }
+                    let created_thread = batch.iter().find_map(|event| match event {
+                        AgentEvent::ThreadCreated { thread_id } => Some(thread_id.clone()),
+                        _ => None,
+                    });
                     let finished = this.apply_agent_event_batch(batch);
+                    if let Some(thread_id) = created_thread {
+                        cx.emit(ConversationThreadCreated { thread_id });
+                    }
                     cx.emit(ConversationChanged);
                     cx.notify();
                     finished
@@ -1232,6 +1436,13 @@ impl ComposerView {
             }
             AgentConnectionEvent::ConfigWarning(_)
             | AgentConnectionEvent::AccountRateLimitsUpdated(_) => None,
+            AgentConnectionEvent::ProjectChanged { .. }
+            | AgentConnectionEvent::ThreadArchived { .. }
+            | AgentConnectionEvent::ThreadUnarchived { .. }
+            | AgentConnectionEvent::ThreadDeleted { .. }
+            | AgentConnectionEvent::ThreadNameUpdated { .. }
+            | AgentConnectionEvent::ThreadClosed { .. }
+            | AgentConnectionEvent::ThreadProjectUpdated { .. } => return false,
         };
         if let Some(thread_id) = scoped_thread_id
             && self.thread_id.as_deref() != Some(thread_id)
@@ -1259,6 +1470,13 @@ impl ComposerView {
             AgentConnectionEvent::AccountRateLimitsUpdated(rate_limits) => {
                 AgentEvent::AccountRateLimitsUpdated(rate_limits)
             }
+            AgentConnectionEvent::ProjectChanged { .. }
+            | AgentConnectionEvent::ThreadArchived { .. }
+            | AgentConnectionEvent::ThreadUnarchived { .. }
+            | AgentConnectionEvent::ThreadDeleted { .. }
+            | AgentConnectionEvent::ThreadNameUpdated { .. }
+            | AgentConnectionEvent::ThreadClosed { .. }
+            | AgentConnectionEvent::ThreadProjectUpdated { .. } => return false,
         };
         self.apply_agent_event_batch(vec![event]);
         true
@@ -2114,7 +2332,7 @@ impl ComposerView {
         };
         self.permission_update_cycle = self.permission_update_cycle.wrapping_add(1);
         let update_cycle = self.permission_update_cycle;
-        let cwd = std::env::current_dir().unwrap_or_default();
+        let cwd = self.cwd.clone();
         let receiver = self
             .backend
             .update_thread_permissions(thread_id, cwd, mode.agent_mode());
@@ -5585,16 +5803,17 @@ mod tests {
     };
     use crate::agent::{
         AgentAccountRateLimits, AgentActivePermissionProfile, AgentAdditionalNetworkPermissions,
-        AgentApprovalControl, AgentApprovalHandle, AgentCommandApprovalChoice,
+        AgentApprovalControl, AgentApprovalHandle, AgentBackend, AgentCommandApprovalChoice,
         AgentCommandApprovalRequest, AgentConfigWarning, AgentConnectionEvent,
         AgentCreditsSnapshot, AgentEffectivePermissions, AgentEvent, AgentInterruptControl,
         AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
         AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog,
-        AgentOptionalField, AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
+        AgentOptionalField, AgentPermissionMode, AgentPermissionProfile,
+        AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
         AgentPermissionsApprovalControl, AgentPermissionsApprovalHandle,
         AgentPermissionsApprovalRequest, AgentRateLimitWindow, AgentReasoning,
-        AgentReasoningEffort, AgentServerRequestFailureKind, AgentServerRequestId,
-        AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier,
+        AgentReasoningEffort, AgentRequest, AgentRun, AgentServerRequestFailureKind,
+        AgentServerRequestId, AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier,
         AgentSpendControlLimit, AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus,
         AgentThreadStatusState, AgentThreadTokenUsage, AgentTokenUsageBreakdown,
         AgentUserInputAnswer, AgentUserInputControl, AgentUserInputHandle, AgentUserInputOption,
@@ -5615,12 +5834,68 @@ mod tests {
         Bounds, Focusable, MouseButton, TestApp, WindowBounds, WindowOptions, point, px, size,
     };
     use std::{
+        path::PathBuf,
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
+
+    struct RecordingBackend {
+        connection_events: async_channel::Receiver<AgentConnectionEvent>,
+        requests: Mutex<Vec<AgentRequest>>,
+        runs: Mutex<Vec<async_channel::Sender<AgentEvent>>>,
+    }
+
+    impl RecordingBackend {
+        fn new() -> Arc<Self> {
+            let (connection_sender, connection_events) = async_channel::unbounded();
+            drop(connection_sender);
+            Arc::new(Self {
+                connection_events,
+                requests: Mutex::new(Vec::new()),
+                runs: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn send_run_event(&self, run: usize, event: AgentEvent) {
+            self.runs.lock().unwrap()[run].send_blocking(event).unwrap();
+        }
+    }
+
+    impl AgentBackend for RecordingBackend {
+        fn subscribe_connection_events(&self) -> async_channel::Receiver<AgentConnectionEvent> {
+            self.connection_events.clone()
+        }
+
+        fn load_model_catalog(&self) -> async_channel::Receiver<Result<AgentModelCatalog, String>> {
+            async_channel::bounded(1).1
+        }
+
+        fn load_permission_profiles(
+            &self,
+            _cwd: PathBuf,
+        ) -> async_channel::Receiver<Result<Vec<AgentPermissionProfile>, String>> {
+            async_channel::bounded(1).1
+        }
+
+        fn update_thread_permissions(
+            &self,
+            _thread_id: String,
+            _cwd: PathBuf,
+            _mode: AgentPermissionMode,
+        ) -> async_channel::Receiver<Result<AgentThreadSettings, String>> {
+            async_channel::bounded(1).1
+        }
+
+        fn run_prompt(&self, request: AgentRequest) -> AgentRun {
+            self.requests.lock().unwrap().push(request);
+            let (sender, receiver) = async_channel::unbounded();
+            self.runs.lock().unwrap().push(sender);
+            AgentRun::new(receiver, None)
+        }
+    }
 
     #[derive(Default)]
     struct RecordingApprovalControl {
@@ -5781,6 +6056,69 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn transcript_keeps_prior_turns_and_first_start_uses_workspace_context() {
+        let mut app = TestApp::new();
+        let backend = RecordingBackend::new();
+        let backend_for_view: Arc<dyn AgentBackend> = backend.clone();
+        let composer = app
+            .new_entity(|cx| ComposerView::new_with_backend(ThemeMode::Dark, backend_for_view, cx));
+        app.update_entity(&composer, |composer, cx| {
+            composer.apply_model_catalog(test_model_catalog());
+            composer.set_workspace_context(
+                PathBuf::from("/tmp/real-project-root"),
+                Some("project-stable-id".to_owned()),
+                None,
+                cx,
+            );
+            composer.submit_prompt("first turn".to_owned(), cx);
+        });
+        let requests = backend.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].cwd, PathBuf::from("/tmp/real-project-root"));
+        assert_eq!(requests[0].project_id.as_deref(), Some("project-stable-id"));
+        assert!(requests[0].thread_id.is_none());
+
+        for event in [
+            AgentEvent::ThreadCreated {
+                thread_id: "thread-stable-id".to_owned(),
+            },
+            AgentEvent::Started,
+            AgentEvent::AssistantMessageStarted {
+                item_id: "message-first".to_owned(),
+            },
+            AgentEvent::TextDelta("first response".to_owned()),
+            AgentEvent::Completed,
+        ] {
+            backend.send_run_event(0, event);
+        }
+        app.run_until_parked();
+        app.advance_clock(STREAM_UPDATE_INTERVAL);
+        app.run_until_parked();
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer.conversation_phase()),
+            ConversationPhase::Complete
+        );
+
+        app.update_entity(&composer, |composer, cx| {
+            composer.submit_prompt("second turn".to_owned(), cx);
+        });
+        let requests = backend.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].thread_id.as_deref(), Some("thread-stable-id"));
+        assert_eq!(requests[1].project_id.as_deref(), Some("project-stable-id"));
+        let transcript = app.read_entity(&composer, |composer, _| {
+            composer.transcript_render_snapshot()
+        });
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].user_message, "first turn");
+        assert_eq!(transcript[0].assistant_message, "first response");
+        assert!(matches!(
+            transcript[0].activities.first(),
+            Some(ConversationActivity::AssistantMessage { text, .. }) if text == "first response"
+        ));
     }
 
     struct TestInterruptControl {

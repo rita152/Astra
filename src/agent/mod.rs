@@ -1,6 +1,6 @@
 mod codex;
 
-use std::{fmt, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, fmt, path::PathBuf, sync::Arc};
 
 use async_channel::Receiver;
 use serde_json::Value;
@@ -38,11 +38,327 @@ pub struct AgentModelCatalog {
     pub models: Vec<AgentModel>,
 }
 
+/// Stable, agent-neutral identifier aliases used by the workspace UI.
+pub type ProjectId = String;
+pub type ThreadId = String;
+pub type ThreadSectionId = String;
+pub type PageCursor = String;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AgentCapability {
+    ProjectList,
+    ProjectCreate,
+    ProjectUpdate,
+    ProjectDelete,
+    ProjectMove,
+    ThreadList,
+    ThreadSearch,
+    ThreadRead,
+    ThreadTurnsList,
+    ThreadItemsList,
+    ThreadRename,
+    ThreadArchive,
+    ThreadUnarchive,
+    ThreadDelete,
+    ThreadMetadataUpdate,
+    ThreadSectionList,
+    ThreadSectionCreate,
+    ThreadSectionMove,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentCapabilities {
+    supported: BTreeSet<AgentCapability>,
+}
+
+impl AgentCapabilities {
+    pub fn new(capabilities: impl IntoIterator<Item = AgentCapability>) -> Self {
+        Self {
+            supported: capabilities.into_iter().collect(),
+        }
+    }
+
+    pub fn supports(&self, capability: AgentCapability) -> bool {
+        self.supported.contains(&capability)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = AgentCapability> + '_ {
+        self.supported.iter().copied()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unsupported {
+    pub capability: AgentCapability,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkspaceError {
+    Unsupported(Unsupported),
+    Backend(String),
+}
+
+impl WorkspaceError {
+    pub fn backend(message: impl Into<String>) -> Self {
+        Self::Backend(message.into())
+    }
+
+    /// Produces an agent-neutral message suitable for product UI. Concrete
+    /// protocol and transport details remain available in the error value for
+    /// diagnostics, but must not cross into views.
+    pub fn user_message(&self, action: &str) -> String {
+        match self {
+            Self::Unsupported(_) => format!("当前 coding agent 不支持{action}"),
+            Self::Backend(_) => format!("{action}失败，请重试"),
+        }
+    }
+
+    fn unsupported(capability: AgentCapability) -> Self {
+        Self::Unsupported(Unsupported {
+            capability,
+            message: format!("当前 coding agent 不支持 {capability:?}"),
+        })
+    }
+}
+
+impl fmt::Display for WorkspaceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported(unsupported) => formatter.write_str(&unsupported.message),
+            Self::Backend(message) => formatter.write_str(message),
+        }
+    }
+}
+
+pub type WorkspaceResult<T> = Result<T, WorkspaceError>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageRequest {
+    pub cursor: Option<PageCursor>,
+    pub limit: u32,
+}
+
+impl Default for PageRequest {
+    fn default() -> Self {
+        Self {
+            cursor: None,
+            limit: 50,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Page<T> {
+    pub data: Vec<T>,
+    pub next_cursor: Option<PageCursor>,
+    pub backwards_cursor: Option<PageCursor>,
+}
+
+impl<T> Page<T> {
+    pub fn single(data: Vec<T>) -> Self {
+        Self {
+            data,
+            next_cursor: None,
+            backwards_cursor: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Project {
+    pub project_id: ProjectId,
+    pub name: String,
+    pub roots: Vec<PathBuf>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub recency_at: Option<i64>,
+    pub position: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateProject {
+    pub name: String,
+    pub roots: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UpdateProject {
+    pub name: Option<String>,
+    pub roots: Option<Vec<PathBuf>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadSection {
+    pub section_id: ThreadSectionId,
+    pub name: String,
+    pub appearance: Option<ThreadSectionAppearance>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThreadSectionAppearance {
+    pub icon: Option<String>,
+    pub color: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThreadActivity {
+    NotLoaded,
+    Idle,
+    SystemError,
+    Active { flags: Vec<AgentThreadActiveFlag> },
+    Closed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadSummary {
+    pub thread_id: ThreadId,
+    pub title: String,
+    pub preview: String,
+    pub cwd: PathBuf,
+    pub project_id: Option<ProjectId>,
+    pub section: Option<ThreadSection>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub recency_at: Option<i64>,
+    pub activity: ThreadActivity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadSortKey {
+    CreatedAt,
+    UpdatedAt,
+    RecencyAt,
+    SectionPosition,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum FilterValue<T> {
+    #[default]
+    Any,
+    None,
+    Value(T),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadListRequest {
+    pub page: PageRequest,
+    pub archived: bool,
+    pub project: FilterValue<ProjectId>,
+    pub section: FilterValue<ThreadSectionId>,
+    pub search_term: Option<String>,
+    pub sort_key: ThreadSortKey,
+    pub sort_direction: SortDirection,
+}
+
+impl Default for ThreadListRequest {
+    fn default() -> Self {
+        Self {
+            page: PageRequest::default(),
+            archived: false,
+            project: FilterValue::Any,
+            section: FilterValue::Any,
+            search_term: None,
+            sort_key: ThreadSortKey::RecencyAt,
+            sort_direction: SortDirection::Descending,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadSearchResult {
+    pub thread: ThreadSummary,
+    pub snippet: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryItemDetail {
+    NotLoaded,
+    Summary,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryTurnStatus {
+    InProgress,
+    Completed,
+    Interrupted,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThreadHistoryItem {
+    UserMessage {
+        item_id: String,
+        text: String,
+    },
+    AssistantMessage {
+        item_id: String,
+        text: String,
+    },
+    Reasoning {
+        item_id: String,
+        summary: Vec<String>,
+        content: Vec<String>,
+    },
+    Command {
+        item_id: String,
+        command: String,
+        output: String,
+        status: CommandExecutionStatus,
+    },
+    Unsupported {
+        item_id: String,
+        kind: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadTurn {
+    pub turn_id: String,
+    pub status: HistoryTurnStatus,
+    pub items_view: HistoryItemDetail,
+    pub items: Vec<ThreadHistoryItem>,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadHistoryItemEntry {
+    pub turn_id: String,
+    pub item: ThreadHistoryItem,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadHistory {
+    pub thread: ThreadSummary,
+    pub turns: Vec<ThreadTurn>,
+    pub next_turn_cursor: Option<PageCursor>,
+    pub backwards_turn_cursor: Option<PageCursor>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThreadMetadataUpdate {
+    /// `Unspecified` keeps the server value, `Null` clears it, and `Value`
+    /// assigns the thread to a project. Concrete adapters own the wire
+    /// representation for the clear operation.
+    pub project: AgentOptionalField<ProjectId>,
+}
+
 /// Agent-neutral input consumed by every coding-agent adapter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentRequest {
     pub prompt: String,
     pub cwd: PathBuf,
+    pub project_id: Option<ProjectId>,
     pub thread_id: Option<String>,
     pub model: String,
     pub effort: String,
@@ -310,7 +626,38 @@ pub enum AgentConnectionEvent {
         thread_id: String,
         settings: AgentThreadSettings,
     },
+    ProjectChanged {
+        project_id: ProjectId,
+        change: ProjectChange,
+    },
+    ThreadArchived {
+        thread_id: ThreadId,
+    },
+    ThreadUnarchived {
+        thread_id: ThreadId,
+    },
+    ThreadDeleted {
+        thread_id: ThreadId,
+    },
+    ThreadNameUpdated {
+        thread_id: ThreadId,
+        name: Option<String>,
+    },
+    ThreadClosed {
+        thread_id: ThreadId,
+    },
+    ThreadProjectUpdated {
+        thread_id: ThreadId,
+        project_id: Option<ProjectId>,
+    },
     AccountRateLimitsUpdated(AgentAccountRateLimits),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectChange {
+    Created,
+    Updated,
+    Deleted,
 }
 
 /// JSON-RPC request ids are deliberately not normalized: a numeric `7` and a
@@ -763,6 +1110,10 @@ pub enum AgentEvent {
 
 /// Boundary between the application and a concrete coding-agent protocol.
 pub trait AgentBackend: Send + Sync {
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities::default()
+    }
+
     fn subscribe_connection_events(&self) -> Receiver<AgentConnectionEvent>;
     #[cfg_attr(test, allow(dead_code))]
     fn load_model_catalog(&self) -> Receiver<Result<AgentModelCatalog, String>>;
@@ -777,5 +1128,130 @@ pub trait AgentBackend: Send + Sync {
         cwd: PathBuf,
         mode: AgentPermissionMode,
     ) -> Receiver<Result<AgentThreadSettings, String>>;
+
+    fn list_projects(&self, _page: PageRequest) -> Receiver<WorkspaceResult<Page<Project>>> {
+        unsupported_receiver(AgentCapability::ProjectList)
+    }
+
+    fn create_project(&self, _project: CreateProject) -> Receiver<WorkspaceResult<Project>> {
+        unsupported_receiver(AgentCapability::ProjectCreate)
+    }
+
+    fn update_project(
+        &self,
+        _project_id: ProjectId,
+        _update: UpdateProject,
+    ) -> Receiver<WorkspaceResult<Project>> {
+        unsupported_receiver(AgentCapability::ProjectUpdate)
+    }
+
+    fn delete_project(&self, _project_id: ProjectId) -> Receiver<WorkspaceResult<()>> {
+        unsupported_receiver(AgentCapability::ProjectDelete)
+    }
+
+    fn move_project(
+        &self,
+        _project_id: ProjectId,
+        _before_project_id: Option<ProjectId>,
+    ) -> Receiver<WorkspaceResult<()>> {
+        unsupported_receiver(AgentCapability::ProjectMove)
+    }
+
+    fn list_threads(
+        &self,
+        _request: ThreadListRequest,
+    ) -> Receiver<WorkspaceResult<Page<ThreadSummary>>> {
+        unsupported_receiver(AgentCapability::ThreadList)
+    }
+
+    fn search_threads(
+        &self,
+        _request: ThreadListRequest,
+    ) -> Receiver<WorkspaceResult<Page<ThreadSearchResult>>> {
+        unsupported_receiver(AgentCapability::ThreadSearch)
+    }
+
+    fn read_thread(&self, _thread_id: ThreadId) -> Receiver<WorkspaceResult<ThreadSummary>> {
+        unsupported_receiver(AgentCapability::ThreadRead)
+    }
+
+    fn list_thread_turns(
+        &self,
+        _thread_id: ThreadId,
+        _page: PageRequest,
+        _detail: HistoryItemDetail,
+    ) -> Receiver<WorkspaceResult<Page<ThreadTurn>>> {
+        unsupported_receiver(AgentCapability::ThreadTurnsList)
+    }
+
+    fn list_thread_items(
+        &self,
+        _thread_id: ThreadId,
+        _turn_id: Option<String>,
+        _page: PageRequest,
+    ) -> Receiver<WorkspaceResult<Page<ThreadHistoryItemEntry>>> {
+        unsupported_receiver(AgentCapability::ThreadItemsList)
+    }
+
+    fn set_thread_name(
+        &self,
+        _thread_id: ThreadId,
+        _name: String,
+    ) -> Receiver<WorkspaceResult<()>> {
+        unsupported_receiver(AgentCapability::ThreadRename)
+    }
+
+    fn archive_thread(&self, _thread_id: ThreadId) -> Receiver<WorkspaceResult<()>> {
+        unsupported_receiver(AgentCapability::ThreadArchive)
+    }
+
+    fn unarchive_thread(&self, _thread_id: ThreadId) -> Receiver<WorkspaceResult<ThreadSummary>> {
+        unsupported_receiver(AgentCapability::ThreadUnarchive)
+    }
+
+    fn delete_thread(&self, _thread_id: ThreadId) -> Receiver<WorkspaceResult<()>> {
+        unsupported_receiver(AgentCapability::ThreadDelete)
+    }
+
+    fn update_thread_metadata(
+        &self,
+        _thread_id: ThreadId,
+        _update: ThreadMetadataUpdate,
+    ) -> Receiver<WorkspaceResult<ThreadSummary>> {
+        unsupported_receiver(AgentCapability::ThreadMetadataUpdate)
+    }
+
+    fn list_thread_sections(
+        &self,
+        _page: PageRequest,
+    ) -> Receiver<WorkspaceResult<Page<ThreadSection>>> {
+        unsupported_receiver(AgentCapability::ThreadSectionList)
+    }
+
+    fn create_thread_section(
+        &self,
+        _name: String,
+        _appearance: Option<ThreadSectionAppearance>,
+    ) -> Receiver<WorkspaceResult<ThreadSection>> {
+        unsupported_receiver(AgentCapability::ThreadSectionCreate)
+    }
+
+    fn move_thread_to_section(
+        &self,
+        _thread_id: ThreadId,
+        _section_id: Option<ThreadSectionId>,
+        _before_thread_id: Option<ThreadId>,
+    ) -> Receiver<WorkspaceResult<()>> {
+        unsupported_receiver(AgentCapability::ThreadSectionMove)
+    }
+
     fn run_prompt(&self, request: AgentRequest) -> AgentRun;
+}
+
+fn unsupported_receiver<T: Send + 'static>(
+    capability: AgentCapability,
+) -> Receiver<WorkspaceResult<T>> {
+    let (sender, receiver) = async_channel::bounded(1);
+    let _ = sender.send_blocking(Err(WorkspaceError::unsupported(capability)));
+    receiver
 }

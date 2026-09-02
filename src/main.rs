@@ -3,6 +3,7 @@ mod app;
 mod components;
 mod settings;
 mod theme;
+mod workspace;
 
 use std::{borrow::Cow, fs, path::PathBuf};
 
@@ -224,9 +225,8 @@ fn main() {
     let right_panel_open = args.iter().any(|arg| arg == "--right-panel-open");
     let projects_menu_open = args.iter().any(|arg| arg == "--projects-menu-open");
     let project_menu_open = args.iter().find_map(|arg| {
-        arg.strip_prefix("--project-menu-open=")?
-            .parse::<usize>()
-            .ok()
+        arg.strip_prefix("--project-menu-open=")
+            .map(ToOwned::to_owned)
     });
     let project_create_open = args.iter().any(|arg| arg == "--project-create-open");
     let project_create_remote = args.iter().any(|arg| arg == "--project-create-remote");
@@ -235,9 +235,8 @@ fn main() {
         .iter()
         .find_map(|arg| arg.strip_prefix("--activity-scroll=")?.parse::<f32>().ok());
     let activity_hover_recent = args.iter().find_map(|arg| {
-        arg.strip_prefix("--activity-hover-recent=")?
-            .parse::<usize>()
-            .ok()
+        arg.strip_prefix("--activity-hover-recent=")
+            .map(ToOwned::to_owned)
     });
     let model_picker_open = args.iter().any(|arg| arg == "--model-picker-open");
     let model_picker_submenu = args.iter().find_map(|arg| {
@@ -388,8 +387,8 @@ fn main() {
                         if projects_menu_open {
                             app.open_projects_section_menu(cx);
                         }
-                        if let Some(index) = project_menu_open {
-                            app.open_project_menu_for_capture(index, cx);
+                        if let Some(project_id) = project_menu_open {
+                            app.open_project_menu_for_capture(project_id, cx);
                         }
                         if project_create_open {
                             app.open_project_creation(cx);
@@ -404,9 +403,9 @@ fn main() {
                             app.open_activity(cx);
                             app.set_activity_scroll_for_capture(offset, cx);
                         }
-                        if let Some(index) = activity_hover_recent {
+                        if let Some(thread_id) = activity_hover_recent {
                             app.open_activity(cx);
-                            app.set_activity_hovered_recent_for_capture(index, cx);
+                            app.set_activity_hovered_thread_for_capture(thread_id, cx);
                         }
                         if model_picker_open {
                             app.open_model_picker(cx);

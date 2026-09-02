@@ -39,6 +39,10 @@ use super::{
     AgentThreadStatusState, AgentThreadTokenUsage, AgentTokenUsageBreakdown, AgentUserInputControl,
     AgentUserInputHandle, AgentUserInputOption, AgentUserInputQuestion, AgentUserInputRequest,
     AgentUserInputResponse, CommandExecution, CommandExecutionAction, CommandExecutionStatus,
+    CreateProject, HistoryItemDetail, Page, PageRequest, Project, ProjectId,
+    ThreadHistoryItemEntry, ThreadId, ThreadListRequest, ThreadMetadataUpdate, ThreadSearchResult,
+    ThreadSection, ThreadSectionAppearance, ThreadSectionId, ThreadSummary, ThreadTurn,
+    UpdateProject, WorkspaceResult,
 };
 
 #[cfg(test)]
@@ -1180,6 +1184,10 @@ impl Default for CodexAppServerBackend {
 }
 
 impl AgentBackend for CodexAppServerBackend {
+    fn capabilities(&self) -> super::AgentCapabilities {
+        self.manager.capabilities()
+    }
+
     fn subscribe_connection_events(&self) -> Receiver<AgentConnectionEvent> {
         self.manager.subscribe_connection_events()
     }
@@ -1202,6 +1210,119 @@ impl AgentBackend for CodexAppServerBackend {
         mode: AgentPermissionMode,
     ) -> Receiver<Result<AgentThreadSettings, String>> {
         self.manager.update_thread_permissions(thread_id, cwd, mode)
+    }
+
+    fn list_projects(&self, page: PageRequest) -> Receiver<WorkspaceResult<Page<Project>>> {
+        self.manager.list_projects(page)
+    }
+
+    fn create_project(&self, project: CreateProject) -> Receiver<WorkspaceResult<Project>> {
+        self.manager.create_project(project)
+    }
+
+    fn update_project(
+        &self,
+        project_id: ProjectId,
+        update: UpdateProject,
+    ) -> Receiver<WorkspaceResult<Project>> {
+        self.manager.update_project(project_id, update)
+    }
+
+    fn delete_project(&self, project_id: ProjectId) -> Receiver<WorkspaceResult<()>> {
+        self.manager.delete_project(project_id)
+    }
+
+    fn move_project(
+        &self,
+        project_id: ProjectId,
+        before_project_id: Option<ProjectId>,
+    ) -> Receiver<WorkspaceResult<()>> {
+        self.manager.move_project(project_id, before_project_id)
+    }
+
+    fn list_threads(
+        &self,
+        request: ThreadListRequest,
+    ) -> Receiver<WorkspaceResult<Page<ThreadSummary>>> {
+        self.manager.list_threads(request)
+    }
+
+    fn search_threads(
+        &self,
+        request: ThreadListRequest,
+    ) -> Receiver<WorkspaceResult<Page<ThreadSearchResult>>> {
+        self.manager.search_threads(request)
+    }
+
+    fn read_thread(&self, thread_id: ThreadId) -> Receiver<WorkspaceResult<ThreadSummary>> {
+        self.manager.read_thread(thread_id)
+    }
+
+    fn list_thread_turns(
+        &self,
+        thread_id: ThreadId,
+        page: PageRequest,
+        detail: HistoryItemDetail,
+    ) -> Receiver<WorkspaceResult<Page<ThreadTurn>>> {
+        self.manager.list_thread_turns(thread_id, page, detail)
+    }
+
+    fn list_thread_items(
+        &self,
+        thread_id: ThreadId,
+        turn_id: Option<String>,
+        page: PageRequest,
+    ) -> Receiver<WorkspaceResult<Page<ThreadHistoryItemEntry>>> {
+        self.manager.list_thread_items(thread_id, turn_id, page)
+    }
+
+    fn set_thread_name(&self, thread_id: ThreadId, name: String) -> Receiver<WorkspaceResult<()>> {
+        self.manager.set_thread_name(thread_id, name)
+    }
+
+    fn archive_thread(&self, thread_id: ThreadId) -> Receiver<WorkspaceResult<()>> {
+        self.manager.archive_thread(thread_id)
+    }
+
+    fn unarchive_thread(&self, thread_id: ThreadId) -> Receiver<WorkspaceResult<ThreadSummary>> {
+        self.manager.unarchive_thread(thread_id)
+    }
+
+    fn delete_thread(&self, thread_id: ThreadId) -> Receiver<WorkspaceResult<()>> {
+        self.manager.delete_thread(thread_id)
+    }
+
+    fn update_thread_metadata(
+        &self,
+        thread_id: ThreadId,
+        update: ThreadMetadataUpdate,
+    ) -> Receiver<WorkspaceResult<ThreadSummary>> {
+        self.manager.update_thread_metadata(thread_id, update)
+    }
+
+    fn list_thread_sections(
+        &self,
+        page: PageRequest,
+    ) -> Receiver<WorkspaceResult<Page<ThreadSection>>> {
+        self.manager.list_thread_sections(page)
+    }
+
+    fn create_thread_section(
+        &self,
+        name: String,
+        appearance: Option<ThreadSectionAppearance>,
+    ) -> Receiver<WorkspaceResult<ThreadSection>> {
+        self.manager.create_thread_section(name, appearance)
+    }
+
+    fn move_thread_to_section(
+        &self,
+        thread_id: ThreadId,
+        section_id: Option<ThreadSectionId>,
+        before_thread_id: Option<ThreadId>,
+    ) -> Receiver<WorkspaceResult<()>> {
+        self.manager
+            .move_thread_to_section(thread_id, section_id, before_thread_id)
     }
 
     fn run_prompt(&self, request: AgentRequest) -> AgentRun {
@@ -2040,6 +2161,13 @@ fn process_turn_message<W: Write + Send + 'static>(
             | "remoteControl/status/changed"
             | "mcpServer/startupStatus/updated"
             | "thread/status/changed"
+            | "thread/archived"
+            | "thread/unarchived"
+            | "thread/deleted"
+            | "thread/name/updated"
+            | "thread/closed"
+            | "thread/project/updated"
+            | "project/changed"
             | "thread/tokenUsage/updated"
             | "account/rateLimits/updated"
             | "thread/started"
@@ -2074,6 +2202,13 @@ fn is_defined_server_method(method: &str) -> bool {
             | "item/reasoning/textDelta"
             | "item/completed"
             | "thread/started"
+            | "thread/archived"
+            | "thread/unarchived"
+            | "thread/deleted"
+            | "thread/name/updated"
+            | "thread/closed"
+            | "thread/project/updated"
+            | "project/changed"
             | "turn/started"
             | "turn/completed"
             | "error"
@@ -4174,6 +4309,7 @@ mod tests {
             &AgentRequest {
                 prompt: "permission probe".into(),
                 cwd,
+                project_id: None,
                 thread_id: None,
                 model: "gpt-test".into(),
                 effort: "medium".into(),
@@ -4461,6 +4597,7 @@ mod tests {
             &AgentRequest {
                 prompt: "打个招呼".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: None,
                 model: "gpt-test".into(),
                 effort: "high".into(),
@@ -4697,6 +4834,7 @@ mod tests {
             &AgentRequest {
                 prompt: "继续对话".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: Some("thr_existing".into()),
                 model: "gpt-test".into(),
                 effort: "high".into(),
@@ -4797,6 +4935,7 @@ mod tests {
                 &AgentRequest {
                     prompt: "继续对话".into(),
                     cwd: PathBuf::from("/tmp/project"),
+                    project_id: None,
                     thread_id: Some("thr_existing".into()),
                     model: "gpt-test".into(),
                     effort: "medium".into(),
@@ -4847,6 +4986,7 @@ mod tests {
             &AgentRequest {
                 prompt: "继续对话".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: Some("thr_existing".into()),
                 model: "gpt-test".into(),
                 effort: "medium".into(),
@@ -4896,6 +5036,7 @@ mod tests {
                 &AgentRequest {
                     prompt: "检查生命周期关联".into(),
                     cwd: PathBuf::from("/tmp/project"),
+                    project_id: None,
                     thread_id: None,
                     model: "gpt-test".into(),
                     effort: "medium".into(),
@@ -4930,6 +5071,7 @@ mod tests {
             &AgentRequest {
                 prompt: "继续对话".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: Some("thr_existing".into()),
                 model: "gpt-test".into(),
                 effort: "medium".into(),
@@ -4968,6 +5110,7 @@ mod tests {
             &AgentRequest {
                 prompt: "继续对话".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: Some("thr_existing".into()),
                 model: "gpt-test".into(),
                 effort: "medium".into(),
@@ -5007,6 +5150,7 @@ mod tests {
             &AgentRequest {
                 prompt: "继续对话".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: Some("thr_existing".into()),
                 model: "gpt-test".into(),
                 effort: "medium".into(),
@@ -5057,6 +5201,7 @@ mod tests {
             &AgentRequest {
                 prompt: "继续对话".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: Some("thr_existing".into()),
                 model: "gpt-test".into(),
                 effort: "medium".into(),
@@ -5109,6 +5254,7 @@ mod tests {
             &AgentRequest {
                 prompt: "继续对话".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: Some("thr_existing".into()),
                 model: "gpt-test".into(),
                 effort: "medium".into(),
@@ -5148,6 +5294,7 @@ mod tests {
             &AgentRequest {
                 prompt: "快速完成".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: None,
                 model: "gpt-test".into(),
                 effort: "medium".into(),
@@ -5189,6 +5336,7 @@ mod tests {
             &AgentRequest {
                 prompt: "继续对话".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: Some("thr_missing".into()),
                 model: "gpt-test".into(),
                 effort: "medium".into(),
@@ -5244,6 +5392,7 @@ mod tests {
                 &AgentRequest {
                     prompt: "继续对话".into(),
                     cwd: PathBuf::from("/tmp/project"),
+                    project_id: None,
                     thread_id: Some("thr_existing".into()),
                     model: "gpt-test".into(),
                     effort: "medium".into(),
@@ -5300,6 +5449,7 @@ mod tests {
             &AgentRequest {
                 prompt: "继续对话".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: Some("thr_existing".into()),
                 model: "gpt-test".into(),
                 effort: "medium".into(),
@@ -5345,6 +5495,7 @@ mod tests {
             &AgentRequest {
                 prompt: "interrupt me".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: None,
                 model: "gpt-test".into(),
                 effort: "medium".into(),
@@ -6055,6 +6206,7 @@ mod tests {
             &AgentRequest {
                 prompt: "probe notices".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: None,
                 model: "model-a".into(),
                 effort: "medium".into(),
@@ -6123,6 +6275,7 @@ mod tests {
             &AgentRequest {
                 prompt: "fail".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: None,
                 model: "model-a".into(),
                 effort: "medium".into(),
@@ -6865,6 +7018,7 @@ mod tests {
         let run = CodexAppServerBackend::new().run_prompt(AgentRequest {
             prompt: "Use the shell to run exactly `curl -I https://example.com` and no other command. Request approval for network access, then wait for my decision.".into(),
             cwd: std::env::current_dir().unwrap(),
+            project_id: None,
             thread_id: None,
             model: model.model.clone(),
             effort: model.default_reasoning_effort.clone(),
@@ -7725,6 +7879,7 @@ mod tests {
             &AgentRequest {
                 prompt: "probe".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: None,
                 model: "gpt-test".into(),
                 effort: "medium".into(),
@@ -7758,6 +7913,7 @@ mod tests {
             &AgentRequest {
                 prompt: "probe".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: None,
                 model: "gpt-test".into(),
                 effort: "medium".into(),
@@ -7804,6 +7960,7 @@ mod tests {
             &AgentRequest {
                 prompt: "probe".into(),
                 cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
                 thread_id: None,
                 model: "model-a".into(),
                 effort: "high".into(),

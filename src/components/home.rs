@@ -21,7 +21,8 @@ use crate::{
         approval::{ApprovalCardCallback, render_approval_card},
         composer::{
             ComposerView, ConversationActivity, ConversationChanged, ConversationPhase,
-            ModelCatalogLoadFinished, ReasoningActivityPresentation, RequestFullAccessConfirmation,
+            ConversationThreadCreated, ConversationTranscriptTurn, ModelCatalogLoadFinished,
+            ReasoningActivityPresentation, RequestFullAccessConfirmation,
         },
         file_change::{
             DiffReviewPresentation, FileApprovalCallback, FileApprovalEvent,
@@ -44,6 +45,7 @@ use crate::{
 pub struct HomeView {
     mode: ThemeMode,
     composer: Entity<ComposerView>,
+    observed_composers: Vec<Entity<ComposerView>>,
     suggestion_scale: [f32; 2],
     suggestion_animation_from: [f32; 2],
     suggestion_animation_to: [f32; 2],
@@ -72,6 +74,7 @@ pub struct HomeView {
 
 impl gpui::EventEmitter<RequestFullAccessConfirmation> for HomeView {}
 impl gpui::EventEmitter<ModelCatalogLoadFinished> for HomeView {}
+impl gpui::EventEmitter<ConversationThreadCreated> for HomeView {}
 
 pub struct OpenDiffReview(pub DiffReviewPresentation);
 impl gpui::EventEmitter<OpenDiffReview> for HomeView {}
@@ -603,23 +606,10 @@ impl HomeView {
         cx: &mut Context<Self>,
     ) -> Self {
         let composer = cx.new(|cx| ComposerView::new_with_backend(mode, backend, cx));
-        cx.subscribe(&composer, |_, _, _: &RequestFullAccessConfirmation, cx| {
-            cx.emit(RequestFullAccessConfirmation);
-        })
-        .detach();
-        cx.subscribe(&composer, |_, _, _: &ModelCatalogLoadFinished, cx| {
-            cx.emit(ModelCatalogLoadFinished);
-        })
-        .detach();
-        cx.subscribe(&composer, |this, composer, _: &ConversationChanged, cx| {
-            let phase = composer.read(cx).conversation_phase();
-            this.sync_thinking_shimmer(phase, cx);
-            cx.notify();
-        })
-        .detach();
-        Self {
+        let mut view = Self {
             mode,
-            composer,
+            composer: composer.clone(),
+            observed_composers: Vec::new(),
             suggestion_scale: [1.0; 2],
             suggestion_animation_from: [1.0; 2],
             suggestion_animation_to: [1.0; 2],
@@ -644,7 +634,62 @@ impl HomeView {
             expanded_commands: HashSet::new(),
             command_scroll_handles: HashMap::new(),
             approval_focus: cx.focus_handle(),
+        };
+        view.observe_composer(composer, cx);
+        view
+    }
+
+    fn observe_composer(&mut self, composer: Entity<ComposerView>, cx: &mut Context<Self>) {
+        if self
+            .observed_composers
+            .iter()
+            .any(|observed| observed == &composer)
+        {
+            return;
         }
+        cx.subscribe(&composer, |_, _, _: &RequestFullAccessConfirmation, cx| {
+            cx.emit(RequestFullAccessConfirmation);
+        })
+        .detach();
+        cx.subscribe(&composer, |_, _, _: &ModelCatalogLoadFinished, cx| {
+            cx.emit(ModelCatalogLoadFinished);
+        })
+        .detach();
+        cx.subscribe(&composer, |_, _, event: &ConversationThreadCreated, cx| {
+            cx.emit(event.clone());
+        })
+        .detach();
+        cx.subscribe(&composer, |this, composer, _: &ConversationChanged, cx| {
+            if *this.composer == *composer {
+                let phase = composer.read(cx).conversation_phase();
+                this.sync_thinking_shimmer(phase, cx);
+                cx.notify();
+            }
+        })
+        .detach();
+        self.observed_composers.push(composer);
+    }
+
+    pub fn composer_entity(&self) -> Entity<ComposerView> {
+        self.composer.clone()
+    }
+
+    pub fn set_composer(&mut self, composer: Entity<ComposerView>, cx: &mut Context<Self>) {
+        self.observe_composer(composer.clone(), cx);
+        self.composer = composer;
+        self.conversation_scroll = ScrollHandle::new();
+        self.expanded_reasoning.clear();
+        self.reasoning_disclosure_transitions.clear();
+        self.reasoning_scroll_handles.clear();
+        self.expanded_tool_groups.clear();
+        self.collapsed_active_tool_groups.clear();
+        self.tool_group_disclosure_transitions.clear();
+        self.tool_group_scroll_handles.clear();
+        self.expanded_commands.clear();
+        self.command_scroll_handles.clear();
+        let phase = self.composer.read(cx).conversation_phase();
+        self.sync_thinking_shimmer(phase, cx);
+        cx.notify();
     }
 
     fn handle_approval_key(
@@ -1296,6 +1341,7 @@ impl HomeView {
 impl Render for HomeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_mode(self.mode);
+        let transcript = self.composer.read(cx).transcript_render_snapshot();
         let (
             phase,
             user_message,
@@ -1392,6 +1438,7 @@ impl Render for HomeView {
             theme,
             self.composer.clone(),
             user_input_other,
+            transcript,
             phase,
             user_message,
             user_message_time,
@@ -1434,6 +1481,7 @@ fn home(
     theme: Theme,
     composer: Entity<ComposerView>,
     user_input_other: Entity<PromptInput>,
+    transcript: Vec<ConversationTranscriptTurn>,
     phase: ConversationPhase,
     user_message: Option<String>,
     user_message_time: Option<String>,
@@ -1535,6 +1583,7 @@ fn home(
             root.child(conversation(
                 home_entity.clone(),
                 theme,
+                transcript,
                 phase,
                 user_message.unwrap_or_default(),
                 user_message_time.unwrap_or_default(),
@@ -1656,6 +1705,7 @@ fn home(
 fn conversation(
     home_entity: Entity<HomeView>,
     theme: Theme,
+    transcript: Vec<ConversationTranscriptTurn>,
     phase: ConversationPhase,
     user_message: String,
     user_message_time: String,
@@ -1688,6 +1738,63 @@ fn conversation(
         ConversationPhase::Complete | ConversationPhase::Failed
     );
 
+    let mut historical_transcript = div().w_full().flex().flex_col().gap(px(24.0));
+    for (index, turn) in transcript.into_iter().enumerate() {
+        let user_message = turn.user_message;
+        let answer = if turn.activities.is_empty() {
+            div()
+                .w_full()
+                .text_size(px(14.0))
+                .line_height(px(22.0))
+                .text_color(theme.text)
+                .child(turn.assistant_message)
+                .into_any_element()
+        } else {
+            activity_stream(
+                home_entity.clone(),
+                turn.activities,
+                conversation_status(turn.phase).is_some(),
+                thinking_shimmer_progress,
+                expanded_reasoning.clone(),
+                reasoning_disclosure_progress.clone(),
+                reasoning_scroll_handles.clone(),
+                expanded_tool_groups.clone(),
+                collapsed_active_tool_groups.clone(),
+                tool_group_disclosure_progress.clone(),
+                tool_group_scroll_handles.clone(),
+                expanded_commands.clone(),
+                command_scroll_handles.clone(),
+                theme,
+            )
+            .into_any_element()
+        };
+        historical_transcript = historical_transcript.child(
+            div()
+                .id(("transcript-turn", index))
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(16.0))
+                .when(!user_message.is_empty(), |row| {
+                    row.child(
+                        div().w_full().flex().justify_end().child(
+                            div()
+                                .max_w(px(600.0))
+                                .px(px(16.0))
+                                .py(px(10.0))
+                                .rounded(px(USER_MESSAGE_BUBBLE_RADIUS))
+                                .bg(theme.text.alpha(0.05))
+                                .text_size(px(14.0))
+                                .line_height(px(22.0))
+                                .text_color(theme.text)
+                                .child(user_message),
+                        ),
+                    )
+                })
+                .child(answer),
+        );
+    }
+
     let conversation_body = div()
         .w_full()
         .max_w(px(736.0))
@@ -1696,6 +1803,7 @@ fn conversation(
         .pb(px(CONVERSATION_BOTTOM_INSET))
         .flex()
         .flex_col()
+        .child(historical_transcript)
         .child(
             div()
                 .h(px(72.0))
