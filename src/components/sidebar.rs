@@ -2203,7 +2203,10 @@ impl Render for SidebarView {
             .flex()
             .flex_col()
             .font_family(".SystemUIFont")
-            .bg(theme.sidebar_surface)
+            // The app shell owns the sidebar material so it is composited only
+            // once over the native blur. Painting the same translucent tint in
+            // this content view would compound its alpha and make the settled
+            // sidebar appear opaque in both light and dark themes.
             .text_color(theme.sidebar_text);
         if self.activity_open {
             sidebar = sidebar

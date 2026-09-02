@@ -34,6 +34,13 @@ fn configure_native_blur_sampling(window: &mut gpui::Window) {
 
     #[allow(unexpected_cfgs)]
     unsafe fn apply() -> bool {
+        use cocoa::{
+            appkit::{
+                NSView, NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectBlendingMode,
+                NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+            },
+            base::{id, nil},
+        };
         use objc::{class, msg_send, runtime::Object, sel, sel_impl};
 
         let application: *mut Object = msg_send![class!(NSApplication), sharedApplication];
@@ -54,11 +61,30 @@ fn configure_native_blur_sampling(window: &mut gpui::Window) {
             let view: *mut Object = msg_send![subviews, objectAtIndex: index];
             let is_visual_effect: bool = msg_send![view, isKindOfClass: class!(NSVisualEffectView)];
             if is_visual_effect {
-                // NSVisualEffectBlendingModeBehindWindow = 0. GPUI creates
-                // this view but otherwise leaves AppKit's WithinWindow mode,
-                // which samples only our own clear surface and looks opaque.
-                let _: () = msg_send![view, setBlendingMode: 0isize];
-                let _: () = msg_send![view, setState: 1isize];
+                // Electron's primary ChatGPT window is transparent and calls
+                // setVibrancy("menu"). GPUI's built-in BlurredView instead
+                // uses Selection material and strips AppKit's tint and
+                // saturation filters in updateLayer, so changing its material
+                // in place still produces a visibly different light sidebar.
+                // Keep GPUI's owned view alive but hidden, then install a plain
+                // NSVisualEffectView with Electron's exact semantic material.
+                unsafe {
+                    let frame = NSView::bounds(content_view);
+                    let menu_view: id =
+                        NSVisualEffectView::initWithFrame_(NSVisualEffectView::alloc(nil), frame);
+                    menu_view.setMaterial_(NSVisualEffectMaterial::Menu);
+                    menu_view.setBlendingMode_(NSVisualEffectBlendingMode::BehindWindow);
+                    menu_view.setState_(NSVisualEffectState::Active);
+                    menu_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+                    let _: () = msg_send![
+                        content_view,
+                        addSubview: menu_view
+                        positioned: -1isize
+                        relativeTo: nil
+                    ];
+                    let _: id = msg_send![menu_view, autorelease];
+                    let _: () = msg_send![view, setHidden: true];
+                }
                 return true;
             }
         }

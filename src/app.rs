@@ -252,9 +252,6 @@ fn startup_loading_view(theme: Theme) -> impl IntoElement {
         .aria_label("GPUI 正在加载")
         .size_full()
         .relative()
-        // Match the normal sidebar's material stack across the entire window:
-        // a theme underlay above the native blur, then the sidebar tint.
-        .bg(theme.surface_underlay)
         .child(
             div()
                 .size_full()
@@ -2512,10 +2509,6 @@ impl Render for ChatApp {
                 "app-shell"
             })
             .size_full()
-            // Apply the subtle theme underlay above the native blurred
-            // material. The sidebar adds its measured tint on top, while the
-            // main pane below is painted fully opaque in its own child.
-            .bg(theme.surface_underlay)
             .relative()
             .flex()
             .font(ui_font())

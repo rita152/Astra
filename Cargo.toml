@@ -19,6 +19,7 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44a
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2", features = ["font-kit"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.25"
 objc = "0.2"
 
 [dev-dependencies]

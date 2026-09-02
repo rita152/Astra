@@ -37,8 +37,6 @@ impl ThemeMode {
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub surface: Rgba,
-    /// Theme underlay tint above the native blurred window material.
-    pub surface_underlay: Rgba,
     /// The sidebar's actual translucent paint, matching the Electron shell.
     pub sidebar_surface: Rgba,
     pub surface_under: Rgba,
@@ -88,15 +86,14 @@ impl Theme {
         match mode {
             ThemeMode::Light => Self {
                 surface: rgba(0xffffffff),
-                // A light underlay stabilizes the material before the stronger
-                // sidebar tint is composited above it.
-                surface_underlay: rgba(0xf9f9f995),
-                // Keep the native material visible without letting a bright
-                // desktop dominate the sidebar. Combined with the underlay,
-                // roughly 23% of the sampled background remains visible.
-                sidebar_surface: rgba(0xededed73),
-                // Resolved sidebar color over the canonical underlay. Sticky
-                // overlays need this opaque value to avoid double compositing.
+                // CDP: --color-surface-tertiary resolves to pure white, then
+                // Electron mixes it at 70% over the native window material.
+                // ChatGPT's renderer uses 70% white over macOS menu vibrancy. GPUI's
+                // color pipeline needs this minute cool compensation to reproduce the
+                // same final `(244, 244, 245)` light-sidebar composite on macOS.
+                sidebar_surface: rgba(0xfdfdffb3),
+                // Opaque secondary surface used where a sticky overlay must
+                // mask scrolling content instead of resampling the material.
                 surface_under: rgba(0xf6f6f6ff),
                 elevated: rgba(0xffffffff),
                 model_picker_surface: rgba(0xfafafaff),
@@ -137,10 +134,6 @@ impl Theme {
             },
             ThemeMode::Dark => Self {
                 surface: rgba(0x181818ff),
-                // Reduce native-material transparency from 30% to 18%. This
-                // retains the glass effect while preventing bright content
-                // behind the window from washing the dark sidebar toward gray.
-                surface_underlay: rgba(0x00000000),
                 // Preserve the original #282828 material color while using a
                 // stronger alpha for reliable contrast over bright desktops.
                 sidebar_surface: rgba(0x282828d1),
@@ -248,11 +241,13 @@ mod tests {
         let light = Theme::for_mode(ThemeMode::Light);
 
         assert!((dark.sidebar_surface.a - 209.0 / 255.0).abs() < f32::EPSILON);
-        assert!((light.sidebar_surface.a - 115.0 / 255.0).abs() < f32::EPSILON);
+        assert_eq!(light.sidebar_surface.r, 253.0 / 255.0);
+        assert_eq!(light.sidebar_surface.g, 253.0 / 255.0);
+        assert_eq!(light.sidebar_surface.b, 1.0);
+        assert!((light.sidebar_surface.a - 179.0 / 255.0).abs() < f32::EPSILON);
         assert!(dark.sidebar_surface.a < 1.0);
         assert!(light.sidebar_surface.a < 1.0);
-        assert_eq!(dark.surface_underlay.a, 0.0);
-        assert!((light.surface_underlay.a - 149.0 / 255.0).abs() < f32::EPSILON);
+        assert!((light.sidebar_surface.a - 0.70).abs() < 0.005);
     }
 
     #[test]
@@ -277,8 +272,7 @@ mod tests {
 
         for mode in [ThemeMode::Light, ThemeMode::Dark] {
             let theme = Theme::for_mode(mode);
-            let underlay = composite(theme.surface_underlay, white);
-            let sidebar = composite(theme.sidebar_surface, underlay);
+            let sidebar = composite(theme.sidebar_surface, white);
             let primary_contrast = contrast_ratio(composite(theme.sidebar_text, sidebar), sidebar);
             let muted_contrast =
                 contrast_ratio(composite(theme.sidebar_text_muted, sidebar), sidebar);
