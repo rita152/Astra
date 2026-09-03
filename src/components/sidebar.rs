@@ -415,6 +415,31 @@ impl SidebarView {
         }
     }
 
+    /// Mirrors the visual state produced by a real sidebar thread selection
+    /// without emitting a second navigation event. The capture resume path
+    /// drives the matching conversation load directly from `ChatApp`.
+    pub fn select_thread_for_capture(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        self.selected_thread_id = Some(thread_id);
+        self.search_open = false;
+        self.activity_open = false;
+        self.archived_open = false;
+        self.project_menu_id = None;
+        self.thread_menu_id = None;
+        cx.notify();
+    }
+
+    #[cfg(feature = "screenshot")]
+    pub fn resumed_thread_ready_for_capture(&self, thread_id: &str) -> Result<bool, String> {
+        if let Some(error) = &self.snapshot.error {
+            return Err(format!("侧栏数据加载失败：{error}"));
+        }
+        Ok(self.selected_thread_id.as_deref() == Some(thread_id)
+            && (cfg!(test) || self.snapshot.thread(thread_id).is_some())
+            && !self.snapshot.loading.projects
+            && !self.snapshot.loading.recent
+            && !self.snapshot.loading.pinned)
+    }
+
     fn select_thread(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
         self.selected_thread_id = Some(thread_id.clone());
         self.search_open = false;

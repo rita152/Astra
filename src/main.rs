@@ -7,6 +7,14 @@ mod workspace;
 
 use std::{borrow::Cow, fs, path::PathBuf};
 
+#[cfg(feature = "screenshot")]
+use std::path::Path;
+#[cfg(feature = "screenshot")]
+use std::time::{Duration, Instant};
+
+#[cfg(feature = "screenshot")]
+const RESUMED_THREAD_STABLE_FRAMES: usize = 3;
+
 use anyhow::Result;
 use app::ChatApp;
 use components::prompt_input::{
@@ -102,15 +110,26 @@ struct Assets {
 }
 
 #[cfg(feature = "screenshot")]
+fn save_screenshot(window: &gpui::Window, path: &str) -> anyhow::Result<()> {
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    window.render_to_image()?.save(path)?;
+    Ok(())
+}
+
+#[cfg(feature = "screenshot")]
 fn schedule_screenshot(window: &mut gpui::Window, path: String, frames: usize) {
     window.on_next_frame(move |window, cx| {
         if frames > 1 {
+            // `on_next_frame` callbacks run before GPUI paints that frame.
+            // Dirty each counted frame so the delay represents real draws.
+            window.refresh();
             schedule_screenshot(window, path, frames - 1);
         } else {
-            match window
-                .render_to_image()
-                .and_then(|image| image.save(&path).map_err(anyhow::Error::from))
-            {
+            match save_screenshot(window, &path) {
                 Ok(()) => println!("{path}"),
                 Err(error) => {
                     eprintln!("failed to save screenshot: {error:#}");
@@ -118,6 +137,80 @@ fn schedule_screenshot(window: &mut gpui::Window, path: String, frames: usize) {
                 }
             }
             cx.quit();
+        }
+    });
+}
+
+#[cfg(feature = "screenshot")]
+fn schedule_resumed_thread_screenshot(
+    window: &mut gpui::Window,
+    app: gpui::Entity<ChatApp>,
+    path: String,
+    thread_id: String,
+    deadline: Instant,
+    scroll_from_bottom: Option<f32>,
+    stable_frames_remaining: usize,
+) {
+    window.on_next_frame(move |window, cx| {
+        let readiness = app.read(cx).resumed_thread_ready(&thread_id, cx);
+        match readiness {
+            Err(error) => {
+                eprintln!("failed to load resumed thread {thread_id}: {error}");
+                std::process::exit(1);
+            }
+            Ok(true) if scroll_from_bottom.is_some() => {
+                let distance = scroll_from_bottom.expect("guarded capture scroll distance");
+                app.update(cx, |app, cx| {
+                    app.set_conversation_scroll_from_bottom_for_capture(distance, cx)
+                });
+                window.refresh();
+                schedule_resumed_thread_screenshot(
+                    window,
+                    app,
+                    path,
+                    thread_id,
+                    deadline,
+                    None,
+                    RESUMED_THREAD_STABLE_FRAMES,
+                );
+            }
+            Ok(true) if stable_frames_remaining > 0 => {
+                // Readiness can flip in this callback, before that frame is
+                // painted. Force a draw for every counted stable frame.
+                window.refresh();
+                schedule_resumed_thread_screenshot(
+                    window,
+                    app,
+                    path,
+                    thread_id,
+                    deadline,
+                    scroll_from_bottom,
+                    stable_frames_remaining - 1,
+                );
+            }
+            Ok(true) => {
+                match save_screenshot(window, &path) {
+                    Ok(()) => println!("{path}"),
+                    Err(error) => {
+                        eprintln!("failed to save screenshot: {error:#}");
+                        std::process::exit(1);
+                    }
+                }
+                cx.quit();
+            }
+            Ok(false) if Instant::now() < deadline => schedule_resumed_thread_screenshot(
+                window,
+                app,
+                path,
+                thread_id,
+                deadline,
+                scroll_from_bottom,
+                RESUMED_THREAD_STABLE_FRAMES,
+            ),
+            Ok(false) => {
+                eprintln!("timed out waiting for resumed thread {thread_id}");
+                std::process::exit(1);
+            }
         }
     });
 }
@@ -144,6 +237,10 @@ impl AssetSource for Assets {
     }
 }
 
+fn normalize_resume_thread_id(value: &str) -> String {
+    value.strip_prefix("local:").unwrap_or(value).to_owned()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args
@@ -161,8 +258,17 @@ fn main() {
                 .ok()
         })
         .unwrap_or(2);
+    let resume_thread = args.iter().find_map(|arg| {
+        arg.strip_prefix("--resume-thread=")
+            .map(normalize_resume_thread_id)
+    });
+    let resume_scroll_from_bottom = args.iter().find_map(|arg| {
+        arg.strip_prefix("--resume-scroll-from-bottom=")?
+            .parse::<f32>()
+            .ok()
+    });
     #[cfg(not(feature = "screenshot"))]
-    let _ = screenshot_frames;
+    let _ = (screenshot_frames, resume_scroll_from_bottom);
     let submit_prompt = args
         .iter()
         .find_map(|arg| arg.strip_prefix("--submit-prompt=").map(ToOwned::to_owned));
@@ -363,19 +469,7 @@ fn main() {
                     if maximize_after_open {
                         window.on_next_frame(|window, _| window.zoom_window());
                     }
-                    #[cfg(feature = "screenshot")]
-                    if let Some(path) = screenshot_path.clone() {
-                        schedule_screenshot(
-                            window,
-                            path,
-                            if maximize_after_open {
-                                screenshot_frames.max(90)
-                            } else {
-                                screenshot_frames
-                            },
-                        );
-                    }
-                    cx.new(|cx| {
+                    let app = cx.new(|cx| {
                         let mut app = ChatApp::new(mode, sidebar_bottom, cx);
                         if permission_ui_capture {
                             app.enable_permission_ui_for_capture(cx);
@@ -506,11 +600,56 @@ fn main() {
                         } else if settings_open {
                             app.open_settings(cx);
                         }
+                        if let Some(thread_id) = resume_thread.as_deref() {
+                            app.resume_thread_for_capture(thread_id.to_owned(), cx);
+                        }
                         app
-                    })
+                    });
+                    #[cfg(feature = "screenshot")]
+                    if let Some(path) = screenshot_path.clone() {
+                        if let Some(thread_id) = resume_thread.clone() {
+                            schedule_resumed_thread_screenshot(
+                                window,
+                                app.clone(),
+                                path,
+                                thread_id,
+                                Instant::now() + Duration::from_secs(60),
+                                resume_scroll_from_bottom,
+                                RESUMED_THREAD_STABLE_FRAMES,
+                            );
+                        } else {
+                            schedule_screenshot(
+                                window,
+                                path,
+                                if maximize_after_open {
+                                    screenshot_frames.max(90)
+                                } else {
+                                    screenshot_frames
+                                },
+                            );
+                        }
+                    }
+                    app
                 },
             )
             .expect("failed to open Codex window");
             cx.activate(true);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_resume_thread_id;
+
+    #[test]
+    fn resume_thread_id_accepts_chatgpt_sidebar_identity() {
+        assert_eq!(
+            normalize_resume_thread_id("local:01a06013-458c-7733-8aea-4f36df979feb"),
+            "01a06013-458c-7733-8aea-4f36df979feb"
+        );
+        assert_eq!(
+            normalize_resume_thread_id("01a06013-458c-7733-8aea-4f36df979feb"),
+            "01a06013-458c-7733-8aea-4f36df979feb"
+        );
+    }
 }

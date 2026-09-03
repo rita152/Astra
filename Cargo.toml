@@ -17,6 +17,8 @@ toml = "0.8"
 unicode-segmentation = "1"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2", features = ["font-kit"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+two-face = { version = "0.5.1", default-features = false, features = ["syntect-onig"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.25"

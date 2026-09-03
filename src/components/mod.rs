@@ -3,6 +3,7 @@ pub mod composer;
 pub mod file_change;
 pub mod home;
 pub mod icons;
+pub mod markdown;
 pub mod permissions_approval;
 pub mod prompt_input;
 pub mod sidebar;

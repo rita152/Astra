@@ -1072,6 +1072,27 @@ impl ComposerView {
         self.history_error.is_some()
     }
 
+    #[cfg(feature = "screenshot")]
+    pub fn history_loading(&self) -> bool {
+        self.history_loading
+    }
+
+    #[cfg(feature = "screenshot")]
+    pub fn history_error(&self) -> Option<&str> {
+        self.history_error.as_deref()
+    }
+
+    #[cfg(feature = "screenshot")]
+    pub fn model_catalog_ready_for_capture(&self) -> Result<bool, String> {
+        if cfg!(test) {
+            return Ok(true);
+        }
+        if let Some(error) = &self.model_catalog_error {
+            return Err(format!("模型目录加载失败：{error}"));
+        }
+        Ok(!self.models.is_empty())
+    }
+
     pub fn set_workspace_context(
         &mut self,
         cwd: PathBuf,

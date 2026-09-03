@@ -569,6 +569,55 @@ impl ChatApp {
         );
     }
 
+    /// Opens a persisted thread without requiring the sidebar to finish loading first.
+    ///
+    /// This is used by the deterministic Markdown capture path. It deliberately
+    /// follows the same history-loading path as a real sidebar selection.
+    pub fn resume_thread_for_capture(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.select_thread_for_capture(thread_id.clone(), cx)
+        });
+        self.select_conversation(thread_id, cx);
+    }
+
+    /// Returns whether the requested thread has finished hydrating, or its load error.
+    #[cfg(feature = "screenshot")]
+    pub fn resumed_thread_ready(&self, thread_id: &str, cx: &gpui::App) -> Result<bool, String> {
+        let sidebar_ready = self
+            .sidebar
+            .read(cx)
+            .resumed_thread_ready_for_capture(thread_id)?;
+        if !(self.startup_model_catalog_resolved
+            && self.startup_sidebar_resolved
+            && self.startup_minimum_duration_elapsed
+            && sidebar_ready)
+        {
+            return Ok(false);
+        }
+        let key = ConversationKey::Thread(thread_id.to_owned());
+        let Some(host) = self.conversation_hosts.get(&key) else {
+            return Ok(false);
+        };
+        let composer = host.composer.read(cx);
+        if let Some(error) = composer.history_error() {
+            return Err(error.to_owned());
+        }
+        Ok(!composer.history_loading()
+            && composer.thread_id() == Some(thread_id)
+            && composer.model_catalog_ready_for_capture()?)
+    }
+
+    #[cfg(feature = "screenshot")]
+    pub fn set_conversation_scroll_from_bottom_for_capture(
+        &mut self,
+        distance: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.home.update(cx, |home, cx| {
+            home.set_conversation_scroll_from_bottom_for_capture(distance, cx)
+        });
+    }
+
     fn load_conversation_history(
         &mut self,
         key: ConversationKey,
@@ -3438,6 +3487,59 @@ mod tests {
             next_turn_cursor: None,
             backwards_turn_cursor: None,
         }
+    }
+
+    #[cfg(feature = "screenshot")]
+    #[test]
+    fn resumed_thread_readiness_tracks_loading_completion_and_errors() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(WindowOptions::default(), |_, cx| {
+            ChatApp::new(ThemeMode::Dark, false, cx)
+        });
+        let composer = window.read(|chat, _| {
+            chat.conversation_hosts[&chat.active_conversation]
+                .composer
+                .clone()
+        });
+        app.update(|cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_workspace_context(
+                    PathBuf::from("/tmp/capture"),
+                    None,
+                    Some("thread-capture".to_owned()),
+                    cx,
+                );
+                composer.set_history_loading(true, cx);
+            });
+        });
+        window.update(|chat, _, cx| chat.rekey_created_thread("thread-capture".to_owned(), cx));
+        window
+            .update(|chat, _, cx| chat.resume_thread_for_capture("thread-capture".to_owned(), cx));
+
+        assert_eq!(
+            window.read(|chat, cx| chat.resumed_thread_ready("thread-capture", cx)),
+            Ok(false)
+        );
+
+        app.update(|cx| {
+            composer.update(cx, |composer, cx| {
+                composer.hydrate_history(history_fixture("thread-capture", "captured history"), cx)
+            });
+        });
+        assert_eq!(
+            window.read(|chat, cx| chat.resumed_thread_ready("thread-capture", cx)),
+            Ok(true)
+        );
+
+        app.update(|cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_history_error("history failed".to_owned(), cx)
+            });
+        });
+        assert_eq!(
+            window.read(|chat, cx| chat.resumed_thread_ready("thread-capture", cx)),
+            Err("history failed".to_owned())
+        );
     }
 
     #[test]

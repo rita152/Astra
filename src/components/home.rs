@@ -30,6 +30,7 @@ use crate::{
             render_file_approval_card, render_file_change_activity,
         },
         icons::{icon, suggestion_icon},
+        markdown::render_assistant_markdown,
         permissions_approval::{
             PermissionApprovalCallback, PermissionApprovalEvent, PermissionApprovalPresentation,
             render_permissions_approval,
@@ -870,6 +871,19 @@ impl HomeView {
 
     pub fn show_user_message_actions_for_capture(&mut self, cx: &mut Context<Self>) {
         self.user_message_actions_visible_for_capture = true;
+        cx.notify();
+    }
+
+    #[cfg(feature = "screenshot")]
+    pub fn set_conversation_scroll_from_bottom_for_capture(
+        &mut self,
+        distance: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let max_scroll = f32::from(self.conversation_scroll.max_offset().y).max(0.0);
+        let scroll_top = (max_scroll - distance.max(0.0)).max(0.0);
+        self.conversation_scroll
+            .set_offset(point(px(0.0), px(-scroll_top)));
         cx.notify();
     }
 
@@ -1811,13 +1825,12 @@ fn conversation(
     for (index, turn) in transcript.into_iter().enumerate() {
         let user_message = turn.user_message;
         let answer = if turn.activities.is_empty() {
-            div()
-                .w_full()
-                .text_size(px(14.0))
-                .line_height(px(22.0))
-                .text_color(theme.text)
-                .child(turn.assistant_message)
-                .into_any_element()
+            render_assistant_markdown(
+                &turn.assistant_message,
+                theme,
+                &format!("historical-assistant-{index}"),
+            )
+            .into_any_element()
         } else {
             activity_stream(
                 home_entity.clone(),
@@ -1992,8 +2005,11 @@ fn conversation(
                                     .flex_col()
                                     .gap(px(16.0))
                                     .when(!assistant_message.is_empty(), |stream| {
-                                        stream
-                                            .child(div().w_full().child(assistant_message.clone()))
+                                        stream.child(render_assistant_markdown(
+                                            &assistant_message,
+                                            theme,
+                                            "current-assistant",
+                                        ))
                                     })
                                     .when(show_thinking_tail, |stream| {
                                         stream.child(thinking_shimmer(
@@ -2200,8 +2216,10 @@ fn activity_stream(
                     ))
                 }
                 ActivityStreamUnit::Standalone(activity) => match activity {
-                    ConversationActivity::AssistantMessage { text, .. } if !text.is_empty() => {
-                        stream.child(div().w_full().child(text))
+                    ConversationActivity::AssistantMessage { item_id, text }
+                        if !text.is_empty() =>
+                    {
+                        stream.child(render_assistant_markdown(&text, theme, &item_id))
                     }
                     ConversationActivity::Reasoning(reasoning) => {
                         let expanded = reasoning.is_active()

@@ -20,6 +20,23 @@ target/release/gpui-chat-clone \
   --screenshot=artifacts/actual-dark.png
 ```
 
+恢复指定线程并等待历史内容稳定后再截图：
+
+```bash
+target/release/gpui-chat-clone \
+  --theme=light \
+  --window-width=1470 \
+  --window-height=923 \
+  --resume-thread=<thread-id> \
+  --resume-scroll-from-bottom=3200 \
+  --screenshot=artifacts/resumed-thread-light.png
+```
+
+该路径会等待线程历史、侧栏和模型目录完成 hydration，并额外等待三个实际绘制的稳定帧；历史加载失败或超时会以非零状态退出，截图输出目录会自动创建。
+`<thread-id>` 可直接使用 ChatGPT App 侧栏 DOM 中的 `local:<uuid>`，也可使用 Codex app-server 的原始 UUID。
+窗口宽高使用逻辑像素；PNG 的物理像素尺寸会跟随当前显示器缩放倍率。
+`--resume-scroll-from-bottom` 为可选的逻辑像素距离，用于让 light/dark 捕获稳定落在同一段历史内容；省略时截图停在会话底部。
+
 ## 验证
 
 Rust 基础校验：
