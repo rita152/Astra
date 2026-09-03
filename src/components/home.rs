@@ -696,8 +696,10 @@ impl HomeView {
         .detach();
         cx.subscribe(&composer, |this, composer, _: &ConversationChanged, cx| {
             if *this.composer == *composer {
-                let phase = composer.read(cx).conversation_phase();
-                this.sync_thinking_shimmer(phase, cx);
+                let composer = composer.read(cx);
+                let needs_shimmer = composer.conversation_phase() == ConversationPhase::Thinking
+                    || composer.has_active_context_compaction();
+                this.sync_thinking_shimmer(needs_shimmer, cx);
                 cx.notify();
             }
         })
@@ -722,8 +724,10 @@ impl HomeView {
         self.tool_group_scroll_handles.clear();
         self.expanded_commands.clear();
         self.command_scroll_handles.clear();
-        let phase = self.composer.read(cx).conversation_phase();
-        self.sync_thinking_shimmer(phase, cx);
+        let composer = self.composer.read(cx);
+        let needs_shimmer = composer.conversation_phase() == ConversationPhase::Thinking
+            || composer.has_active_context_compaction();
+        self.sync_thinking_shimmer(needs_shimmer, cx);
         cx.notify();
     }
 
@@ -750,8 +754,8 @@ impl HomeView {
         }
     }
 
-    fn sync_thinking_shimmer(&mut self, phase: ConversationPhase, cx: &mut Context<Self>) {
-        if phase == ConversationPhase::Thinking {
+    fn sync_thinking_shimmer(&mut self, needs_shimmer: bool, cx: &mut Context<Self>) {
+        if needs_shimmer {
             if !self.thinking_shimmer_running {
                 self.start_thinking_shimmer(cx);
             }
@@ -907,6 +911,13 @@ impl HomeView {
         }
         self.composer.update(cx, |composer, cx| {
             composer.set_command_tool_for_capture(running, cx)
+        });
+        cx.notify();
+    }
+
+    pub fn set_context_compaction_for_capture(&mut self, running: bool, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.set_context_compaction_for_capture(running, cx)
         });
         cx.notify();
     }
@@ -1846,6 +1857,7 @@ fn conversation(
     let user_message_hover_group: SharedString = "user-message-hover".into();
     let assistant_message_hover_group: SharedString = "assistant-message-hover".into();
     let copied_user_message = user_message.clone();
+    let has_assistant_response = !assistant_message.is_empty();
     let complete = matches!(
         phase,
         ConversationPhase::Complete | ConversationPhase::Failed
@@ -2068,7 +2080,7 @@ fn conversation(
                         }
                     },
                 )
-                .when(complete, |answer| {
+                .when(complete && has_assistant_response, |answer| {
                     answer.child(
                         div()
                             .relative()
@@ -2286,6 +2298,9 @@ fn activity_stream(
                             theme,
                         ))
                     }
+                    ConversationActivity::ContextCompaction(compaction) => stream.child(
+                        context_compaction_activity(compaction, thinking_shimmer_progress, theme),
+                    ),
                     ConversationActivity::Command(command) => {
                         stream.child(command_execution_activity(
                             home_entity.clone(),
@@ -3796,85 +3811,114 @@ fn conversation_status(phase: ConversationPhase) -> Option<&'static str> {
 }
 
 fn thinking_shimmer(theme: Theme, progress: f32) -> impl IntoElement {
+    div().id("thinking-shimmer").child(shimmer_label(
+        "正在思考",
+        THINKING_SHIMMER_WIDTH,
+        theme,
+        progress,
+    ))
+}
+
+fn context_compaction_activity(
+    compaction: crate::agent::AgentContextCompaction,
+    shimmer_progress: f32,
+    theme: Theme,
+) -> Div {
+    let color = theme.text.alpha(0.60);
     div()
-        .id("thinking-shimmer")
-        .w(px(THINKING_SHIMMER_WIDTH))
         .h(px(21.0))
-        .child(
-            canvas(
-                move |_, window, _| {
-                    let mut font = window.text_style().font();
-                    font.family = ".SystemUIFont".into();
-                    font.weight = FontWeight::NORMAL;
-                    let shape = |color| {
-                        window.text_system().shape_line(
-                            "正在思考".into(),
-                            px(14.0),
-                            &[TextRun {
-                                len: "正在思考".len(),
-                                font: font.clone(),
-                                color,
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                            }],
-                            None,
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .text_size(px(14.0))
+        .line_height(px(21.0))
+        .font_family(".SystemUIFont")
+        .text_color(color)
+        .child(icon("context-compaction", color.into()).size(px(20.0)))
+        .when(compaction.completed, |row| row.child("上下文已压缩"))
+        .when(!compaction.completed, |row| {
+            row.child(shimmer_label(
+                "正在压缩上下文",
+                98.0,
+                theme,
+                shimmer_progress,
+            ))
+        })
+}
+
+fn shimmer_label(label: &'static str, width: f32, theme: Theme, progress: f32) -> impl IntoElement {
+    div().w(px(width)).h(px(21.0)).child(
+        canvas(
+            move |_, window, _| {
+                let mut font = window.text_style().font();
+                font.family = ".SystemUIFont".into();
+                font.weight = FontWeight::NORMAL;
+                let shape = |color| {
+                    window.text_system().shape_line(
+                        label.into(),
+                        px(14.0),
+                        &[TextRun {
+                            len: label.len(),
+                            font: font.clone(),
+                            color,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    )
+                };
+                let base = shape(theme.text.alpha(0.385).into());
+                let highlights = (1..=THINKING_SHIMMER_ALPHA_LEVELS)
+                    .map(|level| {
+                        shape(
+                            rgba(0xffffff00)
+                                .alpha(0.75 * level as f32 / THINKING_SHIMMER_ALPHA_LEVELS as f32)
+                                .into(),
                         )
-                    };
-                    let base = shape(theme.text.alpha(0.385).into());
-                    let highlights = (1..=THINKING_SHIMMER_ALPHA_LEVELS)
-                        .map(|level| {
-                            shape(
-                                rgba(0xffffff00)
-                                    .alpha(
-                                        0.75 * level as f32 / THINKING_SHIMMER_ALPHA_LEVELS as f32,
-                                    )
-                                    .into(),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    (base, highlights)
-                },
-                move |bounds,
-                      (base, highlights): (ShapedLine, Vec<ShapedLine>),
-                      window: &mut Window,
-                      cx: &mut App| {
-                    let origin = bounds.origin;
-                    base.paint(origin, px(21.0), TextAlign::Left, None, window, cx)
-                        .expect("thinking shimmer base glyphs should paint");
+                    })
+                    .collect::<Vec<_>>();
+                (base, highlights)
+            },
+            move |bounds,
+                  (base, highlights): (ShapedLine, Vec<ShapedLine>),
+                  window: &mut Window,
+                  cx: &mut App| {
+                let origin = bounds.origin;
+                base.paint(origin, px(21.0), TextAlign::Left, None, window, cx)
+                    .expect("context compaction shimmer base glyphs should paint");
 
-                    let text_width = f32::from(bounds.size.width);
-                    let band_width = text_width * THINKING_SHIMMER_BAND_SCALE;
-                    let band_left = f32::from(bounds.origin.x)
-                        + thinking_shimmer_band_left(progress, text_width);
-                    let first_x = band_left.floor().max(f32::from(bounds.left()));
-                    let last_x = (band_left + band_width)
-                        .ceil()
-                        .min(f32::from(bounds.right()));
-
-                    for x in first_x as i32..last_x as i32 {
-                        let band_position = (x as f32 + 0.5 - band_left) / band_width;
-                        let alpha = thinking_shimmer_alpha(band_position);
-                        if alpha <= 0.0 {
-                            continue;
-                        }
-                        let level = ((alpha / 0.75 * THINKING_SHIMMER_ALPHA_LEVELS as f32).ceil()
-                            as usize)
-                            .clamp(1, THINKING_SHIMMER_ALPHA_LEVELS);
-                        let mask = Bounds::from_corners(
-                            point(px(x as f32), bounds.top()),
-                            point(px(x as f32 + 1.0), bounds.bottom()),
-                        );
-                        window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
-                            highlights[level - 1]
-                                .paint(origin, px(21.0), TextAlign::Left, None, window, cx)
-                                .expect("thinking shimmer highlight glyphs should paint");
-                        });
+                let text_width = f32::from(bounds.size.width);
+                let band_width = text_width * THINKING_SHIMMER_BAND_SCALE;
+                let band_left =
+                    f32::from(bounds.origin.x) + thinking_shimmer_band_left(progress, text_width);
+                let first_x = band_left.floor().max(f32::from(bounds.left()));
+                let last_x = (band_left + band_width)
+                    .ceil()
+                    .min(f32::from(bounds.right()));
+                for x in first_x as i32..last_x as i32 {
+                    let band_position = (x as f32 + 0.5 - band_left) / band_width;
+                    let alpha = thinking_shimmer_alpha(band_position);
+                    if alpha <= 0.0 {
+                        continue;
                     }
-                },
-            )
-            .size_full(),
+                    let level = ((alpha / 0.75 * THINKING_SHIMMER_ALPHA_LEVELS as f32).ceil()
+                        as usize)
+                        .clamp(1, THINKING_SHIMMER_ALPHA_LEVELS);
+                    let mask = Bounds::from_corners(
+                        point(px(x as f32), bounds.top()),
+                        point(px(x as f32 + 1.0), bounds.bottom()),
+                    );
+                    window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
+                        highlights[level - 1]
+                            .paint(origin, px(21.0), TextAlign::Left, None, window, cx)
+                            .expect("context compaction shimmer highlight glyphs should paint");
+                    });
+                }
+            },
         )
+        .size_full(),
+    )
 }
 
 fn message_action(
@@ -3962,9 +4006,9 @@ mod tests {
         toggle_tool_activity_group, tool_group_chevron_transition_ease, tool_group_reasoning_title,
     };
     use crate::agent::{
-        AgentImageView, CommandExecution, CommandExecutionAction, CommandExecutionStatus,
-        HistoryItemDetail, HistoryTurnStatus, ThreadActivity, ThreadHistory, ThreadHistoryItem,
-        ThreadSummary, ThreadTurn,
+        AgentContextCompaction, AgentImageView, CommandExecution, CommandExecutionAction,
+        CommandExecutionStatus, HistoryItemDetail, HistoryTurnStatus, ThreadActivity,
+        ThreadHistory, ThreadHistoryItem, ThreadSummary, ThreadTurn,
     };
     use crate::components::{
         composer::{ConversationActivity, ConversationPhase, ReasoningActivityPresentation},
@@ -4112,6 +4156,37 @@ mod tests {
             &units[1],
             ActivityStreamUnit::Standalone(ConversationActivity::ImageView(image))
                 if image.id == "image_1" && image.path == PathBuf::from("/tmp/screenshot.png")
+        ));
+        assert!(matches!(units[2], ActivityStreamUnit::ToolGroup(_)));
+    }
+
+    #[test]
+    fn context_compaction_stays_standalone_between_tool_groups() {
+        let command = |id: &str| {
+            ConversationActivity::Command(command(
+                id,
+                CommandExecutionAction::Unknown {
+                    command: "cargo test".into(),
+                },
+                CommandExecutionStatus::Completed,
+            ))
+        };
+        let activities = vec![
+            command("before"),
+            ConversationActivity::ContextCompaction(AgentContextCompaction {
+                id: "compact_1".into(),
+                completed: true,
+            }),
+            command("after"),
+        ];
+
+        let units = activity_stream_units(&activities);
+        assert_eq!(units.len(), 3);
+        assert!(matches!(units[0], ActivityStreamUnit::ToolGroup(_)));
+        assert!(matches!(
+            &units[1],
+            ActivityStreamUnit::Standalone(ConversationActivity::ContextCompaction(compaction))
+                if compaction.id == "compact_1" && compaction.completed
         ));
         assert!(matches!(units[2], ActivityStreamUnit::ToolGroup(_)));
     }
@@ -5102,9 +5177,7 @@ mod tests {
         assert!((wrapped_progress - 1.0 / THINKING_SHIMMER_STEPS).abs() < 0.000_001);
         assert!(app.read_entity(&home, |home, _| home.thinking_shimmer_running));
 
-        app.update_entity(&home, |home, cx| {
-            home.sync_thinking_shimmer(ConversationPhase::Streaming, cx)
-        });
+        app.update_entity(&home, |home, cx| home.sync_thinking_shimmer(false, cx));
         app.advance_clock(THINKING_SHIMMER_FRAME_INTERVAL);
         app.run_until_parked();
         assert_eq!(

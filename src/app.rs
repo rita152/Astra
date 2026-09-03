@@ -813,6 +813,12 @@ impl ChatApp {
         });
     }
 
+    pub fn set_context_compaction_for_capture(&mut self, running: bool, cx: &mut Context<Self>) {
+        self.home.update(cx, |home, cx| {
+            home.set_context_compaction_for_capture(running, cx)
+        });
+    }
+
     pub fn set_tool_group_for_capture(
         &mut self,
         running: bool,

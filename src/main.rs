@@ -318,6 +318,10 @@ fn main() {
         arg.strip_prefix("--turn-diff-ui-state=")
             .map(ToOwned::to_owned)
     });
+    let context_compaction_ui_state = args.iter().find_map(|arg| {
+        arg.strip_prefix("--context-compaction-ui-state=")
+            .map(ToOwned::to_owned)
+    });
     let approval_ui_kind = args
         .iter()
         .find_map(|arg| {
@@ -482,6 +486,7 @@ fn main() {
                             || permissions_approval_ui_state.is_some()
                             || file_change_ui_state.is_some()
                             || turn_diff_ui_state.is_some()
+                            || context_compaction_ui_state.is_some()
                             || permission_mode.is_some()
                             || permission_menu_open
                             || permission_menu_state.is_some()
@@ -560,6 +565,12 @@ fn main() {
                             app.set_command_tool_for_capture(
                                 state.eq_ignore_ascii_case("running"),
                                 command_tool_expanded,
+                                cx,
+                            );
+                        }
+                        if let Some(state) = context_compaction_ui_state.as_deref() {
+                            app.set_context_compaction_for_capture(
+                                state.eq_ignore_ascii_case("running"),
                                 cx,
                             );
                         }

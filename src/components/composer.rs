@@ -10,17 +10,18 @@ use gpui::{
 use crate::{
     agent::{
         AgentAccountRateLimits, AgentApprovalHandle, AgentBackend, AgentCommandApprovalChoice,
-        AgentConfigWarning, AgentConnectionEvent, AgentCreditsSnapshot, AgentEffectivePermissions,
-        AgentEvent, AgentFileChange, AgentFileChangeStatus, AgentFileSystemAccess,
-        AgentFileSystemPath, AgentFileSystemSpecialPath, AgentImageView, AgentInterruptHandle,
-        AgentInterruptOutcome, AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
-        AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog, AgentOptionalField,
-        AgentPermissionMode, AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
-        AgentPermissionsApprovalHandle, AgentRateLimitWindow, AgentReasoning, AgentRequest,
-        AgentServerRequestFailureKind, AgentServerRequestKind, AgentServerRequestMetadata,
-        AgentThreadStatus, AgentThreadTokenUsage, AgentUserInputAnswer, AgentUserInputHandle,
-        AgentUserInputResponse, CodexAppServerBackend, CommandExecution, CommandExecutionAction,
-        CommandExecutionStatus, HistoryTurnStatus, ProjectId, ThreadHistory, ThreadHistoryItem,
+        AgentConfigWarning, AgentConnectionEvent, AgentContextCompaction, AgentCreditsSnapshot,
+        AgentEffectivePermissions, AgentEvent, AgentFileChange, AgentFileChangeStatus,
+        AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemSpecialPath, AgentImageView,
+        AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
+        AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog,
+        AgentOptionalField, AgentPermissionMode, AgentPermissionRequestProfile,
+        AgentPermissionsApprovalChoice, AgentPermissionsApprovalHandle, AgentRateLimitWindow,
+        AgentReasoning, AgentRequest, AgentServerRequestFailureKind, AgentServerRequestKind,
+        AgentServerRequestMetadata, AgentThreadStatus, AgentThreadTokenUsage, AgentUserInputAnswer,
+        AgentUserInputHandle, AgentUserInputResponse, CodexAppServerBackend, CommandExecution,
+        CommandExecutionAction, CommandExecutionStatus, HistoryTurnStatus, ProjectId,
+        ThreadHistory, ThreadHistoryItem,
     },
     components::{
         approval::{
@@ -178,6 +179,7 @@ pub enum ConversationActivity {
     PermissionsApproval(PermissionApprovalPresentation),
     FileChange(FileChangeActivityPresentation),
     ImageView(AgentImageView),
+    ContextCompaction(AgentContextCompaction),
     UserInput(UserInputRequestPresentation),
     ProtocolError {
         message: String,
@@ -1061,6 +1063,15 @@ impl ComposerView {
         self.conversation_phase
     }
 
+    pub fn has_active_context_compaction(&self) -> bool {
+        self.conversation_activity.iter().any(|activity| {
+            matches!(
+                activity,
+                ConversationActivity::ContextCompaction(compaction) if !compaction.completed
+            )
+        })
+    }
+
     pub fn transcript_render_snapshot(&self) -> Vec<ConversationTranscriptTurn> {
         self.transcript.clone()
     }
@@ -1199,6 +1210,10 @@ impl ComposerView {
                         }
                         ThreadHistoryItem::ImageView(image) => {
                             activities.push(ConversationActivity::ImageView(image.clone()));
+                        }
+                        ThreadHistoryItem::ContextCompaction(compaction) => {
+                            activities
+                                .push(ConversationActivity::ContextCompaction(compaction.clone()));
                         }
                         ThreadHistoryItem::Unsupported { kind, .. } => {
                             activities.push(ConversationActivity::Warning {
@@ -1775,6 +1790,12 @@ impl ComposerView {
                         self.conversation_activity
                             .push(ConversationActivity::ImageView(image));
                     }
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Streaming;
+                    }
+                }
+                AgentEvent::ContextCompactionUpdated(compaction) => {
+                    upsert_context_compaction_activity(&mut self.conversation_activity, compaction);
                     if self.conversation_phase != ConversationPhase::Stopping {
                         self.conversation_phase = ConversationPhase::Streaming;
                     }
@@ -2664,6 +2685,26 @@ impl ComposerView {
                     text: "输出为：\n\nSHELLPIXEL20260830".to_owned(),
                 });
         }
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn set_context_compaction_for_capture(&mut self, running: bool, cx: &mut Context<Self>) {
+        self.user_message = Some("请压缩当前聊天的上下文。".to_owned());
+        self.user_message_time = Some("19:19".to_owned());
+        self.assistant_message.clear();
+        self.assistant_message_time = None;
+        self.conversation_phase = if running {
+            ConversationPhase::Streaming
+        } else {
+            ConversationPhase::Complete
+        };
+        self.conversation_activity = vec![ConversationActivity::ContextCompaction(
+            AgentContextCompaction {
+                id: "context-compaction-ui-capture".to_owned(),
+                completed: !running,
+            },
+        )];
         cx.emit(ConversationChanged);
         cx.notify();
     }
@@ -4149,6 +4190,22 @@ fn upsert_command_activity(
         *existing = incoming;
     } else {
         activities.push(ConversationActivity::Command(incoming));
+    }
+}
+
+fn upsert_context_compaction_activity(
+    activities: &mut Vec<ConversationActivity>,
+    incoming: AgentContextCompaction,
+) {
+    if let Some(existing) = activities.iter_mut().find_map(|activity| match activity {
+        ConversationActivity::ContextCompaction(existing) if existing.id == incoming.id => {
+            Some(existing)
+        }
+        _ => None,
+    }) {
+        *existing = incoming;
+    } else {
+        activities.push(ConversationActivity::ContextCompaction(incoming));
     }
 }
 

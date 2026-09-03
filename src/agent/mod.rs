@@ -318,10 +318,17 @@ pub enum ThreadHistoryItem {
     },
     FileChange(AgentFileChange),
     ImageView(AgentImageView),
+    ContextCompaction(AgentContextCompaction),
     Unsupported {
         item_id: String,
         kind: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentContextCompaction {
+    pub id: String,
+    pub completed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1110,6 +1117,7 @@ pub enum AgentEvent {
     CommandCompleted(CommandExecution),
     FileChangeUpdated(AgentFileChange),
     ImageViewed(AgentImageView),
+    ContextCompactionUpdated(AgentContextCompaction),
     FileChangePatchUpdated {
         item_id: String,
         changes: Vec<AgentFileChangeEntry>,

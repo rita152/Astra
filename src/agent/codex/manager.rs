@@ -1163,6 +1163,12 @@ fn parse_history_item(value: &Value) -> Result<ThreadHistoryItem> {
             id: item_id,
             path: PathBuf::from(string_field(value, "path", "imageView item")?),
         })),
+        "contextCompaction" => Ok(ThreadHistoryItem::ContextCompaction(
+            crate::agent::AgentContextCompaction {
+                id: item_id,
+                completed: true,
+            },
+        )),
         _ => Ok(ThreadHistoryItem::Unsupported { item_id, kind }),
     }
 }
@@ -2992,7 +2998,10 @@ mod tests {
     use async_channel::TryRecvError;
     use serde_json::{Value, json};
 
-    use super::{AppServerSpawner, CodexAppServerManager, ManagedProcess, SpawnedAppServer};
+    use super::{
+        AppServerSpawner, CodexAppServerManager, ManagedProcess, SpawnedAppServer,
+        parse_history_item,
+    };
     use crate::agent::{
         AgentCommandApprovalChoice, AgentConnectionEvent, AgentEvent, AgentFileChange,
         AgentImageView, AgentInterruptOutcome, AgentOptionalField, AgentPermissionMode,
@@ -3003,6 +3012,21 @@ mod tests {
     };
 
     const WAIT: Duration = Duration::from_secs(3);
+
+    #[test]
+    fn history_context_compaction_is_a_first_class_completed_item() {
+        assert_eq!(
+            parse_history_item(&json!({
+                "type": "contextCompaction",
+                "id": "compact_history_1"
+            }))
+            .unwrap(),
+            ThreadHistoryItem::ContextCompaction(crate::agent::AgentContextCompaction {
+                id: "compact_history_1".into(),
+                completed: true,
+            })
+        );
+    }
 
     struct ChannelReader {
         receiver: async_channel::Receiver<Vec<u8>>,

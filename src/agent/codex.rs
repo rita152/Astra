@@ -2030,6 +2030,16 @@ fn process_turn_message<W: Write + Send + 'static>(
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
+                "contextCompaction" => {
+                    let compaction = parse_context_compaction(item, false)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::ContextCompactionUpdated(compaction),
+                        "item/started contextCompaction",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
                 unsupported => {
                     return Err(turn_item_protocol_error(
                         message,
@@ -2199,6 +2209,16 @@ fn process_turn_message<W: Write + Send + 'static>(
                         events,
                         AgentEvent::ImageViewed(image),
                         "item/completed imageView",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
+                "contextCompaction" => {
+                    let compaction = parse_context_compaction(item, true)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::ContextCompactionUpdated(compaction),
+                        "item/completed contextCompaction",
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
@@ -2990,6 +3010,20 @@ fn parse_image_view(item: &serde_json::Map<String, Value>) -> Result<AgentImageV
     Ok(AgentImageView {
         id: required_item_string(item, "imageView", "id")?,
         path: PathBuf::from(required_item_string(item, "imageView", "path")?),
+    })
+}
+
+fn parse_context_compaction(
+    item: &serde_json::Map<String, Value>,
+    completed: bool,
+) -> Result<crate::agent::AgentContextCompaction> {
+    let item_type = required_item_string(item, "contextCompaction", "type")?;
+    if item_type != "contextCompaction" {
+        bail!("contextCompaction item.type 必须是 `contextCompaction`，实际为 `{item_type}`");
+    }
+    Ok(crate::agent::AgentContextCompaction {
+        id: required_item_string(item, "contextCompaction", "id")?,
+        completed,
     })
 }
 
@@ -7717,6 +7751,53 @@ mod tests {
     }
 
     #[test]
+    fn context_compaction_started_and_completed_map_to_the_same_agent_item() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut streamed_text = false;
+        for method in ["item/started", "item/completed"] {
+            super::process_turn_message(
+                &session,
+                &turn_item_message(
+                    method,
+                    json!({"type": "contextCompaction", "id": "compact_1"}),
+                ),
+                "thr_1",
+                "turn_1",
+                &tx,
+                &mut streamed_text,
+            )
+            .unwrap();
+        }
+        drop(tx);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AgentEvent::ContextCompactionUpdated(crate::agent::AgentContextCompaction {
+                id: "compact_1".into(),
+                completed: false,
+            })
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AgentEvent::ContextCompactionUpdated(crate::agent::AgentContextCompaction {
+                id: "compact_1".into(),
+                completed: true,
+            })
+        );
+        assert!(rx.try_recv().is_err());
+
+        for item in [
+            json!({"type": "contextCompaction"}),
+            json!({"type": "contextCompaction", "id": 1}),
+        ] {
+            assert_turn_message_fails(
+                &turn_item_message("item/started", item),
+                &["contextCompaction", "item.id"],
+            );
+        }
+    }
+
+    #[test]
     fn every_unsupported_thread_item_type_fails_for_started_and_completed() {
         for item_type in [
             "hookPrompt",
@@ -7731,7 +7812,6 @@ mod tests {
             "imageGeneration",
             "enteredReviewMode",
             "exitedReviewMode",
-            "contextCompaction",
         ] {
             for method in ["item/started", "item/completed"] {
                 let item_id = format!("{item_type}_1");
