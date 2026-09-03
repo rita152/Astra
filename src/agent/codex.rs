@@ -29,7 +29,7 @@ use super::{
     AgentConnectionEvent, AgentCreditsSnapshot, AgentEffectivePermissions, AgentEvent,
     AgentFileChange, AgentFileChangeEntry, AgentFileChangeKind, AgentFileChangeStatus,
     AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemPermissionEntry,
-    AgentFileSystemSpecialPath, AgentInterruptControl, AgentInterruptOutcome,
+    AgentFileSystemSpecialPath, AgentImageView, AgentInterruptControl, AgentInterruptOutcome,
     AgentMcpServerStartupFailureReason, AgentMcpServerStartupState, AgentMcpServerStartupStatus,
     AgentModel, AgentModelCatalog, AgentOptionalField, AgentPermissionMode, AgentPermissionProfile,
     AgentPermissionRequestProfile, AgentPermissionsApprovalChoice, AgentPermissionsApprovalControl,
@@ -2020,6 +2020,16 @@ fn process_turn_message<W: Write + Send + 'static>(
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
+                "imageView" => {
+                    let image = parse_image_view(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::ImageViewed(image),
+                        "item/started imageView",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
                 unsupported => {
                     return Err(turn_item_protocol_error(
                         message,
@@ -2179,6 +2189,16 @@ fn process_turn_message<W: Write + Send + 'static>(
                         events,
                         AgentEvent::FileChangeUpdated(file_change),
                         "item/completed fileChange",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
+                "imageView" => {
+                    let image = parse_image_view(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::ImageViewed(image),
+                        "item/completed imageView",
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
@@ -2960,6 +2980,17 @@ fn parse_agent_message(item: &serde_json::Map<String, Value>) -> Result<(String,
         required_item_string(item, "agentMessage", "id")?,
         required_item_string(item, "agentMessage", "text")?,
     ))
+}
+
+fn parse_image_view(item: &serde_json::Map<String, Value>) -> Result<AgentImageView> {
+    let item_type = required_item_string(item, "imageView", "type")?;
+    if item_type != "imageView" {
+        bail!("imageView item.type 必须是 `imageView`，实际为 `{item_type}`");
+    }
+    Ok(AgentImageView {
+        id: required_item_string(item, "imageView", "id")?,
+        path: PathBuf::from(required_item_string(item, "imageView", "path")?),
+    })
 }
 
 fn optional_item_strings(
@@ -4159,11 +4190,12 @@ mod tests {
 
     use super::{
         AgentAccountRateLimits, AgentBackend, AgentCommandApprovalChoice, AgentConfigWarning,
-        AgentCreditsSnapshot, AgentEvent, AgentFileChangeStatus, AgentInterruptControl,
-        AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
-        AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentOptionalField,
-        AgentPermissionMode, AgentPermissionsApprovalChoice, AgentRateLimitWindow, AgentReasoning,
-        AgentRequest, AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
+        AgentCreditsSnapshot, AgentEvent, AgentFileChangeStatus, AgentImageView,
+        AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome,
+        AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
+        AgentMcpServerStartupStatus, AgentOptionalField, AgentPermissionMode,
+        AgentPermissionsApprovalChoice, AgentRateLimitWindow, AgentReasoning, AgentRequest,
+        AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
         AgentServerRequestMetadata, AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus,
         AgentThreadStatusState, AgentThreadTokenUsage, AgentTokenUsageBreakdown,
         AgentUserInputResponse, AppServerProcess, CodexAppServerBackend, CodexTurnSession,
@@ -7626,6 +7658,65 @@ mod tests {
     }
 
     #[test]
+    fn image_view_started_and_completed_map_to_the_same_agent_item() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut streamed_text = false;
+        for method in ["item/started", "item/completed"] {
+            let message = turn_item_message(
+                method,
+                json!({
+                    "type": "imageView",
+                    "id": "image_1",
+                    "path": "/tmp/reference.png"
+                }),
+            );
+            assert_eq!(
+                super::process_turn_message(
+                    &session,
+                    &message,
+                    "thr_1",
+                    "turn_1",
+                    &tx,
+                    &mut streamed_text,
+                )
+                .unwrap(),
+                None
+            );
+        }
+        drop(tx);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AgentEvent::ImageViewed(AgentImageView {
+                id: "image_1".into(),
+                path: PathBuf::from("/tmp/reference.png"),
+            })
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AgentEvent::ImageViewed(AgentImageView {
+                id: "image_1".into(),
+                path: PathBuf::from("/tmp/reference.png"),
+            })
+        );
+        assert!(rx.try_recv().is_err());
+
+        for (item, expected) in [
+            (json!({"type":"imageView","path":"/tmp/a.png"}), "item.id"),
+            (json!({"type":"imageView","id":"image_1"}), "item.path"),
+            (
+                json!({"type":"imageView","id":"image_1","path":1}),
+                "item.path",
+            ),
+        ] {
+            assert_turn_message_fails(
+                &turn_item_message("item/started", item),
+                &["imageView", expected],
+            );
+        }
+    }
+
+    #[test]
     fn every_unsupported_thread_item_type_fails_for_started_and_completed() {
         for item_type in [
             "hookPrompt",
@@ -7636,7 +7727,6 @@ mod tests {
             "collabAgentToolCall",
             "subAgentActivity",
             "webSearch",
-            "imageView",
             "sleep",
             "imageGeneration",
             "enteredReviewMode",

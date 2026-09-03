@@ -8,9 +8,9 @@ use std::{
 
 use gpui::{
     Animation, AnimationExt, BoxShadow, Context, Div, Entity, FocusHandle, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
-    Render, Role, StyleRefinement, Transformation, Window, WindowAppearance, canvas, deferred, div,
-    hsla, linear_color_stop, linear_gradient, prelude::*, px, radians, rgba,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    PathPromptOptions, Render, Role, StyleRefinement, Transformation, Window, WindowAppearance,
+    canvas, deferred, div, hsla, linear_color_stop, linear_gradient, prelude::*, px, radians, rgba,
 };
 
 gpui::actions!(permission_ui, [DismissPermissionUi]);
@@ -26,7 +26,7 @@ use crate::{
             DiffFileVisualState, DiffReviewCallback, DiffReviewEvent, DiffReviewPresentation,
             captured_diff_review_fixture, render_diff_review_panel,
         },
-        home::{HomeView, OpenDiffReview},
+        home::{HomeView, OpenDiffReview, OpenImagePreview},
         icons::icon,
         sidebar::{NewConversation, OpenProjectCreation, OpenSettings, SelectThread, SidebarView},
     },
@@ -80,6 +80,8 @@ pub struct ChatApp {
     right_panel_resize_dragging: bool,
     right_panel_resize_pointer_offset: f32,
     diff_review: Option<DiffReviewPresentation>,
+    image_preview: Option<PathBuf>,
+    image_preview_zoom: f32,
     permission_confirmation_open: bool,
     project_creation_open: bool,
     project_creation_kind: ProjectCreationKind,
@@ -384,6 +386,12 @@ impl ChatApp {
             this.open_diff_review(event.0.clone(), cx);
         })
         .detach();
+        cx.subscribe(&home, |this, _, event: &OpenImagePreview, cx| {
+            this.image_preview = Some(event.0.clone());
+            this.image_preview_zoom = 1.0;
+            cx.notify();
+        })
+        .detach();
         cx.subscribe(&home, |this, _, event: &ConversationThreadCreated, cx| {
             this.rekey_created_thread(event.thread_id.clone(), cx);
         })
@@ -455,6 +463,8 @@ impl ChatApp {
             right_panel_resize_dragging: false,
             right_panel_resize_pointer_offset: 0.0,
             diff_review: None,
+            image_preview: None,
+            image_preview_zoom: 1.0,
             permission_confirmation_open: false,
             project_creation_open: false,
             project_creation_kind: ProjectCreationKind::Local,
@@ -1028,6 +1038,13 @@ impl ChatApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.image_preview.is_some() && event.keystroke.key == "escape" {
+            self.image_preview = None;
+            self.image_preview_zoom = 1.0;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if !self.project_creation_open {
             return;
         }
@@ -1081,6 +1098,26 @@ impl ChatApp {
         }
         cx.stop_propagation();
         cx.notify();
+    }
+
+    fn download_preview_image(&mut self, source: PathBuf, cx: &mut Context<Self>) {
+        let suggested_name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("image.png")
+            .to_owned();
+        let initial_directory = source
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let destination = cx.prompt_for_new_path(&initial_directory, Some(suggested_name.as_str()));
+        cx.spawn(async move |_, _| {
+            let Ok(Ok(Some(destination))) = destination.await else {
+                return;
+            };
+            let _ = std::fs::copy(source, destination);
+        })
+        .detach();
     }
 
     pub fn open_bottom_panel(&mut self, cx: &mut Context<Self>) {
@@ -2851,6 +2888,225 @@ impl Render for ChatApp {
             .when(self.project_creation_open, |shell| {
                 shell.child(self.project_creation_overlay(theme, cx))
             })
+            .when_some(self.image_preview.clone(), |shell, path| {
+                let viewport = window.viewport_size();
+                let zoom = self.image_preview_zoom;
+                let image_width = (f32::from(viewport.width) - 64.0).max(160.0) * zoom;
+                let image_height = (f32::from(viewport.height) - 128.0).max(120.0) * zoom;
+                let percentage = format!("{}%", (zoom * 100.0).round() as i32);
+                shell.child(
+                    div()
+                        .id("image-preview-dialog")
+                        .role(Role::Dialog)
+                        .aria_label("图片预览")
+                        .absolute()
+                        .inset_0()
+                        .bg(theme.surface)
+                        .overflow_hidden()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.image_preview = None;
+                            this.image_preview_zoom = 1.0;
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .id("image-preview-image-scroll")
+                                .absolute()
+                                .inset_0()
+                                .pt(px(48.0))
+                                .pb(px(80.0))
+                                .px(px(32.0))
+                                .overflow_scroll()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_click(|_, _, cx| cx.stop_propagation())
+                                .child(
+                                    gpui::img(path.clone())
+                                        .w(px(image_width))
+                                        .h(px(image_height))
+                                        .flex_none()
+                                        .rounded(px(12.5))
+                                        .object_fit(ObjectFit::Contain),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px(12.0))
+                                .right(px(12.0))
+                                .flex()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .id("image-preview-open-original")
+                                        .h(px(40.0))
+                                        .min_w(px(40.0))
+                                        .px(px(12.0))
+                                        .rounded_full()
+                                        .bg(theme.model_picker_surface.alpha(0.95))
+                                        .shadow(vec![
+                                            BoxShadow::new(
+                                                px(0.0),
+                                                px(2.0),
+                                                rgba(0x00000014).into(),
+                                            )
+                                            .blur_radius(px(4.0))
+                                            .spread_radius(px(-1.0)),
+                                        ])
+                                        .role(Role::Button)
+                                        .aria_label("下载图片")
+                                        .focusable()
+                                        .tab_stop(true)
+                                        .cursor_pointer()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .hover(move |button| button.bg(theme.elevated))
+                                        .on_click({
+                                            let path = path.clone();
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.download_preview_image(path.clone(), cx);
+                                                cx.stop_propagation();
+                                            })
+                                        })
+                                        .on_key_down({
+                                            let path = path.clone();
+                                            cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                                                if matches!(
+                                                    event.keystroke.key.as_str(),
+                                                    "enter" | "space"
+                                                ) {
+                                                    this.download_preview_image(path.clone(), cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            })
+                                        })
+                                        .child(
+                                            icon("image-download", theme.text.into()).size(px(20.0)),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("image-preview-close")
+                                        .h(px(40.0))
+                                        .min_w(px(40.0))
+                                        .px(px(12.0))
+                                        .rounded_full()
+                                        .bg(theme.model_picker_surface.alpha(0.95))
+                                        .shadow(vec![
+                                            BoxShadow::new(
+                                                px(0.0),
+                                                px(2.0),
+                                                rgba(0x00000014).into(),
+                                            )
+                                            .blur_radius(px(4.0))
+                                            .spread_radius(px(-1.0)),
+                                        ])
+                                        .role(Role::Button)
+                                        .aria_label("关闭图片预览")
+                                        .focusable()
+                                        .tab_stop(true)
+                                        .cursor_pointer()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .hover(move |button| button.bg(theme.elevated))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.image_preview = None;
+                                            this.image_preview_zoom = 1.0;
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        }))
+                                        .on_key_down(cx.listener(
+                                            |this, event: &KeyDownEvent, _, cx| {
+                                                if matches!(
+                                                    event.keystroke.key.as_str(),
+                                                    "enter" | "space"
+                                                ) {
+                                                    this.image_preview = None;
+                                                    this.image_preview_zoom = 1.0;
+                                                    cx.stop_propagation();
+                                                    cx.notify();
+                                                }
+                                            },
+                                        ))
+                                        .child(icon("close-dialog", theme.text.into()).size(px(21.0))),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .bottom(px(32.0))
+                                .left_0()
+                                .right_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .id("image-preview-zoom-controls")
+                                        .h(px(36.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .on_click(|_, _, cx| cx.stop_propagation())
+                                        .child(
+                                            div()
+                                                .id("image-preview-zoom-out")
+                                                .size(px(36.0))
+                                                .rounded_full()
+                                                .bg(theme.text.alpha(0.10))
+                                                .role(Role::Button)
+                                                .aria_label("缩小图片")
+                                                .focusable()
+                                                .tab_stop(true)
+                                                .cursor_pointer()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_size(px(20.0))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.image_preview_zoom =
+                                                        (this.image_preview_zoom - 0.25).max(0.5);
+                                                    cx.notify();
+                                                }))
+                                                .child("−"),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(56.0))
+                                                .text_center()
+                                                .text_size(px(13.0))
+                                                .text_color(theme.text)
+                                                .child(percentage),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("image-preview-zoom-in")
+                                                .size(px(36.0))
+                                                .rounded_full()
+                                                .bg(theme.text.alpha(0.10))
+                                                .role(Role::Button)
+                                                .aria_label("放大图片")
+                                                .focusable()
+                                                .tab_stop(true)
+                                                .cursor_pointer()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_size(px(20.0))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.image_preview_zoom =
+                                                        (this.image_preview_zoom + 0.25).min(3.0);
+                                                    cx.notify();
+                                                }))
+                                                .child("+"),
+                                        ),
+                                ),
+                        ),
+                )
+            })
             .into_any_element()
     }
 }
@@ -2922,6 +3178,58 @@ mod tests {
             app.read_from_clipboard().and_then(|item| item.text()),
             Some(path.to_owned())
         );
+    }
+
+    #[test]
+    fn image_preview_download_copies_the_source_and_close_unmounts_the_overlay() {
+        let suffix = std::process::id();
+        let source = std::env::temp_dir().join(format!("gpui-image-preview-source-{suffix}.png"));
+        let destination =
+            std::env::temp_dir().join(format!("gpui-image-preview-download-{suffix}.png"));
+        std::fs::write(&source, b"real image payload").unwrap();
+        let _ = std::fs::remove_file(&destination);
+
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
+        );
+        window.update(|chat, _, cx| {
+            chat.startup_model_catalog_resolved = true;
+            chat.startup_sidebar_resolved = true;
+            chat.startup_minimum_duration_elapsed = true;
+            chat.image_preview = Some(source.clone());
+            chat.image_preview_zoom = 1.75;
+            cx.notify();
+        });
+        window.draw();
+
+        // CDP geometry scaled to the 900px test viewport: download is the
+        // left 40px control and close is the right 40px control.
+        window.simulate_click(point(px(812.0), px(32.0)), MouseButton::Left);
+        assert!(app.did_prompt_for_new_path());
+        assert_eq!(
+            window.read(|chat, _| chat.image_preview.clone()),
+            Some(source.clone())
+        );
+        app.simulate_new_path_selection(|_| Some(destination.clone()));
+        app.run_until_parked();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"real image payload");
+
+        window.simulate_click(point(px(866.0), px(32.0)), MouseButton::Left);
+        window.read(|chat, _| {
+            assert_eq!(chat.image_preview, None);
+            assert_eq!(chat.image_preview_zoom, 1.0);
+        });
+
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_file(destination).unwrap();
     }
 
     #[test]

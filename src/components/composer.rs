@@ -12,7 +12,7 @@ use crate::{
         AgentAccountRateLimits, AgentApprovalHandle, AgentBackend, AgentCommandApprovalChoice,
         AgentConfigWarning, AgentConnectionEvent, AgentCreditsSnapshot, AgentEffectivePermissions,
         AgentEvent, AgentFileChange, AgentFileChangeStatus, AgentFileSystemAccess,
-        AgentFileSystemPath, AgentFileSystemSpecialPath, AgentInterruptHandle,
+        AgentFileSystemPath, AgentFileSystemSpecialPath, AgentImageView, AgentInterruptHandle,
         AgentInterruptOutcome, AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
         AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog, AgentOptionalField,
         AgentPermissionMode, AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
@@ -177,6 +177,7 @@ pub enum ConversationActivity {
     FileApproval(FileApprovalPresentation),
     PermissionsApproval(PermissionApprovalPresentation),
     FileChange(FileChangeActivityPresentation),
+    ImageView(AgentImageView),
     UserInput(UserInputRequestPresentation),
     ProtocolError {
         message: String,
@@ -1196,6 +1197,9 @@ impl ComposerView {
                                 ),
                             ));
                         }
+                        ThreadHistoryItem::ImageView(image) => {
+                            activities.push(ConversationActivity::ImageView(image.clone()));
+                        }
                         ThreadHistoryItem::Unsupported { kind, .. } => {
                             activities.push(ConversationActivity::Warning {
                                 message: format!("历史包含当前 UI 尚未呈现的 {kind} 项"),
@@ -1756,6 +1760,21 @@ impl ComposerView {
                 }
                 AgentEvent::FileChangeUpdated(change) => {
                     upsert_file_change_activity(&mut self.conversation_activity, change, &self.cwd);
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Streaming;
+                    }
+                }
+                AgentEvent::ImageViewed(image) => {
+                    if let Some(ConversationActivity::ImageView(existing)) = self
+                        .conversation_activity
+                        .iter_mut()
+                        .find(|activity| matches!(activity, ConversationActivity::ImageView(existing) if existing.id == image.id))
+                    {
+                        *existing = image;
+                    } else {
+                        self.conversation_activity
+                            .push(ConversationActivity::ImageView(image));
+                    }
                     if self.conversation_phase != ConversationPhase::Stopping {
                         self.conversation_phase = ConversationPhase::Streaming;
                     }
@@ -2645,6 +2664,27 @@ impl ComposerView {
                     text: "输出为：\n\nSHELLPIXEL20260830".to_owned(),
                 });
         }
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn set_image_view_for_capture(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.user_message = Some("请查看这张图像。".to_owned());
+        self.user_message_time = Some("21:45".to_owned());
+        self.assistant_message.clear();
+        self.assistant_message_time = Some("21:45".to_owned());
+        self.conversation_phase = ConversationPhase::Complete;
+        self.conversation_activity = vec![
+            ConversationActivity::AssistantMessage {
+                item_id: "msg-image-preamble".to_owned(),
+                text: "我来查看这张图像。".to_owned(),
+            },
+            ConversationActivity::ImageView(AgentImageView {
+                id: "image-view-ui-capture".to_owned(),
+                path,
+            }),
+        ];
         cx.emit(ConversationChanged);
         cx.notify();
     }

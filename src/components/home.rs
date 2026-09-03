@@ -7,15 +7,16 @@ use std::{
 
 use gpui::{
     App, Bounds, BoxShadow, ContentMask, Context, Div, Entity, FocusHandle, FontWeight,
-    KeyDownEvent, MouseButton, PathBuilder, Pixels, Render, Role, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, ShapedLine, SharedString, TextAlign, TextRun, Transformation, Window, canvas,
-    div, linear_color_stop, linear_gradient, point, prelude::*, px, radians, relative, rgba,
+    KeyDownEvent, MouseButton, ObjectFit, PathBuilder, Pixels, Render, Role, ScrollDelta,
+    ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, TextAlign, TextRun, Transformation,
+    Window, canvas, div, linear_color_stop, linear_gradient, point, prelude::*, px, radians,
+    relative, rgba,
 };
 
 use crate::{
     agent::{
-        AgentBackend, AgentFileChangeStatus, CodexAppServerBackend, CommandExecution,
-        CommandExecutionAction, CommandExecutionStatus,
+        AgentBackend, AgentFileChangeStatus, AgentImageView, CodexAppServerBackend,
+        CommandExecution, CommandExecutionAction, CommandExecutionStatus,
     },
     components::{
         approval::{ApprovalCardCallback, render_approval_card},
@@ -79,6 +80,9 @@ impl gpui::EventEmitter<ConversationThreadCreated> for HomeView {}
 
 pub struct OpenDiffReview(pub DiffReviewPresentation);
 impl gpui::EventEmitter<OpenDiffReview> for HomeView {}
+
+pub struct OpenImagePreview(pub PathBuf);
+impl gpui::EventEmitter<OpenImagePreview> for HomeView {}
 
 const SUGGESTION_PRESSED_SCALE: f32 = 0.99;
 const SUGGESTION_TRANSITION_DURATION: Duration = Duration::from_millis(150);
@@ -907,6 +911,16 @@ impl HomeView {
         cx.notify();
     }
 
+    #[cfg(test)]
+    pub fn set_image_view_for_capture(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.expanded_tool_groups.clear();
+        self.collapsed_active_tool_groups.clear();
+        self.composer.update(cx, |composer, cx| {
+            composer.set_image_view_for_capture(path, cx)
+        });
+        cx.notify();
+    }
+
     pub fn set_tool_group_for_capture(
         &mut self,
         running: bool,
@@ -1237,9 +1251,23 @@ impl HomeView {
                 ActivityStreamUnit::Standalone(_) => None,
             })
             .collect::<Vec<_>>();
+        let image_views = units
+            .iter()
+            .filter_map(|unit| match unit {
+                ActivityStreamUnit::Standalone(ConversationActivity::ImageView(image)) => {
+                    Some(image)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let present_groups = groups
             .iter()
             .map(|group| group.id.clone())
+            .collect::<HashSet<_>>();
+        let present_disclosures = present_groups
+            .iter()
+            .cloned()
+            .chain(image_views.iter().map(|image| image.id.clone()))
             .collect::<HashSet<_>>();
         let active_groups = groups
             .iter()
@@ -1247,9 +1275,11 @@ impl HomeView {
             .map(|group| group.id.clone())
             .collect::<HashSet<_>>();
         self.expanded_tool_groups
-            .retain(|group_id| present_groups.contains(group_id));
-        self.collapsed_active_tool_groups
-            .retain(|group_id| active_groups.contains(group_id));
+            .retain(|group_id| present_disclosures.contains(group_id));
+        self.collapsed_active_tool_groups.retain(|group_id| {
+            active_groups.contains(group_id)
+                || image_views.iter().any(|image| image.id == *group_id)
+        });
         self.tool_group_scroll_handles
             .retain(|group_id, _| present_groups.contains(group_id));
 
@@ -2242,6 +2272,20 @@ fn activity_stream(
                             theme,
                         ))
                     }
+                    ConversationActivity::ImageView(image) => {
+                        let expanded = if show_thinking_tail {
+                            !collapsed_active_tool_groups.contains(&image.id)
+                        } else {
+                            expanded_tool_groups.contains(&image.id)
+                        };
+                        stream.child(image_view_activity(
+                            home_entity.clone(),
+                            image,
+                            expanded,
+                            show_thinking_tail,
+                            theme,
+                        ))
+                    }
                     ConversationActivity::Command(command) => {
                         stream.child(command_execution_activity(
                             home_entity.clone(),
@@ -2331,6 +2375,168 @@ fn activity_stream(
         // it always follows the latest rendered JSON-RPC item.
         .when(show_thinking_tail, |stream| {
             stream.child(thinking_shimmer(theme, thinking_shimmer_progress))
+        })
+}
+
+fn image_view_activity(
+    home_entity: Entity<HomeView>,
+    image: AgentImageView,
+    expanded: bool,
+    active_turn: bool,
+    theme: Theme,
+) -> impl IntoElement {
+    let item_id = image.id.clone();
+    let path = image.path.clone();
+    let click_home = home_entity.clone();
+    let preview_home = home_entity.clone();
+    let key_home = home_entity.clone();
+    let preview_key_home = home_entity.clone();
+    let click_item_id = item_id.clone();
+    let key_item_id = item_id.clone();
+    let hover_group: SharedString = format!("image-view-header-{item_id}").into();
+    let label = if expanded {
+        "已查看 1 张图像，折叠图像"
+    } else {
+        "已查看 1 张图像，展开图像"
+    };
+    let thumbnail_path = path.clone();
+    let thumbnail_key_path = path.clone();
+
+    div()
+        .id(SharedString::from(format!("image-view-{item_id}")))
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .items_start()
+        .child(
+            div()
+                .id(SharedString::from(format!("image-view-header-{item_id}")))
+                .group(hover_group.clone())
+                .h(px(21.0))
+                .max_w_full()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .rounded(px(6.0))
+                .focusable()
+                .tab_stop(true)
+                .role(Role::Button)
+                .aria_expanded(expanded)
+                .aria_label(label)
+                .cursor_pointer()
+                .focus_visible(|style| {
+                    style.px(px(2.0)).shadow(vec![
+                        BoxShadow::new(px(0.0), px(0.0), rgba(0x3a83f7ff).into())
+                            .spread_radius(px(2.0))
+                            .inset(),
+                    ])
+                })
+                .on_click(move |_, _, cx| {
+                    toggle_tool_activity_group(
+                        &click_home,
+                        &click_item_id,
+                        active_turn,
+                        &ScrollHandle::new(),
+                        cx,
+                    );
+                })
+                .on_key_down(move |event, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        toggle_tool_activity_group(
+                            &key_home,
+                            &key_item_id,
+                            active_turn,
+                            &ScrollHandle::new(),
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    }
+                })
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_color(theme.text.alpha(0.60))
+                        .child(
+                            icon("activity-image", theme.text.alpha(0.60).into())
+                                .size(px(21.0))
+                                .flex_none(),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(14.0))
+                                .line_height(px(21.0))
+                                .font_family(".SystemUIFont")
+                                .font_weight(FontWeight::NORMAL)
+                                .text_color(theme.text.alpha(0.40))
+                                .child("已查看 1 张图像"),
+                        ),
+                )
+                .child(
+                    icon("settings-chevron-right", theme.text.alpha(0.60).into())
+                        .size(px(20.0))
+                        .flex_none()
+                        .opacity(if expanded { 1.0 } else { 0.0 })
+                        .group_hover(hover_group, |chevron| chevron.opacity(1.0))
+                        .with_transformation(Transformation::rotate(radians(if expanded {
+                            std::f32::consts::FRAC_PI_2
+                        } else {
+                            0.0
+                        }))),
+                ),
+        )
+        .when(expanded, |activity| {
+            activity.child(
+                div().pt(px(8.0)).pb(px(4.0)).flex().gap(px(8.0)).child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "image-view-thumbnail-{item_id}"
+                        )))
+                        .size(px(80.0))
+                        .flex_none()
+                        .rounded(px(8.0))
+                        .border(px(1.0))
+                        .border_color(theme.text.alpha(0.20))
+                        .overflow_hidden()
+                        .role(Role::Button)
+                        .aria_label("已检查的图像")
+                        .focusable()
+                        .tab_stop(true)
+                        .cursor_pointer()
+                        .focus_visible(|style| {
+                            style.shadow(vec![
+                                BoxShadow::new(px(0.0), px(0.0), rgba(0x3a83f7ff).into())
+                                    .spread_radius(px(2.0)),
+                            ])
+                        })
+                        .on_click(move |_, _, cx| {
+                            preview_home.update(cx, |_, cx| {
+                                cx.emit(OpenImagePreview(thumbnail_path.clone()));
+                            });
+                            cx.stop_propagation();
+                        })
+                        .on_key_down(move |event, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                preview_key_home.update(cx, |_, cx| {
+                                    cx.emit(OpenImagePreview(thumbnail_key_path.clone()));
+                                });
+                                cx.stop_propagation();
+                            }
+                        })
+                        .child(
+                            gpui::img(path)
+                                .size_full()
+                                .rounded(px(6.0))
+                                .object_fit(ObjectFit::Cover),
+                        ),
+                ),
+            )
         })
 }
 
@@ -3713,7 +3919,11 @@ fn message_action(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Duration};
+    use std::{
+        path::PathBuf,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use gpui::{
         AppContext, Bounds, KeyBinding, MouseButton, TestApp, TestAppWindow, WindowBounds,
@@ -3728,17 +3938,18 @@ mod tests {
         COMMAND_CARD_TEXT_SIZE, CONVERSATION_BOTTOM_INSET, CONVERSATION_TOP_INSET,
         DISCLOSURE_FOCUS_PADDING, HomeView, NOTICE_BUTTON_HEIGHT, NOTICE_ERROR_CONTENT_GAP,
         NOTICE_ERROR_GAP, NOTICE_ICON_SIZE, NOTICE_LINE_HEIGHT, NOTICE_RADIUS, NOTICE_TEXT_SIZE,
-        NOTICE_WARNING_CONTENT_GAP, NOTICE_WARNING_GAP, REASONING_BODY_MAX_HEIGHT,
-        REASONING_CHEVRON_SIZE, REASONING_HEADER_HEIGHT, REASONING_LINE_HEIGHT,
-        REASONING_TEXT_SIZE, REASONING_TRANSITION_DURATION, RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT,
-        RESPONSE_ACTION_FOOTER_HEIGHT, RESPONSE_ACTION_FOOTER_OFFSET, RESPONSE_ACTION_GAP,
-        RESPONSE_ACTION_ICON_SIZE, RESPONSE_TIME_LINE_HEIGHT, RESPONSE_TIME_MARGIN,
-        RESPONSE_TIME_SIZE, SUGGESTION_PRESSED_SCALE, THINKING_SHIMMER_DURATION,
-        THINKING_SHIMMER_FRAME_INTERVAL, THINKING_SHIMMER_STEPS, THINKING_SHIMMER_WIDTH,
-        TOOL_GROUP_BODY_MAX_HEIGHT, TOOL_GROUP_CHEVRON_SIZE, TOOL_GROUP_EDGE_FADE_DISTANCE,
-        TOOL_GROUP_HEADER_CHEVRON_GAP, TOOL_GROUP_HEADER_HEIGHT, TOOL_GROUP_ICON_SIZE,
-        TOOL_GROUP_ICON_TEXT_GAP, TOOL_GROUP_ITEM_GAP, TOOL_GROUP_LINE_HEIGHT,
-        TOOL_GROUP_TEXT_SIZE, TOOL_GROUP_TRANSITION_DURATION, USER_MESSAGE_BUBBLE_RADIUS,
+        NOTICE_WARNING_CONTENT_GAP, NOTICE_WARNING_GAP, OpenImagePreview,
+        REASONING_BODY_MAX_HEIGHT, REASONING_CHEVRON_SIZE, REASONING_HEADER_HEIGHT,
+        REASONING_LINE_HEIGHT, REASONING_TEXT_SIZE, REASONING_TRANSITION_DURATION,
+        RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT, RESPONSE_ACTION_FOOTER_HEIGHT,
+        RESPONSE_ACTION_FOOTER_OFFSET, RESPONSE_ACTION_GAP, RESPONSE_ACTION_ICON_SIZE,
+        RESPONSE_TIME_LINE_HEIGHT, RESPONSE_TIME_MARGIN, RESPONSE_TIME_SIZE,
+        SUGGESTION_PRESSED_SCALE, THINKING_SHIMMER_DURATION, THINKING_SHIMMER_FRAME_INTERVAL,
+        THINKING_SHIMMER_STEPS, THINKING_SHIMMER_WIDTH, TOOL_GROUP_BODY_MAX_HEIGHT,
+        TOOL_GROUP_CHEVRON_SIZE, TOOL_GROUP_EDGE_FADE_DISTANCE, TOOL_GROUP_HEADER_CHEVRON_GAP,
+        TOOL_GROUP_HEADER_HEIGHT, TOOL_GROUP_ICON_SIZE, TOOL_GROUP_ICON_TEXT_GAP,
+        TOOL_GROUP_ITEM_GAP, TOOL_GROUP_LINE_HEIGHT, TOOL_GROUP_TEXT_SIZE,
+        TOOL_GROUP_TRANSITION_DURATION, USER_MESSAGE_BUBBLE_RADIUS,
         USER_MESSAGE_BUBBLE_SUPERELLIPSE, USER_MESSAGE_FOOTER_GAP, USER_MESSAGE_FOOTER_HEIGHT,
         USER_MESSAGE_FOOTER_OFFSET, USER_MESSAGE_FOOTER_SIDE_MARGIN, USER_MESSAGE_TIME_LINE_HEIGHT,
         USER_MESSAGE_TIME_SIZE, active_reasoning_body, activity_stream_units,
@@ -3751,9 +3962,9 @@ mod tests {
         toggle_tool_activity_group, tool_group_chevron_transition_ease, tool_group_reasoning_title,
     };
     use crate::agent::{
-        CommandExecution, CommandExecutionAction, CommandExecutionStatus, HistoryItemDetail,
-        HistoryTurnStatus, ThreadActivity, ThreadHistory, ThreadHistoryItem, ThreadSummary,
-        ThreadTurn,
+        AgentImageView, CommandExecution, CommandExecutionAction, CommandExecutionStatus,
+        HistoryItemDetail, HistoryTurnStatus, ThreadActivity, ThreadHistory, ThreadHistoryItem,
+        ThreadSummary, ThreadTurn,
     };
     use crate::components::{
         composer::{ConversationActivity, ConversationPhase, ReasoningActivityPresentation},
@@ -3867,6 +4078,42 @@ mod tests {
             separated_units[2],
             ActivityStreamUnit::ToolGroup(_)
         ));
+    }
+
+    #[test]
+    fn image_view_stays_a_standalone_disclosure_between_tool_groups() {
+        let activities = vec![
+            ConversationActivity::Command(command(
+                "read_1",
+                CommandExecutionAction::Read {
+                    command: "sed -n '1,20p' screenshot.png".into(),
+                    name: "screenshot.png".into(),
+                    path: "screenshot.png".into(),
+                },
+                CommandExecutionStatus::Completed,
+            )),
+            ConversationActivity::ImageView(AgentImageView {
+                id: "image_1".into(),
+                path: PathBuf::from("/tmp/screenshot.png"),
+            }),
+            ConversationActivity::Command(command(
+                "test_1",
+                CommandExecutionAction::Unknown {
+                    command: "cargo test".into(),
+                },
+                CommandExecutionStatus::Completed,
+            )),
+        ];
+
+        let units = activity_stream_units(&activities);
+        assert_eq!(units.len(), 3);
+        assert!(matches!(units[0], ActivityStreamUnit::ToolGroup(_)));
+        assert!(matches!(
+            &units[1],
+            ActivityStreamUnit::Standalone(ConversationActivity::ImageView(image))
+                if image.id == "image_1" && image.path == PathBuf::from("/tmp/screenshot.png")
+        ));
+        assert!(matches!(units[2], ActivityStreamUnit::ToolGroup(_)));
     }
 
     #[test]
@@ -4714,6 +4961,53 @@ mod tests {
         window.simulate_keystrokes("space");
         assert!(
             !window.read(|home, _| { home.expanded_tool_groups.contains("tool-group-ui-capture") })
+        );
+    }
+
+    #[test]
+    fn image_view_disclosure_responds_to_real_pointer_and_keyboard_events() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+
+        window.update(|home, _, cx| {
+            home.set_image_view_for_capture(PathBuf::from("/tmp/image-view.png"), cx)
+        });
+        let preview_path = Arc::new(Mutex::new(None));
+        let observed_preview_path = preview_path.clone();
+        let home = window.root();
+        let _observer = app.new_entity(|cx| {
+            cx.subscribe(&home, move |_: &mut (), _, event: &OpenImagePreview, _| {
+                *observed_preview_path.lock().unwrap() = Some(event.0.clone());
+            })
+            .detach();
+        });
+        window.draw();
+        // The entire captured 21px disclosure row at y=204..225 is clickable.
+        window.simulate_click(point(px(100.0), px(214.0)), MouseButton::Left);
+        assert!(
+            window.read(|home, _| { home.expanded_tool_groups.contains("image-view-ui-capture") })
+        );
+
+        window.simulate_keystrokes("space");
+        assert!(
+            window.read(|home, _| { !home.expanded_tool_groups.contains("image-view-ui-capture") })
+        );
+
+        window.simulate_keystrokes("enter");
+        window.draw();
+        window.simulate_click(point(px(100.0), px(250.0)), MouseButton::Left);
+        assert_eq!(
+            *preview_path.lock().unwrap(),
+            Some(PathBuf::from("/tmp/image-view.png"))
         );
     }
 

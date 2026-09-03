@@ -317,10 +317,17 @@ pub enum ThreadHistoryItem {
         status: CommandExecutionStatus,
     },
     FileChange(AgentFileChange),
+    ImageView(AgentImageView),
     Unsupported {
         item_id: String,
         kind: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentImageView {
+    pub id: String,
+    pub path: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1102,6 +1109,7 @@ pub enum AgentEvent {
     },
     CommandCompleted(CommandExecution),
     FileChangeUpdated(AgentFileChange),
+    ImageViewed(AgentImageView),
     FileChangePatchUpdated {
         item_id: String,
         changes: Vec<AgentFileChangeEntry>,

@@ -24,15 +24,15 @@ use super::{
 };
 use crate::agent::{
     AgentCapabilities, AgentCapability, AgentConnectionEvent, AgentEvent, AgentFileChange,
-    AgentFileChangeEntry, AgentFileChangeKind, AgentFileChangeStatus, AgentInterruptControl,
-    AgentInterruptHandle, AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentOptionalField,
-    AgentPermissionMode, AgentPermissionProfile, AgentRequest, AgentRun, AgentServerRequestId,
-    AgentThreadActiveFlag, AgentThreadSettings, CommandExecutionStatus, CreateProject, FilterValue,
-    HistoryItemDetail, HistoryTurnStatus, Page, PageRequest, Project, ProjectChange, ProjectId,
-    SortDirection, ThreadActivity, ThreadHistoryItem, ThreadHistoryItemEntry, ThreadId,
-    ThreadListRequest, ThreadMetadataUpdate, ThreadSearchResult, ThreadSection,
-    ThreadSectionAppearance, ThreadSectionId, ThreadSummary, ThreadTurn, UpdateProject,
-    WorkspaceError, WorkspaceResult,
+    AgentFileChangeEntry, AgentFileChangeKind, AgentFileChangeStatus, AgentImageView,
+    AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome, AgentModel,
+    AgentModelCatalog, AgentOptionalField, AgentPermissionMode, AgentPermissionProfile,
+    AgentRequest, AgentRun, AgentServerRequestId, AgentThreadActiveFlag, AgentThreadSettings,
+    CommandExecutionStatus, CreateProject, FilterValue, HistoryItemDetail, HistoryTurnStatus, Page,
+    PageRequest, Project, ProjectChange, ProjectId, SortDirection, ThreadActivity,
+    ThreadHistoryItem, ThreadHistoryItemEntry, ThreadId, ThreadListRequest, ThreadMetadataUpdate,
+    ThreadSearchResult, ThreadSection, ThreadSectionAppearance, ThreadSectionId, ThreadSummary,
+    ThreadTurn, UpdateProject, WorkspaceError, WorkspaceResult,
 };
 
 trait ManagedProcess: Send + Sync {
@@ -1159,6 +1159,10 @@ fn parse_history_item(value: &Value) -> Result<ThreadHistoryItem> {
         "fileChange" => Ok(ThreadHistoryItem::FileChange(parse_history_file_change(
             value, item_id,
         )?)),
+        "imageView" => Ok(ThreadHistoryItem::ImageView(AgentImageView {
+            id: item_id,
+            path: PathBuf::from(string_field(value, "path", "imageView item")?),
+        })),
         _ => Ok(ThreadHistoryItem::Unsupported { item_id, kind }),
     }
 }
@@ -2976,6 +2980,7 @@ mod tests {
     use std::{
         collections::{HashMap, HashSet},
         io::Read,
+        path::PathBuf,
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -2990,7 +2995,7 @@ mod tests {
     use super::{AppServerSpawner, CodexAppServerManager, ManagedProcess, SpawnedAppServer};
     use crate::agent::{
         AgentCommandApprovalChoice, AgentConnectionEvent, AgentEvent, AgentFileChange,
-        AgentInterruptOutcome, AgentOptionalField, AgentPermissionMode,
+        AgentImageView, AgentInterruptOutcome, AgentOptionalField, AgentPermissionMode,
         AgentPermissionsApprovalChoice, AgentRequest, AgentServerRequestId, AgentUserInputAnswer,
         AgentUserInputResponse, CreateProject, FilterValue, HistoryItemDetail, PageRequest,
         ProjectChange, SortDirection, ThreadHistoryItem, ThreadListRequest, ThreadMetadataUpdate,
@@ -3632,16 +3637,23 @@ mod tests {
                 "data": [{
                     "id": "turn-a",
                     "status": "completed",
-                    "items": [{
-                        "type": "fileChange",
-                        "id": "file-a",
-                        "status": "completed",
-                        "changes": [{
-                            "path": "/tmp/example.txt",
-                            "kind": { "type": "add" },
-                            "diff": "hello\n"
-                        }]
-                    }]
+                    "items": [
+                        {
+                            "type": "fileChange",
+                            "id": "file-a",
+                            "status": "completed",
+                            "changes": [{
+                                "path": "/tmp/example.txt",
+                                "kind": { "type": "add" },
+                                "diff": "hello\n"
+                            }]
+                        },
+                        {
+                            "type": "imageView",
+                            "id": "image-a",
+                            "path": "/tmp/reference.png"
+                        }
+                    ]
                 }],
                 "nextCursor": null
             }),
@@ -3650,6 +3662,32 @@ mod tests {
             wait_value(&turns).unwrap().data[0].items[0],
             ThreadHistoryItem::FileChange(AgentFileChange { ref id, ref changes, .. })
                 if id == "file-a" && changes.len() == 1
+        ));
+        let turns = manager.list_thread_turns(
+            "thread-a".to_owned(),
+            PageRequest::default(),
+            HistoryItemDetail::Full,
+        );
+        let request = assert_workspace_request(&mut endpoint, "thread/turns/list");
+        endpoint.respond(
+            &request,
+            json!({
+                "data": [{
+                    "id": "turn-image",
+                    "status": "completed",
+                    "items": [{
+                        "type": "imageView",
+                        "id": "image-a",
+                        "path": "/tmp/reference.png"
+                    }]
+                }],
+                "nextCursor": null
+            }),
+        );
+        assert!(matches!(
+            wait_value(&turns).unwrap().data[0].items[0],
+            ThreadHistoryItem::ImageView(AgentImageView { ref id, ref path })
+                if id == "image-a" && path == &PathBuf::from("/tmp/reference.png")
         ));
 
         let items = manager.list_thread_items(
