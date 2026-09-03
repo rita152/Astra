@@ -27,6 +27,7 @@ use super::{
     AgentAdditionalNetworkPermissions, AgentApprovalControl, AgentApprovalHandle, AgentBackend,
     AgentCommandApprovalChoice, AgentCommandApprovalRequest, AgentConfigWarning,
     AgentConnectionEvent, AgentCreditsSnapshot, AgentEffectivePermissions, AgentEvent,
+    AgentFileChange, AgentFileChangeEntry, AgentFileChangeKind, AgentFileChangeStatus,
     AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemPermissionEntry,
     AgentFileSystemSpecialPath, AgentInterruptControl, AgentInterruptOutcome,
     AgentMcpServerStartupFailureReason, AgentMcpServerStartupState, AgentMcpServerStartupStatus,
@@ -123,10 +124,13 @@ const TURN_SCOPED_SERVER_METHODS: &[&str] = &[
     "item/agentMessage/delta",
     "item/commandExecution/outputDelta",
     "item/commandExecution/terminalInteraction",
+    "item/fileChange/outputDelta",
+    "item/fileChange/patchUpdated",
     "item/reasoning/summaryPartAdded",
     "item/reasoning/summaryTextDelta",
     "item/reasoning/textDelta",
     "item/completed",
+    "turn/diff/updated",
     "turn/started",
     "turn/completed",
     "error",
@@ -2006,6 +2010,16 @@ fn process_turn_message<W: Write + Send + 'static>(
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
+                "fileChange" => {
+                    let file_change = parse_file_change(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::FileChangeUpdated(file_change),
+                        "item/started fileChange",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
                 unsupported => {
                     return Err(turn_item_protocol_error(
                         message,
@@ -2047,6 +2061,23 @@ fn process_turn_message<W: Write + Send + 'static>(
                 "item/commandExecution/terminalInteraction",
             )?;
         }
+        Some("item/fileChange/outputDelta") => {
+            let _item_id = required_notification_string(message, "itemId")?;
+            let _delta = required_notification_string(message, "delta")?;
+        }
+        Some("item/fileChange/patchUpdated") => {
+            let item_id = required_notification_string(message, "itemId")?;
+            let changes = message
+                .pointer("/params/changes")
+                .context("item/fileChange/patchUpdated 通知缺少 params.changes")?;
+            let changes =
+                parse_file_change_entries(changes, "item/fileChange/patchUpdated params")?;
+            send_turn_event(
+                events,
+                AgentEvent::FileChangePatchUpdated { item_id, changes },
+                "item/fileChange/patchUpdated",
+            )?;
+        }
         Some("item/reasoning/summaryPartAdded") => {
             let item_id = required_notification_string(message, "itemId")?;
             let summary_index = required_notification_index(message, "summaryIndex")?;
@@ -2085,6 +2116,14 @@ fn process_turn_message<W: Write + Send + 'static>(
                     delta,
                 },
                 "item/reasoning/textDelta",
+            )?;
+        }
+        Some("turn/diff/updated") => {
+            let diff = required_notification_string(message, "diff")?;
+            send_turn_event(
+                events,
+                AgentEvent::TurnDiffUpdated { diff },
+                "turn/diff/updated",
             )?;
         }
         Some("item/completed") => {
@@ -2130,6 +2169,16 @@ fn process_turn_message<W: Write + Send + 'static>(
                         events,
                         AgentEvent::CommandCompleted(command),
                         "item/completed commandExecution",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
+                "fileChange" => {
+                    let file_change = parse_file_change(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::FileChangeUpdated(file_change),
+                        "item/completed fileChange",
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
@@ -2197,6 +2246,8 @@ fn is_defined_server_method(method: &str) -> bool {
             | "item/agentMessage/delta"
             | "item/commandExecution/outputDelta"
             | "item/commandExecution/terminalInteraction"
+            | "item/fileChange/outputDelta"
+            | "item/fileChange/patchUpdated"
             | "item/reasoning/summaryPartAdded"
             | "item/reasoning/summaryTextDelta"
             | "item/reasoning/textDelta"
@@ -2210,6 +2261,7 @@ fn is_defined_server_method(method: &str) -> bool {
             | "thread/project/updated"
             | "project/changed"
             | "turn/started"
+            | "turn/diff/updated"
             | "turn/completed"
             | "error"
             | "thread/settings/updated"
@@ -2942,6 +2994,74 @@ fn parse_reasoning(item: &serde_json::Map<String, Value>) -> Result<AgentReasoni
         id: required_item_string(item, "reasoning", "id")?,
         summary: optional_item_strings(item, "reasoning", "summary")?,
         content: optional_item_strings(item, "reasoning", "content")?,
+    })
+}
+
+fn parse_file_change_status(value: &str, context: &str) -> Result<AgentFileChangeStatus> {
+    match value {
+        "inProgress" => Ok(AgentFileChangeStatus::InProgress),
+        "completed" => Ok(AgentFileChangeStatus::Completed),
+        "failed" => Ok(AgentFileChangeStatus::Failed),
+        "declined" => Ok(AgentFileChangeStatus::Declined),
+        other => bail!("{context}.status 包含未知值 `{other}`"),
+    }
+}
+
+fn parse_file_change_entries(value: &Value, context: &str) -> Result<Vec<AgentFileChangeEntry>> {
+    let changes = value
+        .as_array()
+        .with_context(|| format!("{context}.changes 必须是数组"))?;
+    changes
+        .iter()
+        .enumerate()
+        .map(|(index, change)| {
+            let change = change
+                .as_object()
+                .with_context(|| format!("{context}.changes[{index}] 必须是对象"))?;
+            let change_context = format!("{context}.changes[{index}]");
+            let kind = change
+                .get("kind")
+                .and_then(Value::as_object)
+                .with_context(|| format!("{change_context}.kind 必须是对象"))?;
+            let kind_type = required_item_string(kind, &format!("{change_context}.kind"), "type")?;
+            let kind = match kind_type.as_str() {
+                "add" => AgentFileChangeKind::Add,
+                "delete" => AgentFileChangeKind::Delete,
+                "update" => {
+                    let move_path = match kind.get("move_path") {
+                        None | Some(Value::Null) => None,
+                        Some(Value::String(path)) => Some(path.clone()),
+                        Some(_) => bail!("{change_context}.kind.move_path 必须是字符串或 null"),
+                    };
+                    AgentFileChangeKind::Update { move_path }
+                }
+                other => bail!("{change_context}.kind.type 包含未知值 `{other}`"),
+            };
+            Ok(AgentFileChangeEntry {
+                path: required_item_string(change, &change_context, "path")?,
+                diff: required_item_string(change, &change_context, "diff")?,
+                kind,
+            })
+        })
+        .collect()
+}
+
+fn parse_file_change(item: &serde_json::Map<String, Value>) -> Result<AgentFileChange> {
+    let item_type = required_item_string(item, "fileChange", "type")?;
+    if item_type != "fileChange" {
+        bail!("fileChange item.type 必须是 `fileChange`，实际为 `{item_type}`");
+    }
+    Ok(AgentFileChange {
+        id: required_item_string(item, "fileChange", "id")?,
+        changes: parse_file_change_entries(
+            item.get("changes")
+                .context("fileChange item.changes 缺失")?,
+            "fileChange item",
+        )?,
+        status: parse_file_change_status(
+            &required_item_string(item, "fileChange", "status")?,
+            "fileChange item",
+        )?,
     })
 }
 
@@ -4039,11 +4159,11 @@ mod tests {
 
     use super::{
         AgentAccountRateLimits, AgentBackend, AgentCommandApprovalChoice, AgentConfigWarning,
-        AgentCreditsSnapshot, AgentEvent, AgentInterruptControl, AgentInterruptHandle,
-        AgentInterruptOutcome, AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
-        AgentMcpServerStartupStatus, AgentOptionalField, AgentPermissionMode,
-        AgentPermissionsApprovalChoice, AgentRateLimitWindow, AgentReasoning, AgentRequest,
-        AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
+        AgentCreditsSnapshot, AgentEvent, AgentFileChangeStatus, AgentInterruptControl,
+        AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
+        AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentOptionalField,
+        AgentPermissionMode, AgentPermissionsApprovalChoice, AgentRateLimitWindow, AgentReasoning,
+        AgentRequest, AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
         AgentServerRequestMetadata, AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus,
         AgentThreadStatusState, AgentThreadTokenUsage, AgentTokenUsageBreakdown,
         AgentUserInputResponse, AppServerProcess, CodexAppServerBackend, CodexTurnSession,
@@ -7061,69 +7181,95 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_turn_diff_notification_is_undefined() {
-        let mut reader = Cursor::new(
-            b"{\"method\":\"turn/diff/updated\",\"params\":{\"threadId\":\"thr_1\",\"turnId\":\"turn_1\",\"diff\":\"*** Begin Patch\"}}\n",
-        );
-        let mut output = Vec::new();
+    fn file_change_item_patch_and_turn_diff_emit_typed_events() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut streamed_text = false;
+        let change = json!({
+            "path": "/tmp/example.txt",
+            "kind": { "type": "update", "move_path": null },
+            "diff": "@@ -1 +1 @@\n-old\n+new\n"
+        });
 
-        let error = wait_for_response(&mut reader, &mut output, INITIALIZE_ID, None)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("turn/diff/updated"));
-        assert!(error.contains("通知"));
-        assert!(output.is_empty());
-    }
-
-    #[test]
-    fn item_started_file_change_fails_fast_with_full_context() {
-        let message = turn_item_message(
-            "item/started",
-            json!({
-                "type": "fileChange",
-                "id": "file_1",
-                "status": "inProgress",
-                "changes": []
-            }),
-        );
-        assert_turn_message_fails(
-            &message,
-            &[
+        for (method, status, expected_status) in [
+            (
                 "item/started",
-                "fileChange",
-                "file_1",
-                "itemId",
-                "thr_1",
-                "turn_1",
-                "changes",
-            ],
-        );
-    }
-
-    #[test]
-    fn item_completed_file_change_fails_fast_with_full_context() {
-        let message = turn_item_message(
-            "item/completed",
-            json!({
-                "type": "fileChange",
-                "id": "file_1",
-                "status": "completed",
-                "changes": []
-            }),
-        );
-        assert_turn_message_fails(
-            &message,
-            &[
+                "inProgress",
+                AgentFileChangeStatus::InProgress,
+            ),
+            (
                 "item/completed",
-                "fileChange",
-                "file_1",
-                "itemId",
-                "thr_1",
-                "turn_1",
-                "changes",
-            ],
-        );
+                "completed",
+                AgentFileChangeStatus::Completed,
+            ),
+        ] {
+            let message = turn_item_message(
+                method,
+                json!({
+                    "type": "fileChange",
+                    "id": "file_1",
+                    "status": status,
+                    "changes": [change.clone()]
+                }),
+            );
+            assert_eq!(
+                super::process_turn_message(
+                    &session,
+                    &message,
+                    "thr_1",
+                    "turn_1",
+                    &tx,
+                    &mut streamed_text,
+                )
+                .unwrap(),
+                None
+            );
+            let AgentEvent::FileChangeUpdated(file_change) = rx.try_recv().unwrap() else {
+                panic!("expected file change event");
+            };
+            assert_eq!(file_change.id, "file_1");
+            assert_eq!(file_change.status, expected_status);
+            assert_eq!(file_change.changes.len(), 1);
+        }
+
+        let patch = json!({
+            "method": "item/fileChange/patchUpdated",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "itemId": "file_1",
+                "changes": [change]
+            }
+        });
+        super::process_turn_message(&session, &patch, "thr_1", "turn_1", &tx, &mut streamed_text)
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::FileChangePatchUpdated { item_id, changes }
+                if item_id == "file_1" && changes.len() == 1
+        ));
+
+        let turn_diff = json!({
+            "method": "turn/diff/updated",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "diff": "diff --git a/example.txt b/example.txt\n@@ -1 +1 @@\n-old\n+new\n"
+            }
+        });
+        super::process_turn_message(
+            &session,
+            &turn_diff,
+            "thr_1",
+            "turn_1",
+            &tx,
+            &mut streamed_text,
+        )
+        .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::TurnDiffUpdated { diff } if diff.contains("example.txt")
+        ));
     }
 
     #[test]
@@ -7485,7 +7631,6 @@ mod tests {
             "hookPrompt",
             "functionCallOutput",
             "plan",
-            "fileChange",
             "mcpToolCall",
             "dynamicToolCall",
             "collabAgentToolCall",

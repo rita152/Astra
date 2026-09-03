@@ -316,10 +316,40 @@ pub enum ThreadHistoryItem {
         output: String,
         status: CommandExecutionStatus,
     },
+    FileChange(AgentFileChange),
     Unsupported {
         item_id: String,
         kind: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentFileChangeKind {
+    Add,
+    Delete,
+    Update { move_path: Option<String> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentFileChangeEntry {
+    pub path: String,
+    pub diff: String,
+    pub kind: AgentFileChangeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentFileChangeStatus {
+    InProgress,
+    Completed,
+    Failed,
+    Declined,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentFileChange {
+    pub id: String,
+    pub changes: Vec<AgentFileChangeEntry>,
+    pub status: AgentFileChangeStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1071,6 +1101,14 @@ pub enum AgentEvent {
         wrote_stdin: bool,
     },
     CommandCompleted(CommandExecution),
+    FileChangeUpdated(AgentFileChange),
+    FileChangePatchUpdated {
+        item_id: String,
+        changes: Vec<AgentFileChangeEntry>,
+    },
+    TurnDiffUpdated {
+        diff: String,
+    },
     CommandApprovalRequested {
         request: AgentCommandApprovalRequest,
         responder: AgentApprovalHandle,

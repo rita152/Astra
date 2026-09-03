@@ -11,16 +11,16 @@ use crate::{
     agent::{
         AgentAccountRateLimits, AgentApprovalHandle, AgentBackend, AgentCommandApprovalChoice,
         AgentConfigWarning, AgentConnectionEvent, AgentCreditsSnapshot, AgentEffectivePermissions,
-        AgentEvent, AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemSpecialPath,
-        AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
-        AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog,
-        AgentOptionalField, AgentPermissionMode, AgentPermissionRequestProfile,
-        AgentPermissionsApprovalChoice, AgentPermissionsApprovalHandle, AgentRateLimitWindow,
-        AgentReasoning, AgentRequest, AgentServerRequestFailureKind, AgentServerRequestKind,
-        AgentServerRequestMetadata, AgentThreadStatus, AgentThreadTokenUsage, AgentUserInputAnswer,
-        AgentUserInputHandle, AgentUserInputResponse, CodexAppServerBackend, CommandExecution,
-        CommandExecutionAction, CommandExecutionStatus, HistoryTurnStatus, ProjectId,
-        ThreadHistory, ThreadHistoryItem,
+        AgentEvent, AgentFileChange, AgentFileChangeStatus, AgentFileSystemAccess,
+        AgentFileSystemPath, AgentFileSystemSpecialPath, AgentInterruptHandle,
+        AgentInterruptOutcome, AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
+        AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog, AgentOptionalField,
+        AgentPermissionMode, AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
+        AgentPermissionsApprovalHandle, AgentRateLimitWindow, AgentReasoning, AgentRequest,
+        AgentServerRequestFailureKind, AgentServerRequestKind, AgentServerRequestMetadata,
+        AgentThreadStatus, AgentThreadTokenUsage, AgentUserInputAnswer, AgentUserInputHandle,
+        AgentUserInputResponse, CodexAppServerBackend, CommandExecution, CommandExecutionAction,
+        CommandExecutionStatus, HistoryTurnStatus, ProjectId, ThreadHistory, ThreadHistoryItem,
     },
     components::{
         approval::{
@@ -29,10 +29,10 @@ use crate::{
             ApprovalVisualState,
         },
         file_change::{
-            FileApprovalEvent, FileApprovalKeyboardFocus, FileApprovalMenuItem,
-            FileApprovalPresentation, FileApprovalStatus, FileApprovalVisualState,
-            FileChangeActivityPresentation, captured_file_approval_fixture,
-            captured_file_change_activity_fixture,
+            DiffReviewPresentation, FileApprovalEvent, FileApprovalKeyboardFocus,
+            FileApprovalMenuItem, FileApprovalPresentation, FileApprovalStatus,
+            FileApprovalVisualState, FileChangeActivityPresentation,
+            captured_file_approval_fixture, captured_file_change_activity_fixture,
         },
         icons::icon,
         permissions_approval::{
@@ -1166,6 +1166,15 @@ impl ComposerView {
                             status: *status,
                             exit_code: None,
                         })),
+                        ThreadHistoryItem::FileChange(change) => {
+                            activities.push(ConversationActivity::FileChange(
+                                FileChangeActivityPresentation::from_agent_change(
+                                    change,
+                                    "上一轮",
+                                    Some(&history.thread.cwd),
+                                ),
+                            ));
+                        }
                         ThreadHistoryItem::Unsupported { kind, .. } => {
                             activities.push(ConversationActivity::Warning {
                                 message: format!("历史包含当前 UI 尚未呈现的 {kind} 项"),
@@ -1722,6 +1731,41 @@ impl ComposerView {
                     upsert_command_activity(&mut self.conversation_activity, command);
                     if self.conversation_phase != ConversationPhase::Stopping {
                         self.conversation_phase = ConversationPhase::Streaming;
+                    }
+                }
+                AgentEvent::FileChangeUpdated(change) => {
+                    upsert_file_change_activity(&mut self.conversation_activity, change, &self.cwd);
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Streaming;
+                    }
+                }
+                AgentEvent::FileChangePatchUpdated { item_id, changes } => {
+                    upsert_file_change_activity(
+                        &mut self.conversation_activity,
+                        AgentFileChange {
+                            id: item_id,
+                            changes,
+                            status: AgentFileChangeStatus::InProgress,
+                        },
+                        &self.cwd,
+                    );
+                }
+                AgentEvent::TurnDiffUpdated { diff } => {
+                    if let Some(ConversationActivity::FileChange(activity)) = self
+                        .conversation_activity
+                        .iter_mut()
+                        .rev()
+                        .find(|activity| matches!(activity, ConversationActivity::FileChange(_)))
+                    {
+                        let review = DiffReviewPresentation::from_unified_diff(
+                            format!("turn-diff-{}", activity.item_id),
+                            "上一轮",
+                            &diff,
+                            Some(&self.cwd),
+                        );
+                        if !review.files.is_empty() {
+                            *activity = activity.clone().with_review(review);
+                        }
                     }
                 }
                 AgentEvent::CommandApprovalRequested { request, responder } => {
@@ -4044,6 +4088,25 @@ fn upsert_command_activity(
         *existing = incoming;
     } else {
         activities.push(ConversationActivity::Command(incoming));
+    }
+}
+
+fn upsert_file_change_activity(
+    activities: &mut Vec<ConversationActivity>,
+    change: AgentFileChange,
+    cwd: &std::path::Path,
+) {
+    let presentation =
+        FileChangeActivityPresentation::from_agent_change(&change, "上一轮", Some(cwd));
+    if let Some(existing) = activities.iter_mut().find_map(|activity| match activity {
+        ConversationActivity::FileChange(existing) if existing.item_id == change.id => {
+            Some(existing)
+        }
+        _ => None,
+    }) {
+        *existing = presentation;
+    } else {
+        activities.push(ConversationActivity::FileChange(presentation));
     }
 }
 

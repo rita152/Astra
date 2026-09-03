@@ -23,7 +23,8 @@ use super::{
     validate_remote_control_status_changed, validate_resume_goal_cleared,
 };
 use crate::agent::{
-    AgentCapabilities, AgentCapability, AgentConnectionEvent, AgentEvent, AgentInterruptControl,
+    AgentCapabilities, AgentCapability, AgentConnectionEvent, AgentEvent, AgentFileChange,
+    AgentFileChangeEntry, AgentFileChangeKind, AgentFileChangeStatus, AgentInterruptControl,
     AgentInterruptHandle, AgentInterruptOutcome, AgentModel, AgentModelCatalog, AgentOptionalField,
     AgentPermissionMode, AgentPermissionProfile, AgentRequest, AgentRun, AgentServerRequestId,
     AgentThreadActiveFlag, AgentThreadSettings, CommandExecutionStatus, CreateProject, FilterValue,
@@ -1054,6 +1055,52 @@ fn parse_command_status(value: &str) -> Result<CommandExecutionStatus> {
     }
 }
 
+fn parse_file_change_status(value: &str) -> Result<AgentFileChangeStatus> {
+    match value {
+        "inProgress" => Ok(AgentFileChangeStatus::InProgress),
+        "completed" => Ok(AgentFileChangeStatus::Completed),
+        "failed" => Ok(AgentFileChangeStatus::Failed),
+        "declined" => Ok(AgentFileChangeStatus::Declined),
+        other => bail!("fileChange.status 包含未知值 `{other}`"),
+    }
+}
+
+fn parse_history_file_change(value: &Value, item_id: String) -> Result<AgentFileChange> {
+    let changes = object_field(value, "changes", "fileChange item")?
+        .as_array()
+        .context("fileChange item.changes 必须是数组")?
+        .iter()
+        .enumerate()
+        .map(|(index, change)| {
+            let context = format!("fileChange item.changes[{index}]");
+            let kind_value = object_field(change, "kind", &context)?;
+            let kind_type = string_field(kind_value, "type", &format!("{context}.kind"))?;
+            let kind = match kind_type.as_str() {
+                "add" => AgentFileChangeKind::Add,
+                "delete" => AgentFileChangeKind::Delete,
+                "update" => AgentFileChangeKind::Update {
+                    move_path: optional_nullable_string_field(
+                        kind_value,
+                        "move_path",
+                        &format!("{context}.kind"),
+                    )?,
+                },
+                other => bail!("{context}.kind.type 包含未知值 `{other}`"),
+            };
+            Ok(AgentFileChangeEntry {
+                path: string_field(change, "path", &context)?,
+                diff: string_field(change, "diff", &context)?,
+                kind,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(AgentFileChange {
+        id: item_id,
+        changes,
+        status: parse_file_change_status(&string_field(value, "status", "fileChange item")?)?,
+    })
+}
+
 fn string_array_field(value: &Value, field: &str, context: &str) -> Result<Vec<String>> {
     match value.as_object().and_then(|object| object.get(field)) {
         None => Ok(Vec::new()),
@@ -1109,6 +1156,9 @@ fn parse_history_item(value: &Value) -> Result<ThreadHistoryItem> {
             .unwrap_or_default(),
             status: parse_command_status(&string_field(value, "status", "commandExecution item")?)?,
         }),
+        "fileChange" => Ok(ThreadHistoryItem::FileChange(parse_history_file_change(
+            value, item_id,
+        )?)),
         _ => Ok(ThreadHistoryItem::Unsupported { item_id, kind }),
     }
 }
@@ -2939,12 +2989,12 @@ mod tests {
 
     use super::{AppServerSpawner, CodexAppServerManager, ManagedProcess, SpawnedAppServer};
     use crate::agent::{
-        AgentCommandApprovalChoice, AgentConnectionEvent, AgentEvent, AgentInterruptOutcome,
-        AgentOptionalField, AgentPermissionMode, AgentPermissionsApprovalChoice, AgentRequest,
-        AgentServerRequestId, AgentUserInputAnswer, AgentUserInputResponse, CreateProject,
-        FilterValue, HistoryItemDetail, PageRequest, ProjectChange, SortDirection,
-        ThreadHistoryItem, ThreadListRequest, ThreadMetadataUpdate, ThreadSectionAppearance,
-        ThreadSortKey, UpdateProject,
+        AgentCommandApprovalChoice, AgentConnectionEvent, AgentEvent, AgentFileChange,
+        AgentInterruptOutcome, AgentOptionalField, AgentPermissionMode,
+        AgentPermissionsApprovalChoice, AgentRequest, AgentServerRequestId, AgentUserInputAnswer,
+        AgentUserInputResponse, CreateProject, FilterValue, HistoryItemDetail, PageRequest,
+        ProjectChange, SortDirection, ThreadHistoryItem, ThreadListRequest, ThreadMetadataUpdate,
+        ThreadSectionAppearance, ThreadSortKey, UpdateProject,
     };
 
     const WAIT: Duration = Duration::from_secs(3);
@@ -3546,7 +3596,19 @@ mod tests {
                 "data": [{
                     "id": "turn-a",
                     "status": "completed",
-                    "items": [{ "type": "agentMessage", "id": "message-a", "text": "done" }],
+                    "items": [
+                        { "type": "agentMessage", "id": "message-a", "text": "done" },
+                        {
+                            "type": "fileChange",
+                            "id": "file-a",
+                            "status": "completed",
+                            "changes": [{
+                                "path": "/tmp/example.txt",
+                                "kind": { "type": "add" },
+                                "diff": "hello\n"
+                            }]
+                        }
+                    ],
                     "startedAt": 1,
                     "completedAt": 2,
                     "durationMs": 1
@@ -3557,6 +3619,37 @@ mod tests {
         assert!(matches!(
             wait_value(&turns).unwrap().data[0].items[0],
             ThreadHistoryItem::AssistantMessage { .. }
+        ));
+        let turns = manager.list_thread_turns(
+            "thread-a".to_owned(),
+            PageRequest::default(),
+            HistoryItemDetail::Full,
+        );
+        let request = assert_workspace_request(&mut endpoint, "thread/turns/list");
+        endpoint.respond(
+            &request,
+            json!({
+                "data": [{
+                    "id": "turn-a",
+                    "status": "completed",
+                    "items": [{
+                        "type": "fileChange",
+                        "id": "file-a",
+                        "status": "completed",
+                        "changes": [{
+                            "path": "/tmp/example.txt",
+                            "kind": { "type": "add" },
+                            "diff": "hello\n"
+                        }]
+                    }]
+                }],
+                "nextCursor": null
+            }),
+        );
+        assert!(matches!(
+            wait_value(&turns).unwrap().data[0].items[0],
+            ThreadHistoryItem::FileChange(AgentFileChange { ref id, ref changes, .. })
+                if id == "file-a" && changes.len() == 1
         ));
 
         let items = manager.list_thread_items(

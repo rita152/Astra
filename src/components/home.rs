@@ -14,8 +14,8 @@ use gpui::{
 
 use crate::{
     agent::{
-        AgentBackend, CodexAppServerBackend, CommandExecution, CommandExecutionAction,
-        CommandExecutionStatus,
+        AgentBackend, AgentFileChangeStatus, CodexAppServerBackend, CommandExecution,
+        CommandExecutionAction, CommandExecutionStatus,
     },
     components::{
         approval::{ApprovalCardCallback, render_approval_card},
@@ -196,6 +196,7 @@ struct ToolActivityGroupPresentation {
     id: String,
     reasoning: Vec<ReasoningActivityPresentation>,
     commands: Vec<CommandExecution>,
+    file_changes: Vec<crate::components::file_change::FileChangeActivityPresentation>,
 }
 
 impl ToolActivityGroupPresentation {
@@ -207,6 +208,10 @@ impl ToolActivityGroupPresentation {
                 .commands
                 .iter()
                 .any(|command| command.status == CommandExecutionStatus::InProgress)
+            || self
+                .file_changes
+                .iter()
+                .any(|change| change.status == AgentFileChangeStatus::InProgress)
     }
 }
 
@@ -221,13 +226,14 @@ struct PendingToolActivityGroup {
     id: Option<String>,
     reasoning: Vec<ReasoningActivityPresentation>,
     commands: Vec<CommandExecution>,
+    file_changes: Vec<crate::components::file_change::FileChangeActivityPresentation>,
 }
 
 fn flush_pending_tool_activity_group(
     pending: &mut PendingToolActivityGroup,
     units: &mut Vec<ActivityStreamUnit>,
 ) {
-    if pending.commands.is_empty() {
+    if pending.commands.is_empty() && pending.file_changes.is_empty() {
         // ChatGPT does not render completed reasoning as an independent
         // "思考了 …" row. It is presentation context for an adjacent tool
         // block and remains invisible when no command belongs to the group.
@@ -242,6 +248,7 @@ fn flush_pending_tool_activity_group(
             id,
             reasoning: std::mem::take(&mut pending.reasoning),
             commands: std::mem::take(&mut pending.commands),
+            file_changes: std::mem::take(&mut pending.file_changes),
         },
     ));
 }
@@ -270,6 +277,10 @@ fn activity_stream_units(activities: &[ConversationActivity]) -> Vec<ActivityStr
             ConversationActivity::Command(command) => {
                 pending.id.get_or_insert_with(|| command.id.clone());
                 pending.commands.push(command.clone());
+            }
+            ConversationActivity::FileChange(change) => {
+                pending.id.get_or_insert_with(|| change.item_id.clone());
+                pending.file_changes.push(change.clone());
             }
             standalone => {
                 flush_pending_tool_activity_group(&mut pending, &mut units);
@@ -421,10 +432,17 @@ fn generic_command_activity_summary(
     command: &CommandExecution,
     display_command: &str,
 ) -> CommandActivitySummary {
-    let display_command = if display_command.trim().is_empty() {
+    // Browser text in ChatGPT's one-line activity label uses normal
+    // whitespace collapsing. GPUI preserves embedded newlines, so a heredoc
+    // command otherwise paints several lines through the fixed 21px row.
+    let display_command = display_command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let display_command = if display_command.is_empty() {
         "命令"
     } else {
-        display_command
+        &display_command
     };
     let text = match command.status {
         CommandExecutionStatus::InProgress => format!("正在运行 {display_command}"),
@@ -447,14 +465,21 @@ fn completed_tool_group_summary(group: &ToolActivityGroupPresentation) -> Comman
         .collect::<Vec<_>>();
     let reads_files = command_summaries.iter().any(|summary| summary.reads_files);
     let runs_command = command_summaries.iter().any(|summary| summary.runs_command);
-    let text = match (reads_files, runs_command) {
-        (true, true) => "已读取文件运行了命令",
-        (true, false) => "已读取文件",
-        (false, true) => "运行了命令",
-        (false, false) => "已工作",
+    let edits_files = !group.file_changes.is_empty();
+    let text = match (edits_files, reads_files, runs_command) {
+        (true, true, true) => "编辑了文件读取文件运行了命令",
+        (true, true, false) => "编辑了文件读取文件",
+        (true, false, true) => "编辑了文件运行了命令",
+        (true, false, false) => "编辑了文件",
+        (false, true, true) => "已读取文件运行了命令",
+        (false, true, false) => "已读取文件",
+        (false, false, true) => "运行了命令",
+        (false, false, false) => "已工作",
     };
     CommandActivitySummary {
-        icon: if reads_files {
+        icon: if edits_files {
+            "message-edit"
+        } else if reads_files {
             "activity-read"
         } else {
             "panel-terminal"
@@ -470,7 +495,12 @@ fn command_activity_row_count(command: &CommandExecution) -> usize {
 }
 
 fn tool_group_row_count(group: &ToolActivityGroupPresentation) -> usize {
-    group.commands.iter().map(command_activity_row_count).sum()
+    group
+        .commands
+        .iter()
+        .map(command_activity_row_count)
+        .sum::<usize>()
+        + group.file_changes.len()
 }
 
 fn strip_terminal_line_ending(output: &str) -> &str {
@@ -926,6 +956,14 @@ impl HomeView {
     }
 
     pub fn set_file_change_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.expanded_tool_groups.clear();
+        self.expanded_commands.clear();
+        if state.contains("expanded") {
+            self.expanded_tool_groups
+                .insert("file-change-ui-capture".to_owned());
+            self.expanded_commands
+                .insert("file-change-ui-capture".to_owned());
+        }
         self.composer.update(cx, |composer, cx| {
             composer.set_file_change_for_capture(state, cx)
         });
@@ -978,7 +1016,12 @@ impl HomeView {
         cx: &mut Context<Self>,
     ) {
         match event {
-            FileChangeActivityEvent::OpenReview(review) => cx.emit(OpenDiffReview(review)),
+            FileChangeActivityEvent::ToggleDetails { item_id } => {
+                if !self.expanded_commands.remove(&item_id) {
+                    self.expanded_commands.insert(item_id);
+                }
+                cx.notify();
+            }
         }
     }
 
@@ -1076,7 +1119,7 @@ impl HomeView {
 
     fn sync_reasoning_disclosure_transitions(
         &mut self,
-        activities: &[ConversationActivity],
+        units: &[ActivityStreamUnit],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1084,16 +1127,17 @@ impl HomeView {
         let mut present_items = HashSet::new();
         let mut should_animate = false;
 
-        let visible_reasoning = activity_stream_units(activities)
-            .into_iter()
-            .filter_map(|unit| match unit {
-                ActivityStreamUnit::Standalone(ConversationActivity::Reasoning(reasoning)) => {
-                    Some(reasoning)
-                }
-                ActivityStreamUnit::Standalone(_) | ActivityStreamUnit::ToolGroup(_) => None,
-            });
+        let visible_reasoning = units.iter().filter_map(|unit| match unit {
+            ActivityStreamUnit::Standalone(ConversationActivity::Reasoning(reasoning)) => {
+                Some(reasoning)
+            }
+            ActivityStreamUnit::Standalone(_) | ActivityStreamUnit::ToolGroup(_) => None,
+        });
         for reasoning in visible_reasoning {
             present_items.insert(reasoning.item_id.clone());
+            self.reasoning_scroll_handles
+                .entry(reasoning.item_id.clone())
+                .or_insert_with(ScrollHandle::new);
             let has_content = !reasoning_body_text(&reasoning).trim().is_empty();
             let expanded = has_content
                 && (reasoning.is_active() || self.expanded_reasoning.contains(&reasoning.item_id));
@@ -1116,6 +1160,8 @@ impl HomeView {
         }
 
         self.reasoning_disclosure_transitions
+            .retain(|item_id, _| present_items.contains(item_id));
+        self.reasoning_scroll_handles
             .retain(|item_id, _| present_items.contains(item_id));
         if should_animate && !self.reasoning_transition_running {
             self.reasoning_transition_running = true;
@@ -1165,13 +1211,13 @@ impl HomeView {
 
     fn sync_tool_group_disclosure_transitions(
         &mut self,
-        activities: &[ConversationActivity],
+        units: &[ActivityStreamUnit],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let now = cx.background_executor().now();
-        let groups = activity_stream_units(activities)
-            .into_iter()
+        let groups = units
+            .iter()
             .filter_map(|unit| match unit {
                 ActivityStreamUnit::ToolGroup(group) => Some(group),
                 ActivityStreamUnit::Standalone(_) => None,
@@ -1195,6 +1241,9 @@ impl HomeView {
 
         let mut should_animate = false;
         for group in groups {
+            self.tool_group_scroll_handles
+                .entry(group.id.clone())
+                .or_insert_with(ScrollHandle::new);
             let expanded = if group.is_active() {
                 !self.collapsed_active_tool_groups.contains(&group.id)
             } else {
@@ -1203,7 +1252,7 @@ impl HomeView {
             let target = if expanded { 1.0 } else { 0.0 };
             let transition = self
                 .tool_group_disclosure_transitions
-                .entry(group.id)
+                .entry(group.id.clone())
                 .or_insert_with(|| ToolGroupDisclosureTransition::settled(expanded));
             if (transition.target - target).abs() > f32::EPSILON {
                 if cx.reduce_motion() {
@@ -1369,8 +1418,28 @@ impl Render for HomeView {
             let prompt_focus = self.composer.read(cx).prompt_focus_handle(cx);
             window.focus(&prompt_focus, cx);
         }
-        self.sync_reasoning_disclosure_transitions(&conversation_activity, window, cx);
-        self.sync_tool_group_disclosure_transitions(&conversation_activity, window, cx);
+        // Disclosure state belongs to every visible turn. On resume, all but
+        // the last turn live in `transcript`; syncing only the current turn
+        // immediately pruned a historical group id after its header was
+        // clicked, making a valid command block appear inert.
+        let visible_activity_units = transcript
+            .iter()
+            .flat_map(|turn| activity_stream_units(&turn.activities))
+            .chain(activity_stream_units(&conversation_activity))
+            .collect::<Vec<_>>();
+        self.sync_reasoning_disclosure_transitions(&visible_activity_units, window, cx);
+        self.sync_tool_group_disclosure_transitions(&visible_activity_units, window, cx);
+        for activity in transcript
+            .iter()
+            .flat_map(|turn| turn.activities.iter())
+            .chain(conversation_activity.iter())
+        {
+            if let ConversationActivity::Command(command) = activity {
+                self.command_scroll_handles
+                    .entry(command.id.clone())
+                    .or_insert_with(ScrollHandle::new);
+            }
+        }
         let reasoning_disclosure_progress = self
             .reasoning_disclosure_transitions
             .iter()
@@ -2174,7 +2243,10 @@ fn activity_stream(
                                 home.handle_file_change_activity_event(event, cx)
                             });
                         });
-                        stream.child(render_file_change_activity(&model, theme, callback))
+                        let expanded = expanded_commands.contains(&model.item_id);
+                        stream.child(render_file_change_activity(
+                            &model, expanded, theme, callback,
+                        ))
                     }
                     ConversationActivity::UserInput(_) => stream,
                     ConversationActivity::ProtocolError {
@@ -2818,19 +2890,32 @@ fn tool_activity_group(
             runs_command: false,
         }
     } else if active {
-        group
-            .commands
+        if group
+            .file_changes
             .iter()
-            .rev()
-            .find(|command| command.status == CommandExecutionStatus::InProgress)
-            .or_else(|| group.commands.last())
-            .and_then(|command| command_activity_summaries(command).into_iter().last())
-            .unwrap_or_else(|| CommandActivitySummary {
-                icon: "panel-terminal",
-                text: "正在工作".to_owned(),
+            .any(|change| change.status == AgentFileChangeStatus::InProgress)
+        {
+            CommandActivitySummary {
+                icon: "message-edit",
+                text: "正在编辑文件".to_owned(),
                 reads_files: false,
-                runs_command: true,
-            })
+                runs_command: false,
+            }
+        } else {
+            group
+                .commands
+                .iter()
+                .rev()
+                .find(|command| command.status == CommandExecutionStatus::InProgress)
+                .or_else(|| group.commands.last())
+                .and_then(|command| command_activity_summaries(command).into_iter().last())
+                .unwrap_or_else(|| CommandActivitySummary {
+                    icon: "panel-terminal",
+                    text: "正在工作".to_owned(),
+                    reads_files: false,
+                    runs_command: true,
+                })
+        }
     } else {
         completed_tool_group_summary(&group)
     };
@@ -2860,9 +2945,10 @@ fn tool_activity_group(
     let show_top_fade = scroll_top > 0.5;
     let show_bottom_fade = has_overflow && (max_scroll <= 0.5 || scroll_top + 0.5 < max_scroll);
 
-    let command_rows = group.commands.into_iter().fold(
+    let activity_rows = group.commands.into_iter().fold(
         div()
             .w_full()
+            .flex_none()
             .flex()
             .flex_col()
             .gap(px(TOOL_GROUP_ITEM_GAP)),
@@ -2876,6 +2962,29 @@ fn tool_activity_group(
             ))
         },
     );
+    let activity_rows = group
+        .file_changes
+        .into_iter()
+        .fold(activity_rows, |rows, file_change| {
+            let expanded = expanded_commands.contains(&file_change.item_id);
+            let target = home_entity.clone();
+            let callback = FileChangeActivityCallback::new(move |event, _, cx| {
+                target.update(cx, move |home, cx| {
+                    home.handle_file_change_activity_event(event, cx)
+                });
+            });
+            rows.child(
+                div()
+                    .w_full()
+                    .flex_none()
+                    .child(render_file_change_activity(
+                        &file_change,
+                        expanded,
+                        theme,
+                        callback,
+                    )),
+            )
+        });
 
     div()
         .w_full()
@@ -3006,7 +3115,7 @@ fn tool_activity_group(
                                         home.update(cx, |_, cx| cx.notify());
                                     });
                                 })
-                                .child(command_rows),
+                                .child(activity_rows),
                         )
                         .when(show_top_fade, |body| {
                             body.child(
@@ -3088,6 +3197,8 @@ fn static_command_action_activity(
         .id(SharedString::from(format!("command-action-{row_id}")))
         .group(hover_group.clone())
         .h(px(TOOL_GROUP_HEADER_HEIGHT))
+        .flex_none()
+        .overflow_hidden()
         .max_w_full()
         .min_w(px(0.0))
         .flex()
@@ -3181,6 +3292,7 @@ fn command_execution_activity(
     actions.into_iter().enumerate().fold(
         div()
             .w_full()
+            .flex_none()
             .flex()
             .flex_col()
             .gap(px(TOOL_GROUP_ITEM_GAP)),
@@ -3279,6 +3391,7 @@ fn command_activity(
     div()
         .w_full()
         .min_w(px(0.0))
+        .flex_none()
         .flex()
         .flex_col()
         .items_start()
@@ -3287,6 +3400,8 @@ fn command_activity(
                 .id(SharedString::from(format!("command-activity-{item_id}")))
                 .group(hover_group.clone())
                 .h(px(21.0))
+                .flex_none()
+                .overflow_hidden()
                 .max_w_full()
                 .min_w(px(0.0))
                 .flex()
@@ -3580,7 +3695,7 @@ fn message_action(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{path::PathBuf, time::Duration};
 
     use gpui::{
         AppContext, Bounds, KeyBinding, MouseButton, TestApp, TestAppWindow, WindowBounds,
@@ -3611,15 +3726,20 @@ mod tests {
         USER_MESSAGE_TIME_SIZE, active_reasoning_body, activity_stream_units,
         command_activity_row_count, command_activity_summaries, command_activity_summary,
         completed_reasoning_body, completed_tool_group_summary, conversation_status,
-        format_reasoning_elapsed, reasoning_activity_title, reasoning_header_label,
-        reasoning_transition_ease, scroll_should_follow_output, strip_terminal_line_ending,
-        thinking_shimmer_alpha, thinking_shimmer_band_left, thinking_shimmer_progress,
-        thinking_shimmer_step, toggle_reasoning_item, toggle_tool_activity_group,
-        tool_group_chevron_transition_ease, tool_group_reasoning_title,
+        format_reasoning_elapsed, generic_command_activity_summary, reasoning_activity_title,
+        reasoning_header_label, reasoning_transition_ease, scroll_should_follow_output,
+        strip_terminal_line_ending, thinking_shimmer_alpha, thinking_shimmer_band_left,
+        thinking_shimmer_progress, thinking_shimmer_step, toggle_reasoning_item,
+        toggle_tool_activity_group, tool_group_chevron_transition_ease, tool_group_reasoning_title,
     };
-    use crate::agent::{CommandExecution, CommandExecutionAction, CommandExecutionStatus};
+    use crate::agent::{
+        CommandExecution, CommandExecutionAction, CommandExecutionStatus, HistoryItemDetail,
+        HistoryTurnStatus, ThreadActivity, ThreadHistory, ThreadHistoryItem, ThreadSummary,
+        ThreadTurn,
+    };
     use crate::components::{
         composer::{ConversationActivity, ConversationPhase, ReasoningActivityPresentation},
+        file_change::captured_file_change_activity_fixture,
         prompt_input::Submit,
         user_input_request::{UserInputKeyboardFocus, UserInputRequestStatus},
     };
@@ -3729,6 +3849,42 @@ mod tests {
             separated_units[2],
             ActivityStreamUnit::ToolGroup(_)
         ));
+    }
+
+    #[test]
+    fn file_change_joins_the_tool_group_and_leads_its_completed_summary() {
+        let activities = vec![
+            ConversationActivity::Reasoning(reasoning("reasoning_1", "Applying changes", false)),
+            ConversationActivity::Command(command(
+                "read_1",
+                CommandExecutionAction::Read {
+                    command: "sed -n '1,20p' src/main.rs".into(),
+                    name: "main.rs".into(),
+                    path: "src/main.rs".into(),
+                },
+                CommandExecutionStatus::Completed,
+            )),
+            ConversationActivity::FileChange(captured_file_change_activity_fixture("completed")),
+            ConversationActivity::Command(command(
+                "run_1",
+                CommandExecutionAction::Unknown {
+                    command: "cargo test".into(),
+                },
+                CommandExecutionStatus::Completed,
+            )),
+        ];
+
+        let units = activity_stream_units(&activities);
+        assert_eq!(units.len(), 1);
+        let ActivityStreamUnit::ToolGroup(group) = &units[0] else {
+            panic!("expected fileChange inside the tool activity group");
+        };
+        assert_eq!(group.file_changes.len(), 1);
+        assert_eq!(
+            completed_tool_group_summary(group).text,
+            "编辑了文件读取文件运行了命令"
+        );
+        assert_eq!(completed_tool_group_summary(group).icon, "message-edit");
     }
 
     #[test]
@@ -3870,6 +4026,24 @@ mod tests {
             CommandExecutionStatus::Completed,
         );
         assert_eq!(command_activity_summary(&shell).text, "已运行 cargo check");
+    }
+
+    #[test]
+    fn multiline_history_command_summary_collapses_to_one_activity_row() {
+        let command = command(
+            "multiline-command",
+            CommandExecutionAction::Unknown {
+                command: "python3 - <<'PY'\nfrom PIL import Image\nprint('done')\nPY".to_owned(),
+            },
+            CommandExecutionStatus::Completed,
+        );
+
+        let summary = generic_command_activity_summary(&command, &command.command);
+        assert_eq!(
+            summary.text,
+            "已运行 python3 - <<'PY' from PIL import Image print('done') PY"
+        );
+        assert_eq!(summary.text.lines().count(), 1);
     }
 
     #[test]
@@ -4082,6 +4256,182 @@ mod tests {
         assert!(app.read_entity(&home, |home, _| {
             home.collapsed_active_tool_groups.contains("group_1")
         }));
+    }
+
+    #[test]
+    fn resumed_historical_tool_group_keeps_its_disclosure_state() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+        let command_turn = |turn_id: &str, item_id: &str, prompt: &str| ThreadTurn {
+            turn_id: turn_id.to_owned(),
+            status: HistoryTurnStatus::Completed,
+            items_view: HistoryItemDetail::Full,
+            items: vec![
+                ThreadHistoryItem::UserMessage {
+                    item_id: format!("{turn_id}-user"),
+                    text: prompt.to_owned(),
+                },
+                ThreadHistoryItem::Command {
+                    item_id: item_id.to_owned(),
+                    command: "cargo check".to_owned(),
+                    output: "Finished dev profile".to_owned(),
+                    status: CommandExecutionStatus::Completed,
+                },
+            ],
+            started_at: Some(1_000),
+            completed_at: Some(2_000),
+            duration_ms: Some(1_000),
+            error: None,
+        };
+        let history = ThreadHistory {
+            thread: ThreadSummary {
+                thread_id: "resume-thread".to_owned(),
+                title: "Resume disclosure".to_owned(),
+                preview: String::new(),
+                cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
+                section: None,
+                created_at: 1,
+                updated_at: 2,
+                recency_at: Some(2),
+                activity: ThreadActivity::Idle,
+            },
+            turns: vec![
+                command_turn("historical-turn", "historical-command", "first"),
+                command_turn("current-turn", "current-command", "second"),
+            ],
+            next_turn_cursor: None,
+            backwards_turn_cursor: None,
+        };
+
+        window.update(|home, _, cx| {
+            home.composer_entity()
+                .update(cx, |composer, cx| composer.hydrate_history(history, cx));
+        });
+        window.draw();
+        window.read(|home, _| {
+            assert!(
+                home.tool_group_disclosure_transitions
+                    .contains_key("historical-command")
+            );
+            assert!(
+                home.command_scroll_handles
+                    .contains_key("historical-command")
+            );
+        });
+
+        window.update(|home, _, cx| {
+            home.expanded_tool_groups
+                .insert("historical-command".to_owned());
+            cx.notify();
+        });
+        window.draw();
+        window.read(|home, _| {
+            assert!(home.expanded_tool_groups.contains("historical-command"));
+            assert_eq!(
+                home.tool_group_disclosure_transitions
+                    .get("historical-command")
+                    .expect("historical transition")
+                    .target,
+                1.0
+            );
+        });
+    }
+
+    #[test]
+    fn dense_resumed_tool_group_preserves_row_height_and_scrolls_instead_of_overlapping() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+        let mut dense_items = vec![ThreadHistoryItem::UserMessage {
+            item_id: "dense-user".to_owned(),
+            text: "inspect the native material".to_owned(),
+        }];
+        dense_items.extend((0..20).map(|index| ThreadHistoryItem::Command {
+            item_id: format!("dense-command-{index}"),
+            command: if index == 4 {
+                "python3 - <<'PY'\nfrom PIL import Image\nprint('done')\nPY".to_owned()
+            } else {
+                format!("cargo check --package fixture-{index}")
+            },
+            output: "Finished dev profile".to_owned(),
+            status: CommandExecutionStatus::Completed,
+        }));
+        let history = ThreadHistory {
+            thread: ThreadSummary {
+                thread_id: "dense-resume-thread".to_owned(),
+                title: "Dense resume disclosure".to_owned(),
+                preview: String::new(),
+                cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
+                section: None,
+                created_at: 1,
+                updated_at: 2,
+                recency_at: Some(2),
+                activity: ThreadActivity::Idle,
+            },
+            turns: vec![
+                ThreadTurn {
+                    turn_id: "dense-historical-turn".to_owned(),
+                    status: HistoryTurnStatus::Completed,
+                    items_view: HistoryItemDetail::Full,
+                    items: dense_items,
+                    started_at: Some(1_000),
+                    completed_at: Some(2_000),
+                    duration_ms: Some(1_000),
+                    error: None,
+                },
+                ThreadTurn {
+                    turn_id: "current-turn".to_owned(),
+                    status: HistoryTurnStatus::Completed,
+                    items_view: HistoryItemDetail::Full,
+                    items: vec![ThreadHistoryItem::UserMessage {
+                        item_id: "current-user".to_owned(),
+                        text: "continue".to_owned(),
+                    }],
+                    started_at: Some(3_000),
+                    completed_at: Some(4_000),
+                    duration_ms: Some(1_000),
+                    error: None,
+                },
+            ],
+            next_turn_cursor: None,
+            backwards_turn_cursor: None,
+        };
+
+        window.update(|home, _, cx| {
+            home.composer_entity()
+                .update(cx, |composer, cx| composer.hydrate_history(history, cx));
+            home.expanded_tool_groups
+                .insert("dense-command-0".to_owned());
+        });
+        window.draw();
+        window.read(|home, _| {
+            let scroll = home
+                .tool_group_scroll_handles
+                .get("dense-command-0")
+                .expect("dense historical tool group scroll handle");
+            // 20 fixed 21px rows, 19 four-pixel gaps, and the four-pixel top
+            // inset produce 500px of content in the captured 224px viewport.
+            assert_eq!(f32::from(scroll.max_offset().y), 276.0);
+        });
     }
 
     #[test]
@@ -4839,7 +5189,7 @@ mod tests {
     }
 
     #[test]
-    fn file_change_review_event_keeps_the_completed_activity_mounted() {
+    fn file_change_disclosure_event_toggles_the_inline_diff() {
         use crate::components::file_change::FileChangeActivityEvent;
 
         let mut app = TestApp::new();
@@ -4855,7 +5205,7 @@ mod tests {
         );
 
         window.update(|home, _, cx| home.set_file_change_for_capture("completed", cx));
-        let review = window.read(|home, cx| {
+        let item_id = window.read(|home, cx| {
             home.composer
                 .read(cx)
                 .conversation_render_snapshot()
@@ -4865,24 +5215,29 @@ mod tests {
                     let ConversationActivity::FileChange(model) = activity else {
                         return None;
                     };
-                    Some(model.review.clone())
+                    Some(model.item_id.clone())
                 })
                 .expect("completed fileChange activity")
         });
 
         window.update(|home, _, cx| {
             home.handle_file_change_activity_event(
-                FileChangeActivityEvent::OpenReview(review.clone()),
+                FileChangeActivityEvent::ToggleDetails {
+                    item_id: item_id.clone(),
+                },
                 cx,
             )
         });
-
-        window.read(|home, cx| {
-            let activities = home.composer.read(cx).conversation_render_snapshot().5;
-            assert!(activities.iter().any(|activity| {
-                matches!(activity, ConversationActivity::FileChange(model) if model.review == review)
-            }));
+        assert!(window.read(|home, _| home.expanded_commands.contains(&item_id)));
+        window.update(|home, _, cx| {
+            home.handle_file_change_activity_event(
+                FileChangeActivityEvent::ToggleDetails {
+                    item_id: item_id.clone(),
+                },
+                cx,
+            )
         });
+        assert!(!window.read(|home, _| home.expanded_commands.contains(&item_id)));
     }
 
     #[test]

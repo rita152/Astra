@@ -16,6 +16,7 @@ use gpui::{
 };
 
 use crate::{
+    agent::{AgentFileChange, AgentFileChangeEntry, AgentFileChangeKind, AgentFileChangeStatus},
     components::icons::icon,
     theme::{Theme, ThemeMode, UI_FONT_FAMILY, UI_MONOSPACE_FONT_FAMILY},
 };
@@ -31,10 +32,12 @@ pub const FILE_APPROVAL_FILE_ROW_HEIGHT: f32 = 33.0;
 pub const FILE_APPROVAL_FILES_VERTICAL_PADDING: f32 = 16.0;
 pub const FILE_APPROVAL_FILES_MAX_HEIGHT: f32 = 200.0;
 
-pub const FILE_CHANGE_ACTIVITY_HEIGHT: f32 = 64.5;
-pub const FILE_CHANGE_ACTIVITY_ICON_SIZE: f32 = 40.0;
-pub const FILE_CHANGE_FILE_ROW_HEIGHT: f32 = 36.0;
-pub const FILE_CHANGE_FILE_LIST_BORDER_HEIGHT: f32 = 1.0;
+pub const FILE_CHANGE_ACTIVITY_ROW_HEIGHT: f32 = 21.0;
+pub const FILE_CHANGE_ACTIVITY_ICON_SIZE: f32 = 16.0;
+pub const FILE_CHANGE_ACTIVITY_ICON_TEXT_GAP: f32 = 6.0;
+pub const FILE_CHANGE_INLINE_BODY_GAP: f32 = 8.0;
+pub const FILE_CHANGE_INLINE_CARD_HEADER_HEIGHT: f32 = 28.0;
+pub const FILE_CHANGE_INLINE_CARD_RADIUS: f32 = 12.5;
 
 pub const REVIEW_TAB_BAR_HEIGHT: f32 = 46.0;
 pub const REVIEW_TOOLBAR_HEIGHT: f32 = 40.0;
@@ -407,7 +410,6 @@ impl FileApprovalCallback {
 struct FilePalette {
     mode: ThemeMode,
     surface: gpui::Rgba,
-    elevated: gpui::Rgba,
     card: gpui::Rgba,
     text: gpui::Rgba,
     tertiary: gpui::Rgba,
@@ -433,7 +435,6 @@ impl FilePalette {
             Self {
                 mode: ThemeMode::Dark,
                 surface: rgba(0x181818ff),
-                elevated: rgba(0x232323ff),
                 // CDP 39-43 rasterize the approval surface to a flat #2c2c2c.
                 // Keep this opaque: GPUI's premultiplication otherwise rounds
                 // the captured card up to #2d2d2d.
@@ -465,10 +466,11 @@ impl FilePalette {
             Self {
                 mode: ThemeMode::Light,
                 surface: rgba(0xffffffff),
-                elevated: rgba(0xffffffff),
                 card: rgba(0xffffffff),
                 text: rgba(0x1a1c1fff),
-                tertiary: rgba(0x1a1c1f7e),
+                // Current Electron `text-codex-description` resolves to the
+                // 70% text token (26/28/31 composited over white -> 95/96/98).
+                tertiary: rgba(0x1a1c1fb2),
                 approval_secondary: rgba(0x1a1c1f74),
                 approval_icon: rgba(0x1a1c1fa6),
                 approval_decline_text: rgba(0x1a1c1fdb),
@@ -958,21 +960,13 @@ fn approval_change_counts(additions: u32, deletions: u32, palette: FilePalette) 
         )
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum FileChangeActivityVisualState {
-    #[default]
-    Default,
-    HeaderHovered,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileChangeActivityPresentation {
     pub item_id: String,
     pub path: String,
     pub additions: u32,
     pub deletions: u32,
-    pub visual_state: FileChangeActivityVisualState,
-    pub details_expanded: bool,
+    pub status: AgentFileChangeStatus,
     pub review: DiffReviewPresentation,
 }
 
@@ -1002,48 +996,67 @@ impl FileChangeActivityPresentation {
             path,
             additions,
             deletions,
-            visual_state: FileChangeActivityVisualState::Default,
-            details_expanded: false,
+            status: AgentFileChangeStatus::Completed,
             review,
         }
     }
 
     pub fn with_review(mut self, review: DiffReviewPresentation) -> Self {
-        // `path` is only the legacy single-file title fallback. Multi-file
-        // activities render every entry from `review.files` below and must not
+        // `path` is only the single-file title fallback. Multi-file activities
+        // render one inline edit row per `review.files` entry and must not
         // silently collapse their identity to the first file.
         if review.files.len() == 1 {
             self.path = review.files[0].path.clone();
         }
         self.additions = review.total_additions();
         self.deletions = review.total_deletions();
-        self.details_expanded = review.files.len() > 1;
         self.review = review;
         self
     }
 
+    pub fn from_agent_change(
+        change: &AgentFileChange,
+        turn_label: impl Into<String>,
+        cwd: Option<&Path>,
+    ) -> Self {
+        let review = DiffReviewPresentation::from_file_change_entries(
+            format!("file-change-{}", change.id),
+            turn_label,
+            &change.changes,
+            cwd,
+        );
+        let path = review
+            .files
+            .first()
+            .map(|file| file.path.clone())
+            .or_else(|| change.changes.first().map(|entry| entry.path.clone()))
+            .unwrap_or_else(|| "变更".to_owned());
+        let mut presentation = Self::edited(
+            change.id.clone(),
+            path,
+            review.total_additions(),
+            review.total_deletions(),
+        )
+        .with_review(review);
+        presentation.status = change.status;
+        presentation
+    }
+
     pub fn title(&self) -> String {
+        if self.review.files.is_empty() {
+            return "已编辑 0 个文件".to_owned();
+        }
         if self.review.files.len() > 1 {
             return format!("已编辑 {} 个文件", self.review.files.len());
         }
         let (_, name) = split_directory_and_name(&self.path);
         format!("已编辑 {name}")
     }
-
-    pub fn geometry_height(&self) -> f32 {
-        FILE_CHANGE_ACTIVITY_HEIGHT
-            + if self.details_expanded {
-                FILE_CHANGE_FILE_LIST_BORDER_HEIGHT
-                    + self.review.files.len() as f32 * FILE_CHANGE_FILE_ROW_HEIGHT
-            } else {
-                0.0
-            }
-    }
 }
 
 /// Completed two-file fixture from natural captures 26/27. Each file and the
 /// +2/-0 aggregate come directly from the correlated `item/completed` item.
-pub fn captured_file_change_activity_fixture(state: &str) -> FileChangeActivityPresentation {
+pub fn captured_file_change_activity_fixture(_state: &str) -> FileChangeActivityPresentation {
     let review = DiffReviewPresentation::new(
         "file-change-ui-capture-review",
         "上一轮",
@@ -1070,25 +1083,18 @@ pub fn captured_file_change_activity_fixture(state: &str) -> FileChangeActivityP
             },
         ],
     );
-    let mut model = FileChangeActivityPresentation::edited(
+    FileChangeActivityPresentation::edited(
         "file-change-ui-capture",
         review.files[0].path.clone(),
         review.total_additions(),
         review.total_deletions(),
     )
-    .with_review(review);
-    if matches!(state, "hover" | "header-hover" | "completed-hover") {
-        model.visual_state = FileChangeActivityVisualState::HeaderHovered;
-    }
-    if matches!(state, "collapsed" | "completed-collapsed") {
-        model.details_expanded = false;
-    }
-    model
+    .with_review(review)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileChangeActivityEvent {
-    OpenReview(DiffReviewPresentation),
+    ToggleDetails { item_id: String },
 }
 
 #[derive(Clone)]
@@ -1110,103 +1116,18 @@ impl FileChangeActivityCallback {
 
 pub fn render_file_change_activity(
     model: &FileChangeActivityPresentation,
+    expanded: bool,
     theme: Theme,
     callback: FileChangeActivityCallback,
 ) -> Stateful<Div> {
     let palette = FilePalette::for_theme(theme);
-    let (activity_outline, icon_tile, icon_color) = match palette.mode {
-        // The light CDP strict crop starts just inside the 0.5px Electron
-        // elevation stroke. Painting that stroke at GPUI's different vertical
-        // raster phase leaves a false full-width grey row in the local crop.
-        ThemeMode::Light => (rgba(0x1a1c1f00), rgba(0xf7f7f7ff), rgba(0x8b8c8eff)),
-        ThemeMode::Dark => (
-            // GPUI covers the half-pixel spread more strongly than Chromium;
-            // 0x0b produces the captured #2a edge over the #232323 card.
-            rgba(0xffffff0b),
-            rgba(0x151515ff),
-            rgba(0x777777ff),
-        ),
-    };
-    let hovered = model.visual_state == FileChangeActivityVisualState::HeaderHovered;
-    let review_callback = callback.clone();
-    let review = model.review.clone();
-
-    let header = div()
-        .h(px(FILE_CHANGE_ACTIVITY_HEIGHT))
-        .flex_none()
-        .px(px(12.0))
-        .py(px(12.0))
-        .flex()
-        .items_center()
-        .gap(px(10.0))
-        .when(hovered, |header| header.bg(palette.soft_hover))
-        .hover(move |header| header.bg(palette.soft_hover))
-        .child(
-            div()
-                .size(px(FILE_CHANGE_ACTIVITY_ICON_SIZE))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(12.5))
-                .bg(icon_tile)
-                .child(icon("panel-review", icon_color.into()).size(px(24.0))),
-        )
-        .child(
-            div()
-                .min_w(px(0.0))
-                .flex_1()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .truncate()
-                        .text_size(px(14.0))
-                        .line_height(px(21.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(palette.text)
-                        .child(model.title()),
-                )
-                .child(div().h(px(19.5)).flex().items_center().child(change_counts(
-                    model.additions,
-                    model.deletions,
-                    palette,
-                ))),
-        )
-        .child(
-            // The captured app also exposes Undo here, but GPUI does not yet
-            // own a reversible file operation or a confirmed server-side
-            // revert. Keep the action absent instead of presenting a
-            // destructive-looking dismiss-only control.
-            div().flex_none().flex().items_center().child(
-                div()
-                    .id(element_id("file-change-review", &model.item_id))
-                    .role(Role::Button)
-                    .h(px(28.0))
-                    .px(px(8.0))
-                    .flex()
-                    .items_center()
-                    .rounded(px(12.5))
-                    .border_1()
-                    .border_color(palette.outline)
-                    .bg(palette.soft)
-                    .text_size(px(14.0))
-                    .line_height(px(18.0))
-                    .text_color(palette.text)
-                    .cursor_pointer()
-                    .hover(move |button| button.bg(palette.soft_hover))
-                    .on_click(move |_, window, cx| {
-                        review_callback.emit(
-                            FileChangeActivityEvent::OpenReview(review.clone()),
-                            window,
-                            cx,
-                        );
-                    })
-                    .child("审核"),
-            ),
-        );
-
-    let mut card = div()
+    let row_color = theme.text.alpha(0.60);
+    let hover_group: SharedString = format!("file-change-disclosure-{}", model.item_id).into();
+    let click_callback = callback.clone();
+    let click_item_id = model.item_id.clone();
+    let key_callback = callback.clone();
+    let key_item_id = model.item_id.clone();
+    let mut activity = div()
         .id(element_id("file-change-activity", &model.item_id))
         .role(Role::Group)
         .aria_label(format!(
@@ -1215,93 +1136,208 @@ pub fn render_file_change_activity(
             model.additions,
             model.deletions
         ))
-        .relative()
-        .h(px(model.geometry_height()))
         .w_full()
-        .overflow_hidden()
         .flex()
         .flex_col()
-        .rounded(px(12.5))
-        .bg(palette.elevated)
-        .shadow(vec![
-            BoxShadow::new(px(0.0), px(0.0), activity_outline.into()).spread_radius(px(0.5)),
-        ])
-        .child(header);
-
-    if model.details_expanded {
-        let mut details = div()
-            .h(px(FILE_CHANGE_FILE_LIST_BORDER_HEIGHT
-                + model.review.files.len() as f32
-                    * FILE_CHANGE_FILE_ROW_HEIGHT))
-            .flex_none()
-            .border_t_1()
-            .border_color(palette.outline)
-            .flex()
-            .flex_col();
-        for (index, file) in model.review.files.iter().enumerate() {
-            let row_callback = callback.clone();
-            let row_review = model.review.clone();
-            let (directory, name) = split_directory_and_name(&file.path);
-            details = details.child(
-                div()
-                    .id(element_id(
-                        "file-change-file-row",
-                        &format!("{}-{index}", model.item_id),
-                    ))
-                    .role(Role::Button)
-                    .h(px(FILE_CHANGE_FILE_ROW_HEIGHT))
-                    .w_full()
-                    .flex_none()
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .bg(palette.surface.alpha(0.70))
-                    .cursor_pointer()
-                    .hover(move |row| row.bg(palette.soft_hover))
-                    .on_click(move |_, window, cx| {
-                        row_callback.emit(
-                            FileChangeActivityEvent::OpenReview(row_review.clone()),
+        .gap(px(FILE_CHANGE_INLINE_BODY_GAP))
+        .child(
+            div()
+                .id(element_id("file-change-disclosure", &model.item_id))
+                .group(hover_group.clone())
+                .role(Role::Button)
+                .aria_expanded(expanded)
+                .aria_label(if expanded {
+                    "已编辑的文件，折叠文件更改"
+                } else {
+                    "已编辑的文件，展开文件更改"
+                })
+                .focusable()
+                .tab_stop(true)
+                .h(px(FILE_CHANGE_ACTIVITY_ROW_HEIGHT))
+                .max_w_full()
+                .min_w(px(0.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(FILE_CHANGE_ACTIVITY_ICON_TEXT_GAP))
+                .rounded(px(4.0))
+                .text_color(row_color)
+                .cursor_pointer()
+                .focus_visible(|style| {
+                    style.shadow(vec![
+                        BoxShadow::new(px(0.0), px(0.0), rgba(0x3a83f7ff).into())
+                            .spread_radius(px(2.0))
+                            .inset(),
+                    ])
+                })
+                .on_click(move |_, window, cx| {
+                    click_callback.emit(
+                        FileChangeActivityEvent::ToggleDetails {
+                            item_id: click_item_id.clone(),
+                        },
+                        window,
+                        cx,
+                    );
+                })
+                .on_key_down(move |event, window, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        key_callback.emit(
+                            FileChangeActivityEvent::ToggleDetails {
+                                item_id: key_item_id.clone(),
+                            },
                             window,
                             cx,
                         );
-                    })
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .text_size(px(14.0))
-                            .line_height(px(21.0))
-                            .child(
-                                div()
-                                    .min_w(px(0.0))
-                                    .truncate()
-                                    .text_color(palette.tertiary)
-                                    .child(directory.to_owned()),
-                            )
-                            .child(
-                                div()
-                                    .max_w_full()
-                                    .flex_none()
-                                    .truncate()
-                                    .text_color(palette.text)
-                                    .child(name.to_owned()),
-                            ),
-                    )
-                    .child(approval_change_counts(
-                        file.additions,
-                        file.deletions,
-                        palette,
-                    )),
-            );
-        }
-        card = card.child(details);
+                        cx.stop_propagation();
+                    }
+                })
+                .child(
+                    icon("message-edit", row_color.into())
+                        .size(px(FILE_CHANGE_ACTIVITY_ICON_SIZE))
+                        .flex_none(),
+                )
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .max_w_full()
+                        .flex()
+                        .items_center()
+                        .truncate()
+                        .text_size(px(14.0))
+                        .line_height(px(FILE_CHANGE_ACTIVITY_ROW_HEIGHT))
+                        .font_family(".SystemUIFont")
+                        .font_weight(FontWeight::NORMAL)
+                        .text_color(row_color)
+                        .group_hover(hover_group, move |label| label.text_color(theme.text))
+                        .child("已编辑的文件"),
+                )
+                .child(
+                    icon("settings-chevron-right", row_color.into())
+                        .size(px(14.0))
+                        .flex_none()
+                        .with_transformation(gpui::Transformation::rotate(gpui::radians(
+                            if expanded {
+                                std::f32::consts::FRAC_PI_2
+                            } else {
+                                0.0
+                            },
+                        ))),
+                ),
+        );
+
+    if expanded {
+        let files = model.review.files.iter().enumerate().fold(
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(FILE_CHANGE_INLINE_BODY_GAP)),
+            |files, (index, file)| {
+                files.child(render_inline_file_change_file(
+                    &model.item_id,
+                    index,
+                    file,
+                    palette,
+                ))
+            },
+        );
+        activity = activity.child(files);
     }
 
-    card
+    activity
+}
+
+fn render_inline_file_change_file(
+    item_id: &str,
+    index: usize,
+    file: &DiffFilePresentation,
+    palette: FilePalette,
+) -> Stateful<Div> {
+    let (_, name) = split_directory_and_name(&file.path);
+    let path_for_copy = file
+        .resolved_path
+        .clone()
+        .unwrap_or_else(|| file.path.clone());
+    let lines = if file.lines.is_empty() {
+        vec![DiffLinePresentation::context(1, 1, "")]
+    } else {
+        file.lines.clone()
+    };
+    let rows_height = review_diff_rows_height(lines.len());
+    let mut rows = div().relative().w_full().h(px(rows_height)).flex_none();
+    for (line_index, line) in lines.iter().enumerate() {
+        rows = rows.child(
+            render_diff_line(line, palette)
+                .absolute()
+                .top(px(review_diff_row_top(line_index)))
+                .left_0()
+                .right_0(),
+        );
+    }
+
+    div()
+        .id(element_id(
+            "file-change-inline-card",
+            &format!("{item_id}-{index}"),
+        ))
+        .role(Role::Region)
+        .aria_label(format!(
+            "{name}，增加 {} 行，删除 {} 行",
+            file.additions, file.deletions
+        ))
+        .w_full()
+        .overflow_hidden()
+        .rounded(px(FILE_CHANGE_INLINE_CARD_RADIUS))
+        .bg(palette.surface)
+        .shadow(vec![
+            BoxShadow::new(px(0.0), px(0.0), palette.outline.into()).spread_radius(px(0.5)),
+        ])
+        .child(
+            div()
+                .h(px(FILE_CHANGE_INLINE_CARD_HEADER_HEIGHT))
+                .w_full()
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .border_b_1()
+                .border_color(palette.outline)
+                .bg(match palette.mode {
+                    ThemeMode::Light => rgba(0xf7f7f7ff),
+                    ThemeMode::Dark => rgba(0x232323ff),
+                })
+                .text_size(px(14.0))
+                .line_height(px(21.0))
+                .text_color(palette.tertiary)
+                .child(name.to_owned())
+                .child(change_counts(file.additions, file.deletions, palette))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id(element_id(
+                            "file-change-inline-copy",
+                            &format!("{item_id}-{index}"),
+                        ))
+                        .role(Role::Button)
+                        .aria_label(format!("复制 {name} 的路径"))
+                        .size(px(24.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(8.0))
+                        .cursor_pointer()
+                        .hover(move |button| button.bg(palette.soft_hover))
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                path_for_copy.clone(),
+                            ));
+                            cx.stop_propagation();
+                        })
+                        .child(icon("message-copy", palette.tertiary.into()).size(px(16.0))),
+                ),
+        )
+        .child(rows)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1532,6 +1568,81 @@ impl DiffReviewPresentation {
         }
         finish_file(&mut current, &mut files);
 
+        Self::new(review_id, turn_label, files)
+    }
+
+    pub fn from_file_change_entries(
+        review_id: impl Into<String>,
+        turn_label: impl Into<String>,
+        changes: &[AgentFileChangeEntry],
+        cwd: Option<&Path>,
+    ) -> Self {
+        let files = changes
+            .iter()
+            .map(|change| {
+                let protocol_path = match &change.kind {
+                    AgentFileChangeKind::Update {
+                        move_path: Some(path),
+                    } => path.as_str(),
+                    AgentFileChangeKind::Add
+                    | AgentFileChangeKind::Delete
+                    | AgentFileChangeKind::Update { move_path: None } => change.path.as_str(),
+                };
+                let resolved_path = resolve_review_path(protocol_path, cwd);
+                let path = review_display_path(protocol_path, resolved_path.as_deref(), cwd);
+                let mut lines = Vec::new();
+                match &change.kind {
+                    AgentFileChangeKind::Add => {
+                        for (index, content) in change.diff.lines().enumerate() {
+                            lines.push(DiffLinePresentation::added(index as u32 + 1, content));
+                        }
+                    }
+                    AgentFileChangeKind::Delete => {
+                        for (index, content) in change.diff.lines().enumerate() {
+                            lines.push(DiffLinePresentation::deleted(index as u32 + 1, content));
+                        }
+                    }
+                    AgentFileChangeKind::Update { .. } => {
+                        let mut old_line = 0_u32;
+                        let mut new_line = 0_u32;
+                        for raw_line in change.diff.lines() {
+                            if let Some((old_start, new_start)) = parse_hunk_header(raw_line) {
+                                old_line = old_start;
+                                new_line = new_start;
+                            } else if let Some(content) = raw_line.strip_prefix('+') {
+                                lines.push(DiffLinePresentation::added(new_line, content));
+                                new_line = new_line.saturating_add(1);
+                            } else if let Some(content) = raw_line.strip_prefix('-') {
+                                lines.push(DiffLinePresentation::deleted(old_line, content));
+                                old_line = old_line.saturating_add(1);
+                            } else if let Some(content) = raw_line.strip_prefix(' ') {
+                                lines.push(DiffLinePresentation::context(
+                                    old_line, new_line, content,
+                                ));
+                                old_line = old_line.saturating_add(1);
+                                new_line = new_line.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+                let additions = lines
+                    .iter()
+                    .filter(|line| line.kind == DiffLineKind::Added)
+                    .count() as u32;
+                let deletions = lines
+                    .iter()
+                    .filter(|line| line.kind == DiffLineKind::Deleted)
+                    .count() as u32;
+                DiffFilePresentation {
+                    path,
+                    resolved_path,
+                    additions,
+                    deletions,
+                    lines,
+                    visual_state: DiffFileVisualState::Expanded,
+                }
+            })
+            .collect();
         Self::new(review_id, turn_label, files)
     }
 }
@@ -2223,6 +2334,7 @@ mod tests {
             let events = self.events.clone();
             render_file_change_activity(
                 &self.model,
+                true,
                 Theme::for_mode(ThemeMode::Dark),
                 FileChangeActivityCallback::new(move |event, _, _| {
                     events.borrow_mut().push(event);
@@ -2450,24 +2562,67 @@ mod tests {
             1,
             0,
         );
-        assert_eq!(FILE_CHANGE_ACTIVITY_HEIGHT, 64.5);
-        assert_eq!(FILE_CHANGE_ACTIVITY_ICON_SIZE, 40.0);
+        assert_eq!(FILE_CHANGE_ACTIVITY_ROW_HEIGHT, 21.0);
+        assert_eq!(FILE_CHANGE_ACTIVITY_ICON_SIZE, 16.0);
+        assert_eq!(FILE_CHANGE_ACTIVITY_ICON_TEXT_GAP, 6.0);
         assert_eq!(
             activity.title(),
             "已编辑 chatgpt-cdp-file-approval-approved.txt"
         );
-        assert_eq!(activity.geometry_height(), 64.5);
     }
 
     #[test]
-    fn completed_activity_hides_undo_until_a_real_reversal_exists() {
+    fn agent_file_changes_build_real_multifile_review_rows_and_counts() {
+        let change = AgentFileChange {
+            id: "file-1".to_owned(),
+            status: crate::agent::AgentFileChangeStatus::Completed,
+            changes: vec![
+                AgentFileChangeEntry {
+                    path: "/workspace/new.txt".to_owned(),
+                    diff: "first\nsecond\n".to_owned(),
+                    kind: AgentFileChangeKind::Add,
+                },
+                AgentFileChangeEntry {
+                    path: "/workspace/old.txt".to_owned(),
+                    diff: "before\n".to_owned(),
+                    kind: AgentFileChangeKind::Delete,
+                },
+                AgentFileChangeEntry {
+                    path: "/workspace/source.txt".to_owned(),
+                    diff: "@@ -4 +4 @@\n-before\n+after\n".to_owned(),
+                    kind: AgentFileChangeKind::Update {
+                        move_path: Some("/workspace/renamed.txt".to_owned()),
+                    },
+                },
+            ],
+        };
+        let activity = FileChangeActivityPresentation::from_agent_change(
+            &change,
+            "上一轮",
+            Some(Path::new("/workspace")),
+        );
+
+        assert_eq!(activity.title(), "已编辑 3 个文件");
+        assert_eq!(activity.additions, 3);
+        assert_eq!(activity.deletions, 2);
+        assert_eq!(activity.review.files[0].path, "new.txt");
+        assert_eq!(activity.review.files[1].path, "old.txt");
+        assert_eq!(activity.review.files[2].path, "renamed.txt");
+        assert_eq!(
+            activity.review.files[2].resolved_path.as_deref(),
+            Some("/workspace/renamed.txt")
+        );
+    }
+
+    #[test]
+    fn completed_activity_disclosure_toggles_from_the_full_header_row() {
         let model = FileChangeActivityPresentation::edited(
             "file-item-no-fake-undo",
             "/tmp/real-domain-data.txt",
             3,
             2,
         );
-        let expected_review = model.review.clone();
+        let item_id = model.item_id.clone();
         let events = Rc::new(RefCell::new(Vec::new()));
         let captured_events = events.clone();
         let mut app = TestApp::new();
@@ -2475,7 +2630,7 @@ mod tests {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
                     origin: point(px(0.0), px(0.0)),
-                    size: size(px(500.0), px(80.0)),
+                    size: size(px(500.0), px(50.0)),
                 })),
                 ..Default::default()
             },
@@ -2484,18 +2639,11 @@ mod tests {
 
         window.draw();
 
-        // This was the center of the former Undo control. It must be inert
-        // while no reversible domain operation or server acknowledgement
-        // exists.
-        window.simulate_click(point(px(404.0), px(32.0)), MouseButton::Left);
-        assert!(captured_events.borrow().is_empty());
-
-        // Review remains live and transports the presentation owned by this
-        // activity rather than opening a capture fixture.
-        window.simulate_click(point(px(466.0), px(32.0)), MouseButton::Left);
+        // The full disclosure header is the button, including the pencil.
+        window.simulate_click(point(px(8.0), px(10.0)), MouseButton::Left);
         assert_eq!(
             captured_events.borrow().as_slice(),
-            &[FileChangeActivityEvent::OpenReview(expected_review)]
+            &[FileChangeActivityEvent::ToggleDetails { item_id }]
         );
     }
 
@@ -2667,8 +2815,6 @@ mod tests {
         );
         assert_eq!((model.additions, model.deletions), (2, 0));
         assert_eq!(model.title(), "已编辑 2 个文件");
-        assert!(model.details_expanded);
-        assert_eq!(model.geometry_height(), 137.5);
         assert_eq!(model.review.files[0].lines[0].content, "APPROVAL_A");
         assert_eq!(model.review.files[1].lines[0].content, "APPROVAL_B");
     }
@@ -2763,9 +2909,8 @@ mod tests {
     }
 
     #[test]
-    fn completed_multifile_rows_open_the_owned_real_review_data() {
+    fn completed_multifile_diff_body_does_not_retrigger_the_disclosure() {
         let model = captured_file_change_activity_fixture("completed");
-        let expected_review = model.review.clone();
         let events = Rc::new(RefCell::new(Vec::new()));
         let captured_events = events.clone();
         let mut app = TestApp::new();
@@ -2773,7 +2918,7 @@ mod tests {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
                     origin: point(px(0.0), px(0.0)),
-                    size: size(px(736.0), px(137.5)),
+                    size: size(px(736.0), px(60.0)),
                 })),
                 ..Default::default()
             },
@@ -2781,10 +2926,7 @@ mod tests {
         );
 
         window.draw();
-        window.simulate_click(point(px(200.0), px(82.0)), MouseButton::Left);
-        assert_eq!(
-            captured_events.borrow().as_slice(),
-            &[FileChangeActivityEvent::OpenReview(expected_review)]
-        );
+        window.simulate_click(point(px(8.0), px(50.0)), MouseButton::Left);
+        assert!(captured_events.borrow().is_empty());
     }
 }
