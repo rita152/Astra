@@ -24,9 +24,9 @@ use crate::{
     components::{
         approval::{ApprovalCardCallback, render_approval_card},
         composer::{
-            ComposerView, ConversationActivity, ConversationChanged, ConversationPhase,
-            ConversationThreadCreated, ConversationTranscriptTurn, ModelCatalogLoadFinished,
-            ReasoningActivityPresentation, RequestFullAccessConfirmation,
+            COMPOSER_CORNER_RADIUS, ComposerView, ConversationActivity, ConversationChanged,
+            ConversationPhase, ConversationThreadCreated, ConversationTranscriptTurn,
+            ModelCatalogLoadFinished, ReasoningActivityPresentation, RequestFullAccessConfirmation,
         },
         file_change::{
             DiffReviewPresentation, FileApprovalCallback, FileApprovalEvent,
@@ -118,6 +118,7 @@ const THINKING_SHIMMER_FRAME_INTERVAL: Duration = Duration::from_micros(20_833);
 const THINKING_SHIMMER_WIDTH: f32 = 56.0;
 const THINKING_SHIMMER_BAND_SCALE: f32 = 0.5;
 const THINKING_SHIMMER_ALPHA_LEVELS: usize = 32;
+const COMPOSER_BOTTOM_INSET: f32 = 15.0;
 const CONVERSATION_TOP_INSET: f32 = 78.0;
 const CONVERSATION_BOTTOM_INSET: f32 = 153.0;
 const CONVERSATION_BOTTOM_EPSILON: f32 = 0.5;
@@ -2096,6 +2097,20 @@ fn home(
                 expanded_collaborations,
             ))
         })
+        .when(phase != ConversationPhase::Empty, |root| {
+            root.child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .w_full()
+                    // The upper corner cutouts remain open so rows pass behind
+                    // the floating Composer. Its lower corners and the window
+                    // inset are outside the conversation's visible region.
+                    .h(px(COMPOSER_BOTTOM_INSET + COMPOSER_CORNER_RADIUS))
+                    .bg(theme.surface),
+            )
+        })
         .when_some(pending_command_approval, |root, model| {
             let card = command_approval_card(home_entity.clone(), model, theme);
             root.when_some(card, |root, card| {
@@ -2164,7 +2179,7 @@ fn home(
                 .id("composer-overlay")
                 .debug_selector(|| "composer-overlay".to_owned())
                 .absolute()
-                .bottom(px(15.0))
+                .bottom(px(COMPOSER_BOTTOM_INSET))
                 .w_full()
                 .max_w(px(748.0))
                 // Match the reference composition at every window size: the
@@ -2616,6 +2631,12 @@ fn conversation(
         .debug_selector(|| "conversation-scroll".to_owned())
         .absolute()
         .inset_0()
+        // `ListState` deliberately lays out an overdraw band above and below
+        // the viewport. Unlike the previous `overflow_y_scroll` container,
+        // the virtual list does not establish its own paint mask. Keep that
+        // overdraw inside the window without shortening the scroll area at
+        // the Composer's top edge.
+        .overflow_hidden()
         .child(conversation_rows)
 }
 
@@ -5384,24 +5405,25 @@ mod tests {
         COMMAND_ACTIVITY_ICON_SIZE, COMMAND_CARD_COMMAND_MAX_HEIGHT,
         COMMAND_CARD_HEADER_LINE_HEIGHT, COMMAND_CARD_HEADER_SIZE, COMMAND_CARD_LINE_HEIGHT,
         COMMAND_CARD_OUTPUT_MAX_HEIGHT, COMMAND_CARD_RADIUS, COMMAND_CARD_STATUS_HEIGHT,
-        COMMAND_CARD_TEXT_SIZE, CONVERSATION_BOTTOM_INSET, CONVERSATION_TOP_INSET,
-        DISCLOSURE_FOCUS_PADDING, HomeView, MCP_TOOL_CALL_ICON_SIZE, MCP_TOOL_CALL_ICON_TEXT_GAP,
-        MCP_TOOL_CALL_ROW_HEIGHT, MCP_TOOL_CALL_TEXT_SIZE, NOTICE_BUTTON_HEIGHT,
-        NOTICE_ERROR_CONTENT_GAP, NOTICE_ERROR_GAP, NOTICE_ICON_SIZE, NOTICE_LINE_HEIGHT,
-        NOTICE_RADIUS, NOTICE_TEXT_SIZE, NOTICE_WARNING_CONTENT_GAP, NOTICE_WARNING_GAP,
-        OpenImagePreview, OpenSubAgentPanel, REASONING_BODY_MAX_HEIGHT, REASONING_CHEVRON_SIZE,
-        REASONING_HEADER_HEIGHT, REASONING_LINE_HEIGHT, REASONING_TEXT_SIZE,
-        REASONING_TRANSITION_DURATION, RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT,
-        RESPONSE_ACTION_FOOTER_HEIGHT, RESPONSE_ACTION_FOOTER_OFFSET, RESPONSE_ACTION_GAP,
-        RESPONSE_ACTION_ICON_SIZE, RESPONSE_TIME_LINE_HEIGHT, RESPONSE_TIME_MARGIN,
-        RESPONSE_TIME_SIZE, RetryImageGeneration, SUGGESTION_PRESSED_SCALE,
-        THINKING_SHIMMER_DURATION, THINKING_SHIMMER_FRAME_INTERVAL, THINKING_SHIMMER_STEPS,
-        THINKING_SHIMMER_WIDTH, TOOL_GROUP_BODY_MAX_HEIGHT, TOOL_GROUP_CHEVRON_SIZE,
-        TOOL_GROUP_EDGE_FADE_DISTANCE, TOOL_GROUP_HEADER_CHEVRON_GAP, TOOL_GROUP_HEADER_HEIGHT,
-        TOOL_GROUP_ICON_SIZE, TOOL_GROUP_ICON_TEXT_GAP, TOOL_GROUP_ITEM_GAP,
-        TOOL_GROUP_LINE_HEIGHT, TOOL_GROUP_TEXT_SIZE, TOOL_GROUP_TRANSITION_DURATION,
-        USER_MESSAGE_BUBBLE_RADIUS, USER_MESSAGE_BUBBLE_SUPERELLIPSE, USER_MESSAGE_FOOTER_GAP,
-        USER_MESSAGE_FOOTER_HEIGHT, USER_MESSAGE_FOOTER_OFFSET, USER_MESSAGE_FOOTER_SIDE_MARGIN,
+        COMMAND_CARD_TEXT_SIZE, COMPOSER_BOTTOM_INSET, COMPOSER_CORNER_RADIUS,
+        CONVERSATION_BOTTOM_INSET, CONVERSATION_TOP_INSET, DISCLOSURE_FOCUS_PADDING, HomeView,
+        MCP_TOOL_CALL_ICON_SIZE, MCP_TOOL_CALL_ICON_TEXT_GAP, MCP_TOOL_CALL_ROW_HEIGHT,
+        MCP_TOOL_CALL_TEXT_SIZE, NOTICE_BUTTON_HEIGHT, NOTICE_ERROR_CONTENT_GAP, NOTICE_ERROR_GAP,
+        NOTICE_ICON_SIZE, NOTICE_LINE_HEIGHT, NOTICE_RADIUS, NOTICE_TEXT_SIZE,
+        NOTICE_WARNING_CONTENT_GAP, NOTICE_WARNING_GAP, OpenImagePreview, OpenSubAgentPanel,
+        REASONING_BODY_MAX_HEIGHT, REASONING_CHEVRON_SIZE, REASONING_HEADER_HEIGHT,
+        REASONING_LINE_HEIGHT, REASONING_TEXT_SIZE, REASONING_TRANSITION_DURATION,
+        RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT, RESPONSE_ACTION_FOOTER_HEIGHT,
+        RESPONSE_ACTION_FOOTER_OFFSET, RESPONSE_ACTION_GAP, RESPONSE_ACTION_ICON_SIZE,
+        RESPONSE_TIME_LINE_HEIGHT, RESPONSE_TIME_MARGIN, RESPONSE_TIME_SIZE, RetryImageGeneration,
+        SUGGESTION_PRESSED_SCALE, THINKING_SHIMMER_DURATION, THINKING_SHIMMER_FRAME_INTERVAL,
+        THINKING_SHIMMER_STEPS, THINKING_SHIMMER_WIDTH, TOOL_GROUP_BODY_MAX_HEIGHT,
+        TOOL_GROUP_CHEVRON_SIZE, TOOL_GROUP_EDGE_FADE_DISTANCE, TOOL_GROUP_HEADER_CHEVRON_GAP,
+        TOOL_GROUP_HEADER_HEIGHT, TOOL_GROUP_ICON_SIZE, TOOL_GROUP_ICON_TEXT_GAP,
+        TOOL_GROUP_ITEM_GAP, TOOL_GROUP_LINE_HEIGHT, TOOL_GROUP_TEXT_SIZE,
+        TOOL_GROUP_TRANSITION_DURATION, USER_MESSAGE_BUBBLE_RADIUS,
+        USER_MESSAGE_BUBBLE_SUPERELLIPSE, USER_MESSAGE_FOOTER_GAP, USER_MESSAGE_FOOTER_HEIGHT,
+        USER_MESSAGE_FOOTER_OFFSET, USER_MESSAGE_FOOTER_SIDE_MARGIN,
         USER_MESSAGE_HORIZONTAL_PADDING, USER_MESSAGE_LINE_HEIGHT, USER_MESSAGE_MAX_WIDTH_RATIO,
         USER_MESSAGE_PARAGRAPH_GAP, USER_MESSAGE_TEXT_SIZE, USER_MESSAGE_TIME_LINE_HEIGHT,
         USER_MESSAGE_TIME_SIZE, USER_MESSAGE_VERTICAL_PADDING, active_reasoning_body,
@@ -6196,10 +6218,12 @@ mod tests {
     }
 
     #[test]
-    fn conversation_insets_preserve_the_original_top_and_clear_the_fixed_composer() {
+    fn conversation_insets_preserve_the_full_viewport_and_composer_clearance() {
         assert_eq!(CONVERSATION_TOP_INSET, 78.0);
         assert_eq!(CONVERSATION_BOTTOM_INSET, 153.0);
-        assert!(CONVERSATION_BOTTOM_INSET > 15.0 + 98.0);
+        assert_eq!(COMPOSER_BOTTOM_INSET, 15.0);
+        assert_eq!(COMPOSER_CORNER_RADIUS, 24.0);
+        assert!(CONVERSATION_BOTTOM_INSET > COMPOSER_BOTTOM_INSET + 98.0);
     }
 
     #[test]

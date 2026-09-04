@@ -57,6 +57,8 @@ use crate::{
     theme::{Theme, ThemeMode, ui_font},
 };
 
+pub(crate) const COMPOSER_CORNER_RADIUS: f32 = 24.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PickerSubmenu {
     Model,
@@ -5979,7 +5981,7 @@ impl ComposerView {
                 div()
                     .h(px(98.0))
                     .w_full()
-                    .rounded(px(24.0))
+                    .rounded(px(COMPOSER_CORNER_RADIUS))
                     .bg(theme.control_soft)
                     .shadow(vec![
                         BoxShadow::new(px(0.0), px(0.0), theme.border.into())
