@@ -2834,6 +2834,7 @@ impl ComposerView {
                         status: collaborator_status,
                         message: (status == AgentCollaborationStatus::Failed)
                             .then(|| "Agent failed while collecting evidence.".to_owned()),
+                        name: None,
                     },
                 )]),
                 prompt: (status == AgentCollaborationStatus::Failed)
@@ -6394,6 +6395,7 @@ mod tests {
                 AgentCollaboratorState {
                     status: agent_status,
                     message: None,
+                    name: None,
                 },
             )]),
             prompt: None,
@@ -7718,6 +7720,7 @@ mod tests {
                 AgentCollaboratorState {
                     status: agent_status,
                     message: None,
+                    name: None,
                 },
             )]),
             prompt: None,

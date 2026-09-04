@@ -10,7 +10,7 @@ use gpui::{
     KeyDownEvent, MouseButton, ObjectFit, PathBuilder, Pixels, Render, Role, ScrollDelta,
     ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, TextAlign, TextRun, Transformation,
     Window, canvas, div, linear_color_stop, linear_gradient, point, prelude::*, px, radians,
-    relative, rgba,
+    relative, rgba, svg,
 };
 
 use crate::{
@@ -49,6 +49,7 @@ use crate::{
 
 pub struct HomeView {
     mode: ThemeMode,
+    presentation: HomePresentation,
     composer: Entity<ComposerView>,
     observed_composers: Vec<Entity<ComposerView>>,
     suggestion_scale: [f32; 2],
@@ -78,6 +79,12 @@ pub struct HomeView {
     approval_focus: FocusHandle,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HomePresentation {
+    Conversation,
+    Subagent,
+}
+
 impl gpui::EventEmitter<RequestFullAccessConfirmation> for HomeView {}
 impl gpui::EventEmitter<ModelCatalogLoadFinished> for HomeView {}
 impl gpui::EventEmitter<ConversationThreadCreated> for HomeView {}
@@ -88,8 +95,12 @@ impl gpui::EventEmitter<OpenDiffReview> for HomeView {}
 pub struct OpenImagePreview(pub PathBuf);
 impl gpui::EventEmitter<OpenImagePreview> for HomeView {}
 
-pub struct OpenSubAgentThread(pub String);
-impl gpui::EventEmitter<OpenSubAgentThread> for HomeView {}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenSubAgentPanel {
+    pub thread_id: String,
+    pub name: String,
+}
+impl gpui::EventEmitter<OpenSubAgentPanel> for HomeView {}
 
 pub struct RetryImageGeneration;
 impl gpui::EventEmitter<RetryImageGeneration> for HomeView {}
@@ -105,7 +116,9 @@ const THINKING_SHIMMER_ALPHA_LEVELS: usize = 32;
 const CONVERSATION_TOP_INSET: f32 = 78.0;
 const CONVERSATION_BOTTOM_INSET: f32 = 153.0;
 const CONVERSATION_BOTTOM_EPSILON: f32 = 0.5;
+const CONVERSATION_CONTENT_MAX_WIDTH: f32 = 736.0;
 const USER_MESSAGE_MAX_WIDTH_RATIO: f32 = 0.7;
+const USER_MESSAGE_TEXT_LAYOUT_EPSILON: f32 = 1.0;
 const USER_MESSAGE_HORIZONTAL_PADDING: f32 = 16.0;
 const USER_MESSAGE_VERTICAL_PADDING: f32 = 10.0;
 const USER_MESSAGE_TEXT_SIZE: f32 = 14.0;
@@ -171,6 +184,13 @@ const COLLABORATION_ROW_HEIGHT: f32 = 20.0;
 const COLLABORATION_ICON_SIZE: f32 = 16.0;
 const COLLABORATION_TEXT_SIZE: f32 = 14.0;
 const COLLABORATION_DETAIL_MAX_WIDTH: f32 = 520.0;
+const MCP_TOOL_CALL_ROW_HEIGHT: f32 = 21.0;
+// GPUI's monochrome SVG rasterizer paints the ChatGPT 20 px MCP glyph at the
+// same physical silhouette when the asset is laid out at 16 px. Preserve the
+// reference's 22 px icon-to-label advance with the compensating 6 px gap.
+const MCP_TOOL_CALL_ICON_SIZE: f32 = 16.0;
+const MCP_TOOL_CALL_ICON_TEXT_GAP: f32 = 6.0;
+const MCP_TOOL_CALL_TEXT_SIZE: f32 = 14.0;
 
 #[derive(Clone, Copy, Debug)]
 struct ReasoningDisclosureTransition {
@@ -619,12 +639,12 @@ fn user_message_paragraphs(source: &str) -> Vec<String> {
     paragraphs
 }
 
-fn render_user_message_text(source: String) -> Div {
+fn render_user_message_text(source: String, minimum_width: Pixels) -> Div {
     user_message_paragraphs(&source)
         .into_iter()
         .enumerate()
         .fold(
-            div().relative().flex().flex_col(),
+            div().relative().min_w(minimum_width).flex().flex_col(),
             |content, (index, paragraph)| {
                 content.child(
                     div()
@@ -637,14 +657,60 @@ fn render_user_message_text(source: String) -> Div {
         )
 }
 
-fn user_message_bubble(message: String, theme: Theme) -> Div {
+fn user_message_text_width(message: &str, window: &mut Window) -> f32 {
+    let mut font = window.text_style().font();
+    font.family = ".SystemUIFont".into();
+    font.weight = FontWeight(430.0);
+    let color = window.text_style().color;
+    message
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let run = TextRun {
+                len: line.len(),
+                font: font.clone(),
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(
+                window
+                    .text_system()
+                    .shape_line(
+                        line.to_owned().into(),
+                        px(USER_MESSAGE_TEXT_SIZE),
+                        &[run],
+                        None,
+                    )
+                    .width(),
+            )
+        })
+        .fold(0.0_f32, f32::max)
+}
+
+fn user_message_bubble(message: String, theme: Theme, window: &mut Window) -> Div {
+    let text_width = user_message_text_width(&message, window);
+    let measured_width = px(text_width + USER_MESSAGE_HORIZONTAL_PADDING * 2.0);
+    let maximum_text_width = CONVERSATION_CONTENT_MAX_WIDTH * USER_MESSAGE_MAX_WIDTH_RATIO
+        - USER_MESSAGE_HORIZONTAL_PADDING * 2.0;
+    let minimum_text_width = if text_width < maximum_text_width {
+        text_width + USER_MESSAGE_TEXT_LAYOUT_EPSILON
+    } else {
+        maximum_text_width
+    };
     div()
-        .max_w(relative(USER_MESSAGE_MAX_WIDTH_RATIO))
+        .w(measured_width)
+        .max_w(px(
+            CONVERSATION_CONTENT_MAX_WIDTH * USER_MESSAGE_MAX_WIDTH_RATIO
+        ))
         .px(px(USER_MESSAGE_HORIZONTAL_PADDING))
         .py(px(USER_MESSAGE_VERTICAL_PADDING))
         .relative()
         .text_size(px(USER_MESSAGE_TEXT_SIZE))
         .line_height(px(USER_MESSAGE_LINE_HEIGHT))
+        .font_family(".SystemUIFont")
+        .font_weight(FontWeight::NORMAL)
         .text_color(theme.user_message_text)
         .child(
             canvas(
@@ -656,7 +722,7 @@ fn user_message_bubble(message: String, theme: Theme) -> Div {
             .absolute()
             .inset_0(),
         )
-        .child(render_user_message_text(message))
+        .child(render_user_message_text(message, px(minimum_text_width)))
 }
 
 fn thinking_shimmer_step(progress: f32) -> f32 {
@@ -722,8 +788,26 @@ impl HomeView {
         cx: &mut Context<Self>,
     ) -> Self {
         let composer = cx.new(|cx| ComposerView::new_with_backend(mode, backend, cx));
+        Self::with_composer(mode, HomePresentation::Conversation, composer, cx)
+    }
+
+    pub fn new_subagent(
+        mode: ThemeMode,
+        composer: Entity<ComposerView>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_composer(mode, HomePresentation::Subagent, composer, cx)
+    }
+
+    fn with_composer(
+        mode: ThemeMode,
+        presentation: HomePresentation,
+        composer: Entity<ComposerView>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut view = Self {
             mode,
+            presentation,
             composer: composer.clone(),
             observed_composers: Vec::new(),
             suggestion_scale: [1.0; 2],
@@ -1590,12 +1674,13 @@ impl Render for HomeView {
         ) = self.composer.read(cx).conversation_render_snapshot();
         let user_input_other = self.composer.read(cx).user_input_other_entity();
         let user_input_other_focus = self.composer.read(cx).user_input_other_focus_handle(cx);
-        let blocking_keyboard_request_pending = conversation_activity.iter().any(|activity| {
-            matches!(activity, ConversationActivity::Approval(model) if model.should_render())
-                || matches!(activity, ConversationActivity::FileApproval(model) if model.should_render())
-                || matches!(activity, ConversationActivity::PermissionsApproval(model) if model.should_render())
-                || matches!(activity, ConversationActivity::UserInput(model) if model.should_render())
-        });
+        let blocking_keyboard_request_pending = self.presentation == HomePresentation::Conversation
+            && conversation_activity.iter().any(|activity| {
+                matches!(activity, ConversationActivity::Approval(model) if model.should_render())
+                    || matches!(activity, ConversationActivity::FileApproval(model) if model.should_render())
+                    || matches!(activity, ConversationActivity::PermissionsApproval(model) if model.should_render())
+                    || matches!(activity, ConversationActivity::UserInput(model) if model.should_render())
+            });
         if blocking_keyboard_request_pending
             && !self.approval_focus.is_focused(window)
             && !user_input_other_focus.is_focused(window)
@@ -1691,51 +1776,77 @@ impl Render for HomeView {
         } else if scroll_should_follow_output(&self.conversation_scroll) {
             self.conversation_scroll.scroll_to_bottom();
         }
-        home(
-            cx.entity(),
-            theme,
-            self.composer.clone(),
-            user_input_other,
-            transcript,
-            phase,
-            user_message,
-            user_message_time,
-            assistant_message,
-            assistant_message_time,
-            conversation_activity,
-            self.conversation_scroll.clone(),
-            self.thinking_shimmer_progress,
-            self.response_feedback,
-            self.user_message_actions_visible_for_capture,
-            self.expanded_reasoning.clone(),
-            reasoning_disclosure_progress,
-            self.reasoning_scroll_handles.clone(),
-            self.expanded_tool_groups.clone(),
-            self.collapsed_active_tool_groups.clone(),
-            tool_group_disclosure_progress,
-            self.tool_group_scroll_handles.clone(),
-            self.expanded_commands.clone(),
-            self.command_scroll_handles.clone(),
-            self.expanded_collaborations.clone(),
-            self.suggestion(
-                0,
-                "Prove plugin upgrades never mutate an active run",
+        let content = match self.presentation {
+            HomePresentation::Conversation => home(
+                window,
+                cx.entity(),
                 theme,
-                cx,
+                self.composer.clone(),
+                user_input_other,
+                transcript,
+                phase,
+                user_message,
+                user_message_time,
+                assistant_message,
+                assistant_message_time,
+                conversation_activity,
+                self.conversation_scroll.clone(),
+                self.thinking_shimmer_progress,
+                self.response_feedback,
+                self.user_message_actions_visible_for_capture,
+                self.expanded_reasoning.clone(),
+                reasoning_disclosure_progress,
+                self.reasoning_scroll_handles.clone(),
+                self.expanded_tool_groups.clone(),
+                self.collapsed_active_tool_groups.clone(),
+                tool_group_disclosure_progress,
+                self.tool_group_scroll_handles.clone(),
+                self.expanded_commands.clone(),
+                self.command_scroll_handles.clone(),
+                self.expanded_collaborations.clone(),
+                self.suggestion(
+                    0,
+                    "Prove plugin upgrades never mutate an active run",
+                    theme,
+                    cx,
+                ),
+                self.suggestion(
+                    1,
+                    "Verify the full /plugins lifecycle in the interactive terminal",
+                    theme,
+                    cx,
+                ),
             ),
-            self.suggestion(
-                1,
-                "Verify the full /plugins lifecycle in the interactive terminal",
+            HomePresentation::Subagent => subagent_conversation(
+                cx.entity(),
                 theme,
-                cx,
+                transcript,
+                phase,
+                assistant_message,
+                conversation_activity,
+                self.conversation_scroll.clone(),
+                self.thinking_shimmer_progress,
+                self.response_feedback,
+                self.expanded_reasoning.clone(),
+                reasoning_disclosure_progress,
+                self.reasoning_scroll_handles.clone(),
+                self.expanded_tool_groups.clone(),
+                self.collapsed_active_tool_groups.clone(),
+                tool_group_disclosure_progress,
+                self.tool_group_scroll_handles.clone(),
+                self.expanded_commands.clone(),
+                self.command_scroll_handles.clone(),
+                self.expanded_collaborations.clone(),
             ),
-        )
-        .track_focus(&self.approval_focus)
-        .on_key_down(cx.listener(Self::handle_approval_key))
+        };
+        content
+            .track_focus(&self.approval_focus)
+            .on_key_down(cx.listener(Self::handle_approval_key))
     }
 }
 
 fn home(
+    window: &mut Window,
     home_entity: Entity<HomeView>,
     theme: Theme,
     composer: Entity<ComposerView>,
@@ -1841,6 +1952,7 @@ fn home(
         })
         .when(phase != ConversationPhase::Empty, |root| {
             root.child(conversation(
+                window,
                 home_entity.clone(),
                 theme,
                 transcript,
@@ -1963,7 +2075,226 @@ fn home(
         )
 }
 
+fn subagent_conversation(
+    home_entity: Entity<HomeView>,
+    theme: Theme,
+    transcript: Vec<ConversationTranscriptTurn>,
+    phase: ConversationPhase,
+    assistant_message: String,
+    conversation_activity: Vec<ConversationActivity>,
+    conversation_scroll: ScrollHandle,
+    thinking_shimmer_progress: f32,
+    response_feedback: i8,
+    expanded_reasoning: HashSet<String>,
+    reasoning_disclosure_progress: HashMap<String, f32>,
+    reasoning_scroll_handles: HashMap<String, ScrollHandle>,
+    expanded_tool_groups: HashSet<String>,
+    collapsed_active_tool_groups: HashSet<String>,
+    tool_group_disclosure_progress: HashMap<String, (f32, f32)>,
+    tool_group_scroll_handles: HashMap<String, ScrollHandle>,
+    expanded_commands: HashSet<String>,
+    command_scroll_handles: HashMap<String, ScrollHandle>,
+    expanded_collaborations: HashSet<String>,
+) -> Div {
+    let has_historical_content = transcript
+        .iter()
+        .any(|turn| !turn.assistant_message.is_empty() || !turn.activities.is_empty());
+    let has_current_content = !assistant_message.is_empty() || !conversation_activity.is_empty();
+    let has_active_reasoning = conversation_activity.iter().any(|activity| {
+        matches!(activity, ConversationActivity::Reasoning(reasoning) if reasoning.is_active())
+    });
+    let show_thinking_tail = conversation_status(phase).is_some() && !has_active_reasoning;
+    let has_visible_current = has_current_content || show_thinking_tail;
+    let complete = matches!(
+        phase,
+        ConversationPhase::Complete | ConversationPhase::Failed
+    );
+    let copied_assistant_message = assistant_message.clone();
+
+    let mut messages = div()
+        .w_full()
+        // Live Electron child view: the 16px toolbar gutter plus stable
+        // scrollbar gutters place content 31px from each panel edge.
+        .px(px(31.0))
+        .pt(px(32.0))
+        .pb(px(32.0))
+        .flex()
+        .flex_col()
+        .gap(px(12.0));
+
+    for (index, turn) in transcript.into_iter().enumerate() {
+        if turn.assistant_message.is_empty() && turn.activities.is_empty() {
+            continue;
+        }
+        let answer = if turn.activities.is_empty() {
+            render_assistant_markdown(
+                &turn.assistant_message,
+                theme,
+                &format!("subagent-historical-assistant-{index}"),
+            )
+            .into_any_element()
+        } else {
+            activity_stream(
+                home_entity.clone(),
+                turn.activities,
+                conversation_status(turn.phase).is_some(),
+                thinking_shimmer_progress,
+                expanded_reasoning.clone(),
+                reasoning_disclosure_progress.clone(),
+                reasoning_scroll_handles.clone(),
+                expanded_tool_groups.clone(),
+                collapsed_active_tool_groups.clone(),
+                tool_group_disclosure_progress.clone(),
+                tool_group_scroll_handles.clone(),
+                expanded_commands.clone(),
+                command_scroll_handles.clone(),
+                expanded_collaborations.clone(),
+                theme,
+            )
+            .into_any_element()
+        };
+        messages = messages.child(
+            div()
+                .id(("subagent-transcript-turn", index))
+                .w_full()
+                .text_size(px(14.0))
+                .line_height(px(22.0))
+                .text_color(theme.text)
+                .child(answer),
+        );
+    }
+
+    if has_visible_current {
+        let answer = if conversation_activity.is_empty() {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(16.0))
+                .when(!assistant_message.is_empty(), |stream| {
+                    stream.child(render_assistant_markdown(
+                        &assistant_message,
+                        theme,
+                        "subagent-current-assistant",
+                    ))
+                })
+                .when(show_thinking_tail, |stream| {
+                    stream.child(thinking_shimmer(theme, thinking_shimmer_progress))
+                })
+        } else {
+            activity_stream(
+                home_entity.clone(),
+                conversation_activity,
+                show_thinking_tail,
+                thinking_shimmer_progress,
+                expanded_reasoning,
+                reasoning_disclosure_progress,
+                reasoning_scroll_handles,
+                expanded_tool_groups,
+                collapsed_active_tool_groups,
+                tool_group_disclosure_progress,
+                tool_group_scroll_handles,
+                expanded_commands,
+                command_scroll_handles,
+                expanded_collaborations,
+                theme,
+            )
+        };
+        messages = messages.child(
+            div()
+                .id("subagent-current-turn")
+                .w_full()
+                .text_size(px(14.0))
+                .line_height(px(22.0))
+                .text_color(theme.text)
+                .child(answer)
+                .when(complete && !copied_assistant_message.is_empty(), |turn| {
+                    turn.child(
+                        div()
+                            .mt(px(6.0))
+                            .h(px(20.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(2.0))
+                            .child(message_action(
+                                "message-copy",
+                                "subagent-response-copy",
+                                0,
+                                false,
+                                copied_assistant_message.clone(),
+                                home_entity.clone(),
+                                theme,
+                            ))
+                            .child(message_action(
+                                "message-thumb-up",
+                                "subagent-response-thumb-up",
+                                1,
+                                response_feedback == 1,
+                                copied_assistant_message.clone(),
+                                home_entity.clone(),
+                                theme,
+                            ))
+                            .child(message_action(
+                                "message-thumb-down",
+                                "subagent-response-thumb-down",
+                                2,
+                                response_feedback == -1,
+                                copied_assistant_message.clone(),
+                                home_entity.clone(),
+                                theme,
+                            )),
+                    )
+                }),
+        );
+    }
+
+    div().size_full().relative().child(
+        div()
+            .id("subagent-conversation")
+            .size_full()
+            .relative()
+            .when(!has_historical_content && !has_visible_current, |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .id("subagent-loading")
+                                .role(Role::ProgressIndicator)
+                                .aria_label("正在载入子智能体")
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .text_size(px(13.0))
+                                .line_height(px(20.0))
+                                .text_color(theme.text_tertiary)
+                                .child(icon("subagent-activity", theme.text.into()).size(px(16.0)))
+                                .child("正在载入子智能体…"),
+                        ),
+                )
+            })
+            .when(has_historical_content || has_visible_current, |root| {
+                root.child(
+                    div()
+                        .id("subagent-conversation-scroll")
+                        .absolute()
+                        .inset_0()
+                        .overflow_y_scroll()
+                        .restrict_scroll_to_axis()
+                        .scrollbar_width(px(0.0))
+                        .track_scroll(&conversation_scroll)
+                        .child(messages),
+                )
+            }),
+    )
+}
+
 fn conversation(
+    window: &mut Window,
     home_entity: Entity<HomeView>,
     theme: Theme,
     transcript: Vec<ConversationTranscriptTurn>,
@@ -2044,7 +2375,7 @@ fn conversation(
                             .w_full()
                             .flex()
                             .justify_end()
-                            .child(user_message_bubble(user_message, theme)),
+                            .child(user_message_bubble(user_message, theme, window)),
                     )
                 })
                 .child(answer),
@@ -2076,7 +2407,7 @@ fn conversation(
                         .flex()
                         .flex_col()
                         .items_end()
-                        .child(user_message_bubble(user_message, theme))
+                        .child(user_message_bubble(user_message, theme, window))
                         .child(
                             div()
                                 .mt(px(USER_MESSAGE_FOOTER_OFFSET))
@@ -2633,6 +2964,7 @@ fn image_generation_error_activity(
                 .id(SharedString::from(format!(
                     "image-generation-retry-{item_id}"
                 )))
+                .debug_selector(|| "image-generation-retry".to_owned())
                 .h(px(36.0))
                 .px(px(14.0))
                 .self_start()
@@ -2741,6 +3073,7 @@ fn image_generation_activity(
         .unwrap_or_default();
     div()
         .id(SharedString::from(format!("image-generation-{item_id}")))
+        .debug_selector(|| "image-generation-preview".to_owned())
         .w(px(width))
         .h(px(height))
         .max_w_full()
@@ -4205,6 +4538,14 @@ fn thinking_shimmer(theme: Theme, progress: f32) -> impl IntoElement {
 }
 
 fn collaboration_display_name(collaboration: &AgentCollaboration, thread_id: &str) -> String {
+    if let Some(name) = collaboration
+        .agents_states
+        .get(thread_id)
+        .and_then(|state| state.name.as_deref())
+        .filter(|name| !name.trim().is_empty())
+    {
+        return name.to_owned();
+    }
     if let Some(path) = collaboration
         .legacy_agent_path
         .as_deref()
@@ -4292,6 +4633,7 @@ fn collaboration_status_label(collaboration: &AgentCollaboration, thread_id: &st
     }
 }
 
+#[cfg(test)]
 fn toggle_collaboration_item(home_entity: &Entity<HomeView>, item_id: &str, cx: &mut App) {
     let item_id = item_id.to_owned();
     home_entity.update(cx, |home, cx| {
@@ -4302,9 +4644,12 @@ fn toggle_collaboration_item(home_entity: &Entity<HomeView>, item_id: &str, cx: 
     });
 }
 
-fn open_sub_agent_thread(home_entity: &Entity<HomeView>, thread_id: &str, cx: &mut App) {
-    let thread_id = thread_id.to_owned();
-    home_entity.update(cx, |_, cx| cx.emit(OpenSubAgentThread(thread_id)));
+fn open_sub_agent_panel(home_entity: &Entity<HomeView>, thread_id: &str, name: &str, cx: &mut App) {
+    let event = OpenSubAgentPanel {
+        thread_id: thread_id.to_owned(),
+        name: name.to_owned(),
+    };
+    home_entity.update(cx, |_, cx| cx.emit(event));
 }
 
 fn collaboration_activity(
@@ -4329,15 +4674,14 @@ fn collaboration_activity(
     for (index, thread_id) in receiver_thread_ids.iter().enumerate() {
         let name = collaboration_display_name(&collaboration, thread_id);
         let status = collaboration_status_label(&collaboration, thread_id);
-        let accessible_label = if expanded {
-            format!("{name}{status}，关闭子智能体详情")
-        } else {
-            format!("{name}{status}，打开子智能体详情")
-        };
+        let accessible_label = format!("在右侧打开子智能体 {name}，状态{status}");
         let click_home = home_entity.clone();
         let key_home = home_entity.clone();
-        let click_item_id = item_id.clone();
-        let key_item_id = item_id.clone();
+        let click_thread_id = thread_id.clone();
+        let key_thread_id = thread_id.clone();
+        let click_name = name.clone();
+        let key_name = name.clone();
+        let can_open = !thread_id.is_empty();
         let failure = matches!(status, "失败" | "未找到");
         let text_color = if failure {
             theme.warning
@@ -4358,8 +4702,10 @@ fn collaboration_activity(
                 .line_height(px(COLLABORATION_ROW_HEIGHT))
                 .text_color(text_color)
                 .child(
-                    icon("subagent-activity", theme.text.into())
+                    svg()
+                        .path("icons/subagent-activity.svg")
                         .size(px(COLLABORATION_ICON_SIZE))
+                        .text_color(rgba(0xb9afd3ff))
                         .flex_none(),
                 )
                 .child(
@@ -4373,27 +4719,48 @@ fn collaboration_activity(
                                     "collaboration-agent-{item_id}-{index}"
                                 )))
                                 .debug_selector(|| "collaboration-agent".to_owned())
-                                .focusable()
-                                .tab_stop(true)
-                                .role(Role::Button)
-                                .aria_expanded(expanded)
-                                .aria_label(accessible_label)
                                 .rounded(px(6.0))
-                                .cursor_pointer()
-                                .hover(move |label| label.text_color(theme.text))
-                                .focus_visible(|style| {
-                                    style.shadow(vec![
-                                        BoxShadow::new(px(0.0), px(0.0), rgba(0x3a83f7ff).into())
-                                            .spread_radius(px(2.0))
-                                            .inset(),
-                                    ])
+                                .when(can_open, |label| {
+                                    label
+                                        .focusable()
+                                        .tab_stop(true)
+                                        .role(Role::Button)
+                                        .aria_label(accessible_label)
+                                        .cursor_pointer()
+                                        .hover(move |label| label.text_color(theme.text))
+                                        .focus_visible(|style| {
+                                            style.shadow(vec![
+                                                BoxShadow::new(
+                                                    px(0.0),
+                                                    px(0.0),
+                                                    rgba(0x3a83f7ff).into(),
+                                                )
+                                                .spread_radius(px(2.0))
+                                                .inset(),
+                                            ])
+                                        })
                                 })
                                 .on_click(move |_, _, cx| {
-                                    toggle_collaboration_item(&click_home, &click_item_id, cx);
+                                    if !click_thread_id.is_empty() {
+                                        open_sub_agent_panel(
+                                            &click_home,
+                                            &click_thread_id,
+                                            &click_name,
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                    }
                                 })
                                 .on_key_down(move |event, _, cx| {
-                                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                        toggle_collaboration_item(&key_home, &key_item_id, cx);
+                                    if !key_thread_id.is_empty()
+                                        && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                                    {
+                                        open_sub_agent_panel(
+                                            &key_home,
+                                            &key_thread_id,
+                                            &key_name,
+                                            cx,
+                                        );
                                         cx.stop_propagation();
                                     }
                                 })
@@ -4448,8 +4815,10 @@ fn collaboration_activity(
             let key_home = home_entity.clone();
             let click_thread_id = thread_id.clone();
             let key_thread_id = thread_id.clone();
+            let click_name = name.clone();
+            let key_name = name.clone();
             let can_open = !thread_id.is_empty();
-            let receiver_label = format!("进入子任务 {name}，状态{status}");
+            let receiver_label = format!("在右侧打开子智能体 {name}，状态{status}");
             let message = collaboration
                 .agents_states
                 .get(&thread_id)
@@ -4476,14 +4845,14 @@ fn collaboration_activity(
                     })
                     .on_click(move |_, _, cx| {
                         if !click_thread_id.is_empty() {
-                            open_sub_agent_thread(&click_home, &click_thread_id, cx)
+                            open_sub_agent_panel(&click_home, &click_thread_id, &click_name, cx)
                         }
                     })
                     .on_key_down(move |event, _, cx| {
                         if !key_thread_id.is_empty()
                             && matches!(event.keystroke.key.as_str(), "enter" | "space")
                         {
-                            open_sub_agent_thread(&key_home, &key_thread_id, cx);
+                            open_sub_agent_panel(&key_home, &key_thread_id, &key_name, cx);
                             cx.stop_propagation();
                         }
                     })
@@ -4579,7 +4948,9 @@ fn mcp_tool_call_activity(tool_call: AgentMcpToolCall, theme: Theme) -> impl Int
     let label_color = if failed {
         theme.warning
     } else {
-        theme.text.alpha(0.40)
+        // ChatGPT's inner label declares text/40, but the enclosing
+        // `[&_*:not(button)]:!text-text/60` rule wins in the live DOM.
+        theme.text.alpha(0.60)
     };
 
     div()
@@ -4595,25 +4966,35 @@ fn mcp_tool_call_activity(tool_call: AgentMcpToolCall, theme: Theme) -> impl Int
         .aria_label(accessible_label)
         .child(
             div()
-                .h(px(21.0))
+                .h(px(MCP_TOOL_CALL_ROW_HEIGHT))
                 .max_w_full()
                 .min_w(px(0.0))
                 .flex()
                 .items_center()
-                .gap(px(6.0))
+                .gap(px(MCP_TOOL_CALL_ICON_TEXT_GAP))
                 .child(
                     icon("mcp-tool-call", foreground.into())
-                        .size(px(16.0))
+                        .size(px(MCP_TOOL_CALL_ICON_SIZE))
+                        // CoreGraphics places the same 16 px SVG silhouette one
+                        // Retina sample right/up of Chromium's live MCP row.
+                        // A half-point optical offset aligns the native raster
+                        // without changing the measured flex advance.
+                        .relative()
+                        .left(px(-0.5))
+                        .top(px(0.5))
                         .flex_none(),
                 )
                 .child(
                     div()
                         .min_w(px(0.0))
                         .truncate()
-                        .text_size(px(14.0))
-                        .line_height(px(21.0))
+                        .text_size(px(MCP_TOOL_CALL_TEXT_SIZE))
+                        .line_height(px(MCP_TOOL_CALL_ROW_HEIGHT))
                         .font_family(".SystemUIFont")
-                        .font_weight(FontWeight(430.0))
+                        // CoreText exposes the system UI face as a discrete
+                        // regular weight; that is the closest native match for
+                        // Chromium's variable CSS weight 430.
+                        .font_weight(FontWeight::NORMAL)
                         .text_color(label_color)
                         .child(display_label),
                 ),
@@ -4794,22 +5175,23 @@ mod tests {
         COMMAND_CARD_HEADER_LINE_HEIGHT, COMMAND_CARD_HEADER_SIZE, COMMAND_CARD_LINE_HEIGHT,
         COMMAND_CARD_OUTPUT_MAX_HEIGHT, COMMAND_CARD_RADIUS, COMMAND_CARD_STATUS_HEIGHT,
         COMMAND_CARD_TEXT_SIZE, CONVERSATION_BOTTOM_INSET, CONVERSATION_TOP_INSET,
-        DISCLOSURE_FOCUS_PADDING, HomeView, NOTICE_BUTTON_HEIGHT, NOTICE_ERROR_CONTENT_GAP,
-        NOTICE_ERROR_GAP, NOTICE_ICON_SIZE, NOTICE_LINE_HEIGHT, NOTICE_RADIUS, NOTICE_TEXT_SIZE,
-        NOTICE_WARNING_CONTENT_GAP, NOTICE_WARNING_GAP, OpenImagePreview, OpenSubAgentThread,
-        REASONING_BODY_MAX_HEIGHT, REASONING_CHEVRON_SIZE, REASONING_HEADER_HEIGHT,
-        REASONING_LINE_HEIGHT, REASONING_TEXT_SIZE, REASONING_TRANSITION_DURATION,
-        RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT, RESPONSE_ACTION_FOOTER_HEIGHT,
-        RESPONSE_ACTION_FOOTER_OFFSET, RESPONSE_ACTION_GAP, RESPONSE_ACTION_ICON_SIZE,
-        RESPONSE_TIME_LINE_HEIGHT, RESPONSE_TIME_MARGIN, RESPONSE_TIME_SIZE, RetryImageGeneration,
-        SUGGESTION_PRESSED_SCALE, THINKING_SHIMMER_DURATION, THINKING_SHIMMER_FRAME_INTERVAL,
-        THINKING_SHIMMER_STEPS, THINKING_SHIMMER_WIDTH, TOOL_GROUP_BODY_MAX_HEIGHT,
-        TOOL_GROUP_CHEVRON_SIZE, TOOL_GROUP_EDGE_FADE_DISTANCE, TOOL_GROUP_HEADER_CHEVRON_GAP,
-        TOOL_GROUP_HEADER_HEIGHT, TOOL_GROUP_ICON_SIZE, TOOL_GROUP_ICON_TEXT_GAP,
-        TOOL_GROUP_ITEM_GAP, TOOL_GROUP_LINE_HEIGHT, TOOL_GROUP_TEXT_SIZE,
-        TOOL_GROUP_TRANSITION_DURATION, USER_MESSAGE_BUBBLE_RADIUS,
-        USER_MESSAGE_BUBBLE_SUPERELLIPSE, USER_MESSAGE_FOOTER_GAP, USER_MESSAGE_FOOTER_HEIGHT,
-        USER_MESSAGE_FOOTER_OFFSET, USER_MESSAGE_FOOTER_SIDE_MARGIN,
+        DISCLOSURE_FOCUS_PADDING, HomeView, MCP_TOOL_CALL_ICON_SIZE, MCP_TOOL_CALL_ICON_TEXT_GAP,
+        MCP_TOOL_CALL_ROW_HEIGHT, MCP_TOOL_CALL_TEXT_SIZE, NOTICE_BUTTON_HEIGHT,
+        NOTICE_ERROR_CONTENT_GAP, NOTICE_ERROR_GAP, NOTICE_ICON_SIZE, NOTICE_LINE_HEIGHT,
+        NOTICE_RADIUS, NOTICE_TEXT_SIZE, NOTICE_WARNING_CONTENT_GAP, NOTICE_WARNING_GAP,
+        OpenImagePreview, OpenSubAgentPanel, REASONING_BODY_MAX_HEIGHT, REASONING_CHEVRON_SIZE,
+        REASONING_HEADER_HEIGHT, REASONING_LINE_HEIGHT, REASONING_TEXT_SIZE,
+        REASONING_TRANSITION_DURATION, RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT,
+        RESPONSE_ACTION_FOOTER_HEIGHT, RESPONSE_ACTION_FOOTER_OFFSET, RESPONSE_ACTION_GAP,
+        RESPONSE_ACTION_ICON_SIZE, RESPONSE_TIME_LINE_HEIGHT, RESPONSE_TIME_MARGIN,
+        RESPONSE_TIME_SIZE, RetryImageGeneration, SUGGESTION_PRESSED_SCALE,
+        THINKING_SHIMMER_DURATION, THINKING_SHIMMER_FRAME_INTERVAL, THINKING_SHIMMER_STEPS,
+        THINKING_SHIMMER_WIDTH, TOOL_GROUP_BODY_MAX_HEIGHT, TOOL_GROUP_CHEVRON_SIZE,
+        TOOL_GROUP_EDGE_FADE_DISTANCE, TOOL_GROUP_HEADER_CHEVRON_GAP, TOOL_GROUP_HEADER_HEIGHT,
+        TOOL_GROUP_ICON_SIZE, TOOL_GROUP_ICON_TEXT_GAP, TOOL_GROUP_ITEM_GAP,
+        TOOL_GROUP_LINE_HEIGHT, TOOL_GROUP_TEXT_SIZE, TOOL_GROUP_TRANSITION_DURATION,
+        USER_MESSAGE_BUBBLE_RADIUS, USER_MESSAGE_BUBBLE_SUPERELLIPSE, USER_MESSAGE_FOOTER_GAP,
+        USER_MESSAGE_FOOTER_HEIGHT, USER_MESSAGE_FOOTER_OFFSET, USER_MESSAGE_FOOTER_SIDE_MARGIN,
         USER_MESSAGE_HORIZONTAL_PADDING, USER_MESSAGE_LINE_HEIGHT, USER_MESSAGE_MAX_WIDTH_RATIO,
         USER_MESSAGE_PARAGRAPH_GAP, USER_MESSAGE_TEXT_SIZE, USER_MESSAGE_TIME_LINE_HEIGHT,
         USER_MESSAGE_TIME_SIZE, USER_MESSAGE_VERTICAL_PADDING, active_reasoning_body,
@@ -4911,6 +5293,7 @@ mod tests {
                 AgentCollaboratorState {
                     status: agent_status,
                     message: None,
+                    name: None,
                 },
             )]),
             prompt: None,
@@ -5189,7 +5572,7 @@ mod tests {
     }
 
     #[test]
-    fn collaboration_disclosure_and_thread_navigation_share_pointer_keyboard_paths() {
+    fn collaboration_disclosure_fixture_and_panel_event_keep_stable_identity() {
         let mut app = TestApp::new();
         let home = app.new_entity(|cx| HomeView::new(ThemeMode::Dark, cx));
         app.update(|cx| toggle_collaboration_item(&home, "collaboration_1", cx));
@@ -5204,20 +5587,23 @@ mod tests {
         let opened = Arc::new(Mutex::new(None));
         let observed = opened.clone();
         let _observer = app.new_entity(|cx| {
-            cx.subscribe(
-                &home,
-                move |_: &mut (), _, event: &OpenSubAgentThread, _| {
-                    *observed.lock().unwrap() = Some(event.0.clone());
-                },
-            )
+            cx.subscribe(&home, move |_: &mut (), _, event: &OpenSubAgentPanel, _| {
+                *observed.lock().unwrap() = Some(event.clone());
+            })
             .detach();
         });
-        app.update(|cx| super::open_sub_agent_thread(&home, "agent_1", cx));
-        assert_eq!(*opened.lock().unwrap(), Some("agent_1".to_owned()));
+        app.update(|cx| super::open_sub_agent_panel(&home, "agent_1", "Evidence agent", cx));
+        assert_eq!(
+            *opened.lock().unwrap(),
+            Some(OpenSubAgentPanel {
+                thread_id: "agent_1".to_owned(),
+                name: "Evidence agent".to_owned(),
+            })
+        );
     }
 
     #[test]
-    fn collaboration_row_handles_real_pointer_keyboard_and_receiver_activation() {
+    fn collaboration_row_opens_the_subagent_panel_with_pointer_and_keyboard() {
         let mut app = TestApp::new();
         let mut window = app.open_window_with_options(
             WindowOptions {
@@ -5235,44 +5621,32 @@ mod tests {
         let observed = opened.clone();
         let home = window.root();
         let _observer = app.new_entity(|cx| {
-            cx.subscribe(
-                &home,
-                move |_: &mut (), _, event: &OpenSubAgentThread, _| {
-                    *observed.lock().unwrap() = Some(event.0.clone());
-                },
-            )
+            cx.subscribe(&home, move |_: &mut (), _, event: &OpenSubAgentPanel, _| {
+                *observed.lock().unwrap() = Some(event.clone());
+            })
             .detach();
         });
 
         window.draw();
-        let disclosure = window
-            .debug_bounds("collaboration-agent")
-            .expect("collaboration disclosure must render");
-        window.simulate_click(disclosure.center(), MouseButton::Left);
-        assert!(window.read(|home, _| {
-            home.expanded_collaborations
-                .contains("legacy-01a06b7a-14c2-73b3-9c62-b29e27bd8689")
-        }));
-
-        window.simulate_keystrokes("space");
-        assert!(!window.read(|home, _| {
-            home.expanded_collaborations
-                .contains("legacy-01a06b7a-14c2-73b3-9c62-b29e27bd8689")
-        }));
-        window.simulate_keystrokes("enter");
-        window.draw();
-        assert!(window.read(|home, _| {
-            home.expanded_collaborations
-                .contains("legacy-01a06b7a-14c2-73b3-9c62-b29e27bd8689")
-        }));
-
-        let receiver = window
-            .debug_bounds("collaboration-receiver")
-            .expect("expanded collaboration receiver must render");
-        window.simulate_click(receiver.center(), MouseButton::Left);
+        // TestApp's titlebar inset places the first 21 px activity header at
+        // y=166..187. This point is inside the focusable agent label.
+        window.simulate_click(point(px(180.0), px(180.0)), MouseButton::Left);
         assert_eq!(
             *opened.lock().unwrap(),
-            Some("01a06b7a-14c2-73b3-9c62-b29e27bd8689".to_owned())
+            Some(OpenSubAgentPanel {
+                thread_id: "01a06b7a-14c2-73b3-9c62-b29e27bd8689".to_owned(),
+                name: "Collab evidence probe".to_owned(),
+            })
+        );
+        *opened.lock().unwrap() = None;
+
+        window.simulate_keystrokes("space");
+        assert_eq!(
+            *opened.lock().unwrap(),
+            Some(OpenSubAgentPanel {
+                thread_id: "01a06b7a-14c2-73b3-9c62-b29e27bd8689".to_owned(),
+                name: "Collab evidence probe".to_owned(),
+            })
         );
     }
 
@@ -5418,6 +5792,10 @@ mod tests {
 
     #[test]
     fn mcp_tool_call_label_matches_the_captured_chatgpt_row() {
+        assert_eq!(MCP_TOOL_CALL_ROW_HEIGHT, 21.0);
+        assert_eq!(MCP_TOOL_CALL_ICON_SIZE, 16.0);
+        assert_eq!(MCP_TOOL_CALL_ICON_TEXT_GAP, 6.0);
+        assert_eq!(MCP_TOOL_CALL_TEXT_SIZE, 14.0);
         assert_eq!(
             humanize_mcp_tool_name("get_usage_limits"),
             "Get usage limits"
@@ -6247,12 +6625,16 @@ mod tests {
             .detach();
         });
         window.draw();
+        // This point stays well inside the 480×480 preview in the fixed
+        // 900×700 test viewport, even after the conversation follows its tail.
         window.simulate_click(point(px(220.0), px(320.0)), MouseButton::Left);
         assert_eq!(*preview.lock().unwrap(), Some(path.clone()));
 
         window.update(|home, _, cx| home.set_image_generation_for_capture("failed", None, cx));
         window.draw();
-        window.simulate_click(point(px(110.0), px(248.0)), MouseButton::Left);
+        // The retry control is 36px high; click its interior instead of an
+        // antialiased border pixel so this remains a real pointer-path test.
+        window.simulate_click(point(px(113.0), px(298.0)), MouseButton::Left);
         assert_eq!(*retries.lock().unwrap(), 1);
 
         std::fs::remove_file(path).unwrap();
@@ -6448,19 +6830,18 @@ mod tests {
             |_, cx| HomeView::new(ThemeMode::Dark, cx),
         );
 
-        window.update(|home, _, cx| home.submit_prompt_for_capture("clipboard prompt", cx));
+        window.update(|home, _, cx| home.submit_prompt_for_capture("clipboard", cx));
         window.draw();
 
-        let copy_bounds = window
-            .debug_bounds("USER_MESSAGE_COPY")
-            .expect("copy action should be laid out");
-        assert_eq!(copy_bounds.size, size(px(26.0), px(26.0)));
-        window.simulate_mouse_move(copy_bounds.center());
-        window.simulate_click(copy_bounds.center(), MouseButton::Left);
+        // The footer action is 26×26 in this fixed viewport. Hover first to
+        // exercise the same pointer affordance a user sees before clicking.
+        let copy_button_center = point(px(801.0), px(138.0));
+        window.simulate_mouse_move(copy_button_center);
+        window.simulate_click(copy_button_center, MouseButton::Left);
 
         assert_eq!(
             app.read_from_clipboard().and_then(|item| item.text()),
-            Some("clipboard prompt".to_owned())
+            Some("clipboard".to_owned())
         );
     }
 

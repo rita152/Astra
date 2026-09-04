@@ -411,6 +411,8 @@ pub enum AgentCollaboratorStatus {
 pub struct AgentCollaboratorState {
     pub status: AgentCollaboratorStatus,
     pub message: Option<String>,
+    /// Optional product-facing label supplied by newer collaboration items.
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -421,8 +423,8 @@ pub enum LegacySubAgentActivityKind {
     Completed,
 }
 
-/// Agent-neutral form shared by the current `collabAgentToolCall` wire item
-/// and persisted legacy `subAgentActivity` items.
+/// Agent-neutral form shared by the public `collabToolCall`, the installed
+/// desktop app's `collabAgentToolCall`, and persisted `subAgentActivity` items.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentCollaboration {
     pub id: String,

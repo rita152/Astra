@@ -2057,7 +2057,7 @@ fn process_turn_message<W: Write + Send + 'static>(
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
-                "collabAgentToolCall" | "subAgentActivity" => {
+                "collabToolCall" | "collabAgentToolCall" | "subAgentActivity" => {
                     let collaboration = parse_collaboration(item)
                         .map_err(|error| turn_item_protocol_error(message, error))?;
                     send_turn_event(
@@ -2281,7 +2281,7 @@ fn process_turn_message<W: Write + Send + 'static>(
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
-                "collabAgentToolCall" | "subAgentActivity" => {
+                "collabToolCall" | "collabAgentToolCall" | "subAgentActivity" => {
                     let collaboration = parse_collaboration(item)
                         .map_err(|error| turn_item_protocol_error(message, error))?;
                     send_turn_event(
@@ -3399,7 +3399,7 @@ pub(super) fn parse_image_generation(
     let (path, dimensions, load_error) = if status == AgentImageGenerationStatus::Completed {
         let resolved_path = match saved_path {
             Some(path) if path.is_file() => Ok(Some(path)),
-            missing_or_unreadable if !result.is_empty() => {
+            _missing_or_unreadable if !result.is_empty() => {
                 materialize_image_generation_result(&id, result).map(Some)
             }
             Some(path) => Err(anyhow!("生成的图像文件不存在：{}", path.display())),
@@ -3522,11 +3522,113 @@ fn parse_legacy_sub_agent_kind(value: &str) -> Result<LegacySubAgentActivityKind
     })
 }
 
+fn default_collaborator_status(status: AgentCollaborationStatus) -> AgentCollaboratorStatus {
+    match status {
+        AgentCollaborationStatus::InProgress => AgentCollaboratorStatus::Running,
+        AgentCollaborationStatus::Completed => AgentCollaboratorStatus::Completed,
+        AgentCollaborationStatus::Failed => AgentCollaboratorStatus::Errored,
+        AgentCollaborationStatus::Interrupted => AgentCollaboratorStatus::Interrupted,
+    }
+}
+
+fn parse_collaborator_state(value: &Value, context: &str) -> Result<AgentCollaboratorState> {
+    match value {
+        Value::String(status) => Ok(AgentCollaboratorState {
+            status: parse_collaborator_status(status)?,
+            message: None,
+            name: None,
+        }),
+        Value::Object(state) => Ok(AgentCollaboratorState {
+            status: parse_collaborator_status(&required_item_string(state, context, "status")?)?,
+            message: optional_nullable_item_string(state, context, "message")?,
+            name: None,
+        }),
+        _ => bail!("{context} 必须是状态字符串或对象"),
+    }
+}
+
+fn humanize_agent_path(path: &str) -> Option<String> {
+    let leaf = path.rsplit('/').find(|part| !part.is_empty())?;
+    let words = leaf
+        .split(['_', '-'])
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let joined = words.join(" ");
+    let mut characters = joined.chars();
+    let leading = characters.next()?.to_uppercase().collect::<String>();
+    Some(format!("{leading}{}", characters.as_str()))
+}
+
 pub(super) fn parse_collaboration(
     item: &serde_json::Map<String, Value>,
 ) -> Result<AgentCollaboration> {
     let item_type = required_item_string(item, "collaboration", "type")?;
     match item_type.as_str() {
+        "collabToolCall" => {
+            let context = "collabToolCall";
+            let status =
+                parse_collaboration_status(&required_item_string(item, context, "status")?)?;
+            let default_status = default_collaborator_status(status);
+            let mut receiver_thread_ids = Vec::new();
+            for field in ["receiverThreadId", "newThreadId"] {
+                if let Some(thread_id) = optional_nullable_item_string(item, context, field)?
+                    && !receiver_thread_ids.contains(&thread_id)
+                {
+                    receiver_thread_ids.push(thread_id);
+                }
+            }
+            let mut agents_states = receiver_thread_ids
+                .iter()
+                .cloned()
+                .map(|thread_id| {
+                    (
+                        thread_id,
+                        AgentCollaboratorState {
+                            status: default_status,
+                            message: None,
+                            name: None,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+
+            if let Some(agent_status) = item.get("agentStatus") {
+                let parsed =
+                    parse_collaborator_state(agent_status, "collabToolCall item.agentStatus")?;
+                let thread_id = receiver_thread_ids.first().cloned().context(
+                    "collabToolCall item.agentStatus 存在时必须提供 receiverThreadId 或 newThreadId",
+                )?;
+                agents_states.insert(thread_id, parsed);
+            }
+
+            let agent_path = optional_nullable_item_string(item, context, "agentPath")?;
+            let name = optional_nullable_item_string(item, context, "agentName")?
+                .or(optional_nullable_item_string(
+                    item,
+                    context,
+                    "newAgentNickname",
+                )?)
+                .or_else(|| agent_path.as_deref().and_then(humanize_agent_path));
+            if let (Some(thread_id), Some(name)) = (receiver_thread_ids.first(), name)
+                && let Some(state) = agents_states.get_mut(thread_id)
+            {
+                state.name = Some(name);
+            }
+
+            Ok(AgentCollaboration {
+                id: required_item_string(item, context, "id")?,
+                tool: parse_collaboration_tool(&required_item_string(item, context, "tool")?)?,
+                status,
+                sender_thread_id: required_item_string(item, context, "senderThreadId")?,
+                receiver_thread_ids,
+                agents_states,
+                prompt: optional_nullable_item_string(item, context, "prompt")?,
+                model: None,
+                reasoning_effort: None,
+                legacy_agent_path: agent_path,
+                legacy_kind: None,
+            })
+        }
         "collabAgentToolCall" => {
             let mut agents_states = BTreeMap::new();
             let states = item
@@ -3549,7 +3651,11 @@ pub(super) fn parse_collaboration(
                 )?;
                 agents_states.insert(
                     thread_id.clone(),
-                    AgentCollaboratorState { status, message },
+                    AgentCollaboratorState {
+                        status,
+                        message,
+                        name: None,
+                    },
                 );
             }
 
@@ -3620,6 +3726,7 @@ pub(super) fn parse_collaboration(
                     AgentCollaboratorState {
                         status: agent_status,
                         message: None,
+                        name: None,
                     },
                 )]),
                 prompt: None,
@@ -8820,6 +8927,88 @@ mod tests {
     }
 
     #[test]
+    fn public_collab_tool_call_maps_single_target_metadata_and_lifecycle() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut streamed_text = false;
+        for (method, item) in [
+            (
+                "item/started",
+                json!({
+                    "type": "collabToolCall",
+                    "id": "public_collab_1",
+                    "tool": "spawnAgent",
+                    "status": "inProgress",
+                    "senderThreadId": "thr_1",
+                    "newThreadId": "agent_a",
+                    "newAgentNickname": "Protocol auditor",
+                    "agentStatus": "running",
+                    "prompt": "Inspect protocol evidence"
+                }),
+            ),
+            (
+                "item/completed",
+                json!({
+                    "type": "collabToolCall",
+                    "id": "public_collab_1",
+                    "tool": "spawnAgent",
+                    "status": "completed",
+                    "senderThreadId": "thr_1",
+                    "receiverThreadId": "agent_a",
+                    "agentName": "Protocol auditor",
+                    "agentStatus": {"status": "completed", "message": "done"},
+                    "prompt": "Inspect protocol evidence"
+                }),
+            ),
+        ] {
+            assert_eq!(
+                super::process_turn_message(
+                    &session,
+                    &turn_item_message(method, item),
+                    "thr_1",
+                    "turn_1",
+                    &tx,
+                    &mut streamed_text,
+                )
+                .unwrap(),
+                None
+            );
+        }
+
+        let AgentEvent::CollaborationUpdated(started) = rx.try_recv().unwrap() else {
+            panic!("expected public collaboration started update");
+        };
+        assert_eq!(started.receiver_thread_ids, ["agent_a"]);
+        assert_eq!(
+            started.agents_states["agent_a"].name.as_deref(),
+            Some("Protocol auditor")
+        );
+        assert_eq!(
+            started.status,
+            crate::agent::AgentCollaborationStatus::InProgress
+        );
+
+        let AgentEvent::CollaborationUpdated(completed) = rx.try_recv().unwrap() else {
+            panic!("expected public collaboration completed update");
+        };
+        assert_eq!(completed.id, "public_collab_1");
+        assert_eq!(
+            completed.status,
+            crate::agent::AgentCollaborationStatus::Completed
+        );
+        assert_eq!(
+            completed.agents_states["agent_a"].status,
+            crate::agent::AgentCollaboratorStatus::Completed
+        );
+        assert_eq!(
+            completed.agents_states["agent_a"].message.as_deref(),
+            Some("done")
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(!streamed_text);
+    }
+
+    #[test]
     fn every_collaboration_tool_and_legacy_kind_is_typed() {
         for tool in [
             "spawnAgent",
@@ -8925,6 +9114,13 @@ mod tests {
                     "agentThreadId":"agent_a","agentPath":"/root/a"
                 }),
                 "item.kind 包含未知值",
+            ),
+            (
+                json!({
+                    "type":"collabToolCall","id":"bad_1","tool":"wait",
+                    "status":"completed","senderThreadId":"thr_1","agentStatus":"running"
+                }),
+                "必须提供 receiverThreadId 或 newThreadId",
             ),
         ];
         for (item, expected) in cases {

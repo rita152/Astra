@@ -1181,7 +1181,7 @@ fn parse_history_item(value: &Value) -> Result<ThreadHistoryItem> {
                 completed: true,
             },
         )),
-        "collabAgentToolCall" | "subAgentActivity" => {
+        "collabToolCall" | "collabAgentToolCall" | "subAgentActivity" => {
             Ok(ThreadHistoryItem::Collaboration(parse_collaboration(
                 value
                     .as_object()
@@ -3088,6 +3088,27 @@ mod tests {
 
     #[test]
     fn history_collaboration_items_are_first_class_and_strict() {
+        let public = parse_history_item(&json!({
+            "type": "collabToolCall",
+            "id": "collab_public_history_1",
+            "tool": "sendMessage",
+            "status": "completed",
+            "senderThreadId": "parent",
+            "receiverThreadId": "agent_a",
+            "agentName": "Reviewer",
+            "agentStatus": "completed",
+            "prompt": "Review the implementation"
+        }))
+        .unwrap();
+        let ThreadHistoryItem::Collaboration(public) = public else {
+            panic!("expected public collaboration history item");
+        };
+        assert_eq!(public.receiver_thread_ids, ["agent_a"]);
+        assert_eq!(
+            public.agents_states["agent_a"].name.as_deref(),
+            Some("Reviewer")
+        );
+
         let canonical = parse_history_item(&json!({
             "type": "collabAgentToolCall",
             "id": "collab_history_1",

@@ -30,7 +30,7 @@ use crate::{
             captured_diff_review_fixture, render_diff_review_panel,
         },
         home::{
-            HomeView, OpenDiffReview, OpenImagePreview, OpenSubAgentThread, RetryImageGeneration,
+            HomeView, OpenDiffReview, OpenImagePreview, OpenSubAgentPanel, RetryImageGeneration,
         },
         icons::icon,
         sidebar::{NewConversation, OpenProjectCreation, OpenSettings, SelectThread, SidebarView},
@@ -84,6 +84,8 @@ pub struct ChatApp {
     right_panel_resize_hovered: bool,
     right_panel_resize_dragging: bool,
     right_panel_resize_pointer_offset: f32,
+    subagent_panel: Option<SubagentPanel>,
+    subagent_panel_menu_open: bool,
     diff_review: Option<DiffReviewPresentation>,
     image_preview: Option<PathBuf>,
     image_preview_dimensions: Option<(u32, u32)>,
@@ -111,6 +113,13 @@ struct ConversationHost {
     composer: Entity<ComposerView>,
     cwd: PathBuf,
     project_id: Option<ProjectId>,
+}
+
+#[derive(Clone)]
+struct SubagentPanel {
+    thread_id: ThreadId,
+    name: String,
+    home: Entity<HomeView>,
 }
 
 impl Drop for ChatApp {
@@ -174,6 +183,8 @@ const RIGHT_PANEL_ITEMS: &[(RightPanelMode, &str, &str, &str)] = &[
 ];
 const RIGHT_PANEL_MIN_WIDTH: f32 = 320.0;
 const RIGHT_PANEL_MAIN_MIN_WIDTH: f32 = 384.0;
+const SUBAGENT_PANEL_DEFAULT_WIDTH: f32 = 603.0;
+const SUBAGENT_PANEL_HEADER_HEIGHT: f32 = 48.0;
 const MAIN_CONTENT_HORIZONTAL_GUTTER: f32 = 24.0;
 // The native 14px traffic lights start at y=18px, so their center is y=25px.
 // Center the 28px leading titlebar controls on that same horizontal axis.
@@ -375,6 +386,9 @@ impl ChatApp {
                     composer.set_mode(event.0, cx);
                 });
             }
+            if let Some(panel) = &this.subagent_panel {
+                panel.home.update(cx, |home, cx| home.set_mode(event.0, cx));
+            }
             cx.notify();
         })
         .detach();
@@ -399,8 +413,8 @@ impl ChatApp {
             cx.notify();
         })
         .detach();
-        cx.subscribe(&home, |this, _, event: &OpenSubAgentThread, cx| {
-            this.select_conversation(event.0.clone(), cx);
+        cx.subscribe(&home, |this, _, event: &OpenSubAgentPanel, cx| {
+            this.open_subagent_panel(event.clone(), cx);
         })
         .detach();
         cx.subscribe(&home, |this, _, _: &RetryImageGeneration, cx| {
@@ -480,6 +494,8 @@ impl ChatApp {
             right_panel_resize_hovered: false,
             right_panel_resize_dragging: false,
             right_panel_resize_pointer_offset: 0.0,
+            subagent_panel: None,
+            subagent_panel_menu_open: false,
             diff_review: None,
             image_preview: None,
             image_preview_dimensions: None,
@@ -535,22 +551,25 @@ impl ChatApp {
         self.switch_home_to(key, cx);
     }
 
-    fn select_conversation(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+    fn ensure_thread_conversation(
+        &mut self,
+        thread_id: ThreadId,
+        cx: &mut Context<Self>,
+    ) -> Entity<ComposerView> {
         let key = ConversationKey::Thread(thread_id.clone());
         if let Some(host) = self.conversation_hosts.get(&key) {
             let composer = host.composer.clone();
             let retry_history = composer.read(cx).history_needs_retry();
-            self.switch_home_to(key, cx);
             if retry_history {
                 composer.update(cx, |composer, cx| composer.set_history_loading(true, cx));
                 self.load_conversation_history(
                     ConversationKey::Thread(thread_id.clone()),
                     thread_id,
-                    composer,
+                    composer.clone(),
                     cx,
                 );
             }
-            return;
+            return composer;
         }
 
         let snapshot = self.workspace_store.snapshot();
@@ -588,14 +607,64 @@ impl ChatApp {
                 project_id,
             },
         );
-        self.switch_home_to(key, cx);
 
         self.load_conversation_history(
             ConversationKey::Thread(thread_id.clone()),
             thread_id,
-            composer,
+            composer.clone(),
             cx,
         );
+        composer
+    }
+
+    fn select_conversation(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        let key = ConversationKey::Thread(thread_id.clone());
+        self.ensure_thread_conversation(thread_id, cx);
+        self.switch_home_to(key, cx);
+    }
+
+    fn open_subagent_panel(&mut self, event: OpenSubAgentPanel, cx: &mut Context<Self>) {
+        let composer = self.ensure_thread_conversation(event.thread_id.clone(), cx);
+        let panel_home = cx.new(|cx| HomeView::new_subagent(self.mode, composer.clone(), cx));
+
+        cx.subscribe(&panel_home, |this, _, nested: &OpenSubAgentPanel, cx| {
+            this.open_subagent_panel(nested.clone(), cx)
+        })
+        .detach();
+        cx.subscribe(&panel_home, |this, _, preview: &OpenImagePreview, cx| {
+            this.image_preview = Some(preview.0.clone());
+            this.image_preview_dimensions = generated_image_dimensions(&preview.0).ok().flatten();
+            this.image_preview_zoom = 1.0;
+            cx.notify();
+        })
+        .detach();
+        cx.subscribe(&panel_home, |this, _, review: &OpenDiffReview, cx| {
+            this.open_diff_review(review.0.clone(), cx)
+        })
+        .detach();
+        cx.subscribe(&panel_home, |this, _, _: &RetryImageGeneration, cx| {
+            if let Some(panel) = &this.subagent_panel {
+                let composer = panel.home.read(cx).composer_entity();
+                composer.update(cx, |composer, cx| composer.retry_image_generation(cx));
+            }
+        })
+        .detach();
+
+        self.subagent_panel = Some(SubagentPanel {
+            thread_id: event.thread_id,
+            name: event.name,
+            home: panel_home,
+        });
+        self.subagent_panel_menu_open = false;
+        self.right_panel_open = true;
+        self.right_panel_mode = None;
+        self.diff_review = None;
+        if self.right_panel_width.is_none() {
+            self.right_panel_width = Some(SUBAGENT_PANEL_DEFAULT_WIDTH);
+        }
+        self.right_panel_keyboard_focus = false;
+        self.right_panel_focus_pending = true;
+        cx.notify();
     }
 
     /// Opens a persisted thread without requiring the sidebar to finish loading first.
@@ -911,6 +980,8 @@ impl ChatApp {
 
     fn open_diff_review(&mut self, review: DiffReviewPresentation, cx: &mut Context<Self>) {
         self.diff_review = Some(review);
+        self.subagent_panel = None;
+        self.subagent_panel_menu_open = false;
         self.right_panel_open = true;
         self.right_panel_mode = None;
         // Natural long-diff capture 29: the 2560px viewport split begins at
@@ -1331,6 +1402,8 @@ impl ChatApp {
     pub fn open_right_panel(&mut self, cx: &mut Context<Self>) {
         self.right_panel_open = true;
         self.right_panel_mode = None;
+        self.subagent_panel = None;
+        self.subagent_panel_menu_open = false;
         self.diff_review = None;
         self.right_panel_focused_item = 0;
         self.right_panel_keyboard_focus = false;
@@ -1342,6 +1415,8 @@ impl ChatApp {
         if self.right_panel_open {
             self.right_panel_open = false;
             self.right_panel_mode = None;
+            self.subagent_panel = None;
+            self.subagent_panel_menu_open = false;
             self.diff_review = None;
             self.right_panel_keyboard_focus = false;
             self.right_panel_focus_pending = false;
@@ -1364,6 +1439,8 @@ impl ChatApp {
             return;
         };
         self.right_panel_mode = Some(*mode);
+        self.subagent_panel = None;
+        self.subagent_panel_menu_open = false;
         self.diff_review = None;
         self.right_panel_keyboard_focus = false;
         cx.notify();
@@ -1376,6 +1453,21 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) {
         if !self.right_panel_open {
+            return;
+        }
+        if self.subagent_panel.is_some() {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    if self.subagent_panel_menu_open {
+                        self.subagent_panel_menu_open = false;
+                        cx.notify();
+                    } else {
+                        self.close_right_panel(cx);
+                    }
+                    cx.stop_propagation();
+                }
+                _ => return,
+            }
             return;
         }
         match event.keystroke.key.as_str() {
@@ -2461,12 +2553,335 @@ impl ChatApp {
             })
     }
 
+    fn subagent_right_panel(
+        &self,
+        panel: SubagentPanel,
+        panel_width: gpui::Pixels,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let menu_open = self.subagent_panel_menu_open;
+        let tab_trigger = div()
+            .id("subagent-panel-tab-trigger")
+            .h_full()
+            .min_w(px(0.0))
+            .flex_1()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_expanded(menu_open)
+            .aria_label(if menu_open {
+                "关闭面板信息下拉框"
+            } else {
+                "打开面板信息下拉框"
+            })
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.subagent_panel_menu_open = !this.subagent_panel_menu_open;
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.subagent_panel_menu_open = !this.subagent_panel_menu_open;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .child(icon("settings-agent", theme.text.into()).size(px(16.0)))
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(13.0))
+                    .line_height(px(18.5714))
+                    .text_color(theme.text)
+                    .child("子智能体"),
+            )
+            .child(
+                icon("chevron-down", theme.text_tertiary.into())
+                    .size(px(12.0))
+                    .flex_none(),
+            );
+        let close_button = div()
+            .id("subagent-panel-close")
+            .size(px(20.0))
+            .rounded(px(5.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label("关闭子智能体面板")
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.sidebar_hover))
+            .active(move |style| style.bg(theme.text.alpha(0.12)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.close_right_panel(cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    cx.stop_propagation();
+                    this.close_right_panel(cx);
+                }
+            }))
+            .child(icon("close-dialog", theme.text_tertiary.into()).size(px(12.0)));
+        let plus_button = div()
+            .id("subagent-panel-add-tab")
+            .size(px(28.0))
+            .rounded(px(8.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label("打开面板选择器")
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.sidebar_hover))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.subagent_panel_menu_open = !this.subagent_panel_menu_open;
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.subagent_panel_menu_open = !this.subagent_panel_menu_open;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .text_size(px(21.0))
+                    .line_height(px(21.0))
+                    .font_weight(gpui::FontWeight(350.0))
+                    .text_color(theme.text_tertiary)
+                    .child("+"),
+            );
+        let toolbar = div()
+            .id("subagent-panel-toolbar")
+            .h(px(46.0))
+            .w_full()
+            .flex_none()
+            .px(px(8.0))
+            .bg(theme.surface_under)
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .id("subagent-panel-tab")
+                    .h(px(28.0))
+                    .w(px(156.0))
+                    .px(px(8.0))
+                    .rounded(px(12.5))
+                    .bg(theme.surface)
+                    .flex()
+                    .items_center()
+                    .child(tab_trigger)
+                    .child(close_button),
+            )
+            .child(plus_button);
+
+        let back_button = div()
+            .id("subagent-panel-back")
+            .size(px(24.0))
+            .rounded(px(10.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label("返回子智能体列表")
+            .cursor_pointer()
+            .hover(move |style| style.bg(theme.sidebar_hover))
+            .active(move |style| style.bg(theme.text.alpha(0.12)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.close_right_panel(cx);
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    cx.stop_propagation();
+                    this.close_right_panel(cx);
+                }
+            }))
+            .child(icon("back", theme.text_tertiary.into()).size(px(16.0)));
+        let panel_name = panel.name.clone();
+        let panel_label = format!("子智能体 {panel_name}，任务 {}", panel.thread_id);
+        let header = div()
+            .id("subagent-panel-header")
+            .h(px(SUBAGENT_PANEL_HEADER_HEIGHT))
+            .w_full()
+            .flex_none()
+            .px(px(16.0))
+            .border_b_1()
+            .border_color(theme.command_border)
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .aria_label(panel_label)
+            .child(back_button)
+            .child(
+                icon("subagent-activity", rgba(0xff7b7fff).into())
+                    .size(px(24.0))
+                    .flex_none(),
+            )
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(13.0))
+                    .line_height(px(18.5714))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(panel_name.clone()),
+            );
+
+        let dropdown = div()
+            .id("subagent-panel-menu")
+            .absolute()
+            .top(px(59.0))
+            .left(px(43.0))
+            .w(px(240.0))
+            .h(px(204.0))
+            .p(px(10.0))
+            .rounded(px(25.0))
+            .bg(theme.elevated)
+            .shadow(vec![
+                BoxShadow::new(px(0.0), px(0.0), theme.border.into()).spread_radius(px(0.5)),
+                BoxShadow::new(px(0.0), px(3.0), rgba(0x0000000a).into()).blur_radius(px(7.5)),
+                BoxShadow::new(px(0.0), px(0.0), rgba(0x0000000d).into()).blur_radius(px(20.0)),
+            ])
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .px(px(4.0))
+                    .text_size(px(14.0))
+                    .line_height(px(21.0))
+                    .text_color(theme.text_tertiary)
+                    .child("环境信息"),
+            )
+            .child(
+                div()
+                    .px(px(4.0))
+                    .text_size(px(14.0))
+                    .line_height(px(21.0))
+                    .text_color(theme.text_tertiary)
+                    .child("变更"),
+            )
+            .child(div().h(px(0.5)).mx(px(4.0)).bg(theme.border))
+            .child(
+                div()
+                    .h(px(28.0))
+                    .px(px(4.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_size(px(14.0))
+                    .line_height(px(21.0))
+                    .text_color(theme.text_tertiary)
+                    .child("子智能体")
+                    .child("1 完成"),
+            )
+            .child(
+                div()
+                    .id("subagent-panel-menu-current")
+                    .h(px(40.0))
+                    .px(px(8.0))
+                    .rounded(px(12.5))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .focusable()
+                    .tab_stop(true)
+                    .role(Role::Button)
+                    .aria_label(format!("子智能体 {panel_name}"))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(theme.sidebar_hover))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.subagent_panel_menu_open = false;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            this.subagent_panel_menu_open = false;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
+                    .child(icon("subagent-activity", rgba(0xff7b7fff).into()).size(px(20.0)))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .truncate()
+                            .text_size(px(13.0))
+                            .line_height(px(18.5714))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(panel_name),
+                    ),
+            );
+
+        div()
+            .id("right-panel")
+            .w(panel_width)
+            .min_w(panel_width)
+            .h_full()
+            .flex_none()
+            .relative()
+            .border_l_1()
+            .border_color(theme.border)
+            .bg(theme.surface)
+            .track_focus(&self.right_panel_focus)
+            .on_key_down(cx.listener(Self::handle_right_panel_key))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .flex()
+            .flex_col()
+            .child(self.right_panel_resize_handle(theme, cx))
+            .child(toolbar)
+            .child(header)
+            .child(
+                div()
+                    .id("subagent-panel-body")
+                    .min_h(px(0.0))
+                    .flex_1()
+                    .bg(theme.surface)
+                    .child(panel.home.cached(StyleRefinement::default().size_full())),
+            )
+            .when(menu_open, |panel| panel.child(dropdown))
+    }
+
     fn right_panel(
         &self,
         panel_width: gpui::Pixels,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
+        if let Some(panel) = self.subagent_panel.clone() {
+            return self.subagent_right_panel(panel, panel_width, theme, cx);
+        }
         if let Some(review) = self.diff_review.clone() {
             let target = cx.entity();
             let callback = DiffReviewCallback::new(move |event, _, cx| {
@@ -2651,6 +3066,10 @@ impl Render for ChatApp {
                 this.sidebar
                     .update(cx, |sidebar, cx| sidebar.close_transient_menus(cx));
                 this.close_bottom_panel_menu(cx);
+                if this.subagent_panel_menu_open {
+                    this.subagent_panel_menu_open = false;
+                    cx.notify();
+                }
             }))
             .on_key_down(cx.listener(Self::handle_project_creation_key))
             .on_action(cx.listener(|this, _: &DismissPermissionUi, _, cx| {
@@ -3187,8 +3606,9 @@ mod tests {
         ThreadSummary, ThreadTurn,
     };
     use crate::components::{
-        composer::{ConversationPhase, ModelCatalogLoadFinished},
+        composer::{ComposerView, ConversationPhase, ModelCatalogLoadFinished},
         file_change::DiffReviewEvent,
+        home::OpenSubAgentPanel,
         sidebar::OpenSettings,
     };
     use crate::theme::ThemeMode;
@@ -3418,6 +3838,90 @@ mod tests {
         window.draw();
         window.simulate_click(trigger, MouseButton::Left);
         assert!(!window.read(|chat, _| chat.right_panel_open));
+    }
+
+    #[test]
+    fn collaboration_event_opens_a_read_only_subagent_panel_without_switching_parent() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(1_440.0), px(900.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ChatApp::new(ThemeMode::Light, false, cx),
+        );
+        window.update(|chat, _, cx| {
+            let backend = chat._agent_backend.clone();
+            let child = cx.new(|cx| ComposerView::new_with_backend(chat.mode, backend, cx));
+            let child_cwd = PathBuf::from("/tmp/collab-evidence-child");
+            child.update(cx, |composer, cx| {
+                composer.set_workspace_context(
+                    child_cwd.clone(),
+                    None,
+                    Some("thread-collab-evidence-child".to_owned()),
+                    cx,
+                )
+            });
+            chat.conversation_hosts.insert(
+                ConversationKey::Thread("thread-collab-evidence-child".to_owned()),
+                super::ConversationHost {
+                    composer: child,
+                    cwd: child_cwd,
+                    project_id: None,
+                },
+            );
+        });
+        let (parent_key, parent_composer, home) = window.read(|chat, cx| {
+            (
+                chat.active_conversation.clone(),
+                chat.home.read(cx).composer_entity(),
+                chat.home.clone(),
+            )
+        });
+
+        app.update(|cx| {
+            home.update(cx, |_, cx| {
+                cx.emit(OpenSubAgentPanel {
+                    thread_id: "thread-collab-evidence-child".to_owned(),
+                    name: "Collab evidence child".to_owned(),
+                })
+            })
+        });
+
+        window.read(|chat, cx| {
+            assert!(chat.right_panel_open);
+            assert_eq!(chat.active_conversation, parent_key);
+            assert!(chat.home.read(cx).composer_entity() == parent_composer);
+            let panel = chat
+                .subagent_panel
+                .as_ref()
+                .expect("collaboration row should mount a subagent panel");
+            assert_eq!(panel.thread_id, "thread-collab-evidence-child");
+            assert_eq!(panel.name, "Collab evidence child");
+            assert_eq!(
+                panel.home.read(cx).composer_entity().read(cx).thread_id(),
+                Some("thread-collab-evidence-child")
+            );
+        });
+
+        window.draw();
+        // At 1440px the 603px panel begins at x=837; the live 156×28 tab
+        // occupies x=845..1001 and toggles the same information popover.
+        window.simulate_click(point(px(900.0), px(23.0)), MouseButton::Left);
+        assert!(window.read(|chat, _| chat.subagent_panel_menu_open));
+        window.simulate_keystroke("escape");
+        assert!(window.read(|chat, _| chat.right_panel_open));
+        assert!(!window.read(|chat, _| chat.subagent_panel_menu_open));
+
+        window.simulate_keystroke("escape");
+        window.read(|chat, _| {
+            assert!(!chat.right_panel_open);
+            assert!(chat.subagent_panel.is_none());
+            assert_eq!(chat.active_conversation, parent_key);
+        });
     }
 
     #[test]
