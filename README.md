@@ -37,6 +37,32 @@ target/release/gpui-chat-clone \
 窗口宽高使用逻辑像素；PNG 的物理像素尺寸会跟随当前显示器缩放倍率。
 `--resume-scroll-from-bottom` 为可选的逻辑像素距离，用于让 light/dark 捕获稳定落在同一段历史内容；省略时截图停在会话底部。
 
+图像生成组件可用同一条确定性截图路径复核。`running`、`completed`、`failed`、`load-error` 分别固定加载、成功、额度失败和文件加载失败状态；成功态传入真实输出文件：
+
+```bash
+target/release/gpui-chat-clone \
+  --theme=light \
+  --window-width=1470 \
+  --window-height=923 \
+  --image-generation-ui-state=completed \
+  --image-generation-path=/absolute/path/to/generated.png \
+  --screenshot=artifacts/image-generation-completed-light.png
+```
+
+使用相同 CSS 尺寸、DPR、主题和输出文件完成两侧截图后，以各自组件左上角和相同宽高执行数值比较；脚本会报告 crop、归一化 MAE 相似度、SSIM、PSNR、精确像素比例及 99.5% 阈值结果：
+
+```bash
+python3 scripts/compare_image_generation_component.py \
+  artifacts/chatgpt-image-generation.png \
+  artifacts/gpui-image-generation.png \
+  --reference-crop=502,209,480,480 \
+  --actual-crop=488,205,480,480 \
+  --dpr=2 \
+  --threshold=0.995 \
+  --output-json=artifacts/image-generation-comparison.json \
+  --diff=artifacts/image-generation-diff.png
+```
+
 ## 验证
 
 Rust 基础校验：

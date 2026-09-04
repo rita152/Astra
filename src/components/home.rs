@@ -16,7 +16,8 @@ use gpui::{
 use crate::{
     agent::{
         AgentBackend, AgentCollaboration, AgentCollaborationStatus, AgentCollaboratorStatus,
-        AgentFileChangeStatus, AgentImageView, AgentMcpToolCall, AgentMcpToolCallStatus,
+        AgentFileChangeStatus, AgentImageGeneration, AgentImageGenerationFailure,
+        AgentImageGenerationStatus, AgentImageView, AgentMcpToolCall, AgentMcpToolCallStatus,
         CodexAppServerBackend, CommandExecution, CommandExecutionAction, CommandExecutionStatus,
         LegacySubAgentActivityKind,
     },
@@ -89,6 +90,9 @@ impl gpui::EventEmitter<OpenImagePreview> for HomeView {}
 
 pub struct OpenSubAgentThread(pub String);
 impl gpui::EventEmitter<OpenSubAgentThread> for HomeView {}
+
+pub struct RetryImageGeneration;
+impl gpui::EventEmitter<RetryImageGeneration> for HomeView {}
 
 const SUGGESTION_PRESSED_SCALE: f32 = 0.99;
 const SUGGESTION_TRANSITION_DURATION: Duration = Duration::from_millis(150);
@@ -776,7 +780,8 @@ impl HomeView {
             if *this.composer == *composer {
                 let composer = composer.read(cx);
                 let needs_shimmer = composer.conversation_phase() == ConversationPhase::Thinking
-                    || composer.has_active_context_compaction();
+                    || composer.has_active_context_compaction()
+                    || composer.has_active_image_generation();
                 this.sync_thinking_shimmer(needs_shimmer, cx);
                 cx.notify();
             }
@@ -805,7 +810,8 @@ impl HomeView {
         self.expanded_collaborations.clear();
         let composer = self.composer.read(cx);
         let needs_shimmer = composer.conversation_phase() == ConversationPhase::Thinking
-            || composer.has_active_context_compaction();
+            || composer.has_active_context_compaction()
+            || composer.has_active_image_generation();
         self.sync_thinking_shimmer(needs_shimmer, cx);
         cx.notify();
     }
@@ -835,7 +841,14 @@ impl HomeView {
 
     fn sync_thinking_shimmer(&mut self, needs_shimmer: bool, cx: &mut Context<Self>) {
         if needs_shimmer {
-            if !self.thinking_shimmer_running {
+            if cx.reduce_motion() {
+                if self.thinking_shimmer_running || self.thinking_shimmer_progress != 0.5 {
+                    self.thinking_shimmer_cycle = self.thinking_shimmer_cycle.wrapping_add(1);
+                    self.thinking_shimmer_progress = 0.5;
+                    self.thinking_shimmer_running = false;
+                    cx.notify();
+                }
+            } else if !self.thinking_shimmer_running {
                 self.start_thinking_shimmer(cx);
             }
         } else if self.thinking_shimmer_running || self.thinking_shimmer_progress != 0.0 {
@@ -861,6 +874,12 @@ impl HomeView {
                 let should_continue = this
                     .update(cx, |this, cx| {
                         if this.thinking_shimmer_cycle != cycle || !this.thinking_shimmer_running {
+                            return false;
+                        }
+                        if cx.reduce_motion() {
+                            this.thinking_shimmer_progress = 0.5;
+                            this.thinking_shimmer_running = false;
+                            cx.notify();
                             return false;
                         }
                         let elapsed =
@@ -1021,6 +1040,18 @@ impl HomeView {
     pub fn set_mcp_tool_call_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
         self.composer.update(cx, |composer, cx| {
             composer.set_mcp_tool_call_for_capture(state, cx)
+        });
+        cx.notify();
+    }
+
+    pub fn set_image_generation_for_capture(
+        &mut self,
+        state: &str,
+        path: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |composer, cx| {
+            composer.set_image_generation_for_capture(state, path, cx)
         });
         cx.notify();
     }
@@ -2382,6 +2413,14 @@ fn activity_stream(
                             theme,
                         ))
                     }
+                    ConversationActivity::ImageGeneration(image) => {
+                        stream.child(image_generation_activity(
+                            home_entity.clone(),
+                            image,
+                            thinking_shimmer_progress,
+                            theme,
+                        ))
+                    }
                     ConversationActivity::ContextCompaction(compaction) => stream.child(
                         context_compaction_activity(compaction, thinking_shimmer_progress, theme),
                     ),
@@ -2488,6 +2527,255 @@ fn activity_stream(
         .when(show_thinking_tail, |stream| {
             stream.child(thinking_shimmer(theme, thinking_shimmer_progress))
         })
+}
+
+fn image_generation_preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
+    let Some((width, height)) = dimensions.filter(|(width, height)| *width > 0 && *height > 0)
+    else {
+        return (480.0, 480.0);
+    };
+    let aspect = width as f32 / height as f32;
+    if aspect >= 1.0 {
+        (480.0, 480.0 / aspect)
+    } else {
+        (480.0 * aspect, 480.0)
+    }
+}
+
+fn image_generation_failure_copy(image: &AgentImageGeneration) -> (String, String) {
+    if let Some(AgentImageGenerationFailure::UsageLimitExceeded {
+        limit_id,
+        resets_at,
+    }) = &image.failure
+    {
+        let reset = resets_at
+            .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
+            .map(|timestamp| {
+                timestamp
+                    .with_timezone(&chrono::Local)
+                    .format("%m月%d日 %H:%M")
+                    .to_string()
+            });
+        let detail = match reset {
+            Some(reset) => format!("额度 {limit_id} 将于 {reset} 重置。"),
+            None => format!("额度 {limit_id} 暂时不可用。"),
+        };
+        return ("图像生成额度已用完".to_owned(), detail);
+    }
+    (
+        "无法显示生成的图像".to_owned(),
+        image
+            .load_error
+            .clone()
+            .unwrap_or_else(|| "图像生成失败，请重试。".to_owned()),
+    )
+}
+
+fn image_generation_error_activity(
+    home_entity: Entity<HomeView>,
+    image: AgentImageGeneration,
+    theme: Theme,
+) -> gpui::AnyElement {
+    let item_id = image.id.clone();
+    let retry_home = home_entity.clone();
+    let key_home = home_entity;
+    let (title, detail) = image_generation_failure_copy(&image);
+    div()
+        .id(SharedString::from(format!(
+            "image-generation-error-{item_id}"
+        )))
+        .w(px(360.0))
+        .max_w_full()
+        .p(px(16.0))
+        .rounded(px(16.0))
+        .border(px(1.0))
+        .border_color(theme.warning.alpha(0.24))
+        .bg(theme.command_surface)
+        .flex()
+        .flex_col()
+        .gap(px(10.0))
+        .child(
+            div()
+                .flex()
+                .items_start()
+                .gap(px(10.0))
+                .child(
+                    icon("permission-warning", theme.warning.into())
+                        .size(px(20.0))
+                        .flex_none(),
+                )
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .font_family(".SystemUIFont")
+                                .text_size(px(14.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .font_family(".SystemUIFont")
+                                .text_size(px(13.0))
+                                .line_height(px(18.0))
+                                .text_color(theme.text_secondary)
+                                .child(detail),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!(
+                    "image-generation-retry-{item_id}"
+                )))
+                .h(px(36.0))
+                .px(px(14.0))
+                .self_start()
+                .rounded(px(10.0))
+                .border(px(1.0))
+                .border_color(theme.border)
+                .bg(theme.control)
+                .role(Role::Button)
+                .aria_label("重试图像生成")
+                .focusable()
+                .tab_stop(true)
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_center()
+                .font_family(".SystemUIFont")
+                .text_size(px(13.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .hover(move |button| button.bg(theme.elevated))
+                .on_click(move |_, _, cx| {
+                    retry_home.update(cx, |_, cx| cx.emit(RetryImageGeneration));
+                    cx.stop_propagation();
+                })
+                .on_key_down(move |event, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        key_home.update(cx, |_, cx| cx.emit(RetryImageGeneration));
+                        cx.stop_propagation();
+                    }
+                })
+                .child("重试"),
+        )
+        .into_any_element()
+}
+
+fn image_generation_activity(
+    home_entity: Entity<HomeView>,
+    image: AgentImageGeneration,
+    shimmer_progress: f32,
+    theme: Theme,
+) -> gpui::AnyElement {
+    let item_id = image.id.clone();
+    if image.status == AgentImageGenerationStatus::InProgress {
+        let dots = (0..64).map(|index| {
+            let row = index / 8;
+            let column = index % 8;
+            let phase = (shimmer_progress + (row + column) as f32 / 14.0) % 1.0;
+            let distance = ((row as f32 - 5.0).powi(2) + (column as f32 - 5.0).powi(2)).sqrt();
+            let alpha = ((1.0 - distance / 8.0) * (0.10 + phase * 0.18)).clamp(0.03, 0.28);
+            div()
+                .size(px(2.0))
+                .rounded_full()
+                .bg(theme.text.alpha(alpha))
+        });
+        return div()
+            .id(SharedString::from(format!(
+                "image-generation-loading-{item_id}"
+            )))
+            .size(px(178.0))
+            .flex_none()
+            .relative()
+            .overflow_hidden()
+            .rounded(px(16.0))
+            .bg(theme.text.alpha(0.055))
+            .role(Role::Status)
+            .aria_label("正在生成图像...")
+            .child(
+                div()
+                    .absolute()
+                    .right(px(18.0))
+                    .bottom(px(18.0))
+                    .w(px(58.0))
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(5.0))
+                    .children(dots),
+            )
+            .into_any_element();
+    }
+
+    let path_missing = image.path.as_ref().is_some_and(|path| !path.is_file());
+    if image.status == AgentImageGenerationStatus::Failed
+        || image.load_error.is_some()
+        || image.path.is_none()
+        || path_missing
+    {
+        let mut failed = image;
+        if path_missing && failed.load_error.is_none() {
+            failed.load_error = Some("生成的图像文件已移动或删除。".to_owned());
+        }
+        return image_generation_error_activity(home_entity, failed, theme);
+    }
+
+    let path = image
+        .path
+        .clone()
+        .expect("completed image path checked above");
+    let preview_path = path.clone();
+    let keyboard_path = path.clone();
+    let click_home = home_entity.clone();
+    let keyboard_home = home_entity;
+    let (width, height) = image_generation_preview_size(image.dimensions);
+    let dimensions = image
+        .dimensions
+        .map(|(width, height)| format!("，{width}×{height}"))
+        .unwrap_or_default();
+    div()
+        .id(SharedString::from(format!("image-generation-{item_id}")))
+        .w(px(width))
+        .h(px(height))
+        .max_w_full()
+        .flex_none()
+        .overflow_hidden()
+        .rounded(px(16.0))
+        .bg(theme.surface)
+        .role(Role::Button)
+        .aria_label(format!("已生成图像 1{dimensions}"))
+        .focusable()
+        .tab_stop(true)
+        .cursor_pointer()
+        .focus_visible(|style| {
+            style.shadow(vec![
+                BoxShadow::new(px(0.0), px(0.0), rgba(0x3a83f7ff).into()).spread_radius(px(2.0)),
+            ])
+        })
+        .on_click(move |_, _, cx| {
+            click_home.update(cx, |_, cx| cx.emit(OpenImagePreview(preview_path.clone())));
+            cx.stop_propagation();
+        })
+        .on_key_down(move |event, _, cx| {
+            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                keyboard_home.update(cx, |_, cx| cx.emit(OpenImagePreview(keyboard_path.clone())));
+                cx.stop_propagation();
+            }
+        })
+        .child(
+            gpui::img(path)
+                .w(px(width))
+                .h(px(height))
+                .rounded(px(16.0))
+                .object_fit(ObjectFit::Contain),
+        )
+        .into_any_element()
 }
 
 fn image_view_activity(
@@ -4494,6 +4782,7 @@ mod tests {
         time::Duration,
     };
 
+    use base64::Engine as _;
     use gpui::{
         AppContext, Bounds, KeyBinding, MouseButton, TestApp, TestAppWindow, WindowBounds,
         WindowOptions, point, px, size,
@@ -4512,7 +4801,7 @@ mod tests {
         REASONING_LINE_HEIGHT, REASONING_TEXT_SIZE, REASONING_TRANSITION_DURATION,
         RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT, RESPONSE_ACTION_FOOTER_HEIGHT,
         RESPONSE_ACTION_FOOTER_OFFSET, RESPONSE_ACTION_GAP, RESPONSE_ACTION_ICON_SIZE,
-        RESPONSE_TIME_LINE_HEIGHT, RESPONSE_TIME_MARGIN, RESPONSE_TIME_SIZE,
+        RESPONSE_TIME_LINE_HEIGHT, RESPONSE_TIME_MARGIN, RESPONSE_TIME_SIZE, RetryImageGeneration,
         SUGGESTION_PRESSED_SCALE, THINKING_SHIMMER_DURATION, THINKING_SHIMMER_FRAME_INTERVAL,
         THINKING_SHIMMER_STEPS, THINKING_SHIMMER_WIDTH, TOOL_GROUP_BODY_MAX_HEIGHT,
         TOOL_GROUP_CHEVRON_SIZE, TOOL_GROUP_EDGE_FADE_DISTANCE, TOOL_GROUP_HEADER_CHEVRON_GAP,
@@ -4528,19 +4817,21 @@ mod tests {
         collaboration_ui_identity, command_activity_row_count, command_activity_summaries,
         command_activity_summary, completed_reasoning_body, completed_tool_group_summary,
         conversation_status, format_reasoning_elapsed, generic_command_activity_summary,
-        humanize_mcp_tool_name, mcp_tool_call_label, reasoning_activity_title,
-        reasoning_header_label, reasoning_transition_ease, scroll_should_follow_output,
-        strip_terminal_line_ending, thinking_shimmer_alpha, thinking_shimmer_band_left,
-        thinking_shimmer_progress, thinking_shimmer_step, toggle_collaboration_item,
-        toggle_reasoning_item, toggle_tool_activity_group, tool_group_chevron_transition_ease,
-        tool_group_reasoning_title, user_message_paragraphs,
+        humanize_mcp_tool_name, image_generation_preview_size, mcp_tool_call_label,
+        reasoning_activity_title, reasoning_header_label, reasoning_transition_ease,
+        scroll_should_follow_output, strip_terminal_line_ending, thinking_shimmer_alpha,
+        thinking_shimmer_band_left, thinking_shimmer_progress, thinking_shimmer_step,
+        toggle_collaboration_item, toggle_reasoning_item, toggle_tool_activity_group,
+        tool_group_chevron_transition_ease, tool_group_reasoning_title, user_message_paragraphs,
     };
     use crate::agent::{
         AgentCollaboration, AgentCollaborationStatus, AgentCollaborationTool,
-        AgentCollaboratorState, AgentCollaboratorStatus, AgentContextCompaction, AgentImageView,
-        AgentMcpToolCall, AgentMcpToolCallStatus, CommandExecution, CommandExecutionAction,
-        CommandExecutionStatus, HistoryItemDetail, HistoryTurnStatus, LegacySubAgentActivityKind,
-        ThreadActivity, ThreadHistory, ThreadHistoryItem, ThreadSummary, ThreadTurn,
+        AgentCollaboratorState, AgentCollaboratorStatus, AgentContextCompaction,
+        AgentImageGeneration, AgentImageGenerationFailure, AgentImageGenerationStatus,
+        AgentImageView, AgentMcpToolCall, AgentMcpToolCallStatus, CommandExecution,
+        CommandExecutionAction, CommandExecutionStatus, HistoryItemDetail, HistoryTurnStatus,
+        LegacySubAgentActivityKind, ThreadActivity, ThreadHistory, ThreadHistoryItem,
+        ThreadSummary, ThreadTurn,
     };
     use crate::components::{
         composer::{ConversationActivity, ConversationPhase, ReasoningActivityPresentation},
@@ -4690,6 +4981,75 @@ mod tests {
             separated_units[2],
             ActivityStreamUnit::ToolGroup(_)
         ));
+    }
+
+    #[test]
+    fn image_generation_is_standalone_and_preserves_reference_geometry() {
+        let image = AgentImageGeneration {
+            id: "generated_1".into(),
+            status: AgentImageGenerationStatus::Completed,
+            revised_prompt: None,
+            path: Some(PathBuf::from("/tmp/generated.png")),
+            dimensions: Some((1024, 512)),
+            transparent_background: Some(false),
+            failure: None,
+            load_error: None,
+        };
+        let units = activity_stream_units(&[
+            ConversationActivity::Command(command(
+                "read_1",
+                CommandExecutionAction::Read {
+                    command: "cat prompt.txt".into(),
+                    name: "prompt.txt".into(),
+                    path: "prompt.txt".into(),
+                },
+                CommandExecutionStatus::Completed,
+            )),
+            ConversationActivity::ImageGeneration(image.clone()),
+        ]);
+        assert_eq!(units.len(), 2);
+        assert!(matches!(units[0], ActivityStreamUnit::ToolGroup(_)));
+        assert!(matches!(
+            &units[1],
+            ActivityStreamUnit::Standalone(ConversationActivity::ImageGeneration(actual))
+                if actual == &image
+        ));
+        assert_eq!(
+            image_generation_preview_size(Some((1024, 1024))),
+            (480.0, 480.0)
+        );
+        assert_eq!(
+            image_generation_preview_size(Some((1024, 512))),
+            (480.0, 240.0)
+        );
+        assert_eq!(
+            image_generation_preview_size(Some((512, 1024))),
+            (240.0, 480.0)
+        );
+    }
+
+    #[test]
+    fn image_generation_failure_copy_keeps_typed_quota_metadata() {
+        let image = AgentImageGeneration {
+            id: "generated_failed".into(),
+            status: AgentImageGenerationStatus::Failed,
+            revised_prompt: None,
+            path: None,
+            dimensions: None,
+            transparent_background: None,
+            failure: Some(AgentImageGenerationFailure::UsageLimitExceeded {
+                limit_id: "image_generation".into(),
+                resets_at: Some(1_788_566_400),
+            }),
+            load_error: None,
+        };
+        let (title, detail) = super::image_generation_failure_copy(&image);
+        assert_eq!(title, "图像生成额度已用完");
+        assert!(detail.contains("image_generation"));
+        assert!(detail.contains("重置"));
+
+        fn assert_retry_event<T: gpui::EventEmitter<RetryImageGeneration>>() {}
+        assert_retry_event::<HomeView>();
     }
 
     #[test]
@@ -5846,6 +6206,56 @@ mod tests {
             *preview_path.lock().unwrap(),
             Some(PathBuf::from("/tmp/image-view.png"))
         );
+    }
+
+    #[test]
+    fn generated_image_preview_and_failure_retry_respond_to_real_clicks() {
+        let suffix = std::process::id();
+        let path = std::env::temp_dir().join(format!("gpui-generated-card-{suffix}.png"));
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            .unwrap();
+        std::fs::write(&path, png).unwrap();
+
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Dark, cx),
+        );
+        window.update(|home, _, cx| {
+            home.set_image_generation_for_capture("completed", Some(path.clone()), cx)
+        });
+        let preview = Arc::new(Mutex::new(None));
+        let observed_preview = preview.clone();
+        let retries = Arc::new(Mutex::new(0usize));
+        let observed_retries = retries.clone();
+        let home = window.root();
+        let _observer = app.new_entity(|cx| {
+            cx.subscribe(&home, move |_: &mut (), _, event: &OpenImagePreview, _| {
+                *observed_preview.lock().unwrap() = Some(event.0.clone());
+            })
+            .detach();
+            cx.subscribe(&home, move |_: &mut (), _, _: &RetryImageGeneration, _| {
+                *observed_retries.lock().unwrap() += 1;
+            })
+            .detach();
+        });
+        window.draw();
+        window.simulate_click(point(px(220.0), px(320.0)), MouseButton::Left);
+        assert_eq!(*preview.lock().unwrap(), Some(path.clone()));
+
+        window.update(|home, _, cx| home.set_image_generation_for_capture("failed", None, cx));
+        window.draw();
+        window.simulate_click(point(px(110.0), px(248.0)), MouseButton::Left);
+        assert_eq!(*retries.lock().unwrap(), 1);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

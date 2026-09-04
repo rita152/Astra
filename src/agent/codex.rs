@@ -2,6 +2,7 @@ mod manager;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fs,
     io::Write,
     path::{Path, PathBuf},
     process::Child,
@@ -19,6 +20,7 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_channel::{Receiver, Sender};
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -30,7 +32,8 @@ use super::{
     AgentConfigWarning, AgentConnectionEvent, AgentCreditsSnapshot, AgentEffectivePermissions,
     AgentEvent, AgentFileChange, AgentFileChangeEntry, AgentFileChangeKind, AgentFileChangeStatus,
     AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemPermissionEntry,
-    AgentFileSystemSpecialPath, AgentImageView, AgentInterruptControl, AgentInterruptOutcome,
+    AgentFileSystemSpecialPath, AgentImageGeneration, AgentImageGenerationFailure,
+    AgentImageGenerationStatus, AgentImageView, AgentInterruptControl, AgentInterruptOutcome,
     AgentMcpServerStartupFailureReason, AgentMcpServerStartupState, AgentMcpServerStartupStatus,
     AgentMcpToolCall, AgentMcpToolCallStatus, AgentModel, AgentModelCatalog, AgentOptionalField,
     AgentPermissionMode, AgentPermissionProfile, AgentPermissionRequestProfile,
@@ -2034,6 +2037,16 @@ fn process_turn_message<W: Write + Send + 'static>(
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
+                "imageGeneration" => {
+                    let image = parse_image_generation(item, false)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::ImageGenerationUpdated(image),
+                        "item/started imageGeneration",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
                 "contextCompaction" => {
                     let compaction = parse_context_compaction(item, false)
                         .map_err(|error| turn_item_protocol_error(message, error))?;
@@ -2245,6 +2258,16 @@ fn process_turn_message<W: Write + Send + 'static>(
                         events,
                         AgentEvent::ImageViewed(image),
                         "item/completed imageView",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
+                "imageGeneration" => {
+                    let image = parse_image_generation(item, false)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::ImageGenerationUpdated(image),
+                        "item/completed imageGeneration",
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
@@ -3103,6 +3126,306 @@ fn parse_image_view(item: &serde_json::Map<String, Value>) -> Result<AgentImageV
     Ok(AgentImageView {
         id: required_item_string(item, "imageView", "id")?,
         path: PathBuf::from(required_item_string(item, "imageView", "path")?),
+    })
+}
+
+fn optional_image_generation_string(
+    item: &serde_json::Map<String, Value>,
+    field: &str,
+    legacy_field: &str,
+    allow_legacy: bool,
+) -> Result<Option<String>> {
+    let value = item
+        .get(field)
+        .or_else(|| allow_legacy.then(|| item.get(legacy_field)).flatten());
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => bail!("imageGeneration item.{field} 必须是字符串或 null"),
+    }
+}
+
+fn optional_image_generation_bool(
+    item: &serde_json::Map<String, Value>,
+    field: &str,
+    legacy_field: &str,
+    allow_legacy: bool,
+) -> Result<Option<bool>> {
+    let value = item
+        .get(field)
+        .or_else(|| allow_legacy.then(|| item.get(legacy_field)).flatten());
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => bail!("imageGeneration item.{field} 必须是布尔值或 null"),
+    }
+}
+
+fn optional_image_generation_i64(
+    value: &serde_json::Map<String, Value>,
+    field: &str,
+    legacy_field: &str,
+    allow_legacy: bool,
+    context: &str,
+) -> Result<Option<i64>> {
+    let value = value
+        .get(field)
+        .or_else(|| allow_legacy.then(|| value.get(legacy_field)).flatten());
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_i64()
+            .map(Some)
+            .with_context(|| format!("{context}.{field} 必须是 int64 或 null")),
+        Some(_) => bail!("{context}.{field} 必须是 int64 或 null"),
+    }
+}
+
+fn parse_image_generation_failure(
+    item: &serde_json::Map<String, Value>,
+    allow_legacy: bool,
+) -> Result<Option<AgentImageGenerationFailure>> {
+    let Some(failure) = item.get("failure") else {
+        return Ok(None);
+    };
+    let Value::Object(failure) = failure else {
+        if failure.is_null() {
+            return Ok(None);
+        }
+        bail!("imageGeneration item.failure 必须是对象或 null");
+    };
+    let failure_type = failure
+        .get("type")
+        .and_then(Value::as_str)
+        .context("imageGeneration item.failure.type 必须是字符串")?;
+    match failure_type {
+        "usageLimitExceeded" | "usage_limit_exceeded" if allow_legacy => {
+            let limit_id = failure
+                .get("limitId")
+                .or_else(|| failure.get("limit_id"))
+                .and_then(Value::as_str)
+                .context("imageGeneration item.failure.limitId 必须是字符串")?
+                .to_owned();
+            Ok(Some(AgentImageGenerationFailure::UsageLimitExceeded {
+                limit_id,
+                resets_at: optional_image_generation_i64(
+                    failure,
+                    "resetsAt",
+                    "resets_at",
+                    true,
+                    "imageGeneration item.failure",
+                )?,
+            }))
+        }
+        "usageLimitExceeded" => {
+            let limit_id = failure
+                .get("limitId")
+                .and_then(Value::as_str)
+                .context("imageGeneration item.failure.limitId 必须是字符串")?
+                .to_owned();
+            Ok(Some(AgentImageGenerationFailure::UsageLimitExceeded {
+                limit_id,
+                resets_at: optional_image_generation_i64(
+                    failure,
+                    "resetsAt",
+                    "resetsAt",
+                    false,
+                    "imageGeneration item.failure",
+                )?,
+            }))
+        }
+        other => bail!("imageGeneration item.failure.type 包含未知值 `{other}`"),
+    }
+}
+
+fn sanitized_image_generation_id(item_id: &str) -> String {
+    let sanitized = item_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(160)
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "image".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn image_file_extension(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png"
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        "jpg"
+    } else if bytes.starts_with(b"GIF8") {
+        "gif"
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        "webp"
+    } else {
+        "img"
+    }
+}
+
+fn materialize_image_generation_result(item_id: &str, encoded: &str) -> Result<PathBuf> {
+    let encoded = encoded
+        .split_once(',')
+        .filter(|(prefix, _)| prefix.starts_with("data:image/"))
+        .map_or(encoded, |(_, bytes)| bytes);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("imageGeneration item.result 不是有效 base64")?;
+    if bytes.is_empty() {
+        bail!("imageGeneration item.result 解码为空");
+    }
+    let directory = std::env::temp_dir()
+        .join("gpui-chat-clone")
+        .join("generated-images");
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("无法创建 imageGeneration 缓存目录 {}", directory.display()))?;
+    let path = directory.join(format!(
+        "{}.{}",
+        sanitized_image_generation_id(item_id),
+        image_file_extension(&bytes)
+    ));
+    fs::write(&path, bytes)
+        .with_context(|| format!("无法写入 imageGeneration 缓存 {}", path.display()))?;
+    Ok(path)
+}
+
+pub(crate) fn generated_image_dimensions(path: &Path) -> Result<Option<(u32, u32)>> {
+    let bytes = fs::read(path).with_context(|| format!("无法读取生成的图像 {}", path.display()))?;
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.len() >= 24 {
+        return Ok(Some((
+            u32::from_be_bytes(bytes[16..20].try_into().expect("four PNG width bytes")),
+            u32::from_be_bytes(bytes[20..24].try_into().expect("four PNG height bytes")),
+        )));
+    }
+    if bytes.starts_with(b"GIF8") && bytes.len() >= 10 {
+        return Ok(Some((
+            u16::from_le_bytes([bytes[6], bytes[7]]).into(),
+            u16::from_le_bytes([bytes[8], bytes[9]]).into(),
+        )));
+    }
+    if bytes.starts_with(b"\xff\xd8") {
+        let mut offset = 2usize;
+        while offset + 9 < bytes.len() {
+            if bytes[offset] != 0xff {
+                offset += 1;
+                continue;
+            }
+            let marker = bytes[offset + 1];
+            offset += 2;
+            if matches!(marker, 0xd8 | 0xd9 | 0x01) || (0xd0..=0xd7).contains(&marker) {
+                continue;
+            }
+            if offset + 2 > bytes.len() {
+                break;
+            }
+            let segment_length =
+                usize::from(u16::from_be_bytes([bytes[offset], bytes[offset + 1]]));
+            if segment_length < 2 || offset + segment_length > bytes.len() {
+                break;
+            }
+            if matches!(
+                marker,
+                0xc0 | 0xc1
+                    | 0xc2
+                    | 0xc3
+                    | 0xc5
+                    | 0xc6
+                    | 0xc7
+                    | 0xc9
+                    | 0xca
+                    | 0xcb
+                    | 0xcd
+                    | 0xce
+                    | 0xcf
+            ) && segment_length >= 7
+            {
+                return Ok(Some((
+                    u16::from_be_bytes([bytes[offset + 5], bytes[offset + 6]]).into(),
+                    u16::from_be_bytes([bytes[offset + 3], bytes[offset + 4]]).into(),
+                )));
+            }
+            offset += segment_length;
+        }
+    }
+    Ok(None)
+}
+
+pub(super) fn parse_image_generation(
+    item: &serde_json::Map<String, Value>,
+    allow_legacy: bool,
+) -> Result<AgentImageGeneration> {
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .context("imageGeneration item.type 必须是字符串")?;
+    if item_type != "imageGeneration" && !(allow_legacy && item_type == "image_generation") {
+        bail!("imageGeneration item.type 包含未知值 `{item_type}`");
+    }
+    let id = required_item_string(item, "imageGeneration", "id")?;
+    let status = match required_item_string(item, "imageGeneration", "status")?.as_str() {
+        "in_progress" => AgentImageGenerationStatus::InProgress,
+        "inProgress" if allow_legacy => AgentImageGenerationStatus::InProgress,
+        "completed" => AgentImageGenerationStatus::Completed,
+        "failed" => AgentImageGenerationStatus::Failed,
+        other => bail!("imageGeneration item.status 包含未知值 `{other}`"),
+    };
+    let revised_prompt =
+        optional_image_generation_string(item, "revisedPrompt", "revised_prompt", allow_legacy)?;
+    let transparent_background = optional_image_generation_bool(
+        item,
+        "transparentBackground",
+        "transparent_background",
+        allow_legacy,
+    )?;
+    let failure = parse_image_generation_failure(item, allow_legacy)?;
+    let saved_path =
+        optional_image_generation_string(item, "savedPath", "saved_path", allow_legacy)?
+            .map(PathBuf::from);
+    let result = match item.get("result") {
+        Some(Value::String(value)) => value.as_str(),
+        None if allow_legacy => "",
+        Some(_) => bail!("imageGeneration item.result 必须是字符串"),
+        None => bail!("imageGeneration item.result 必须是字符串"),
+    };
+
+    let (path, dimensions, load_error) = if status == AgentImageGenerationStatus::Completed {
+        let resolved_path = match saved_path {
+            Some(path) if path.is_file() => Ok(Some(path)),
+            missing_or_unreadable if !result.is_empty() => {
+                materialize_image_generation_result(&id, result).map(Some)
+            }
+            Some(path) => Err(anyhow!("生成的图像文件不存在：{}", path.display())),
+            None => Err(anyhow!("生成结果缺少 savedPath，且 result 为空")),
+        };
+        match resolved_path {
+            Ok(Some(path)) => match generated_image_dimensions(&path) {
+                Ok(dimensions) => (Some(path), dimensions, None),
+                Err(error) => (None, None, Some(format!("{error:#}"))),
+            },
+            Ok(None) => (None, None, Some("生成结果没有可显示的图像".to_owned())),
+            Err(error) => (None, None, Some(format!("{error:#}"))),
+        }
+    } else {
+        (None, None, None)
+    };
+
+    Ok(AgentImageGeneration {
+        id,
+        status,
+        revised_prompt,
+        path,
+        dimensions,
+        transparent_background,
+        failure,
+        load_error,
     })
 }
 
@@ -4603,13 +4926,14 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use base64::Engine as _;
     use serde_json::{Value, json};
 
     use super::{
         AgentAccountRateLimits, AgentBackend, AgentCommandApprovalChoice, AgentConfigWarning,
-        AgentCreditsSnapshot, AgentEvent, AgentFileChangeStatus, AgentImageView,
-        AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome,
-        AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
+        AgentCreditsSnapshot, AgentEvent, AgentFileChangeStatus, AgentImageGenerationFailure,
+        AgentImageGenerationStatus, AgentImageView, AgentInterruptControl, AgentInterruptHandle,
+        AgentInterruptOutcome, AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
         AgentMcpServerStartupStatus, AgentMcpToolCall, AgentMcpToolCallStatus, AgentOptionalField,
         AgentPermissionMode, AgentPermissionsApprovalChoice, AgentRateLimitWindow, AgentReasoning,
         AgentRequest, AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
@@ -8212,6 +8536,159 @@ mod tests {
     }
 
     #[test]
+    fn image_generation_started_completed_and_failed_map_to_canonical_items() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut streamed_text = false;
+        let started = turn_item_message(
+            "item/started",
+            json!({
+                "type": "imageGeneration",
+                "id": "image_generation_live",
+                "status": "in_progress",
+                "revisedPrompt": null,
+                "result": "",
+                "transparentBackground": null,
+                "failure": null
+            }),
+        );
+        super::process_turn_message(
+            &session,
+            &started,
+            "thr_1",
+            "turn_1",
+            &tx,
+            &mut streamed_text,
+        )
+        .unwrap();
+
+        let mut png_header = b"\x89PNG\r\n\x1a\n".to_vec();
+        png_header.extend_from_slice(&[0, 0, 0, 13, b'I', b'H', b'D', b'R']);
+        png_header.extend_from_slice(&1024u32.to_be_bytes());
+        png_header.extend_from_slice(&768u32.to_be_bytes());
+        let completed = turn_item_message(
+            "item/completed",
+            json!({
+                "type": "imageGeneration",
+                "id": "image_generation_live",
+                "status": "completed",
+                "revisedPrompt": "a red paper airplane",
+                "result": base64::engine::general_purpose::STANDARD.encode(&png_header),
+                "transparentBackground": false,
+                "failure": null,
+                "savedPath": null
+            }),
+        );
+        super::process_turn_message(
+            &session,
+            &completed,
+            "thr_1",
+            "turn_1",
+            &tx,
+            &mut streamed_text,
+        )
+        .unwrap();
+
+        let failed = turn_item_message(
+            "item/completed",
+            json!({
+                "type": "imageGeneration",
+                "id": "image_generation_failed",
+                "status": "failed",
+                "revisedPrompt": null,
+                "result": "",
+                "transparentBackground": null,
+                "failure": {
+                    "type": "usageLimitExceeded",
+                    "limitId": "image_generation",
+                    "resetsAt": 1788566400
+                }
+            }),
+        );
+        super::process_turn_message(
+            &session,
+            &failed,
+            "thr_1",
+            "turn_1",
+            &tx,
+            &mut streamed_text,
+        )
+        .unwrap();
+        drop(tx);
+
+        let AgentEvent::ImageGenerationUpdated(started) = rx.try_recv().unwrap() else {
+            panic!("expected started image generation");
+        };
+        assert_eq!(started.status, AgentImageGenerationStatus::InProgress);
+        assert!(started.path.is_none());
+
+        let AgentEvent::ImageGenerationUpdated(completed) = rx.try_recv().unwrap() else {
+            panic!("expected completed image generation");
+        };
+        assert_eq!(completed.status, AgentImageGenerationStatus::Completed);
+        assert_eq!(completed.dimensions, Some((1024, 768)));
+        assert_eq!(
+            completed.revised_prompt.as_deref(),
+            Some("a red paper airplane")
+        );
+        let materialized = completed
+            .path
+            .expect("base64 result should be materialized");
+        assert!(materialized.is_file());
+        std::fs::remove_file(materialized).unwrap();
+
+        let AgentEvent::ImageGenerationUpdated(failed) = rx.try_recv().unwrap() else {
+            panic!("expected failed image generation");
+        };
+        assert_eq!(failed.status, AgentImageGenerationStatus::Failed);
+        assert!(matches!(
+            failed.failure,
+            Some(AgentImageGenerationFailure::UsageLimitExceeded {
+                ref limit_id,
+                resets_at: Some(1788566400)
+            }) if limit_id == "image_generation"
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn image_generation_current_schema_fails_fast_but_history_aliases_are_compatible() {
+        for (item, expected) in [
+            (
+                json!({"type":"imageGeneration","id":"image_1","status":"completed"}),
+                "item.result",
+            ),
+            (
+                json!({"type":"imageGeneration","id":"image_1","status":"done","result":""}),
+                "item.status",
+            ),
+            (
+                json!({"type":"imageGeneration","id":"image_1","status":"failed","result":"","failure":{"type":"usageLimitExceeded","limitId":1}}),
+                "failure.limitId",
+            ),
+        ] {
+            assert_turn_message_fails(
+                &turn_item_message("item/completed", item),
+                &["imageGeneration", expected],
+            );
+        }
+
+        let legacy = json!({
+            "type": "image_generation",
+            "id": "legacy_image",
+            "status": "inProgress",
+            "revised_prompt": "legacy prompt",
+            "transparent_background": true,
+            "saved_path": null,
+            "failure": null
+        });
+        let parsed = super::parse_image_generation(legacy.as_object().unwrap(), true).unwrap();
+        assert_eq!(parsed.status, AgentImageGenerationStatus::InProgress);
+        assert_eq!(parsed.revised_prompt.as_deref(), Some("legacy prompt"));
+        assert_eq!(parsed.transparent_background, Some(true));
+    }
+
+    #[test]
     fn context_compaction_started_and_completed_map_to_the_same_agent_item() {
         let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
         let (tx, rx) = async_channel::unbounded();
@@ -8629,7 +9106,6 @@ mod tests {
             "dynamicToolCall",
             "webSearch",
             "sleep",
-            "imageGeneration",
             "enteredReviewMode",
             "exitedReviewMode",
         ] {

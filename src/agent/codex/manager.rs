@@ -18,8 +18,8 @@ use super::{
     PermissionProfileListResponse, TURN_SCOPED_SERVER_METHODS, TurnOutcome,
     cleanup_pending_server_requests, ensure_server_method_is_defined,
     ensure_session_message_matches, is_integrated_server_request_method, parse_agent_notification,
-    parse_collaboration, parse_mcp_server_startup_status_updated, parse_mcp_tool_call,
-    parse_thread_status_changed, process_turn_message, request_id_from_value,
+    parse_collaboration, parse_image_generation, parse_mcp_server_startup_status_updated,
+    parse_mcp_tool_call, parse_thread_status_changed, process_turn_message, request_id_from_value,
     thread_settings_update_request, thread_started_id, validate_remote_control_status_changed,
     validate_resume_goal_cleared,
 };
@@ -1167,6 +1167,14 @@ fn parse_history_item(value: &Value) -> Result<ThreadHistoryItem> {
             id: item_id,
             path: PathBuf::from(string_field(value, "path", "imageView item")?),
         })),
+        "imageGeneration" | "image_generation" => {
+            Ok(ThreadHistoryItem::ImageGeneration(parse_image_generation(
+                value
+                    .as_object()
+                    .context("imageGeneration history item 必须是对象")?,
+                true,
+            )?))
+        }
         "contextCompaction" => Ok(ThreadHistoryItem::ContextCompaction(
             crate::agent::AgentContextCompaction {
                 id: item_id,
@@ -1250,7 +1258,7 @@ fn validate_workspace_response<T>(
     match parsed {
         Ok(value) => Ok(value),
         Err(error) => {
-            let message = format!("无法解析 {method} 响应；Codex 0.152.1 schema 不匹配：{error:#}");
+            let message = format!("无法解析 {method} 响应；Codex 0.153.0 schema 不匹配：{error:#}");
             connection.fail_protocol(message.clone());
             bail!(message)
         }
@@ -2439,7 +2447,7 @@ impl CodexAppServerManager {
             match update.project {
                 AgentOptionalField::Unspecified => {}
                 AgentOptionalField::Null => {
-                    // Codex 0.152.1 uses an empty string as the explicit
+                    // Codex 0.153.0 uses an empty string as the explicit
                     // project-unassignment sentinel; null only represents an
                     // omitted optional field in the generated JSON schema.
                     params.insert("projectId".into(), Value::String(String::new()));
@@ -2578,7 +2586,7 @@ impl CodexAppServerManager {
                 Ok(page) => page,
                 Err(error) => {
                     let message =
-                        format!("无法解析 model/list 响应；0.152.1 schema 不匹配：{error}");
+                        format!("无法解析 model/list 响应；0.153.0 schema 不匹配：{error}");
                     connection.fail_protocol(message.clone());
                     bail!(message);
                 }
@@ -3018,12 +3026,12 @@ mod tests {
     };
     use crate::agent::{
         AgentCommandApprovalChoice, AgentConnectionEvent, AgentEvent, AgentFileChange,
-        AgentImageView, AgentInterruptOutcome, AgentMcpToolCallStatus, AgentOptionalField,
-        AgentPermissionMode, AgentPermissionsApprovalChoice, AgentRequest, AgentServerRequestId,
-        AgentUserInputAnswer, AgentUserInputResponse, CreateProject, FilterValue,
-        HistoryItemDetail, PageRequest, ProjectChange, SortDirection, ThreadHistoryItem,
-        ThreadListRequest, ThreadMetadataUpdate, ThreadSectionAppearance, ThreadSortKey,
-        UpdateProject,
+        AgentImageGenerationStatus, AgentImageView, AgentInterruptOutcome, AgentMcpToolCallStatus,
+        AgentOptionalField, AgentPermissionMode, AgentPermissionsApprovalChoice, AgentRequest,
+        AgentServerRequestId, AgentUserInputAnswer, AgentUserInputResponse, CreateProject,
+        FilterValue, HistoryItemDetail, PageRequest, ProjectChange, SortDirection,
+        ThreadHistoryItem, ThreadListRequest, ThreadMetadataUpdate, ThreadSectionAppearance,
+        ThreadSortKey, UpdateProject,
     };
 
     const WAIT: Duration = Duration::from_secs(3);
@@ -3167,6 +3175,47 @@ mod tests {
             tool_call.result.unwrap()["structuredContent"]["remaining"],
             29
         );
+    }
+
+    #[test]
+    fn history_image_generation_is_first_class_and_accepts_persisted_aliases() {
+        let current = parse_history_item(&json!({
+            "type": "imageGeneration",
+            "id": "generated_history_1",
+            "status": "failed",
+            "revisedPrompt": "a red paper airplane",
+            "result": "",
+            "transparentBackground": false,
+            "failure": {
+                "type": "usageLimitExceeded",
+                "limitId": "image_generation",
+                "resetsAt": null
+            },
+            "savedPath": null
+        }))
+        .unwrap();
+        assert!(matches!(
+            current,
+            ThreadHistoryItem::ImageGeneration(ref image)
+                if image.status == AgentImageGenerationStatus::Failed
+                    && image.revised_prompt.as_deref() == Some("a red paper airplane")
+        ));
+
+        let legacy = parse_history_item(&json!({
+            "type": "image_generation",
+            "id": "generated_history_legacy",
+            "status": "inProgress",
+            "revised_prompt": "legacy prompt",
+            "transparent_background": true,
+            "saved_path": null
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            ThreadHistoryItem::ImageGeneration(ref image)
+                if image.status == AgentImageGenerationStatus::InProgress
+                    && image.transparent_background == Some(true)
+        ));
     }
 
     struct ChannelReader {
@@ -3524,7 +3573,7 @@ mod tests {
             "updatedAt": 20,
             "recencyAt": 30,
             "status": { "type": "idle" },
-            "cliVersion": "0.152.1",
+            "cliVersion": "0.153.0",
             "ephemeral": false,
             "modelProvider": "openai",
             "sessionId": id,
@@ -3541,7 +3590,7 @@ mod tests {
             !serde_json::to_string(&request)
                 .unwrap()
                 .contains("isPinned"),
-            "0.152.1 does not define isPinned: {request}"
+            "0.153.0 does not define isPinned: {request}"
         );
         request
     }

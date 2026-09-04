@@ -16,7 +16,10 @@ use gpui::{
 gpui::actions!(permission_ui, [DismissPermissionUi]);
 
 use crate::{
-    agent::{AgentBackend, CodexAppServerBackend, CodexAppServerManager, ProjectId, ThreadId},
+    agent::{
+        AgentBackend, CodexAppServerBackend, CodexAppServerManager, ProjectId, ThreadId,
+        generated_image_dimensions,
+    },
     components::{
         composer::{
             ComposerView, ConversationThreadCreated, ModelCatalogLoadFinished,
@@ -26,7 +29,9 @@ use crate::{
             DiffFileVisualState, DiffReviewCallback, DiffReviewEvent, DiffReviewPresentation,
             captured_diff_review_fixture, render_diff_review_panel,
         },
-        home::{HomeView, OpenDiffReview, OpenImagePreview, OpenSubAgentThread},
+        home::{
+            HomeView, OpenDiffReview, OpenImagePreview, OpenSubAgentThread, RetryImageGeneration,
+        },
         icons::icon,
         sidebar::{NewConversation, OpenProjectCreation, OpenSettings, SelectThread, SidebarView},
     },
@@ -81,6 +86,7 @@ pub struct ChatApp {
     right_panel_resize_pointer_offset: f32,
     diff_review: Option<DiffReviewPresentation>,
     image_preview: Option<PathBuf>,
+    image_preview_dimensions: Option<(u32, u32)>,
     image_preview_zoom: f32,
     permission_confirmation_open: bool,
     project_creation_open: bool,
@@ -388,12 +394,20 @@ impl ChatApp {
         .detach();
         cx.subscribe(&home, |this, _, event: &OpenImagePreview, cx| {
             this.image_preview = Some(event.0.clone());
+            this.image_preview_dimensions = generated_image_dimensions(&event.0).ok().flatten();
             this.image_preview_zoom = 1.0;
             cx.notify();
         })
         .detach();
         cx.subscribe(&home, |this, _, event: &OpenSubAgentThread, cx| {
             this.select_conversation(event.0.clone(), cx);
+        })
+        .detach();
+        cx.subscribe(&home, |this, _, _: &RetryImageGeneration, cx| {
+            if let Some(host) = this.conversation_hosts.get(&this.active_conversation) {
+                host.composer
+                    .update(cx, |composer, cx| composer.retry_image_generation(cx));
+            }
         })
         .detach();
         cx.subscribe(&home, |this, _, event: &ConversationThreadCreated, cx| {
@@ -468,6 +482,7 @@ impl ChatApp {
             right_panel_resize_pointer_offset: 0.0,
             diff_review: None,
             image_preview: None,
+            image_preview_dimensions: None,
             image_preview_zoom: 1.0,
             permission_confirmation_open: false,
             project_creation_open: false,
@@ -907,6 +922,18 @@ impl ChatApp {
         cx.notify();
     }
 
+    pub fn set_image_generation_for_capture(
+        &mut self,
+        state: &str,
+        path: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        self.home.update(cx, |home, cx| {
+            home.set_image_generation_for_capture(state, path, cx)
+        });
+        cx.notify();
+    }
+
     fn handle_diff_review_event(&mut self, event: DiffReviewEvent, cx: &mut Context<Self>) {
         match event {
             DiffReviewEvent::Close => {
@@ -1060,6 +1087,7 @@ impl ChatApp {
     ) {
         if self.image_preview.is_some() && event.keystroke.key == "escape" {
             self.image_preview = None;
+            self.image_preview_dimensions = None;
             self.image_preview_zoom = 1.0;
             cx.stop_propagation();
             cx.notify();
@@ -2914,6 +2942,7 @@ impl Render for ChatApp {
                 let image_width = (f32::from(viewport.width) - 64.0).max(160.0) * zoom;
                 let image_height = (f32::from(viewport.height) - 128.0).max(120.0) * zoom;
                 let percentage = format!("{}%", (zoom * 100.0).round() as i32);
+                let preview_dimensions = self.image_preview_dimensions;
                 shell.child(
                     div()
                         .id("image-preview-dialog")
@@ -2925,6 +2954,7 @@ impl Render for ChatApp {
                         .overflow_hidden()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.image_preview = None;
+                            this.image_preview_dimensions = None;
                             this.image_preview_zoom = 1.0;
                             cx.notify();
                         }))
@@ -3034,6 +3064,7 @@ impl Render for ChatApp {
                                         .hover(move |button| button.bg(theme.elevated))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.image_preview = None;
+                                            this.image_preview_dimensions = None;
                                             this.image_preview_zoom = 1.0;
                                             cx.stop_propagation();
                                             cx.notify();
@@ -3045,6 +3076,7 @@ impl Render for ChatApp {
                                                     "enter" | "space"
                                                 ) {
                                                     this.image_preview = None;
+                                                    this.image_preview_dimensions = None;
                                                     this.image_preview_zoom = 1.0;
                                                     cx.stop_propagation();
                                                     cx.notify();
@@ -3071,6 +3103,15 @@ impl Render for ChatApp {
                                         .items_center()
                                         .gap(px(8.0))
                                         .on_click(|_, _, cx| cx.stop_propagation())
+                                        .when_some(preview_dimensions, |controls, (width, height)| {
+                                            controls.child(
+                                                div()
+                                                    .px(px(10.0))
+                                                    .text_size(px(13.0))
+                                                    .text_color(theme.text_secondary)
+                                                    .child(format!("{width} × {height}")),
+                                            )
+                                        })
                                         .child(
                                             div()
                                                 .id("image-preview-zoom-out")
@@ -3225,6 +3266,7 @@ mod tests {
             chat.startup_sidebar_resolved = true;
             chat.startup_minimum_duration_elapsed = true;
             chat.image_preview = Some(source.clone());
+            chat.image_preview_dimensions = Some((1024, 1024));
             chat.image_preview_zoom = 1.75;
             cx.notify();
         });
@@ -3245,6 +3287,7 @@ mod tests {
         window.simulate_click(point(px(866.0), px(32.0)), MouseButton::Left);
         window.read(|chat, _| {
             assert_eq!(chat.image_preview, None);
+            assert_eq!(chat.image_preview_dimensions, None);
             assert_eq!(chat.image_preview_zoom, 1.0);
         });
 

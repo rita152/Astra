@@ -10,6 +10,7 @@ use std::{
 use async_channel::Receiver;
 use serde_json::Value;
 
+pub(crate) use codex::generated_image_dimensions;
 pub use codex::{CodexAppServerBackend, CodexAppServerManager};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -362,6 +363,7 @@ pub enum ThreadHistoryItem {
     },
     FileChange(AgentFileChange),
     ImageView(AgentImageView),
+    ImageGeneration(AgentImageGeneration),
     ContextCompaction(AgentContextCompaction),
     Collaboration(AgentCollaboration),
     McpToolCall(AgentMcpToolCall),
@@ -455,6 +457,13 @@ pub enum AgentMcpToolCallStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentImageGenerationStatus {
+    InProgress,
+    Completed,
+    Failed,
+}
+
 /// Agent-neutral representation of the app-server `mcpToolCall` thread item.
 ///
 /// JSON-valued fields intentionally remain lossless: connector arguments,
@@ -478,6 +487,31 @@ pub struct AgentMcpToolCall {
     pub duration_ms: Option<i64>,
     /// Live `item/mcpToolCall/progress` messages observed for this item.
     pub progress: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentImageGenerationFailure {
+    UsageLimitExceeded {
+        limit_id: String,
+        resets_at: Option<i64>,
+    },
+}
+
+/// Canonical, UI-ready representation of an app-server `imageGeneration` item.
+///
+/// The adapter resolves the potentially very large base64 `result` to a local
+/// file before emitting this value. Keeping transport bytes out of the UI model
+/// makes live upserts and paginated history hydration inexpensive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentImageGeneration {
+    pub id: String,
+    pub status: AgentImageGenerationStatus,
+    pub revised_prompt: Option<String>,
+    pub path: Option<PathBuf>,
+    pub dimensions: Option<(u32, u32)>,
+    pub transparent_background: Option<bool>,
+    pub failure: Option<AgentImageGenerationFailure>,
+    pub load_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1260,6 +1294,7 @@ pub enum AgentEvent {
     CommandCompleted(CommandExecution),
     FileChangeUpdated(AgentFileChange),
     ImageViewed(AgentImageView),
+    ImageGenerationUpdated(AgentImageGeneration),
     ContextCompactionUpdated(AgentContextCompaction),
     CollaborationUpdated(AgentCollaboration),
     McpToolCallUpdated(AgentMcpToolCall),

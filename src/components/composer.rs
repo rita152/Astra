@@ -14,17 +14,19 @@ use crate::{
         AgentCollaboratorStatus, AgentCommandApprovalChoice, AgentConfigWarning,
         AgentConnectionEvent, AgentContextCompaction, AgentCreditsSnapshot,
         AgentEffectivePermissions, AgentEvent, AgentFileChange, AgentFileChangeStatus,
-        AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemSpecialPath, AgentImageView,
-        AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
-        AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentMcpToolCall,
-        AgentMcpToolCallStatus, AgentModel, AgentModelCatalog, AgentOptionalField,
-        AgentPermissionMode, AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
-        AgentPermissionsApprovalHandle, AgentRateLimitWindow, AgentReasoning, AgentRequest,
-        AgentServerRequestFailureKind, AgentServerRequestKind, AgentServerRequestMetadata,
-        AgentThreadStatus, AgentThreadTokenUsage, AgentUserInputAnswer, AgentUserInputHandle,
-        AgentUserInputResponse, CodexAppServerBackend, CommandExecution, CommandExecutionAction,
-        CommandExecutionStatus, HistoryTurnStatus, LegacySubAgentActivityKind, ProjectId,
-        ThreadHistory, ThreadHistoryItem, normalize_user_message_for_display,
+        AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemSpecialPath,
+        AgentImageGeneration, AgentImageGenerationFailure, AgentImageGenerationStatus,
+        AgentImageView, AgentInterruptHandle, AgentInterruptOutcome,
+        AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
+        AgentMcpServerStartupStatus, AgentMcpToolCall, AgentMcpToolCallStatus, AgentModel,
+        AgentModelCatalog, AgentOptionalField, AgentPermissionMode, AgentPermissionRequestProfile,
+        AgentPermissionsApprovalChoice, AgentPermissionsApprovalHandle, AgentRateLimitWindow,
+        AgentReasoning, AgentRequest, AgentServerRequestFailureKind, AgentServerRequestKind,
+        AgentServerRequestMetadata, AgentThreadStatus, AgentThreadTokenUsage, AgentUserInputAnswer,
+        AgentUserInputHandle, AgentUserInputResponse, CodexAppServerBackend, CommandExecution,
+        CommandExecutionAction, CommandExecutionStatus, HistoryTurnStatus,
+        LegacySubAgentActivityKind, ProjectId, ThreadHistory, ThreadHistoryItem,
+        normalize_user_message_for_display,
     },
     components::{
         approval::{
@@ -182,6 +184,7 @@ pub enum ConversationActivity {
     PermissionsApproval(PermissionApprovalPresentation),
     FileChange(FileChangeActivityPresentation),
     ImageView(AgentImageView),
+    ImageGeneration(AgentImageGeneration),
     ContextCompaction(AgentContextCompaction),
     Collaboration(AgentCollaboration),
     McpToolCall(AgentMcpToolCall),
@@ -1077,6 +1080,16 @@ impl ComposerView {
         })
     }
 
+    pub fn has_active_image_generation(&self) -> bool {
+        self.conversation_activity.iter().any(|activity| {
+            matches!(
+                activity,
+                ConversationActivity::ImageGeneration(image)
+                    if image.status == AgentImageGenerationStatus::InProgress
+            )
+        })
+    }
+
     pub fn transcript_render_snapshot(&self) -> Vec<ConversationTranscriptTurn> {
         self.transcript.clone()
     }
@@ -1215,6 +1228,14 @@ impl ComposerView {
                         }
                         ThreadHistoryItem::ImageView(image) => {
                             activities.push(ConversationActivity::ImageView(image.clone()));
+                        }
+                        ThreadHistoryItem::ImageGeneration(image) => {
+                            if image.status != AgentImageGenerationStatus::InProgress
+                                || turn.status == HistoryTurnStatus::InProgress
+                            {
+                                activities
+                                    .push(ConversationActivity::ImageGeneration(image.clone()));
+                            }
                         }
                         ThreadHistoryItem::ContextCompaction(compaction) => {
                             activities
@@ -1805,6 +1826,21 @@ impl ComposerView {
                         self.conversation_phase = ConversationPhase::Streaming;
                     }
                 }
+                AgentEvent::ImageGenerationUpdated(image) => {
+                    if let Some(ConversationActivity::ImageGeneration(existing)) = self
+                        .conversation_activity
+                        .iter_mut()
+                        .find(|activity| matches!(activity, ConversationActivity::ImageGeneration(existing) if existing.id == image.id))
+                    {
+                        *existing = image;
+                    } else {
+                        self.conversation_activity
+                            .push(ConversationActivity::ImageGeneration(image));
+                    }
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Streaming;
+                    }
+                }
                 AgentEvent::ContextCompactionUpdated(compaction) => {
                     upsert_context_compaction_activity(&mut self.conversation_activity, compaction);
                     if self.conversation_phase != ConversationPhase::Stopping {
@@ -2233,6 +2269,7 @@ impl ComposerView {
                     });
                 }
                 AgentEvent::Completed => {
+                    remove_unfinished_image_generations(&mut self.conversation_activity);
                     if self.safety_buffering {
                         self.model_status = None;
                         self.safety_buffering = false;
@@ -2243,6 +2280,7 @@ impl ComposerView {
                     break;
                 }
                 AgentEvent::Interrupted => {
+                    remove_unfinished_image_generations(&mut self.conversation_activity);
                     self.assistant_message_time = Some(current_local_time_label());
                     self.conversation_phase = ConversationPhase::Stopped;
                     self.safety_buffering = false;
@@ -2250,6 +2288,7 @@ impl ComposerView {
                     break;
                 }
                 AgentEvent::Failed(error) => {
+                    remove_unfinished_image_generations(&mut self.conversation_activity);
                     self.assistant_message = error.clone();
                     let already_visible = self.conversation_activity.iter().rev().any(|activity| {
                         matches!(
@@ -2894,6 +2933,71 @@ impl ComposerView {
         ];
         cx.emit(ConversationChanged);
         cx.notify();
+    }
+
+    pub fn set_image_generation_for_capture(
+        &mut self,
+        state: &str,
+        path: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        self.user_message = Some(
+            "请务必调用图像生成工具生成一张 1024×1024 的正方形图片：纯白背景中央是一架红色纸飞机，极简扁平插画，无文字。只生成一张图。"
+                .to_owned(),
+        );
+        self.user_message_time = None;
+        self.assistant_message_time = None;
+        self.conversation_phase = if state == "running" {
+            ConversationPhase::Streaming
+        } else {
+            ConversationPhase::Complete
+        };
+        let status = match state {
+            "running" => AgentImageGenerationStatus::InProgress,
+            "failed" => AgentImageGenerationStatus::Failed,
+            _ => AgentImageGenerationStatus::Completed,
+        };
+        let failure =
+            (state == "failed").then(|| AgentImageGenerationFailure::UsageLimitExceeded {
+                limit_id: "image_generation".to_owned(),
+                resets_at: Some(1_788_566_400),
+            });
+        let load_error =
+            (state == "load-error").then(|| "生成的图像文件不存在，请重试。".to_owned());
+        let mut activities = Vec::new();
+        if status == AgentImageGenerationStatus::Completed && load_error.is_none() {
+            activities.push(ConversationActivity::AssistantMessage {
+                item_id: "msg-image-generation-final".to_owned(),
+                text: "已生成并校准为 **1024×1024 PNG**，仅一张图。".to_owned(),
+            });
+        }
+        activities.push(ConversationActivity::ImageGeneration(
+            AgentImageGeneration {
+                id: "image-generation-ui-capture".to_owned(),
+                status,
+                revised_prompt: Some(
+                    "纯白背景中央的一架红色纸飞机，极简扁平插画，无文字。".to_owned(),
+                ),
+                path,
+                dimensions: (status == AgentImageGenerationStatus::Completed)
+                    .then_some((1024, 1024)),
+                transparent_background: Some(false),
+                failure,
+                load_error,
+            },
+        ));
+        self.assistant_message = if status == AgentImageGenerationStatus::Completed {
+            "已生成并校准为 1024×1024 PNG，仅一张图。".to_owned()
+        } else {
+            String::new()
+        };
+        self.conversation_activity = activities;
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn retry_image_generation(&mut self, cx: &mut Context<Self>) {
+        self.submit_prompt("请重新生成上一张图像，保持相同要求。".to_owned(), cx);
     }
 
     pub fn set_tool_group_for_capture(&mut self, running: bool, cx: &mut Context<Self>) {
@@ -4429,6 +4533,16 @@ fn upsert_collaboration_activity(
     } else {
         activities.push(ConversationActivity::Collaboration(incoming));
     }
+}
+
+fn remove_unfinished_image_generations(activities: &mut Vec<ConversationActivity>) {
+    activities.retain(|activity| {
+        !matches!(
+            activity,
+            ConversationActivity::ImageGeneration(image)
+                if image.status == AgentImageGenerationStatus::InProgress
+        )
+    });
 }
 
 fn upsert_file_change_activity(
@@ -6210,22 +6324,22 @@ mod tests {
         AgentCollaborationStatus, AgentCollaborationTool, AgentCollaboratorState,
         AgentCollaboratorStatus, AgentCommandApprovalChoice, AgentCommandApprovalRequest,
         AgentConfigWarning, AgentConnectionEvent, AgentCreditsSnapshot, AgentEffectivePermissions,
-        AgentEvent, AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome,
-        AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
-        AgentMcpServerStartupStatus, AgentMcpToolCall, AgentMcpToolCallStatus, AgentModel,
-        AgentModelCatalog, AgentOptionalField, AgentPermissionMode, AgentPermissionProfile,
-        AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
-        AgentPermissionsApprovalControl, AgentPermissionsApprovalHandle,
-        AgentPermissionsApprovalRequest, AgentRateLimitWindow, AgentReasoning,
-        AgentReasoningEffort, AgentRequest, AgentRun, AgentServerRequestFailureKind,
-        AgentServerRequestId, AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier,
-        AgentSpendControlLimit, AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus,
-        AgentThreadStatusState, AgentThreadTokenUsage, AgentTokenUsageBreakdown,
-        AgentUserInputAnswer, AgentUserInputControl, AgentUserInputHandle, AgentUserInputOption,
-        AgentUserInputQuestion, AgentUserInputRequest, AgentUserInputResponse, CommandExecution,
-        CommandExecutionAction, CommandExecutionStatus, HistoryItemDetail, HistoryTurnStatus,
-        LegacySubAgentActivityKind, ThreadActivity, ThreadHistory, ThreadHistoryItem,
-        ThreadSummary, ThreadTurn,
+        AgentEvent, AgentImageGeneration, AgentImageGenerationStatus, AgentInterruptControl,
+        AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
+        AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentMcpToolCall,
+        AgentMcpToolCallStatus, AgentModel, AgentModelCatalog, AgentOptionalField,
+        AgentPermissionMode, AgentPermissionProfile, AgentPermissionRequestProfile,
+        AgentPermissionsApprovalChoice, AgentPermissionsApprovalControl,
+        AgentPermissionsApprovalHandle, AgentPermissionsApprovalRequest, AgentRateLimitWindow,
+        AgentReasoning, AgentReasoningEffort, AgentRequest, AgentRun,
+        AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
+        AgentServerRequestMetadata, AgentServiceTier, AgentSpendControlLimit,
+        AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus, AgentThreadStatusState,
+        AgentThreadTokenUsage, AgentTokenUsageBreakdown, AgentUserInputAnswer,
+        AgentUserInputControl, AgentUserInputHandle, AgentUserInputOption, AgentUserInputQuestion,
+        AgentUserInputRequest, AgentUserInputResponse, CommandExecution, CommandExecutionAction,
+        CommandExecutionStatus, HistoryItemDetail, HistoryTurnStatus, LegacySubAgentActivityKind,
+        ThreadActivity, ThreadHistory, ThreadHistoryItem, ThreadSummary, ThreadTurn,
     };
     use crate::components::approval::{ApprovalCardEvent, ApprovalDecision, ApprovalScope};
     use crate::components::permissions_approval::{
@@ -7801,6 +7915,54 @@ mod tests {
         assert_eq!(
             tool_call.result.as_ref().unwrap()["content"][0]["text"],
             "ok"
+        );
+    }
+
+    #[test]
+    fn image_generation_lifecycle_upserts_and_terminal_events_remove_only_loaders() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        let started = AgentImageGeneration {
+            id: "generated_1".into(),
+            status: AgentImageGenerationStatus::InProgress,
+            revised_prompt: None,
+            path: None,
+            dimensions: None,
+            transparent_background: None,
+            failure: None,
+            load_error: None,
+        };
+        let completed = AgentImageGeneration {
+            status: AgentImageGenerationStatus::Completed,
+            revised_prompt: Some("a red paper airplane".into()),
+            path: Some(PathBuf::from("/tmp/generated_1.png")),
+            dimensions: Some((1024, 1024)),
+            transparent_background: Some(false),
+            ..started.clone()
+        };
+
+        app.update_entity(&composer, |composer, _| {
+            assert!(!composer.apply_agent_event_batch(vec![
+                AgentEvent::ImageGenerationUpdated(started.clone()),
+                AgentEvent::ImageGenerationUpdated(completed.clone()),
+            ]));
+        });
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer
+                .conversation_activity_snapshot()),
+            vec![ConversationActivity::ImageGeneration(completed)]
+        );
+
+        app.update_entity(&composer, |composer, _| {
+            composer.conversation_activity = vec![ConversationActivity::ImageGeneration(started)];
+            assert!(composer.apply_agent_event_batch(vec![AgentEvent::Interrupted]));
+        });
+        assert!(app.read_entity(&composer, |composer, _| {
+            composer.conversation_activity_snapshot().is_empty()
+        }));
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer.conversation_phase()),
+            ConversationPhase::Stopped
         );
     }
 
