@@ -32,8 +32,9 @@ use super::{
     AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemPermissionEntry,
     AgentFileSystemSpecialPath, AgentImageView, AgentInterruptControl, AgentInterruptOutcome,
     AgentMcpServerStartupFailureReason, AgentMcpServerStartupState, AgentMcpServerStartupStatus,
-    AgentModel, AgentModelCatalog, AgentOptionalField, AgentPermissionMode, AgentPermissionProfile,
-    AgentPermissionRequestProfile, AgentPermissionsApprovalChoice, AgentPermissionsApprovalControl,
+    AgentMcpToolCall, AgentMcpToolCallStatus, AgentModel, AgentModelCatalog, AgentOptionalField,
+    AgentPermissionMode, AgentPermissionProfile, AgentPermissionRequestProfile,
+    AgentPermissionsApprovalChoice, AgentPermissionsApprovalControl,
     AgentPermissionsApprovalHandle, AgentPermissionsApprovalRequest, AgentRateLimitWindow,
     AgentReasoning, AgentReasoningEffort, AgentRequest, AgentRun, AgentServerRequestFailureKind,
     AgentServerRequestId, AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier,
@@ -121,6 +122,7 @@ const TURN_SCOPED_SERVER_METHODS: &[&str] = &[
     "item/commandExecution/requestApproval",
     "item/permissions/requestApproval",
     "item/tool/requestUserInput",
+    "tool/requestUserInput",
     "item/started",
     "item/agentMessage/delta",
     "item/commandExecution/outputDelta",
@@ -130,6 +132,7 @@ const TURN_SCOPED_SERVER_METHODS: &[&str] = &[
     "item/reasoning/summaryPartAdded",
     "item/reasoning/summaryTextDelta",
     "item/reasoning/textDelta",
+    "item/mcpToolCall/progress",
     "item/completed",
     "turn/diff/updated",
     "turn/started",
@@ -2051,6 +2054,16 @@ fn process_turn_message<W: Write + Send + 'static>(
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
+                "mcpToolCall" => {
+                    let tool_call = parse_mcp_tool_call(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::McpToolCallUpdated(tool_call),
+                        "item/started mcpToolCall",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
                 unsupported => {
                     return Err(turn_item_protocol_error(
                         message,
@@ -2149,6 +2162,18 @@ fn process_turn_message<W: Write + Send + 'static>(
                 "item/reasoning/textDelta",
             )?;
         }
+        Some("item/mcpToolCall/progress") => {
+            let item_id = required_notification_string(message, "itemId")?;
+            let progress_message = required_notification_string(message, "message")?;
+            send_turn_event(
+                events,
+                AgentEvent::McpToolCallProgress {
+                    item_id,
+                    message: progress_message,
+                },
+                "item/mcpToolCall/progress",
+            )?;
+        }
         Some("turn/diff/updated") => {
             let diff = required_notification_string(message, "diff")?;
             send_turn_event(
@@ -2243,6 +2268,16 @@ fn process_turn_message<W: Write + Send + 'static>(
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
+                "mcpToolCall" => {
+                    let tool_call = parse_mcp_tool_call(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::McpToolCallUpdated(tool_call),
+                        "item/completed mcpToolCall",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
                 unsupported => {
                     return Err(turn_item_protocol_error(
                         message,
@@ -2267,6 +2302,7 @@ fn process_turn_message<W: Write + Send + 'static>(
             "item/commandExecution/requestApproval"
             | "item/permissions/requestApproval"
             | "item/tool/requestUserInput"
+            | "tool/requestUserInput"
             | "serverRequest/resolved"
             | "remoteControl/status/changed"
             | "mcpServer/startupStatus/updated"
@@ -2302,6 +2338,7 @@ fn is_defined_server_method(method: &str) -> bool {
         "item/commandExecution/requestApproval"
             | "item/permissions/requestApproval"
             | "item/tool/requestUserInput"
+            | "tool/requestUserInput"
             | "serverRequest/resolved"
             | "item/started"
             | "item/agentMessage/delta"
@@ -2312,6 +2349,7 @@ fn is_defined_server_method(method: &str) -> bool {
             | "item/reasoning/summaryPartAdded"
             | "item/reasoning/summaryTextDelta"
             | "item/reasoning/textDelta"
+            | "item/mcpToolCall/progress"
             | "item/completed"
             | "thread/started"
             | "thread/archived"
@@ -3276,6 +3314,101 @@ pub(super) fn parse_collaboration(
     }
 }
 
+fn optional_mcp_string(
+    item: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>> {
+    match item.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => bail!("mcpToolCall item.{field} 必须是字符串或 null"),
+    }
+}
+
+pub(super) fn parse_mcp_tool_call(
+    item: &serde_json::Map<String, Value>,
+) -> Result<AgentMcpToolCall> {
+    let item_type = required_item_string(item, "mcpToolCall", "type")?;
+    if item_type != "mcpToolCall" {
+        bail!("mcpToolCall item.type 必须是 `mcpToolCall`，实际为 `{item_type}`");
+    }
+    let status = match required_item_string(item, "mcpToolCall", "status")?.as_str() {
+        "inProgress" => AgentMcpToolCallStatus::InProgress,
+        "completed" => AgentMcpToolCallStatus::Completed,
+        "failed" => AgentMcpToolCallStatus::Failed,
+        other => bail!("mcpToolCall item.status 包含未知值 `{other}`"),
+    };
+    let arguments = item
+        .get("arguments")
+        .cloned()
+        .context("mcpToolCall item.arguments 缺失")?;
+    let app_context = match item.get("appContext") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(context)) => {
+            context
+                .get("connectorId")
+                .and_then(Value::as_str)
+                .context("mcpToolCall item.appContext.connectorId 必须是字符串")?;
+            Some(Value::Object(context.clone()))
+        }
+        Some(_) => bail!("mcpToolCall item.appContext 必须是对象或 null"),
+    };
+    let result = match item.get("result") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(result)) => {
+            result
+                .get("content")
+                .and_then(Value::as_array)
+                .context("mcpToolCall item.result.content 必须是数组")?;
+            Some(Value::Object(result.clone()))
+        }
+        Some(_) => bail!("mcpToolCall item.result 必须是对象或 null"),
+    };
+    let error = match item.get("error") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(error)) => Some(
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .context("mcpToolCall item.error.message 必须是字符串")?
+                .to_owned(),
+        ),
+        // Some older persisted histories encoded the same message directly.
+        Some(Value::String(error)) => Some(error.clone()),
+        Some(_) => bail!("mcpToolCall item.error 必须是对象、字符串或 null"),
+    };
+    let read_only_hint = match item.get("readOnlyHint") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => bail!("mcpToolCall item.readOnlyHint 必须是布尔值或 null"),
+    };
+    let duration_ms = match item.get("durationMs") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(value)) => Some(
+            value
+                .as_i64()
+                .context("mcpToolCall item.durationMs 必须是 int64 或 null")?,
+        ),
+        Some(_) => bail!("mcpToolCall item.durationMs 必须是 int64 或 null"),
+    };
+
+    Ok(AgentMcpToolCall {
+        id: required_item_string(item, "mcpToolCall", "id")?,
+        server: required_item_string(item, "mcpToolCall", "server")?,
+        tool: required_item_string(item, "mcpToolCall", "tool")?,
+        status,
+        arguments,
+        app_context,
+        plugin_id: optional_mcp_string(item, "pluginId")?,
+        result,
+        error,
+        legacy_resource_uri: optional_mcp_string(item, "mcpAppResourceUri")?,
+        read_only_hint,
+        duration_ms,
+        progress: Vec::new(),
+    })
+}
+
 fn optional_item_strings(
     item: &serde_json::Map<String, Value>,
     item_kind: &str,
@@ -3621,6 +3754,7 @@ fn is_integrated_server_request_method(method: &str) -> bool {
         method,
         "item/commandExecution/requestApproval"
             | "item/tool/requestUserInput"
+            | "tool/requestUserInput"
             | "item/permissions/requestApproval"
     )
 }
@@ -3760,7 +3894,10 @@ fn respond_to_server_request_on_session<W: Write + Send + 'static>(
         }
         return Ok(());
     }
-    if method == "item/tool/requestUserInput" {
+    if matches!(
+        method,
+        "item/tool/requestUserInput" | "tool/requestUserInput"
+    ) {
         let (request_id, request) = match parse_user_input_request(message) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -4021,7 +4158,16 @@ fn optional_request_string(
 fn parse_user_input_request(
     message: &Value,
 ) -> Result<(AgentServerRequestId, AgentUserInputRequest)> {
-    const METHOD: &str = "item/tool/requestUserInput";
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .filter(|method| {
+            matches!(
+                *method,
+                "item/tool/requestUserInput" | "tool/requestUserInput"
+            )
+        })
+        .context("user input request method 未接入")?;
     let request_id = request_id_from_value(
         message
             .get("id")
@@ -4030,69 +4176,59 @@ fn parse_user_input_request(
     let params = message
         .get("params")
         .and_then(Value::as_object)
-        .context("item/tool/requestUserInput 缺少对象 params")?;
-    let thread_id = required_request_string(params, METHOD, "threadId")?;
-    let turn_id = required_request_string(params, METHOD, "turnId")?;
-    let item_id = required_request_string(params, METHOD, "itemId")?;
+        .with_context(|| format!("{method} 缺少对象 params"))?;
+    let thread_id = required_request_string(params, method, "threadId")?;
+    let turn_id = required_request_string(params, method, "turnId")?;
+    let item_id = required_request_string(params, method, "itemId")?;
     let is_blocking = params
         .get("isBlocking")
         .and_then(Value::as_bool)
-        .context("item/tool/requestUserInput params.isBlocking 必须是布尔值")?;
+        .with_context(|| format!("{method} params.isBlocking 必须是布尔值"))?;
     let auto_resolution_ms =
         match params.get("autoResolutionMs") {
             None | Some(Value::Null) => None,
-            Some(value) => Some(value.as_u64().context(
-                "item/tool/requestUserInput params.autoResolutionMs 必须是 uint64 或 null",
-            )?),
+            Some(value) => Some(value.as_u64().with_context(|| {
+                format!("{method} params.autoResolutionMs 必须是 uint64 或 null")
+            })?),
         };
     let questions = params
         .get("questions")
         .and_then(Value::as_array)
-        .context("item/tool/requestUserInput params.questions 必须是数组")?;
+        .with_context(|| format!("{method} params.questions 必须是数组"))?;
     let mut question_ids = HashSet::new();
     let mut parsed_questions = Vec::with_capacity(questions.len());
     for (index, question) in questions.iter().enumerate() {
-        let question = question.as_object().with_context(|| {
-            format!("item/tool/requestUserInput params.questions[{index}] 必须是对象")
-        })?;
+        let question = question
+            .as_object()
+            .with_context(|| format!("{method} params.questions[{index}] 必须是对象"))?;
         let id = question
             .get("id")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .with_context(|| {
-                format!("item/tool/requestUserInput params.questions[{index}].id 必须是字符串")
-            })?;
+            .with_context(|| format!("{method} params.questions[{index}].id 必须是字符串"))?;
         if !question_ids.insert(id.clone()) {
-            bail!("item/tool/requestUserInput 包含重复 question id `{id}`");
+            bail!("{method} 包含重复 question id `{id}`");
         }
         let header = question
             .get("header")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .with_context(|| {
-                format!("item/tool/requestUserInput params.questions[{index}].header 必须是字符串")
-            })?;
+            .with_context(|| format!("{method} params.questions[{index}].header 必须是字符串"))?;
         let question_text = question
             .get("question")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .with_context(|| {
-                format!(
-                    "item/tool/requestUserInput params.questions[{index}].question 必须是字符串"
-                )
-            })?;
+            .with_context(|| format!("{method} params.questions[{index}].question 必须是字符串"))?;
         let allows_other = match question.get("isOther") {
             None => false,
             Some(value) => value.as_bool().with_context(|| {
-                format!("item/tool/requestUserInput params.questions[{index}].isOther 必须是布尔值")
+                format!("{method} params.questions[{index}].isOther 必须是布尔值")
             })?,
         };
         let is_secret = match question.get("isSecret") {
             None => false,
             Some(value) => value.as_bool().with_context(|| {
-                format!(
-                    "item/tool/requestUserInput params.questions[{index}].isSecret 必须是布尔值"
-                )
+                format!("{method} params.questions[{index}].isSecret 必须是布尔值")
             })?,
         };
         let options = match question.get("options") {
@@ -4102,7 +4238,7 @@ fn parse_user_input_request(
                 for (option_index, option) in options.iter().enumerate() {
                     let option = option.as_object().with_context(|| {
                         format!(
-                            "item/tool/requestUserInput params.questions[{index}].options[{option_index}] 必须是对象"
+                            "{method} params.questions[{index}].options[{option_index}] 必须是对象"
                         )
                     })?;
                     let label = option
@@ -4111,7 +4247,7 @@ fn parse_user_input_request(
                         .map(str::to_owned)
                         .with_context(|| {
                             format!(
-                                "item/tool/requestUserInput params.questions[{index}].options[{option_index}].label 必须是字符串"
+                                "{method} params.questions[{index}].options[{option_index}].label 必须是字符串"
                             )
                         })?;
                     let description = option
@@ -4120,16 +4256,14 @@ fn parse_user_input_request(
                         .map(str::to_owned)
                         .with_context(|| {
                             format!(
-                                "item/tool/requestUserInput params.questions[{index}].options[{option_index}].description 必须是字符串"
+                                "{method} params.questions[{index}].options[{option_index}].description 必须是字符串"
                             )
                         })?;
                     parsed.push(AgentUserInputOption { label, description });
                 }
                 parsed
             }
-            Some(_) => bail!(
-                "item/tool/requestUserInput params.questions[{index}].options 必须是数组或 null"
-            ),
+            Some(_) => bail!("{method} params.questions[{index}].options 必须是数组或 null"),
         };
         parsed_questions.push(AgentUserInputQuestion {
             id,
@@ -4476,9 +4610,9 @@ mod tests {
         AgentCreditsSnapshot, AgentEvent, AgentFileChangeStatus, AgentImageView,
         AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome,
         AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
-        AgentMcpServerStartupStatus, AgentOptionalField, AgentPermissionMode,
-        AgentPermissionsApprovalChoice, AgentRateLimitWindow, AgentReasoning, AgentRequest,
-        AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
+        AgentMcpServerStartupStatus, AgentMcpToolCall, AgentMcpToolCallStatus, AgentOptionalField,
+        AgentPermissionMode, AgentPermissionsApprovalChoice, AgentRateLimitWindow, AgentReasoning,
+        AgentRequest, AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
         AgentServerRequestMetadata, AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus,
         AgentThreadStatusState, AgentThreadTokenUsage, AgentTokenUsageBreakdown,
         AgentUserInputResponse, AppServerProcess, CodexAppServerBackend, CodexTurnSession,
@@ -6999,6 +7133,34 @@ mod tests {
     }
 
     #[test]
+    fn current_tool_request_user_input_alias_uses_the_same_response_contract() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut message = user_input_request(json!(78));
+        message["method"] = json!("tool/requestUserInput");
+        respond_to_server_request_on_session(&session, &message, &tx).unwrap();
+
+        let AgentEvent::UserInputRequested { request, responder } = rx.try_recv().unwrap() else {
+            panic!("expected user input event");
+        };
+        assert_eq!(request.item_id, "tool_1");
+        responder
+            .respond(AgentUserInputResponse {
+                answers: vec![AgentUserInputAnswer {
+                    question_id: "color".into(),
+                    answers: vec!["red".into()],
+                }],
+            })
+            .unwrap();
+        let wire: Value = serde_json::from_slice(&take_session_output(&session)).unwrap();
+        assert_eq!(wire["id"], 78);
+        assert_eq!(
+            wire["result"]["answers"]["color"]["answers"],
+            json!(["red"])
+        );
+    }
+
+    #[test]
     fn user_input_invalid_params_receive_minus_32602_without_creating_pending_ui() {
         let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
         let (tx, rx) = async_channel::unbounded();
@@ -8297,12 +8459,173 @@ mod tests {
     }
 
     #[test]
+    fn mcp_tool_call_lifecycle_preserves_schema_payload_and_progress() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut streamed_text = false;
+        let started = turn_item_message(
+            "item/started",
+            json!({
+                "type": "mcpToolCall",
+                "id": "exec_mcp_1",
+                "server": "codex_app",
+                "tool": "get_usage_limits",
+                "status": "inProgress",
+                "arguments": {"scope": "account"},
+                "appContext": null,
+                "pluginId": null,
+                "readOnlyHint": true,
+                "result": null,
+                "error": null,
+                "durationMs": null
+            }),
+        );
+        super::process_turn_message(
+            &session,
+            &started,
+            "thr_1",
+            "turn_1",
+            &tx,
+            &mut streamed_text,
+        )
+        .unwrap();
+        super::process_turn_message(
+            &session,
+            &json!({
+                "method": "item/mcpToolCall/progress",
+                "params": {
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "itemId": "exec_mcp_1",
+                    "message": "Reading limits"
+                }
+            }),
+            "thr_1",
+            "turn_1",
+            &tx,
+            &mut streamed_text,
+        )
+        .unwrap();
+        let completed = turn_item_message(
+            "item/completed",
+            json!({
+                "type": "mcpToolCall",
+                "id": "exec_mcp_1",
+                "server": "codex_app",
+                "tool": "get_usage_limits",
+                "status": "completed",
+                "arguments": {"scope": "account"},
+                "appContext": {
+                    "connectorId": "connector_1",
+                    "appName": "Codex App Tools",
+                    "actionName": "Get usage limits"
+                },
+                "pluginId": "plugin_1",
+                "mcpAppResourceUri": "ui://legacy/usage.html",
+                "readOnlyHint": true,
+                "result": {
+                    "content": [{"type": "text", "text": "ok"}],
+                    "structuredContent": {"remaining": 29},
+                    "_meta": {"source": "fixture"}
+                },
+                "error": null,
+                "durationMs": 1535
+            }),
+        );
+        super::process_turn_message(
+            &session,
+            &completed,
+            "thr_1",
+            "turn_1",
+            &tx,
+            &mut streamed_text,
+        )
+        .unwrap();
+        drop(tx);
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AgentEvent::McpToolCallUpdated(AgentMcpToolCall {
+                id: "exec_mcp_1".into(),
+                server: "codex_app".into(),
+                tool: "get_usage_limits".into(),
+                status: AgentMcpToolCallStatus::InProgress,
+                arguments: json!({"scope": "account"}),
+                app_context: None,
+                plugin_id: None,
+                result: None,
+                error: None,
+                legacy_resource_uri: None,
+                read_only_hint: Some(true),
+                duration_ms: None,
+                progress: Vec::new(),
+            })
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AgentEvent::McpToolCallProgress {
+                item_id: "exec_mcp_1".into(),
+                message: "Reading limits".into(),
+            }
+        );
+        let AgentEvent::McpToolCallUpdated(completed) = rx.try_recv().unwrap() else {
+            panic!("expected completed MCP tool call");
+        };
+        assert_eq!(completed.status, AgentMcpToolCallStatus::Completed);
+        assert_eq!(completed.plugin_id.as_deref(), Some("plugin_1"));
+        assert_eq!(
+            completed.legacy_resource_uri.as_deref(),
+            Some("ui://legacy/usage.html")
+        );
+        assert_eq!(completed.duration_ms, Some(1535));
+        assert_eq!(
+            completed.result.as_ref().unwrap()["structuredContent"]["remaining"],
+            29
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn mcp_tool_call_failure_and_legacy_missing_metadata_are_valid() {
+        let failed = json!({
+            "type": "mcpToolCall",
+            "id": "exec_mcp_failed",
+            "server": "connector",
+            "tool": "delete_record",
+            "status": "failed",
+            "arguments": null,
+            "error": {"message": "Declined by user"}
+        });
+        let parsed = super::parse_mcp_tool_call(failed.as_object().unwrap()).unwrap();
+        assert_eq!(parsed.status, AgentMcpToolCallStatus::Failed);
+        assert_eq!(parsed.error.as_deref(), Some("Declined by user"));
+        assert_eq!(parsed.arguments, Value::Null);
+        assert!(parsed.app_context.is_none());
+        assert!(parsed.plugin_id.is_none());
+        assert!(parsed.result.is_none());
+
+        for (field, invalid, expected) in [
+            ("status", json!("declined"), "status"),
+            ("appContext", json!({}), "connectorId"),
+            ("result", json!({}), "result.content"),
+            ("error", json!({}), "error.message"),
+            ("pluginId", json!(7), "pluginId"),
+        ] {
+            let mut item = failed.clone();
+            item[field] = invalid;
+            assert_turn_message_fails(
+                &turn_item_message("item/completed", item),
+                &["mcpToolCall", expected],
+            );
+        }
+    }
+
+    #[test]
     fn every_unsupported_thread_item_type_fails_for_started_and_completed() {
         for item_type in [
             "hookPrompt",
             "functionCallOutput",
             "plan",
-            "mcpToolCall",
             "dynamicToolCall",
             "webSearch",
             "sleep",

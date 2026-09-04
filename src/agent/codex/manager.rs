@@ -18,9 +18,10 @@ use super::{
     PermissionProfileListResponse, TURN_SCOPED_SERVER_METHODS, TurnOutcome,
     cleanup_pending_server_requests, ensure_server_method_is_defined,
     ensure_session_message_matches, is_integrated_server_request_method, parse_agent_notification,
-    parse_collaboration, parse_mcp_server_startup_status_updated, parse_thread_status_changed,
-    process_turn_message, request_id_from_value, thread_settings_update_request, thread_started_id,
-    validate_remote_control_status_changed, validate_resume_goal_cleared,
+    parse_collaboration, parse_mcp_server_startup_status_updated, parse_mcp_tool_call,
+    parse_thread_status_changed, process_turn_message, request_id_from_value,
+    thread_settings_update_request, thread_started_id, validate_remote_control_status_changed,
+    validate_resume_goal_cleared,
 };
 use crate::agent::{
     AgentCapabilities, AgentCapability, AgentConnectionEvent, AgentEvent, AgentFileChange,
@@ -1179,6 +1180,9 @@ fn parse_history_item(value: &Value) -> Result<ThreadHistoryItem> {
                     .context("collaboration history item 必须是对象")?,
             )?))
         }
+        "mcpToolCall" => Ok(ThreadHistoryItem::McpToolCall(parse_mcp_tool_call(
+            value.as_object().context("mcpToolCall item 必须是对象")?,
+        )?)),
         _ => Ok(ThreadHistoryItem::Unsupported { item_id, kind }),
     }
 }
@@ -3014,11 +3018,12 @@ mod tests {
     };
     use crate::agent::{
         AgentCommandApprovalChoice, AgentConnectionEvent, AgentEvent, AgentFileChange,
-        AgentImageView, AgentInterruptOutcome, AgentOptionalField, AgentPermissionMode,
-        AgentPermissionsApprovalChoice, AgentRequest, AgentServerRequestId, AgentUserInputAnswer,
-        AgentUserInputResponse, CreateProject, FilterValue, HistoryItemDetail, PageRequest,
-        ProjectChange, SortDirection, ThreadHistoryItem, ThreadListRequest, ThreadMetadataUpdate,
-        ThreadSectionAppearance, ThreadSortKey, UpdateProject,
+        AgentImageView, AgentInterruptOutcome, AgentMcpToolCallStatus, AgentOptionalField,
+        AgentPermissionMode, AgentPermissionsApprovalChoice, AgentRequest, AgentServerRequestId,
+        AgentUserInputAnswer, AgentUserInputResponse, CreateProject, FilterValue,
+        HistoryItemDetail, PageRequest, ProjectChange, SortDirection, ThreadHistoryItem,
+        ThreadListRequest, ThreadMetadataUpdate, ThreadSectionAppearance, ThreadSortKey,
+        UpdateProject,
     };
 
     const WAIT: Duration = Duration::from_secs(3);
@@ -3129,6 +3134,39 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("item.kind 包含未知值"));
+    }
+
+    #[test]
+    fn history_mcp_tool_call_restores_current_and_legacy_metadata() {
+        let item = parse_history_item(&json!({
+            "type": "mcpToolCall",
+            "id": "mcp_history_1",
+            "server": "codex_app",
+            "tool": "get_usage_limits",
+            "status": "completed",
+            "arguments": {},
+            "mcpAppResourceUri": "ui://legacy/usage.html",
+            "result": {
+                "content": [{"type": "text", "text": "ok"}],
+                "structuredContent": {"remaining": 29}
+            }
+        }))
+        .unwrap();
+        let ThreadHistoryItem::McpToolCall(tool_call) = item else {
+            panic!("expected MCP history item");
+        };
+        assert_eq!(tool_call.status, AgentMcpToolCallStatus::Completed);
+        assert_eq!(tool_call.arguments, json!({}));
+        assert_eq!(
+            tool_call.legacy_resource_uri.as_deref(),
+            Some("ui://legacy/usage.html")
+        );
+        assert!(tool_call.app_context.is_none());
+        assert!(tool_call.plugin_id.is_none());
+        assert_eq!(
+            tool_call.result.unwrap()["structuredContent"]["remaining"],
+            29
+        );
     }
 
     struct ChannelReader {

@@ -16,15 +16,15 @@ use crate::{
         AgentEffectivePermissions, AgentEvent, AgentFileChange, AgentFileChangeStatus,
         AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemSpecialPath, AgentImageView,
         AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
-        AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog,
-        AgentOptionalField, AgentPermissionMode, AgentPermissionRequestProfile,
-        AgentPermissionsApprovalChoice, AgentPermissionsApprovalHandle, AgentRateLimitWindow,
-        AgentReasoning, AgentRequest, AgentServerRequestFailureKind, AgentServerRequestKind,
-        AgentServerRequestMetadata, AgentThreadStatus, AgentThreadTokenUsage, AgentUserInputAnswer,
-        AgentUserInputHandle, AgentUserInputResponse, CodexAppServerBackend, CommandExecution,
-        CommandExecutionAction, CommandExecutionStatus, HistoryTurnStatus,
-        LegacySubAgentActivityKind, ProjectId, ThreadHistory, ThreadHistoryItem,
-        normalize_user_message_for_display,
+        AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentMcpToolCall,
+        AgentMcpToolCallStatus, AgentModel, AgentModelCatalog, AgentOptionalField,
+        AgentPermissionMode, AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
+        AgentPermissionsApprovalHandle, AgentRateLimitWindow, AgentReasoning, AgentRequest,
+        AgentServerRequestFailureKind, AgentServerRequestKind, AgentServerRequestMetadata,
+        AgentThreadStatus, AgentThreadTokenUsage, AgentUserInputAnswer, AgentUserInputHandle,
+        AgentUserInputResponse, CodexAppServerBackend, CommandExecution, CommandExecutionAction,
+        CommandExecutionStatus, HistoryTurnStatus, LegacySubAgentActivityKind, ProjectId,
+        ThreadHistory, ThreadHistoryItem, normalize_user_message_for_display,
     },
     components::{
         approval::{
@@ -184,6 +184,7 @@ pub enum ConversationActivity {
     ImageView(AgentImageView),
     ContextCompaction(AgentContextCompaction),
     Collaboration(AgentCollaboration),
+    McpToolCall(AgentMcpToolCall),
     UserInput(UserInputRequestPresentation),
     ProtocolError {
         message: String,
@@ -1222,6 +1223,9 @@ impl ComposerView {
                         ThreadHistoryItem::Collaboration(collaboration) => {
                             upsert_collaboration_activity(&mut activities, collaboration.clone());
                         }
+                        ThreadHistoryItem::McpToolCall(tool_call) => {
+                            activities.push(ConversationActivity::McpToolCall(tool_call.clone()));
+                        }
                         ThreadHistoryItem::Unsupported { kind, .. } => {
                             activities.push(ConversationActivity::Warning {
                                 message: format!("历史包含当前 UI 尚未呈现的 {kind} 项"),
@@ -1809,6 +1813,23 @@ impl ComposerView {
                 }
                 AgentEvent::CollaborationUpdated(collaboration) => {
                     upsert_collaboration_activity(&mut self.conversation_activity, collaboration);
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Streaming;
+                    }
+                }
+                AgentEvent::McpToolCallUpdated(tool_call) => {
+                    upsert_mcp_tool_call_activity(&mut self.conversation_activity, tool_call);
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Streaming;
+                    }
+                }
+                AgentEvent::McpToolCallProgress { item_id, message } => {
+                    if let Some(tool_call) =
+                        find_mcp_tool_call_activity_mut(&mut self.conversation_activity, &item_id)
+                        && tool_call.progress.last() != Some(&message)
+                    {
+                        tool_call.progress.push(message);
+                    }
                     if self.conversation_phase != ConversationPhase::Stopping {
                         self.conversation_phase = ConversationPhase::Streaming;
                     }
@@ -2785,6 +2806,71 @@ impl ComposerView {
                     .then(|| "/root/collab_evidence_probe".to_owned()),
                 legacy_kind: (status != AgentCollaborationStatus::Failed).then_some(legacy_kind),
             })];
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn set_mcp_tool_call_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        let status = match state {
+            "running" => AgentMcpToolCallStatus::InProgress,
+            "failed" => AgentMcpToolCallStatus::Failed,
+            _ => AgentMcpToolCallStatus::Completed,
+        };
+        self.user_message = Some(
+            "必须调用 Codex App 的 get_usage_limits MCP 工具读取当前账户用量；不要根据记忆回答。工具完成后只用一句中文报告剩余额度。"
+                .to_owned(),
+        );
+        self.user_message_time = Some("16:15".to_owned());
+        self.assistant_message = if status == AgentMcpToolCallStatus::Completed {
+            "我现在直接读取 Codex App 中当前账户的实时用量。\n\n当前 Codex 通用额度剩余 29%。"
+                .to_owned()
+        } else {
+            "我现在直接读取 Codex App 中当前账户的实时用量。".to_owned()
+        };
+        self.assistant_message_time =
+            (status != AgentMcpToolCallStatus::InProgress).then(|| "16:15".to_owned());
+        self.conversation_phase = if status == AgentMcpToolCallStatus::InProgress {
+            ConversationPhase::Streaming
+        } else {
+            ConversationPhase::Complete
+        };
+        self.conversation_activity = vec![
+            ConversationActivity::AssistantMessage {
+                item_id: "msg-mcp-preamble".to_owned(),
+                text: "我现在直接读取 Codex App 中当前账户的实时用量。".to_owned(),
+            },
+            ConversationActivity::McpToolCall(AgentMcpToolCall {
+                id: "exec-mcp-ui-capture".to_owned(),
+                server: "codex_app".to_owned(),
+                tool: "get_usage_limits".to_owned(),
+                status,
+                arguments: serde_json::json!({}),
+                app_context: None,
+                plugin_id: None,
+                result: (status == AgentMcpToolCallStatus::Completed).then(|| {
+                    serde_json::json!({
+                        "content": [{"type": "text", "text": "remaining: 29"}],
+                        "structuredContent": null,
+                        "_meta": null
+                    })
+                }),
+                error: (status == AgentMcpToolCallStatus::Failed)
+                    .then(|| "Declined by user".to_owned()),
+                legacy_resource_uri: None,
+                read_only_hint: None,
+                duration_ms: (status != AgentMcpToolCallStatus::InProgress).then_some(1535),
+                progress: (status == AgentMcpToolCallStatus::InProgress)
+                    .then(|| vec!["Reading limits".to_owned()])
+                    .unwrap_or_default(),
+            }),
+        ];
+        if status == AgentMcpToolCallStatus::Completed {
+            self.conversation_activity
+                .push(ConversationActivity::AssistantMessage {
+                    item_id: "msg-mcp-final".to_owned(),
+                    text: "当前 Codex 通用额度剩余 29%。".to_owned(),
+                });
+        }
         cx.emit(ConversationChanged);
         cx.notify();
     }
@@ -4191,6 +4277,16 @@ fn find_command_activity_mut<'a>(
     })
 }
 
+fn find_mcp_tool_call_activity_mut<'a>(
+    activities: &'a mut [ConversationActivity],
+    item_id: &str,
+) -> Option<&'a mut AgentMcpToolCall> {
+    activities.iter_mut().find_map(|activity| match activity {
+        ConversationActivity::McpToolCall(tool_call) if tool_call.id == item_id => Some(tool_call),
+        _ => None,
+    })
+}
+
 fn find_reasoning_activity_mut<'a>(
     activities: &'a mut [ConversationActivity],
     item_id: &str,
@@ -4270,6 +4366,20 @@ fn upsert_command_activity(
         *existing = incoming;
     } else {
         activities.push(ConversationActivity::Command(incoming));
+    }
+}
+
+fn upsert_mcp_tool_call_activity(
+    activities: &mut Vec<ConversationActivity>,
+    mut incoming: AgentMcpToolCall,
+) {
+    if let Some(existing) = find_mcp_tool_call_activity_mut(activities, &incoming.id) {
+        if incoming.progress.is_empty() {
+            incoming.progress = std::mem::take(&mut existing.progress);
+        }
+        *existing = incoming;
+    } else {
+        activities.push(ConversationActivity::McpToolCall(incoming));
     }
 }
 
@@ -6102,19 +6212,20 @@ mod tests {
         AgentConfigWarning, AgentConnectionEvent, AgentCreditsSnapshot, AgentEffectivePermissions,
         AgentEvent, AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome,
         AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
-        AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog, AgentOptionalField,
-        AgentPermissionMode, AgentPermissionProfile, AgentPermissionRequestProfile,
-        AgentPermissionsApprovalChoice, AgentPermissionsApprovalControl,
-        AgentPermissionsApprovalHandle, AgentPermissionsApprovalRequest, AgentRateLimitWindow,
-        AgentReasoning, AgentReasoningEffort, AgentRequest, AgentRun,
-        AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
-        AgentServerRequestMetadata, AgentServiceTier, AgentSpendControlLimit,
-        AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus, AgentThreadStatusState,
-        AgentThreadTokenUsage, AgentTokenUsageBreakdown, AgentUserInputAnswer,
-        AgentUserInputControl, AgentUserInputHandle, AgentUserInputOption, AgentUserInputQuestion,
-        AgentUserInputRequest, AgentUserInputResponse, CommandExecution, CommandExecutionAction,
-        CommandExecutionStatus, HistoryItemDetail, HistoryTurnStatus, LegacySubAgentActivityKind,
-        ThreadActivity, ThreadHistory, ThreadHistoryItem, ThreadSummary, ThreadTurn,
+        AgentMcpServerStartupStatus, AgentMcpToolCall, AgentMcpToolCallStatus, AgentModel,
+        AgentModelCatalog, AgentOptionalField, AgentPermissionMode, AgentPermissionProfile,
+        AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
+        AgentPermissionsApprovalControl, AgentPermissionsApprovalHandle,
+        AgentPermissionsApprovalRequest, AgentRateLimitWindow, AgentReasoning,
+        AgentReasoningEffort, AgentRequest, AgentRun, AgentServerRequestFailureKind,
+        AgentServerRequestId, AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier,
+        AgentSpendControlLimit, AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus,
+        AgentThreadStatusState, AgentThreadTokenUsage, AgentTokenUsageBreakdown,
+        AgentUserInputAnswer, AgentUserInputControl, AgentUserInputHandle, AgentUserInputOption,
+        AgentUserInputQuestion, AgentUserInputRequest, AgentUserInputResponse, CommandExecution,
+        CommandExecutionAction, CommandExecutionStatus, HistoryItemDetail, HistoryTurnStatus,
+        LegacySubAgentActivityKind, ThreadActivity, ThreadHistory, ThreadHistoryItem,
+        ThreadSummary, ThreadTurn,
     };
     use crate::components::approval::{ApprovalCardEvent, ApprovalDecision, ApprovalScope};
     use crate::components::permissions_approval::{
@@ -7633,6 +7744,63 @@ mod tests {
                 item_id: "message_1".into(),
                 text: "流式内容".into(),
             }]
+        );
+    }
+
+    #[test]
+    fn mcp_tool_call_started_progress_and_completed_merge_into_one_activity() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Light, cx));
+        let started = AgentMcpToolCall {
+            id: "mcp_1".into(),
+            server: "codex_app".into(),
+            tool: "get_usage_limits".into(),
+            status: AgentMcpToolCallStatus::InProgress,
+            arguments: serde_json::json!({}),
+            app_context: None,
+            plugin_id: None,
+            result: None,
+            error: None,
+            legacy_resource_uri: None,
+            read_only_hint: Some(true),
+            duration_ms: None,
+            progress: Vec::new(),
+        };
+        let mut completed = started.clone();
+        completed.status = AgentMcpToolCallStatus::Completed;
+        completed.result = Some(serde_json::json!({
+            "content": [{"type": "text", "text": "ok"}]
+        }));
+        completed.duration_ms = Some(1535);
+
+        app.update_entity(&composer, |composer, _| {
+            assert!(!composer.apply_agent_event_batch(vec![
+                AgentEvent::McpToolCallUpdated(started),
+                AgentEvent::McpToolCallProgress {
+                    item_id: "mcp_1".into(),
+                    message: "Reading limits".into(),
+                },
+                AgentEvent::McpToolCallProgress {
+                    item_id: "mcp_1".into(),
+                    message: "Reading limits".into(),
+                },
+                AgentEvent::McpToolCallUpdated(completed),
+            ]));
+        });
+
+        let activities = app.read_entity(&composer, |composer, _| {
+            composer.conversation_activity_snapshot()
+        });
+        assert_eq!(activities.len(), 1);
+        let ConversationActivity::McpToolCall(tool_call) = &activities[0] else {
+            panic!("expected MCP tool activity");
+        };
+        assert_eq!(tool_call.status, AgentMcpToolCallStatus::Completed);
+        assert_eq!(tool_call.progress, ["Reading limits"]);
+        assert_eq!(tool_call.duration_ms, Some(1535));
+        assert_eq!(
+            tool_call.result.as_ref().unwrap()["content"][0]["text"],
+            "ok"
         );
     }
 

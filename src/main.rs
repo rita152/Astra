@@ -326,6 +326,10 @@ fn main() {
         arg.strip_prefix("--collaboration-ui-state=")
             .map(ToOwned::to_owned)
     });
+    let mcp_tool_call_ui_state = args.iter().find_map(|arg| {
+        arg.strip_prefix("--mcp-tool-call-ui-state=")
+            .map(ToOwned::to_owned)
+    });
     let approval_ui_kind = args
         .iter()
         .find_map(|arg| {
@@ -492,6 +496,7 @@ fn main() {
                             || turn_diff_ui_state.is_some()
                             || context_compaction_ui_state.is_some()
                             || collaboration_ui_state.is_some()
+                            || mcp_tool_call_ui_state.is_some()
                             || permission_mode.is_some()
                             || permission_menu_open
                             || permission_menu_state.is_some()
@@ -581,6 +586,9 @@ fn main() {
                         }
                         if let Some(state) = collaboration_ui_state.as_deref() {
                             app.set_collaboration_for_capture(state, cx);
+                        }
+                        if let Some(state) = mcp_tool_call_ui_state.as_deref() {
+                            app.set_mcp_tool_call_for_capture(state, cx);
                         }
                         if let Some(state) = tool_group_state.as_deref() {
                             app.set_tool_group_for_capture(

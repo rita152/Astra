@@ -364,6 +364,7 @@ pub enum ThreadHistoryItem {
     ImageView(AgentImageView),
     ContextCompaction(AgentContextCompaction),
     Collaboration(AgentCollaboration),
+    McpToolCall(AgentMcpToolCall),
     Unsupported {
         item_id: String,
         kind: String,
@@ -445,6 +446,38 @@ pub struct AgentContextCompaction {
 pub struct AgentImageView {
     pub id: String,
     pub path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMcpToolCallStatus {
+    InProgress,
+    Completed,
+    Failed,
+}
+
+/// Agent-neutral representation of the app-server `mcpToolCall` thread item.
+///
+/// JSON-valued fields intentionally remain lossless: connector arguments,
+/// results, and app context are owned by the selected MCP server and can gain
+/// server-specific members independently of this client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentMcpToolCall {
+    pub id: String,
+    pub server: String,
+    pub tool: String,
+    pub status: AgentMcpToolCallStatus,
+    pub arguments: Value,
+    pub app_context: Option<Value>,
+    pub plugin_id: Option<String>,
+    pub result: Option<Value>,
+    pub error: Option<String>,
+    /// Deprecated persisted metadata retained for histories written before
+    /// `appContext.resourceUri` was introduced.
+    pub legacy_resource_uri: Option<String>,
+    pub read_only_hint: Option<bool>,
+    pub duration_ms: Option<i64>,
+    /// Live `item/mcpToolCall/progress` messages observed for this item.
+    pub progress: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1229,6 +1262,11 @@ pub enum AgentEvent {
     ImageViewed(AgentImageView),
     ContextCompactionUpdated(AgentContextCompaction),
     CollaborationUpdated(AgentCollaboration),
+    McpToolCallUpdated(AgentMcpToolCall),
+    McpToolCallProgress {
+        item_id: String,
+        message: String,
+    },
     FileChangePatchUpdated {
         item_id: String,
         changes: Vec<AgentFileChangeEntry>,

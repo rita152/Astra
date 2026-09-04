@@ -16,8 +16,9 @@ use gpui::{
 use crate::{
     agent::{
         AgentBackend, AgentCollaboration, AgentCollaborationStatus, AgentCollaboratorStatus,
-        AgentFileChangeStatus, AgentImageView, CodexAppServerBackend, CommandExecution,
-        CommandExecutionAction, CommandExecutionStatus, LegacySubAgentActivityKind,
+        AgentFileChangeStatus, AgentImageView, AgentMcpToolCall, AgentMcpToolCallStatus,
+        CodexAppServerBackend, CommandExecution, CommandExecutionAction, CommandExecutionStatus,
+        LegacySubAgentActivityKind,
     },
     components::{
         approval::{ApprovalCardCallback, render_approval_card},
@@ -1014,6 +1015,13 @@ impl HomeView {
                 "legacy-01a06b7a-14c2-73b3-9c62-b29e27bd8689".to_owned()
             });
         }
+        cx.notify();
+    }
+
+    pub fn set_mcp_tool_call_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.set_mcp_tool_call_for_capture(state, cx)
+        });
         cx.notify();
     }
 
@@ -2386,6 +2394,9 @@ fn activity_stream(
                             expanded,
                             theme,
                         ))
+                    }
+                    ConversationActivity::McpToolCall(tool_call) => {
+                        stream.child(mcp_tool_call_activity(tool_call, theme))
                     }
                     ConversationActivity::Command(command) => {
                         stream.child(command_execution_activity(
@@ -4206,6 +4217,132 @@ fn collaboration_activity(
     })
 }
 
+fn humanize_mcp_tool_name(tool: &str) -> String {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut previous_was_lowercase = false;
+    for character in tool.chars() {
+        if !character.is_alphanumeric() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            previous_was_lowercase = false;
+            continue;
+        }
+        if character.is_uppercase() && previous_was_lowercase && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+        previous_was_lowercase = character.is_lowercase();
+        word.extend(character.to_lowercase());
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    let mut label = words.join(" ");
+    if label.is_empty() {
+        return "Tool call".to_owned();
+    }
+    if let Some(first) = label.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    label
+}
+
+fn mcp_tool_call_label(tool_call: &AgentMcpToolCall) -> String {
+    tool_call
+        .app_context
+        .as_ref()
+        .and_then(|context| context.get("actionName"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|label| !label.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| humanize_mcp_tool_name(&tool_call.tool))
+}
+
+fn mcp_tool_call_activity(tool_call: AgentMcpToolCall, theme: Theme) -> impl IntoElement {
+    let label = mcp_tool_call_label(&tool_call);
+    let failed = tool_call.status == AgentMcpToolCallStatus::Failed;
+    let display_label = if failed {
+        format!("{label} 失败")
+    } else {
+        label
+    };
+    let status = match tool_call.status {
+        AgentMcpToolCallStatus::InProgress => "进行中",
+        AgentMcpToolCallStatus::Completed => "已完成",
+        AgentMcpToolCallStatus::Failed => "失败",
+    };
+    let accessible_label = if let Some(error) = tool_call.error.as_deref() {
+        format!(
+            "MCP 工具 {} 的 {}，{status}：{error}",
+            tool_call.server, tool_call.tool
+        )
+    } else {
+        format!(
+            "MCP 工具 {} 的 {}，{status}",
+            tool_call.server, tool_call.tool
+        )
+    };
+    let foreground = if failed {
+        theme.warning
+    } else {
+        theme.text.alpha(0.60)
+    };
+    let label_color = if failed {
+        theme.warning
+    } else {
+        theme.text.alpha(0.40)
+    };
+
+    div()
+        .id(SharedString::from(format!(
+            "mcp-tool-call-{}",
+            tool_call.id
+        )))
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .aria_label(accessible_label)
+        .child(
+            div()
+                .h(px(21.0))
+                .max_w_full()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    icon("mcp-tool-call", foreground.into())
+                        .size(px(16.0))
+                        .flex_none(),
+                )
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(14.0))
+                        .line_height(px(21.0))
+                        .font_family(".SystemUIFont")
+                        .font_weight(FontWeight(430.0))
+                        .text_color(label_color)
+                        .child(display_label),
+                ),
+        )
+        .when_some(tool_call.error, |activity, error| {
+            activity.child(
+                div()
+                    .ml(px(22.0))
+                    .text_size(px(13.0))
+                    .line_height(px(20.0))
+                    .font_family(".SystemUIFont")
+                    .text_color(theme.warning)
+                    .child(error),
+            )
+        })
+}
+
 fn context_compaction_activity(
     compaction: crate::agent::AgentContextCompaction,
     shimmer_progress: f32,
@@ -4391,18 +4528,19 @@ mod tests {
         collaboration_ui_identity, command_activity_row_count, command_activity_summaries,
         command_activity_summary, completed_reasoning_body, completed_tool_group_summary,
         conversation_status, format_reasoning_elapsed, generic_command_activity_summary,
-        reasoning_activity_title, reasoning_header_label, reasoning_transition_ease,
-        scroll_should_follow_output, strip_terminal_line_ending, thinking_shimmer_alpha,
-        thinking_shimmer_band_left, thinking_shimmer_progress, thinking_shimmer_step,
-        toggle_collaboration_item, toggle_reasoning_item, toggle_tool_activity_group,
-        tool_group_chevron_transition_ease, tool_group_reasoning_title, user_message_paragraphs,
+        humanize_mcp_tool_name, mcp_tool_call_label, reasoning_activity_title,
+        reasoning_header_label, reasoning_transition_ease, scroll_should_follow_output,
+        strip_terminal_line_ending, thinking_shimmer_alpha, thinking_shimmer_band_left,
+        thinking_shimmer_progress, thinking_shimmer_step, toggle_collaboration_item,
+        toggle_reasoning_item, toggle_tool_activity_group, tool_group_chevron_transition_ease,
+        tool_group_reasoning_title, user_message_paragraphs,
     };
     use crate::agent::{
         AgentCollaboration, AgentCollaborationStatus, AgentCollaborationTool,
         AgentCollaboratorState, AgentCollaboratorStatus, AgentContextCompaction, AgentImageView,
-        CommandExecution, CommandExecutionAction, CommandExecutionStatus, HistoryItemDetail,
-        HistoryTurnStatus, LegacySubAgentActivityKind, ThreadActivity, ThreadHistory,
-        ThreadHistoryItem, ThreadSummary, ThreadTurn,
+        AgentMcpToolCall, AgentMcpToolCallStatus, CommandExecution, CommandExecutionAction,
+        CommandExecutionStatus, HistoryItemDetail, HistoryTurnStatus, LegacySubAgentActivityKind,
+        ThreadActivity, ThreadHistory, ThreadHistoryItem, ThreadSummary, ThreadTurn,
     };
     use crate::components::{
         composer::{ConversationActivity, ConversationPhase, ReasoningActivityPresentation},
@@ -4916,6 +5054,43 @@ mod tests {
             reasoning_activity_title(&titled).as_deref(),
             Some("Header title")
         );
+    }
+
+    #[test]
+    fn mcp_tool_call_label_matches_the_captured_chatgpt_row() {
+        assert_eq!(
+            humanize_mcp_tool_name("get_usage_limits"),
+            "Get usage limits"
+        );
+        assert_eq!(humanize_mcp_tool_name("createThread"), "Create thread");
+        let mut tool_call = AgentMcpToolCall {
+            id: "mcp_1".into(),
+            server: "codex_app".into(),
+            tool: "get_usage_limits".into(),
+            status: AgentMcpToolCallStatus::Completed,
+            arguments: serde_json::json!({}),
+            app_context: None,
+            plugin_id: None,
+            result: Some(serde_json::json!({"content": []})),
+            error: None,
+            legacy_resource_uri: None,
+            read_only_hint: Some(true),
+            duration_ms: Some(1535),
+            progress: Vec::new(),
+        };
+        assert_eq!(mcp_tool_call_label(&tool_call), "Get usage limits");
+        tool_call.app_context = Some(serde_json::json!({
+            "connectorId": "connector_1",
+            "actionName": "Account limits"
+        }));
+        assert_eq!(mcp_tool_call_label(&tool_call), "Account limits");
+
+        let units = activity_stream_units(&[ConversationActivity::McpToolCall(tool_call)]);
+        assert!(matches!(
+            &units[0],
+            ActivityStreamUnit::Standalone(ConversationActivity::McpToolCall(call))
+                if call.id == "mcp_1"
+        ));
     }
 
     #[test]

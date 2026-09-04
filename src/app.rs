@@ -828,6 +828,11 @@ impl ChatApp {
             .update(cx, |home, cx| home.set_collaboration_for_capture(state, cx));
     }
 
+    pub fn set_mcp_tool_call_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.home
+            .update(cx, |home, cx| home.set_mcp_tool_call_for_capture(state, cx));
+    }
+
     pub fn set_tool_group_for_capture(
         &mut self,
         running: bool,
