@@ -6,11 +6,11 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, BoxShadow, ContentMask, Context, Div, Entity, FocusHandle, FontWeight,
-    KeyDownEvent, MouseButton, ObjectFit, PathBuilder, Pixels, Render, Role, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, TextAlign, TextRun, Transformation,
-    Window, canvas, div, linear_color_stop, linear_gradient, point, prelude::*, px, radians,
-    relative, rgba, svg,
+    App, Bounds, BoxShadow, ContentMask, Context, Div, Entity, FocusHandle, FollowMode, FontWeight,
+    KeyDownEvent, ListAlignment, ListState, MouseButton, ObjectFit, PathBuilder, Pixels, Render,
+    Role, ScrollDelta, ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, TextAlign,
+    TextRun, Transformation, Window, canvas, div, linear_color_stop, linear_gradient, list, point,
+    prelude::*, px, radians, relative, rgba, svg,
 };
 
 use crate::{
@@ -63,6 +63,11 @@ pub struct HomeView {
     thinking_shimmer_running: bool,
     response_feedback: i8,
     user_message_actions_visible_for_capture: bool,
+    conversation_rows: Arc<Vec<ConversationListRow>>,
+    conversation_phase: ConversationPhase,
+    conversation_activity: Arc<Vec<ConversationActivity>>,
+    conversation_cache_dirty: bool,
+    conversation_list: ListState,
     conversation_scroll: ScrollHandle,
     expanded_reasoning: HashSet<String>,
     reasoning_disclosure_transitions: HashMap<String, ReasoningDisclosureTransition>,
@@ -116,6 +121,7 @@ const THINKING_SHIMMER_ALPHA_LEVELS: usize = 32;
 const CONVERSATION_TOP_INSET: f32 = 78.0;
 const CONVERSATION_BOTTOM_INSET: f32 = 153.0;
 const CONVERSATION_BOTTOM_EPSILON: f32 = 0.5;
+const CONVERSATION_LIST_OVERDRAW: f32 = 256.0;
 const CONVERSATION_CONTENT_MAX_WIDTH: f32 = 736.0;
 const USER_MESSAGE_MAX_WIDTH_RATIO: f32 = 0.7;
 const USER_MESSAGE_TEXT_LAYOUT_EPSILON: f32 = 1.0;
@@ -264,6 +270,31 @@ impl ToolActivityGroupPresentation {
 enum ActivityStreamUnit {
     Standalone(ConversationActivity),
     ToolGroup(ToolActivityGroupPresentation),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConversationListRow {
+    HistoricalUser {
+        turn_index: usize,
+        message: String,
+    },
+    CurrentUser {
+        message: String,
+        time: String,
+    },
+    AssistantMarkdown {
+        id: String,
+        text: String,
+    },
+    Activity {
+        unit: ActivityStreamUnit,
+        show_thinking_tail: bool,
+    },
+    Thinking,
+    CurrentResponseFooter {
+        message: String,
+        completed_at: Option<String>,
+    },
 }
 
 #[derive(Default)]
@@ -821,6 +852,11 @@ impl HomeView {
             thinking_shimmer_running: false,
             response_feedback: 0,
             user_message_actions_visible_for_capture: false,
+            conversation_rows: Arc::new(Vec::new()),
+            conversation_phase: ConversationPhase::Empty,
+            conversation_activity: Arc::new(Vec::new()),
+            conversation_cache_dirty: false,
+            conversation_list: conversation_list_state(0),
             conversation_scroll: ScrollHandle::new(),
             expanded_reasoning: HashSet::new(),
             reasoning_disclosure_transitions: HashMap::new(),
@@ -836,8 +872,34 @@ impl HomeView {
             expanded_collaborations: HashSet::new(),
             approval_focus: cx.focus_handle(),
         };
+        view.refresh_conversation_cache(cx);
         view.observe_composer(composer, cx);
         view
+    }
+
+    fn refresh_conversation_cache(&mut self, cx: &mut Context<Self>) {
+        let transcript = self.composer.read(cx).transcript_render_snapshot();
+        let (
+            phase,
+            user_message,
+            user_message_time,
+            assistant_message,
+            assistant_message_time,
+            conversation_activity,
+        ) = self.composer.read(cx).conversation_render_snapshot();
+        self.conversation_rows = Arc::new(conversation_list_rows(
+            transcript,
+            phase,
+            user_message.unwrap_or_default(),
+            user_message_time.unwrap_or_default(),
+            assistant_message,
+            assistant_message_time,
+            &conversation_activity,
+        ));
+        self.conversation_phase = phase;
+        self.conversation_activity = Arc::new(conversation_activity);
+        self.conversation_cache_dirty = true;
+        sync_list_item_count(&self.conversation_list, self.conversation_rows.len());
     }
 
     fn observe_composer(&mut self, composer: Entity<ComposerView>, cx: &mut Context<Self>) {
@@ -862,7 +924,13 @@ impl HomeView {
         .detach();
         cx.subscribe(&composer, |this, composer, _: &ConversationChanged, cx| {
             if *this.composer == *composer {
+                this.refresh_conversation_cache(cx);
                 let composer = composer.read(cx);
+                let item_count = this.conversation_list.item_count();
+                if item_count > 0 {
+                    this.conversation_list
+                        .remeasure_items(item_count.saturating_sub(2)..item_count);
+                }
                 let needs_shimmer = composer.conversation_phase() == ConversationPhase::Thinking
                     || composer.has_active_context_compaction()
                     || composer.has_active_image_generation();
@@ -881,6 +949,9 @@ impl HomeView {
     pub fn set_composer(&mut self, composer: Entity<ComposerView>, cx: &mut Context<Self>) {
         self.observe_composer(composer.clone(), cx);
         self.composer = composer;
+        self.conversation_list = conversation_list_state(0);
+        self.refresh_conversation_cache(cx);
+        let composer = self.composer.read(cx);
         self.conversation_scroll = ScrollHandle::new();
         self.expanded_reasoning.clear();
         self.reasoning_disclosure_transitions.clear();
@@ -892,7 +963,6 @@ impl HomeView {
         self.expanded_commands.clear();
         self.command_scroll_handles.clear();
         self.expanded_collaborations.clear();
-        let composer = self.composer.read(cx);
         let needs_shimmer = composer.conversation_phase() == ConversationPhase::Thinking
             || composer.has_active_context_compaction()
             || composer.has_active_image_generation();
@@ -1070,10 +1140,15 @@ impl HomeView {
         distance: f32,
         cx: &mut Context<Self>,
     ) {
-        let max_scroll = f32::from(self.conversation_scroll.max_offset().y).max(0.0);
-        let scroll_top = (max_scroll - distance.max(0.0)).max(0.0);
-        self.conversation_scroll
-            .set_offset(point(px(0.0), px(-scroll_top)));
+        if self.presentation == HomePresentation::Conversation {
+            self.conversation_list.scroll_to_end();
+            self.conversation_list.scroll_by(px(-distance.max(0.0)));
+        } else {
+            let max_scroll = f32::from(self.conversation_scroll.max_offset().y).max(0.0);
+            let scroll_top = (max_scroll - distance.max(0.0)).max(0.0);
+            self.conversation_scroll
+                .set_offset(point(px(0.0), px(-scroll_top)));
+        }
         cx.notify();
     }
 
@@ -1663,15 +1738,20 @@ impl HomeView {
 impl Render for HomeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_mode(self.mode);
-        let transcript = self.composer.read(cx).transcript_render_snapshot();
-        let (
-            phase,
-            user_message,
-            user_message_time,
-            assistant_message,
-            assistant_message_time,
-            conversation_activity,
-        ) = self.composer.read(cx).conversation_render_snapshot();
+        let (transcript, phase, assistant_message, conversation_activity) =
+            if self.presentation == HomePresentation::Conversation {
+                (
+                    Vec::new(),
+                    self.conversation_phase,
+                    String::new(),
+                    self.conversation_activity.clone(),
+                )
+            } else {
+                let transcript = self.composer.read(cx).transcript_render_snapshot();
+                let (phase, _, _, assistant_message, _, activity) =
+                    self.composer.read(cx).conversation_render_snapshot();
+                (transcript, phase, assistant_message, Arc::new(activity))
+            };
         let user_input_other = self.composer.read(cx).user_input_other_entity();
         let user_input_other_focus = self.composer.read(cx).user_input_other_focus_handle(cx);
         let blocking_keyboard_request_pending = self.presentation == HomePresentation::Conversation
@@ -1696,23 +1776,74 @@ impl Render for HomeView {
         // the last turn live in `transcript`; syncing only the current turn
         // immediately pruned a historical group id after its header was
         // clicked, making a valid command block appear inert.
-        let visible_activity_units = transcript
-            .iter()
-            .flat_map(|turn| activity_stream_units(&turn.activities))
-            .chain(activity_stream_units(&conversation_activity))
-            .collect::<Vec<_>>();
-        self.sync_reasoning_disclosure_transitions(&visible_activity_units, window, cx);
-        self.sync_tool_group_disclosure_transitions(&visible_activity_units, window, cx);
-        for activity in transcript
-            .iter()
-            .flat_map(|turn| turn.activities.iter())
-            .chain(conversation_activity.iter())
-        {
-            if let ConversationActivity::Command(command) = activity {
-                self.command_scroll_handles
-                    .entry(command.id.clone())
-                    .or_insert_with(ScrollHandle::new);
+        let disclosure_state_changed = self.conversation_rows.iter().any(|row| {
+            let ConversationListRow::Activity { unit, .. } = row else {
+                return false;
+            };
+            match unit {
+                ActivityStreamUnit::Standalone(ConversationActivity::Reasoning(reasoning)) => {
+                    let expanded = reasoning.is_active()
+                        || self.expanded_reasoning.contains(&reasoning.item_id);
+                    self.reasoning_disclosure_transitions
+                        .get(&reasoning.item_id)
+                        .is_some_and(|transition| {
+                            (transition.target - if expanded { 1.0 } else { 0.0 }).abs()
+                                > f32::EPSILON
+                        })
+                }
+                ActivityStreamUnit::ToolGroup(group) => {
+                    let expanded = if group.is_active() {
+                        !self.collapsed_active_tool_groups.contains(&group.id)
+                    } else {
+                        self.expanded_tool_groups.contains(&group.id)
+                    };
+                    self.tool_group_disclosure_transitions
+                        .get(&group.id)
+                        .is_some_and(|transition| {
+                            (transition.target - if expanded { 1.0 } else { 0.0 }).abs()
+                                > f32::EPSILON
+                        })
+                }
+                _ => false,
             }
+        });
+        let conversation_data_changed = self.conversation_cache_dirty || disclosure_state_changed;
+        if self.presentation == HomePresentation::Subagent || conversation_data_changed {
+            let visible_activity_units = if self.presentation == HomePresentation::Conversation {
+                self.conversation_rows
+                    .iter()
+                    .filter_map(|row| match row {
+                        ConversationListRow::Activity { unit, .. } => Some(unit.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                transcript
+                    .iter()
+                    .flat_map(|turn| activity_stream_units(&turn.activities))
+                    .chain(activity_stream_units(&conversation_activity))
+                    .collect::<Vec<_>>()
+            };
+            self.sync_reasoning_disclosure_transitions(&visible_activity_units, window, cx);
+            self.sync_tool_group_disclosure_transitions(&visible_activity_units, window, cx);
+            for unit in &visible_activity_units {
+                match unit {
+                    ActivityStreamUnit::Standalone(ConversationActivity::Command(command)) => {
+                        self.command_scroll_handles
+                            .entry(command.id.clone())
+                            .or_insert_with(ScrollHandle::new);
+                    }
+                    ActivityStreamUnit::ToolGroup(group) => {
+                        for command in &group.commands {
+                            self.command_scroll_handles
+                                .entry(command.id.clone())
+                                .or_insert_with(ScrollHandle::new);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            self.conversation_cache_dirty = false;
         }
         let reasoning_disclosure_progress = self
             .reasoning_disclosure_transitions
@@ -1729,68 +1860,67 @@ impl Render for HomeView {
                 )
             })
             .collect();
-        for unit in activity_stream_units(&conversation_activity) {
-            let ActivityStreamUnit::ToolGroup(group) = unit else {
-                continue;
-            };
-            let expanded = if group.is_active() {
-                !self.collapsed_active_tool_groups.contains(&group.id)
-            } else {
-                self.expanded_tool_groups.contains(&group.id)
-            };
-            let scroll_handle = self
-                .tool_group_scroll_handles
-                .entry(group.id.clone())
-                .or_insert_with(ScrollHandle::new);
-            if group.is_active() && expanded && scroll_should_follow_output(scroll_handle) {
-                scroll_handle.scroll_to_bottom();
+        if conversation_data_changed || conversation_status(phase).is_some() {
+            for unit in activity_stream_units(&conversation_activity) {
+                let ActivityStreamUnit::ToolGroup(group) = unit else {
+                    continue;
+                };
+                let expanded = if group.is_active() {
+                    !self.collapsed_active_tool_groups.contains(&group.id)
+                } else {
+                    self.expanded_tool_groups.contains(&group.id)
+                };
+                let scroll_handle = self
+                    .tool_group_scroll_handles
+                    .entry(group.id.clone())
+                    .or_insert_with(ScrollHandle::new);
+                if group.is_active() && expanded && scroll_should_follow_output(scroll_handle) {
+                    scroll_handle.scroll_to_bottom();
+                }
+            }
+            for activity in conversation_activity.iter() {
+                match activity {
+                    ConversationActivity::Reasoning(reasoning) => {
+                        let scroll_handle = self
+                            .reasoning_scroll_handles
+                            .entry(reasoning.item_id.clone())
+                            .or_insert_with(ScrollHandle::new);
+                        if reasoning.is_active() && scroll_should_follow_output(scroll_handle) {
+                            scroll_handle.scroll_to_bottom();
+                        }
+                    }
+                    ConversationActivity::Command(command) => {
+                        let scroll_handle = self
+                            .command_scroll_handles
+                            .entry(command.id.clone())
+                            .or_insert_with(ScrollHandle::new);
+                        if command.status == CommandExecutionStatus::InProgress
+                            && scroll_should_follow_output(scroll_handle)
+                        {
+                            scroll_handle.scroll_to_bottom();
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
-        for activity in &conversation_activity {
-            match activity {
-                ConversationActivity::Reasoning(reasoning) => {
-                    let scroll_handle = self
-                        .reasoning_scroll_handles
-                        .entry(reasoning.item_id.clone())
-                        .or_insert_with(ScrollHandle::new);
-                    if reasoning.is_active() && scroll_should_follow_output(scroll_handle) {
-                        scroll_handle.scroll_to_bottom();
-                    }
-                }
-                ConversationActivity::Command(command) => {
-                    let scroll_handle = self
-                        .command_scroll_handles
-                        .entry(command.id.clone())
-                        .or_insert_with(ScrollHandle::new);
-                    if command.status == CommandExecutionStatus::InProgress
-                        && scroll_should_follow_output(scroll_handle)
-                    {
-                        scroll_handle.scroll_to_bottom();
-                    }
-                }
-                _ => {}
+        if self.presentation == HomePresentation::Subagent {
+            if phase == ConversationPhase::Empty {
+                self.conversation_scroll.set_offset(point(px(0.0), px(0.0)));
+            } else if scroll_should_follow_output(&self.conversation_scroll) {
+                self.conversation_scroll.scroll_to_bottom();
             }
-        }
-        if phase == ConversationPhase::Empty {
-            self.conversation_scroll.set_offset(point(px(0.0), px(0.0)));
-        } else if scroll_should_follow_output(&self.conversation_scroll) {
-            self.conversation_scroll.scroll_to_bottom();
         }
         let content = match self.presentation {
             HomePresentation::Conversation => home(
-                window,
                 cx.entity(),
                 theme,
                 self.composer.clone(),
                 user_input_other,
-                transcript,
+                self.conversation_rows.clone(),
                 phase,
-                user_message,
-                user_message_time,
-                assistant_message,
-                assistant_message_time,
                 conversation_activity,
-                self.conversation_scroll.clone(),
+                self.conversation_list.clone(),
                 self.thinking_shimmer_progress,
                 self.response_feedback,
                 self.user_message_actions_visible_for_capture,
@@ -1823,7 +1953,7 @@ impl Render for HomeView {
                 transcript,
                 phase,
                 assistant_message,
-                conversation_activity,
+                conversation_activity.as_ref().clone(),
                 self.conversation_scroll.clone(),
                 self.thinking_shimmer_progress,
                 self.response_feedback,
@@ -1846,19 +1976,14 @@ impl Render for HomeView {
 }
 
 fn home(
-    window: &mut Window,
     home_entity: Entity<HomeView>,
     theme: Theme,
     composer: Entity<ComposerView>,
     user_input_other: Entity<PromptInput>,
-    transcript: Vec<ConversationTranscriptTurn>,
+    conversation_rows: Arc<Vec<ConversationListRow>>,
     phase: ConversationPhase,
-    user_message: Option<String>,
-    user_message_time: Option<String>,
-    assistant_message: String,
-    assistant_message_time: Option<String>,
-    conversation_activity: Vec<ConversationActivity>,
-    conversation_scroll: ScrollHandle,
+    conversation_activity: Arc<Vec<ConversationActivity>>,
+    conversation_list: ListState,
     thinking_shimmer_progress: f32,
     response_feedback: i8,
     user_message_actions_visible_for_capture: bool,
@@ -1952,17 +2077,10 @@ fn home(
         })
         .when(phase != ConversationPhase::Empty, |root| {
             root.child(conversation(
-                window,
                 home_entity.clone(),
                 theme,
-                transcript,
-                phase,
-                user_message.unwrap_or_default(),
-                user_message_time.unwrap_or_default(),
-                assistant_message,
-                assistant_message_time,
-                conversation_activity,
-                conversation_scroll,
+                conversation_rows,
+                conversation_list,
                 thinking_shimmer_progress,
                 response_feedback,
                 user_message_actions_visible_for_capture,
@@ -2293,18 +2411,88 @@ fn subagent_conversation(
     )
 }
 
-fn conversation(
-    window: &mut Window,
-    home_entity: Entity<HomeView>,
-    theme: Theme,
+fn conversation_list_rows(
     transcript: Vec<ConversationTranscriptTurn>,
     phase: ConversationPhase,
     user_message: String,
     user_message_time: String,
     assistant_message: String,
     assistant_message_time: Option<String>,
-    conversation_activity: Vec<ConversationActivity>,
-    conversation_scroll: ScrollHandle,
+    conversation_activity: &[ConversationActivity],
+) -> Vec<ConversationListRow> {
+    let has_active_reasoning = conversation_activity.iter().any(|activity| {
+        matches!(activity, ConversationActivity::Reasoning(reasoning) if reasoning.is_active())
+    });
+    let show_thinking_tail = conversation_status(phase).is_some() && !has_active_reasoning;
+    let mut rows = Vec::new();
+    for (turn_index, turn) in transcript.into_iter().enumerate() {
+        if !turn.user_message.is_empty() {
+            rows.push(ConversationListRow::HistoricalUser {
+                turn_index,
+                message: turn.user_message,
+            });
+        }
+        if turn.activities.is_empty() {
+            if !turn.assistant_message.is_empty() {
+                rows.push(ConversationListRow::AssistantMarkdown {
+                    id: format!("historical-assistant-{turn_index}"),
+                    text: turn.assistant_message,
+                });
+            }
+        } else {
+            let turn_show_thinking = conversation_status(turn.phase).is_some();
+            rows.extend(
+                activity_stream_units(&turn.activities)
+                    .into_iter()
+                    .map(|unit| ConversationListRow::Activity {
+                        unit,
+                        show_thinking_tail: turn_show_thinking,
+                    }),
+            );
+        }
+    }
+    rows.push(ConversationListRow::CurrentUser {
+        message: user_message,
+        time: user_message_time,
+    });
+    if conversation_activity.is_empty() {
+        if !assistant_message.is_empty() {
+            rows.push(ConversationListRow::AssistantMarkdown {
+                id: "current-assistant".to_owned(),
+                text: assistant_message.clone(),
+            });
+        }
+    } else {
+        rows.extend(
+            activity_stream_units(conversation_activity)
+                .into_iter()
+                .map(|unit| ConversationListRow::Activity {
+                    unit,
+                    show_thinking_tail,
+                }),
+        );
+    }
+    if show_thinking_tail {
+        rows.push(ConversationListRow::Thinking);
+    }
+    if matches!(
+        phase,
+        ConversationPhase::Complete | ConversationPhase::Failed
+    ) && !assistant_message.is_empty()
+    {
+        rows.push(ConversationListRow::CurrentResponseFooter {
+            message: assistant_message,
+            completed_at: assistant_message_time,
+        });
+    }
+    rows
+}
+
+fn conversation(
+    home_entity: Entity<HomeView>,
+    theme: Theme,
+    rows: Arc<Vec<ConversationListRow>>,
+    conversation_list: ListState,
     thinking_shimmer_progress: f32,
     response_feedback: i8,
     user_message_actions_visible_for_capture: bool,
@@ -2319,307 +2507,299 @@ fn conversation(
     command_scroll_handles: HashMap<String, ScrollHandle>,
     expanded_collaborations: HashSet<String>,
 ) -> impl IntoElement {
-    let has_active_reasoning = conversation_activity.iter().any(|activity| {
-        matches!(activity, ConversationActivity::Reasoning(reasoning) if reasoning.is_active())
-    });
-    let show_thinking_tail = conversation_status(phase).is_some() && !has_active_reasoning;
-    let user_message_hover_group: SharedString = "user-message-hover".into();
-    let assistant_message_hover_group: SharedString = "assistant-message-hover".into();
-    let copied_user_message = user_message.clone();
-    let has_assistant_response = !assistant_message.is_empty();
-    let complete = matches!(
-        phase,
-        ConversationPhase::Complete | ConversationPhase::Failed
-    );
-
-    let mut historical_transcript = div().w_full().flex().flex_col().gap(px(24.0));
-    for (index, turn) in transcript.into_iter().enumerate() {
-        let user_message = turn.user_message;
-        let answer = if turn.activities.is_empty() {
-            render_assistant_markdown(
-                &turn.assistant_message,
-                theme,
-                &format!("historical-assistant-{index}"),
-            )
-            .into_any_element()
-        } else {
-            activity_stream(
-                home_entity.clone(),
-                turn.activities,
-                conversation_status(turn.phase).is_some(),
-                thinking_shimmer_progress,
-                expanded_reasoning.clone(),
-                reasoning_disclosure_progress.clone(),
-                reasoning_scroll_handles.clone(),
-                expanded_tool_groups.clone(),
-                collapsed_active_tool_groups.clone(),
-                tool_group_disclosure_progress.clone(),
-                tool_group_scroll_handles.clone(),
-                expanded_commands.clone(),
-                command_scroll_handles.clone(),
-                expanded_collaborations.clone(),
-                theme,
-            )
-            .into_any_element()
+    sync_list_item_count(&conversation_list, rows.len());
+    let conversation_rows = list(conversation_list, move |index, window, _cx| {
+        let Some(row) = rows.get(index).cloned() else {
+            return div().into_any_element();
         };
-        historical_transcript = historical_transcript.child(
-            div()
-                .id(("transcript-turn", index))
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap(px(16.0))
-                .when(!user_message.is_empty(), |row| {
-                    row.child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .justify_end()
-                            .child(user_message_bubble(user_message, theme, window)),
-                    )
-                })
-                .child(answer),
-        );
-    }
-
-    let conversation_body = div()
-        .w_full()
-        .max_w(px(736.0))
-        .mx_auto()
-        .pt(px(CONVERSATION_TOP_INSET))
-        .pb(px(CONVERSATION_BOTTOM_INSET))
-        .flex()
-        .flex_col()
-        .child(historical_transcript)
-        .child(
-            div()
-                .min_h(px(USER_MESSAGE_VERTICAL_PADDING * 2.0
-                    + USER_MESSAGE_LINE_HEIGHT
-                    + USER_MESSAGE_FOOTER_OFFSET
-                    + USER_MESSAGE_FOOTER_HEIGHT))
-                .w_full()
-                .flex()
-                .flex_col()
-                .items_end()
-                .child(
-                    div()
-                        .group(user_message_hover_group.clone())
-                        .flex()
-                        .flex_col()
-                        .items_end()
-                        .child(user_message_bubble(user_message, theme, window))
-                        .child(
-                            div()
-                                .mt(px(USER_MESSAGE_FOOTER_OFFSET))
-                                .mx(px(USER_MESSAGE_FOOTER_SIDE_MARGIN))
-                                .h(px(USER_MESSAGE_FOOTER_HEIGHT))
-                                .flex()
-                                .items_center()
-                                .gap(px(USER_MESSAGE_FOOTER_GAP))
-                                .child(
-                                    div()
-                                        .text_size(px(USER_MESSAGE_TIME_SIZE))
-                                        .line_height(px(USER_MESSAGE_TIME_LINE_HEIGHT))
-                                        .text_color(theme.text_tertiary)
-                                        .opacity(if user_message_actions_visible_for_capture {
-                                            1.0
-                                        } else {
-                                            0.0
-                                        })
-                                        .group_hover(user_message_hover_group.clone(), |time| {
-                                            time.opacity(1.0)
-                                        })
-                                        .child(user_message_time),
-                                )
-                                .child(
-                                    div()
-                                        .id("user-message-copy")
-                                        .debug_selector(|| "USER_MESSAGE_COPY".to_owned())
-                                        .size(px(26.0))
-                                        .rounded(px(10.0))
-                                        .opacity(if user_message_actions_visible_for_capture {
-                                            1.0
-                                        } else {
-                                            0.0
-                                        })
-                                        .group_hover(user_message_hover_group, |button| {
-                                            button.opacity(1.0)
-                                        })
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .cursor_pointer()
-                                        .hover(move |button| button.bg(theme.sidebar_hover))
-                                        .active(move |button| button.bg(theme.text.alpha(0.12)))
-                                        .on_click(move |_, _, cx| {
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                                copied_user_message.clone(),
-                                            ));
-                                        })
-                                        .child(
-                                            icon("message-copy", theme.text_tertiary.into())
-                                                .size(px(RESPONSE_ACTION_ICON_SIZE)),
-                                        ),
-                                ),
-                        ),
-                ),
-        )
-        .child(
-            div()
-                .group(assistant_message_hover_group.clone())
-                .mt(px(16.0))
-                .w_full()
-                .min_h(px(48.0))
-                // GPUI group hover is based on the group's own hitbox. The
-                // reference's 26px buttons overflow a 20px footer by 3px, and
-                // CSS :hover still includes those descendants. This invisible
-                // trailing hit area preserves that behavior for every icon px.
-                .pb(px(3.0))
-                .text_size(px(14.0))
-                .line_height(px(22.0))
-                .text_color(theme.text)
-                .when(
-                    !assistant_message.is_empty()
-                        || !conversation_activity.is_empty()
-                        || show_thinking_tail,
-                    |answer| {
-                        if conversation_activity.is_empty() {
-                            answer.child(
-                                div()
-                                    .w_full()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(16.0))
-                                    .when(!assistant_message.is_empty(), |stream| {
-                                        stream.child(render_assistant_markdown(
-                                            &assistant_message,
-                                            theme,
-                                            "current-assistant",
-                                        ))
-                                    })
-                                    .when(show_thinking_tail, |stream| {
-                                        stream.child(thinking_shimmer(
-                                            theme,
-                                            thinking_shimmer_progress,
-                                        ))
-                                    }),
-                            )
-                        } else {
-                            answer.child(activity_stream(
-                                home_entity.clone(),
-                                conversation_activity,
-                                show_thinking_tail,
-                                thinking_shimmer_progress,
-                                expanded_reasoning,
-                                reasoning_disclosure_progress,
-                                reasoning_scroll_handles,
-                                expanded_tool_groups,
-                                collapsed_active_tool_groups,
-                                tool_group_disclosure_progress,
-                                tool_group_scroll_handles,
-                                expanded_commands,
-                                command_scroll_handles,
-                                expanded_collaborations,
-                                theme,
-                            ))
-                        }
-                    },
+        let (row, top_gap, bottom_gap) = match row {
+            ConversationListRow::HistoricalUser {
+                turn_index,
+                message,
+            } => (
+                div()
+                    .id(("transcript-turn-user", turn_index))
+                    .w_full()
+                    .flex()
+                    .justify_end()
+                    .child(user_message_bubble(message, theme, window))
+                    .into_any_element(),
+                0.0,
+                16.0,
+            ),
+            ConversationListRow::CurrentUser { message, time } => (
+                current_user_message(
+                    message,
+                    time,
+                    user_message_actions_visible_for_capture,
+                    theme,
+                    window,
                 )
-                .when(complete && has_assistant_response, |answer| {
-                    answer.child(
-                        div()
-                            .relative()
-                            .left(px(RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT))
-                            .mt(px(RESPONSE_ACTION_FOOTER_OFFSET))
-                            .w_full()
-                            .h(px(RESPONSE_ACTION_FOOTER_HEIGHT))
-                            .flex()
-                            .items_center()
-                            .gap(px(RESPONSE_ACTION_GAP))
-                            .child(
-                                div()
-                                    .h_full()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(RESPONSE_ACTION_GAP))
-                                    .child(message_action(
-                                        "message-copy",
-                                        "response-copy",
-                                        0,
-                                        false,
-                                        assistant_message.clone(),
-                                        home_entity.clone(),
-                                        theme,
-                                    ))
-                                    .child(message_action(
-                                        "message-thumb-up",
-                                        "response-thumb-up",
-                                        1,
-                                        response_feedback == 1,
-                                        assistant_message.clone(),
-                                        home_entity.clone(),
-                                        theme,
-                                    ))
-                                    .child(message_action(
-                                        "message-thumb-down",
-                                        "response-thumb-down",
-                                        2,
-                                        response_feedback == -1,
-                                        assistant_message.clone(),
-                                        home_entity.clone(),
-                                        theme,
-                                    ))
-                                    .child(message_action(
-                                        "message-branch",
-                                        "response-branch",
-                                        3,
-                                        false,
-                                        assistant_message,
-                                        home_entity,
-                                        theme,
-                                    )),
-                            )
-                            .when_some(assistant_message_time, |footer, completed_at| {
-                                footer.child(
-                                    div()
-                                        .ml(px(RESPONSE_TIME_MARGIN))
-                                        .h_full()
-                                        .flex()
-                                        .items_center()
-                                        .opacity(0.0)
-                                        .group_hover(assistant_message_hover_group, |time| {
-                                            time.opacity(1.0)
-                                        })
-                                        .child(
-                                            div()
-                                                .text_size(px(RESPONSE_TIME_SIZE))
-                                                .line_height(px(RESPONSE_TIME_LINE_HEIGHT))
-                                                .font_weight(gpui::FontWeight::NORMAL)
-                                                .text_color(theme.text_tertiary)
-                                                .child(completed_at),
-                                        ),
-                                )
-                            }),
-                    )
-                }),
-        );
+                .into_any_element(),
+                0.0,
+                16.0,
+            ),
+            ConversationListRow::AssistantMarkdown { id, text } => (
+                render_assistant_markdown(&text, theme, &id).into_any_element(),
+                0.0,
+                16.0,
+            ),
+            ConversationListRow::Activity {
+                unit,
+                show_thinking_tail,
+            } => (
+                render_activity_stream_unit(
+                    index,
+                    unit,
+                    show_thinking_tail,
+                    thinking_shimmer_progress,
+                    home_entity.clone(),
+                    theme,
+                    &expanded_reasoning,
+                    &reasoning_disclosure_progress,
+                    &reasoning_scroll_handles,
+                    &expanded_tool_groups,
+                    &collapsed_active_tool_groups,
+                    &tool_group_disclosure_progress,
+                    &tool_group_scroll_handles,
+                    &expanded_commands,
+                    &command_scroll_handles,
+                    &expanded_collaborations,
+                ),
+                0.0,
+                16.0,
+            ),
+            ConversationListRow::Thinking => (
+                thinking_shimmer(theme, thinking_shimmer_progress).into_any_element(),
+                0.0,
+                16.0,
+            ),
+            ConversationListRow::CurrentResponseFooter {
+                message,
+                completed_at,
+            } => (
+                current_response_footer(
+                    message,
+                    completed_at,
+                    response_feedback,
+                    home_entity.clone(),
+                    theme,
+                )
+                .into_any_element(),
+                0.0,
+                3.0,
+            ),
+        };
+        div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(CONVERSATION_CONTENT_MAX_WIDTH))
+                    .pt(px(top_gap))
+                    .pb(px(bottom_gap))
+                    .text_size(px(14.0))
+                    .line_height(px(22.0))
+                    .text_color(theme.text)
+                    .child(row),
+            )
+            .into_any_element()
+    })
+    .size_full()
+    .pt(px(CONVERSATION_TOP_INSET))
+    .pb(px(CONVERSATION_BOTTOM_INSET));
 
     div()
         .id("conversation-scroll")
         .debug_selector(|| "conversation-scroll".to_owned())
         .absolute()
         .inset_0()
-        .overflow_y_scroll()
-        .restrict_scroll_to_axis()
-        .scrollbar_width(px(0.0))
-        .track_scroll(&conversation_scroll)
-        .child(conversation_body)
+        .child(conversation_rows)
+}
+
+fn current_user_message(
+    user_message: String,
+    user_message_time: String,
+    actions_visible_for_capture: bool,
+    theme: Theme,
+    window: &mut Window,
+) -> Div {
+    let hover_group: SharedString = "user-message-hover".into();
+    let copied_user_message = user_message.clone();
+    div()
+        .min_h(px(USER_MESSAGE_VERTICAL_PADDING * 2.0
+            + USER_MESSAGE_LINE_HEIGHT
+            + USER_MESSAGE_FOOTER_OFFSET
+            + USER_MESSAGE_FOOTER_HEIGHT))
+        .w_full()
+        .flex()
+        .flex_col()
+        .items_end()
+        .child(
+            div()
+                .group(hover_group.clone())
+                .flex()
+                .flex_col()
+                .items_end()
+                .child(user_message_bubble(user_message, theme, window))
+                .child(
+                    div()
+                        .mt(px(USER_MESSAGE_FOOTER_OFFSET))
+                        .mx(px(USER_MESSAGE_FOOTER_SIDE_MARGIN))
+                        .h(px(USER_MESSAGE_FOOTER_HEIGHT))
+                        .flex()
+                        .items_center()
+                        .gap(px(USER_MESSAGE_FOOTER_GAP))
+                        .child(
+                            div()
+                                .text_size(px(USER_MESSAGE_TIME_SIZE))
+                                .line_height(px(USER_MESSAGE_TIME_LINE_HEIGHT))
+                                .text_color(theme.text_tertiary)
+                                .opacity(if actions_visible_for_capture {
+                                    1.0
+                                } else {
+                                    0.0
+                                })
+                                .group_hover(hover_group.clone(), |time| time.opacity(1.0))
+                                .child(user_message_time),
+                        )
+                        .child(
+                            div()
+                                .id("user-message-copy")
+                                .debug_selector(|| "USER_MESSAGE_COPY".to_owned())
+                                .size(px(26.0))
+                                .rounded(px(10.0))
+                                .opacity(if actions_visible_for_capture {
+                                    1.0
+                                } else {
+                                    0.0
+                                })
+                                .group_hover(hover_group, |button| button.opacity(1.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(move |button| button.bg(theme.sidebar_hover))
+                                .active(move |button| button.bg(theme.text.alpha(0.12)))
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        copied_user_message.clone(),
+                                    ));
+                                })
+                                .child(
+                                    icon("message-copy", theme.text_tertiary.into())
+                                        .size(px(RESPONSE_ACTION_ICON_SIZE)),
+                                ),
+                        ),
+                ),
+        )
+}
+
+fn current_response_footer(
+    assistant_message: String,
+    completed_at: Option<String>,
+    response_feedback: i8,
+    home_entity: Entity<HomeView>,
+    theme: Theme,
+) -> Div {
+    div()
+        .relative()
+        .left(px(RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT))
+        .mt(px(RESPONSE_ACTION_FOOTER_OFFSET))
+        .w_full()
+        .h(px(RESPONSE_ACTION_FOOTER_HEIGHT))
+        .flex()
+        .items_center()
+        .gap(px(RESPONSE_ACTION_GAP))
+        .child(
+            div()
+                .h_full()
+                .flex()
+                .items_center()
+                .gap(px(RESPONSE_ACTION_GAP))
+                .child(message_action(
+                    "message-copy",
+                    "response-copy",
+                    0,
+                    false,
+                    assistant_message.clone(),
+                    home_entity.clone(),
+                    theme,
+                ))
+                .child(message_action(
+                    "message-thumb-up",
+                    "response-thumb-up",
+                    1,
+                    response_feedback == 1,
+                    assistant_message.clone(),
+                    home_entity.clone(),
+                    theme,
+                ))
+                .child(message_action(
+                    "message-thumb-down",
+                    "response-thumb-down",
+                    2,
+                    response_feedback == -1,
+                    assistant_message.clone(),
+                    home_entity.clone(),
+                    theme,
+                ))
+                .child(message_action(
+                    "message-branch",
+                    "response-branch",
+                    3,
+                    false,
+                    assistant_message,
+                    home_entity,
+                    theme,
+                )),
+        )
+        .when_some(completed_at, |footer, completed_at| {
+            footer.child(
+                div()
+                    .ml(px(RESPONSE_TIME_MARGIN))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(px(RESPONSE_TIME_SIZE))
+                            .line_height(px(RESPONSE_TIME_LINE_HEIGHT))
+                            .font_weight(gpui::FontWeight::NORMAL)
+                            .text_color(theme.text_tertiary)
+                            .child(completed_at),
+                    ),
+            )
+        })
 }
 
 fn scroll_should_follow_output(scroll_handle: &ScrollHandle) -> bool {
     let max_offset = f32::from(scroll_handle.max_offset().y).max(0.0);
     let offset = f32::from(scroll_handle.offset().y);
     max_offset <= CONVERSATION_BOTTOM_EPSILON || max_offset + offset <= CONVERSATION_BOTTOM_EPSILON
+}
+
+fn sync_list_item_count(list: &ListState, item_count: usize) {
+    let previous_count = list.item_count();
+    if item_count > previous_count {
+        list.splice(previous_count..previous_count, item_count - previous_count);
+    } else if item_count < previous_count {
+        list.splice(item_count..previous_count, 0);
+    }
+}
+
+fn conversation_list_state(item_count: usize) -> ListState {
+    let state = ListState::new(
+        item_count,
+        ListAlignment::Top,
+        px(CONVERSATION_LIST_OVERDRAW),
+    );
+    #[cfg(any(feature = "screenshot", test))]
+    let state = state.measure_all();
+    state.set_follow_mode(FollowMode::Tail);
+    state
 }
 
 fn nested_scroll_consumed(
@@ -2652,6 +2832,194 @@ fn nested_scroll_consumed(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn render_activity_stream_unit(
+    index: usize,
+    unit: ActivityStreamUnit,
+    show_thinking_tail: bool,
+    thinking_shimmer_progress: f32,
+    home_entity: Entity<HomeView>,
+    theme: Theme,
+    expanded_reasoning: &HashSet<String>,
+    reasoning_disclosure_progress: &HashMap<String, f32>,
+    reasoning_scroll_handles: &HashMap<String, ScrollHandle>,
+    expanded_tool_groups: &HashSet<String>,
+    collapsed_active_tool_groups: &HashSet<String>,
+    tool_group_disclosure_progress: &HashMap<String, (f32, f32)>,
+    tool_group_scroll_handles: &HashMap<String, ScrollHandle>,
+    expanded_commands: &HashSet<String>,
+    command_scroll_handles: &HashMap<String, ScrollHandle>,
+    expanded_collaborations: &HashSet<String>,
+) -> gpui::AnyElement {
+    match unit {
+        ActivityStreamUnit::ToolGroup(group) => {
+            let active = group.is_active();
+            let expanded = if active {
+                !collapsed_active_tool_groups.contains(&group.id)
+            } else {
+                expanded_tool_groups.contains(&group.id)
+            };
+            let settled_progress = if expanded { 1.0 } else { 0.0 };
+            let (disclosure_progress, chevron_progress) = tool_group_disclosure_progress
+                .get(&group.id)
+                .copied()
+                .unwrap_or((settled_progress, settled_progress));
+            let scroll_handle = tool_group_scroll_handles
+                .get(&group.id)
+                .cloned()
+                .unwrap_or_else(ScrollHandle::new);
+            tool_activity_group(
+                home_entity,
+                group,
+                expanded,
+                disclosure_progress,
+                chevron_progress,
+                scroll_handle,
+                expanded_commands,
+                command_scroll_handles,
+                theme,
+            )
+            .into_any_element()
+        }
+        ActivityStreamUnit::Standalone(activity) => match activity {
+            ConversationActivity::AssistantMessage { item_id, text } if !text.is_empty() => {
+                render_assistant_markdown(&text, theme, &item_id).into_any_element()
+            }
+            ConversationActivity::Reasoning(reasoning) => {
+                let expanded =
+                    reasoning.is_active() || expanded_reasoning.contains(&reasoning.item_id);
+                let disclosure_progress = reasoning_disclosure_progress
+                    .get(&reasoning.item_id)
+                    .copied()
+                    .unwrap_or(if expanded { 1.0 } else { 0.0 });
+                let scroll_handle = reasoning_scroll_handles
+                    .get(&reasoning.item_id)
+                    .cloned()
+                    .unwrap_or_else(ScrollHandle::new);
+                reasoning_activity(
+                    home_entity,
+                    reasoning,
+                    expanded,
+                    disclosure_progress,
+                    scroll_handle,
+                    thinking_shimmer_progress,
+                    theme,
+                )
+                .into_any_element()
+            }
+            ConversationActivity::ImageView(image) => {
+                let expanded = if show_thinking_tail {
+                    !collapsed_active_tool_groups.contains(&image.id)
+                } else {
+                    expanded_tool_groups.contains(&image.id)
+                };
+                image_view_activity(home_entity, image, expanded, show_thinking_tail, theme)
+                    .into_any_element()
+            }
+            ConversationActivity::ImageGeneration(image) => {
+                image_generation_activity(home_entity, image, thinking_shimmer_progress, theme)
+                    .into_any_element()
+            }
+            ConversationActivity::ContextCompaction(compaction) => {
+                context_compaction_activity(compaction, thinking_shimmer_progress, theme)
+                    .into_any_element()
+            }
+            ConversationActivity::Collaboration(collaboration) => {
+                let expanded =
+                    expanded_collaborations.contains(&collaboration_ui_identity(&collaboration));
+                collaboration_activity(home_entity, collaboration, expanded, theme)
+                    .into_any_element()
+            }
+            ConversationActivity::McpToolCall(tool_call) => {
+                mcp_tool_call_activity(tool_call, theme).into_any_element()
+            }
+            ConversationActivity::Command(command) => command_execution_activity(
+                home_entity,
+                command,
+                expanded_commands,
+                command_scroll_handles,
+                theme,
+            )
+            .into_any_element(),
+            ConversationActivity::FileChange(model) => {
+                let target = home_entity;
+                let callback = FileChangeActivityCallback::new(move |event, _, cx| {
+                    target.update(cx, move |home, cx| {
+                        home.handle_file_change_activity_event(event, cx)
+                    });
+                });
+                let expanded = expanded_commands.contains(&model.item_id);
+                render_file_change_activity(&model, expanded, theme, callback).into_any_element()
+            }
+            ConversationActivity::ProtocolError {
+                message,
+                details,
+                will_retry: true,
+            } => retrying_error_activity(index, message, details, theme).into_any_element(),
+            ConversationActivity::ProtocolError {
+                message,
+                details,
+                will_retry: false,
+            } => notice_activity(
+                message,
+                details,
+                None,
+                "Codex 错误",
+                NOTICE_ERROR_GAP,
+                NOTICE_ERROR_CONTENT_GAP,
+                index,
+                theme,
+            )
+            .into_any_element(),
+            ConversationActivity::Warning { message } => notice_activity(
+                message,
+                None,
+                None,
+                "Codex 警告",
+                NOTICE_WARNING_GAP,
+                NOTICE_WARNING_CONTENT_GAP,
+                index,
+                theme,
+            )
+            .into_any_element(),
+            ConversationActivity::ConfigWarning(warning) => {
+                let file = warning.path.map(|path| ConfigWarningFile {
+                    path,
+                    line: warning.line,
+                    column: warning.column,
+                });
+                notice_activity(
+                    warning.summary,
+                    warning.details,
+                    file,
+                    "Codex 配置警告",
+                    NOTICE_WARNING_GAP,
+                    NOTICE_WARNING_CONTENT_GAP,
+                    index,
+                    theme,
+                )
+                .into_any_element()
+            }
+            ConversationActivity::Error { message } => notice_activity(
+                message,
+                None,
+                None,
+                "Codex turn 失败",
+                NOTICE_ERROR_GAP,
+                NOTICE_ERROR_CONTENT_GAP,
+                index,
+                theme,
+            )
+            .into_any_element(),
+            ConversationActivity::Approval(_)
+            | ConversationActivity::FileApproval(_)
+            | ConversationActivity::PermissionsApproval(_)
+            | ConversationActivity::UserInput(_)
+            | ConversationActivity::AssistantMessage { .. } => div().into_any_element(),
+        },
+    }
+}
+
 fn activity_stream(
     home_entity: Entity<HomeView>,
     activities: Vec<ConversationActivity>,
@@ -2669,195 +3037,35 @@ fn activity_stream(
     expanded_collaborations: HashSet<String>,
     theme: Theme,
 ) -> Div {
-    activity_stream_units(&activities)
+    let stream = activity_stream_units(&activities)
         .into_iter()
         .enumerate()
         .fold(
             div().w_full().flex().flex_col().gap(px(16.0)),
-            |stream, (index, unit)| match unit {
-                ActivityStreamUnit::ToolGroup(group) => {
-                    let active = group.is_active();
-                    let expanded = if active {
-                        !collapsed_active_tool_groups.contains(&group.id)
-                    } else {
-                        expanded_tool_groups.contains(&group.id)
-                    };
-                    let settled_progress = if expanded { 1.0 } else { 0.0 };
-                    let (disclosure_progress, chevron_progress) = tool_group_disclosure_progress
-                        .get(&group.id)
-                        .copied()
-                        .unwrap_or((settled_progress, settled_progress));
-                    let scroll_handle = tool_group_scroll_handles
-                        .get(&group.id)
-                        .cloned()
-                        .unwrap_or_else(ScrollHandle::new);
-                    stream.child(tool_activity_group(
-                        home_entity.clone(),
-                        group,
-                        expanded,
-                        disclosure_progress,
-                        chevron_progress,
-                        scroll_handle,
-                        &expanded_commands,
-                        &command_scroll_handles,
-                        theme,
-                    ))
-                }
-                ActivityStreamUnit::Standalone(activity) => match activity {
-                    ConversationActivity::AssistantMessage { item_id, text }
-                        if !text.is_empty() =>
-                    {
-                        stream.child(render_assistant_markdown(&text, theme, &item_id))
-                    }
-                    ConversationActivity::Reasoning(reasoning) => {
-                        let expanded = reasoning.is_active()
-                            || expanded_reasoning.contains(&reasoning.item_id);
-                        let disclosure_progress = reasoning_disclosure_progress
-                            .get(&reasoning.item_id)
-                            .copied()
-                            .unwrap_or(if expanded { 1.0 } else { 0.0 });
-                        let scroll_handle = reasoning_scroll_handles
-                            .get(&reasoning.item_id)
-                            .cloned()
-                            .unwrap_or_else(ScrollHandle::new);
-                        stream.child(reasoning_activity(
-                            home_entity.clone(),
-                            reasoning,
-                            expanded,
-                            disclosure_progress,
-                            scroll_handle,
-                            thinking_shimmer_progress,
-                            theme,
-                        ))
-                    }
-                    ConversationActivity::ImageView(image) => {
-                        let expanded = if show_thinking_tail {
-                            !collapsed_active_tool_groups.contains(&image.id)
-                        } else {
-                            expanded_tool_groups.contains(&image.id)
-                        };
-                        stream.child(image_view_activity(
-                            home_entity.clone(),
-                            image,
-                            expanded,
-                            show_thinking_tail,
-                            theme,
-                        ))
-                    }
-                    ConversationActivity::ImageGeneration(image) => {
-                        stream.child(image_generation_activity(
-                            home_entity.clone(),
-                            image,
-                            thinking_shimmer_progress,
-                            theme,
-                        ))
-                    }
-                    ConversationActivity::ContextCompaction(compaction) => stream.child(
-                        context_compaction_activity(compaction, thinking_shimmer_progress, theme),
-                    ),
-                    ConversationActivity::Collaboration(collaboration) => {
-                        let expanded = expanded_collaborations
-                            .contains(&collaboration_ui_identity(&collaboration));
-                        stream.child(collaboration_activity(
-                            home_entity.clone(),
-                            collaboration,
-                            expanded,
-                            theme,
-                        ))
-                    }
-                    ConversationActivity::McpToolCall(tool_call) => {
-                        stream.child(mcp_tool_call_activity(tool_call, theme))
-                    }
-                    ConversationActivity::Command(command) => {
-                        stream.child(command_execution_activity(
-                            home_entity.clone(),
-                            command,
-                            &expanded_commands,
-                            &command_scroll_handles,
-                            theme,
-                        ))
-                    }
-                    ConversationActivity::Approval(_) => stream,
-                    ConversationActivity::FileApproval(_) => stream,
-                    ConversationActivity::PermissionsApproval(_) => stream,
-                    ConversationActivity::FileChange(model) => {
-                        let target = home_entity.clone();
-                        let callback = FileChangeActivityCallback::new(move |event, _, cx| {
-                            target.update(cx, move |home, cx| {
-                                home.handle_file_change_activity_event(event, cx)
-                            });
-                        });
-                        let expanded = expanded_commands.contains(&model.item_id);
-                        stream.child(render_file_change_activity(
-                            &model, expanded, theme, callback,
-                        ))
-                    }
-                    ConversationActivity::UserInput(_) => stream,
-                    ConversationActivity::ProtocolError {
-                        message,
-                        details,
-                        will_retry: true,
-                    } => stream.child(retrying_error_activity(index, message, details, theme)),
-                    ConversationActivity::ProtocolError {
-                        message,
-                        details,
-                        will_retry: false,
-                    } => stream.child(notice_activity(
-                        message,
-                        details,
-                        None,
-                        "Codex 错误",
-                        NOTICE_ERROR_GAP,
-                        NOTICE_ERROR_CONTENT_GAP,
-                        index,
-                        theme,
-                    )),
-                    ConversationActivity::Warning { message } => stream.child(notice_activity(
-                        message,
-                        None,
-                        None,
-                        "Codex 警告",
-                        NOTICE_WARNING_GAP,
-                        NOTICE_WARNING_CONTENT_GAP,
-                        index,
-                        theme,
-                    )),
-                    ConversationActivity::ConfigWarning(warning) => {
-                        let file = warning.path.map(|path| ConfigWarningFile {
-                            path,
-                            line: warning.line,
-                            column: warning.column,
-                        });
-                        stream.child(notice_activity(
-                            warning.summary,
-                            warning.details,
-                            file,
-                            "Codex 配置警告",
-                            NOTICE_WARNING_GAP,
-                            NOTICE_WARNING_CONTENT_GAP,
-                            index,
-                            theme,
-                        ))
-                    }
-                    ConversationActivity::Error { message } => stream.child(notice_activity(
-                        message,
-                        None,
-                        None,
-                        "Codex turn 失败",
-                        NOTICE_ERROR_GAP,
-                        NOTICE_ERROR_CONTENT_GAP,
-                        index,
-                        theme,
-                    )),
-                    _ => stream,
-                },
+            |stream, (index, unit)| {
+                stream.child(render_activity_stream_unit(
+                    index,
+                    unit,
+                    show_thinking_tail,
+                    thinking_shimmer_progress,
+                    home_entity.clone(),
+                    theme,
+                    &expanded_reasoning,
+                    &reasoning_disclosure_progress,
+                    &reasoning_scroll_handles,
+                    &expanded_tool_groups,
+                    &collapsed_active_tool_groups,
+                    &tool_group_disclosure_progress,
+                    &tool_group_scroll_handles,
+                    &expanded_commands,
+                    &command_scroll_handles,
+                    &expanded_collaborations,
+                ))
             },
-        )
-        // Keep the generic waiting state in the same 16px activity stream so
-        // it always follows the latest rendered JSON-RPC item.
-        .when(show_thinking_tail, |stream| {
-            stream.child(thinking_shimmer(theme, thinking_shimmer_progress))
-        })
+        );
+    stream.when(show_thinking_tail, |stream| {
+        stream.child(thinking_shimmer(theme, thinking_shimmer_progress))
+    })
 }
 
 fn image_generation_preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
@@ -3412,6 +3620,7 @@ fn toggle_reasoning_item(
             home.expanded_reasoning.insert(item_id);
             scroll_handle.scroll_to_bottom();
         }
+        home.conversation_cache_dirty = true;
         cx.notify();
     });
 }
@@ -3821,6 +4030,7 @@ fn toggle_tool_activity_group(
         if expanded {
             scroll_handle.scroll_to_bottom();
         }
+        home.conversation_cache_dirty = true;
         cx.notify();
     });
 }
@@ -5201,10 +5411,10 @@ mod tests {
         conversation_status, format_reasoning_elapsed, generic_command_activity_summary,
         humanize_mcp_tool_name, image_generation_preview_size, mcp_tool_call_label,
         reasoning_activity_title, reasoning_header_label, reasoning_transition_ease,
-        scroll_should_follow_output, strip_terminal_line_ending, thinking_shimmer_alpha,
-        thinking_shimmer_band_left, thinking_shimmer_progress, thinking_shimmer_step,
-        toggle_collaboration_item, toggle_reasoning_item, toggle_tool_activity_group,
-        tool_group_chevron_transition_ease, tool_group_reasoning_title, user_message_paragraphs,
+        strip_terminal_line_ending, thinking_shimmer_alpha, thinking_shimmer_band_left,
+        thinking_shimmer_progress, thinking_shimmer_step, toggle_collaboration_item,
+        toggle_reasoning_item, toggle_tool_activity_group, tool_group_chevron_transition_ease,
+        tool_group_reasoning_title, user_message_paragraphs,
     };
     use crate::agent::{
         AgentCollaboration, AgentCollaborationStatus, AgentCollaborationTool,
@@ -5963,37 +6173,25 @@ mod tests {
         window.update(|home, _, cx| home.set_tool_group_for_capture(true, false, cx));
         window.draw();
 
-        let (initial_offset, max_offset) = window.read(|home, _| {
-            (
-                f32::from(home.conversation_scroll.offset().y),
-                f32::from(home.conversation_scroll.max_offset().y),
-            )
-        });
-        assert!(max_offset > 100.0, "long conversations must overflow");
-        assert!((initial_offset + max_offset).abs() < 0.01);
-        assert!(window.read(|home, _| { scroll_should_follow_output(&home.conversation_scroll) }));
+        assert!(window.read(|home, _| home.conversation_list.is_following_tail()));
 
         // Use the empty gutter beside the centered 736px message column so
         // only the main conversation viewport receives this gesture.
         window.simulate_scroll(point(px(20.0), px(200.0)), point(px(0.0), px(96.0)));
-        let user_offset = window.read(|home, _| f32::from(home.conversation_scroll.offset().y));
-        assert!(user_offset > initial_offset);
-        assert!(!window.read(|home, _| { scroll_should_follow_output(&home.conversation_scroll) }));
+        let user_offset = window.read(|home, _| home.conversation_list.logical_scroll_top());
+        assert!(!window.read(|home, _| home.conversation_list.is_following_tail()));
 
         // A streaming repaint must preserve the user's reading position.
         window.update(|_, _, cx| cx.notify());
         window.draw();
-        let repainted_offset =
-            window.read(|home, _| f32::from(home.conversation_scroll.offset().y));
-        assert!((repainted_offset - user_offset).abs() < 0.01);
+        let repainted_offset = window.read(|home, _| home.conversation_list.logical_scroll_top());
+        assert_eq!(repainted_offset.item_ix, user_offset.item_ix);
+        assert_eq!(repainted_offset.offset_in_item, user_offset.offset_in_item);
 
         window.simulate_scroll(point(px(20.0), px(200.0)), point(px(0.0), px(-10_000.0)));
         window.draw();
         window.read(|home, _| {
-            let offset = f32::from(home.conversation_scroll.offset().y);
-            let max = f32::from(home.conversation_scroll.max_offset().y);
-            assert!((offset + max).abs() < 0.01);
-            assert!(scroll_should_follow_output(&home.conversation_scroll));
+            assert!(home.conversation_list.is_following_tail());
         });
     }
 
@@ -6026,7 +6224,7 @@ mod tests {
                 .get("tool-group-ui-capture")
                 .expect("tool group scroll handle");
             (
-                f32::from(home.conversation_scroll.offset().y),
+                home.conversation_list.is_following_tail(),
                 f32::from(inner.offset().y),
                 f32::from(inner.max_offset().y),
                 inner.bounds().center(),
@@ -6042,7 +6240,7 @@ mod tests {
                 .get("tool-group-ui-capture")
                 .expect("tool group scroll handle");
             (
-                f32::from(home.conversation_scroll.offset().y),
+                home.conversation_list.is_following_tail(),
                 f32::from(inner.offset().y),
             )
         });
@@ -6051,7 +6249,7 @@ mod tests {
             "inner={inner_before}->{inner_after}, outer={outer_before}->{outer_after}, position={inner_position:?}"
         );
         assert!(
-            (outer_after - outer_before).abs() < 0.01,
+            outer_after == outer_before,
             "inner={inner_before}->{inner_after}, outer={outer_before}->{outer_after}, position={inner_position:?}"
         );
 
@@ -6062,11 +6260,11 @@ mod tests {
                 .get("tool-group-ui-capture")
                 .expect("tool group scroll handle");
             (
-                f32::from(home.conversation_scroll.offset().y),
+                home.conversation_list.is_following_tail(),
                 f32::from(inner.offset().y),
             )
         });
-        assert!(outer_at_edge > outer_after);
+        assert!(!outer_at_edge && outer_after);
         assert!(inner_at_edge.abs() < 0.01);
     }
 
