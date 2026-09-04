@@ -473,6 +473,12 @@ struct MarkdownLayout {
     table_cell_max_width: f32,
 }
 
+/// ChatGPT's assistant Markdown root resolves `font-weight: 430`. On macOS
+/// Chromium selects PingFangSC-Medium for Chinese at that weight, so using
+/// GPUI's 400-weight `NORMAL` produces visibly lighter paragraphs even when
+/// the font family, size, and line height all match.
+const CHATGPT_MARKDOWN_BODY_WEIGHT: FontWeight = FontWeight(430.0);
+
 const CHATGPT_MARKDOWN_LAYOUT: MarkdownLayout = MarkdownLayout {
     base_size: 14.0,
     base_line_height: 22.75,
@@ -608,7 +614,7 @@ fn render_markdown_document(document: &MarkdownDocument, theme: Theme, identity_
     .text_size(px(style.layout.base_size))
     .line_height(px(style.layout.base_line_height))
     .font(ui_font())
-    .font_weight(FontWeight::NORMAL)
+    .font_weight(CHATGPT_MARKDOWN_BODY_WEIGHT)
     .text_color(style.palette.text)
 }
 
@@ -724,7 +730,7 @@ fn render_block(
             } else {
                 style.layout.base_line_height
             },
-            FontWeight::NORMAL,
+            CHATGPT_MARKDOWN_BODY_WEIGHT,
             block_identity,
         ),
         MarkdownBlock::Heading { level, content } => {
@@ -923,16 +929,18 @@ fn render_styled_text(
     style: MarkdownRenderStyle,
     base_weight: FontWeight,
 ) -> StyledText {
+    render_styled_text_with_state(inlines, style, base_weight, InlineState::default())
+}
+
+fn render_styled_text_with_state(
+    inlines: &[MarkdownInline],
+    style: MarkdownRenderStyle,
+    base_weight: FontWeight,
+    state: InlineState,
+) -> StyledText {
     let mut text = String::new();
     let mut runs = Vec::new();
-    append_inline_runs(
-        inlines,
-        InlineState::default(),
-        style,
-        base_weight,
-        &mut text,
-        &mut runs,
-    );
+    append_inline_runs(inlines, state, style, base_weight, &mut text, &mut runs);
     StyledText::new(text).with_runs(runs)
 }
 
@@ -1036,7 +1044,7 @@ struct InlineFragment {
     hard_break: bool,
     trailing_space: bool,
     link_destination: Option<String>,
-    link_leading: bool,
+    link_content: Option<Vec<MarkdownInline>>,
 }
 
 fn render_inline_boxes(
@@ -1048,7 +1056,7 @@ fn render_inline_boxes(
     inline_identity: u64,
 ) -> Div {
     let mut fragments = Vec::new();
-    append_inline_fragments(inlines, InlineState::default(), None, &mut fragments);
+    append_inline_fragments(inlines, InlineState::default(), &mut fragments);
     fragments.into_iter().enumerate().fold(
         div()
             .w_full()
@@ -1076,7 +1084,7 @@ fn render_inline_boxes(
             };
             let weight = if fragment.state.strong {
                 FontWeight::SEMIBOLD
-            } else if fragment.state.code || fragment.state.link {
+            } else if fragment.state.link {
                 FontWeight::MEDIUM
             } else {
                 base_weight
@@ -1111,9 +1119,7 @@ fn render_inline_boxes(
                 .when(fragment.trailing_space, |element| {
                     element.mr(px(style.layout.paragraph_space))
                 });
-            if let Some(file_reference) = file_reference
-                && fragment.link_leading
-            {
+            if let Some(file_reference) = file_reference {
                 element = element.child(
                     icon(markdown_file_reference_icon(file_reference), color.into())
                         .size(px(16.0))
@@ -1121,7 +1127,19 @@ fn render_inline_boxes(
                         .mr(px(3.0)),
                 );
             }
-            let element = element.child(StyledText::new(fragment.text));
+            let text = if let Some(link_content) = fragment.link_content.as_deref()
+                && file_reference.is_none()
+            {
+                render_styled_text_with_state(
+                    link_content,
+                    style,
+                    FontWeight::MEDIUM,
+                    fragment.state,
+                )
+            } else {
+                StyledText::new(fragment.text)
+            };
+            let element = element.child(text);
             if let Some(destination) = fragment.link_destination {
                 let link_id = markdown_element_id(
                     "markdown-link",
@@ -1151,7 +1169,6 @@ fn render_inline_boxes(
 fn append_inline_fragments(
     inlines: &[MarkdownInline],
     state: InlineState,
-    link_destination: Option<&str>,
     fragments: &mut Vec<InlineFragment>,
 ) {
     for inline in inlines {
@@ -1168,8 +1185,8 @@ fn append_inline_fragments(
                             state,
                             hard_break: false,
                             trailing_space: false,
-                            link_destination: link_destination.map(ToOwned::to_owned),
-                            link_leading: false,
+                            link_destination: None,
+                            link_content: None,
                         });
                     }
                 }
@@ -1182,8 +1199,8 @@ fn append_inline_fragments(
                     state: next,
                     hard_break: false,
                     trailing_space: false,
-                    link_destination: link_destination.map(ToOwned::to_owned),
-                    link_leading: false,
+                    link_destination: None,
+                    link_content: None,
                 });
             }
             MarkdownInline::SoftBreak => {
@@ -1197,22 +1214,22 @@ fn append_inline_fragments(
                 hard_break: true,
                 trailing_space: false,
                 link_destination: None,
-                link_leading: false,
+                link_content: None,
             }),
             MarkdownInline::Strong(children) => {
                 let mut next = state;
                 next.strong = true;
-                append_inline_fragments(children, next, link_destination, fragments);
+                append_inline_fragments(children, next, fragments);
             }
             MarkdownInline::Emphasis(children) => {
                 let mut next = state;
                 next.emphasis = true;
-                append_inline_fragments(children, next, link_destination, fragments);
+                append_inline_fragments(children, next, fragments);
             }
             MarkdownInline::Strikethrough(children) => {
                 let mut next = state;
                 next.strikethrough = true;
-                append_inline_fragments(children, next, link_destination, fragments);
+                append_inline_fragments(children, next, fragments);
             }
             MarkdownInline::Link {
                 destination,
@@ -1221,14 +1238,35 @@ fn append_inline_fragments(
             } => {
                 let mut next = state;
                 next.link = true;
-                let first_fragment = fragments.len();
-                append_inline_fragments(content, next, Some(destination), fragments);
-                if let Some(fragment) = fragments.get_mut(first_fragment) {
-                    fragment.link_leading = true;
-                }
+                fragments.push(InlineFragment {
+                    text: inline_plain_text(content),
+                    state: next,
+                    hard_break: false,
+                    trailing_space: false,
+                    link_destination: Some(destination.clone()),
+                    link_content: Some(content.clone()),
+                });
             }
         }
     }
+}
+
+fn inline_plain_text(inlines: &[MarkdownInline]) -> String {
+    let mut text = String::new();
+    for inline in inlines {
+        match inline {
+            MarkdownInline::Text(value) | MarkdownInline::Code(value) => text.push_str(value),
+            MarkdownInline::SoftBreak => text.push(' '),
+            MarkdownInline::HardBreak => text.push('\n'),
+            MarkdownInline::Strong(children)
+            | MarkdownInline::Emphasis(children)
+            | MarkdownInline::Strikethrough(children)
+            | MarkdownInline::Link {
+                content: children, ..
+            } => text.push_str(&inline_plain_text(children)),
+        }
+    }
+    text
 }
 
 fn markdown_file_reference_path(destination: &str) -> Option<&str> {
@@ -1689,7 +1727,7 @@ fn highlighted_code_text(
 ) -> StyledText {
     let mut base_font = ui_font();
     base_font.family = UI_MONOSPACE_FONT_FAMILY.into();
-    base_font.weight = FontWeight::NORMAL;
+    base_font.weight = CHATGPT_MARKDOWN_BODY_WEIGHT;
     let spans = highlighted_code_spans(code, language).unwrap_or_else(|| {
         (!code.is_empty())
             .then(|| CodeHighlightSpan {
@@ -1893,7 +1931,7 @@ fn append_table_row(
                 if is_header {
                     FontWeight::SEMIBOLD
                 } else {
-                    FontWeight::NORMAL
+                    CHATGPT_MARKDOWN_BODY_WEIGHT
                 },
                 markdown_hash(&(row_identity, index)),
             ));
@@ -2075,6 +2113,34 @@ fn main() {}
         assert_eq!(light.layout, dark.layout);
         assert_ne!(light.palette, dark.palette);
         assert_eq!(light.palette.link, dark.palette.link);
+    }
+
+    #[test]
+    fn assistant_markdown_body_weight_matches_chatgpt_cdp() {
+        assert_eq!(CHATGPT_MARKDOWN_BODY_WEIGHT, FontWeight(430.0));
+    }
+
+    #[test]
+    fn markdown_link_is_one_contiguous_interaction_fragment() {
+        let document = parse_markdown("前缀 [用户**气泡**像素报告](/Users/example/report.md) 后缀");
+        let MarkdownBlock::Paragraph(inlines) = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        let mut fragments = Vec::new();
+        append_inline_fragments(inlines, InlineState::default(), &mut fragments);
+
+        let links = fragments
+            .iter()
+            .filter(|fragment| fragment.link_destination.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].text, "用户气泡像素报告");
+        assert_eq!(
+            links[0].link_destination.as_deref(),
+            Some("/Users/example/report.md")
+        );
+        assert!(links[0].link_content.is_some());
+        assert!(links[0].state.link);
     }
 
     #[test]
