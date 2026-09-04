@@ -52,6 +52,9 @@ pub struct Theme {
     /// Secondary sidebar foreground measured from the ChatGPT desktop app.
     pub sidebar_text_muted: Rgba,
     pub text: Rgba,
+    /// Foreground and fill of user-authored message bubbles.
+    pub user_message_text: Rgba,
+    pub user_message_surface: Rgba,
     pub sidebar_text: Rgba,
     pub text_secondary: Rgba,
     pub text_tertiary: Rgba,
@@ -131,6 +134,8 @@ impl Theme {
                 sidebar_title_text: rgba(0x1a1c1fd9),
                 sidebar_text_muted: rgba(0x1a1c1f7f),
                 text: rgba(0x1a1c1fff),
+                user_message_text: rgba(0xffffffff),
+                user_message_surface: rgba(0x000000ff),
                 sidebar_text: rgba(0x1a1c1fd9),
                 text_secondary: rgba(0x5d5d5dff),
                 text_tertiary: rgba(0x1a1c1f7e),
@@ -204,6 +209,8 @@ impl Theme {
                 sidebar_title_text: rgba(0xdfdfdfd9),
                 sidebar_text_muted: rgba(0xffffff7f),
                 text: rgba(0xdfdfdfff),
+                user_message_text: rgba(0xdfdfdfff),
+                user_message_surface: rgba(0xdfdfdf0d),
                 sidebar_text: rgba(0xdfdfdfd9),
                 text_secondary: rgba(0xc3c3c3ff),
                 text_tertiary: rgba(0xffffff80),

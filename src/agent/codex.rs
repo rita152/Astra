@@ -2985,10 +2985,44 @@ fn validate_user_message(item: &serde_json::Map<String, Value>) -> Result<()> {
                     Some(_) => bail!("userMessage item.content[{index}].text_elements 必须是数组"),
                 }
             }
-            unsupported => bail!("userMessage item.content[{index}].type `{unsupported}` 尚未接入"),
+            "image" => {
+                let _url = required_item_string(input, &input_kind, "url")?;
+                validate_image_detail(input, index)?;
+            }
+            "localImage" => {
+                let _path = required_item_string(input, &input_kind, "path")?;
+                validate_image_detail(input, index)?;
+            }
+            "audio" => {
+                let _url = required_item_string(input, &input_kind, "url")?;
+            }
+            "localAudio" => {
+                let _path = required_item_string(input, &input_kind, "path")?;
+            }
+            "skill" | "mention" => {
+                let _name = required_item_string(input, &input_kind, "name")?;
+                let _path = required_item_string(input, &input_kind, "path")?;
+            }
+            unsupported => bail!(
+                "userMessage item.content[{index}].type `{unsupported}` 不在当前协议 schema 中"
+            ),
         }
     }
     Ok(())
+}
+
+fn validate_image_detail(input: &serde_json::Map<String, Value>, index: usize) -> Result<()> {
+    match input.get("detail") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(detail))
+            if matches!(detail.as_str(), "auto" | "low" | "high" | "original") =>
+        {
+            Ok(())
+        }
+        Some(_) => bail!(
+            "userMessage item.content[{index}].detail 必须是 auto、low、high、original 或 null"
+        ),
+    }
 }
 
 fn parse_agent_message(item: &serde_json::Map<String, Value>) -> Result<(String, String)> {
@@ -7418,8 +7452,16 @@ mod tests {
                 "text_elements",
             ),
             (
-                json!({"type":"userMessage","id":"user_1","content":[{"type":"image","url":"https://example.com/image.png"}]}),
-                "type `image` 尚未接入",
+                json!({"type":"userMessage","id":"user_1","content":[{"type":"localImage"}]}),
+                "item.path",
+            ),
+            (
+                json!({"type":"userMessage","id":"user_1","content":[{"type":"image","url":"https://example.com/image.png","detail":"medium"}]}),
+                "item.content[0].detail",
+            ),
+            (
+                json!({"type":"userMessage","id":"user_1","content":[{"type":"futureInput","value":"probe"}]}),
+                "不在当前协议 schema",
             ),
         ];
 
@@ -7428,6 +7470,48 @@ mod tests {
                 let message = turn_item_message(method, item.clone());
                 assert_turn_message_fails(&message, &[method, "userMessage", *expected]);
             }
+        }
+    }
+
+    #[test]
+    fn user_message_attachment_lifecycle_matches_generated_schema() {
+        let content = json!([
+            {"type":"text","text":"附件 + \\*\\*Markdown\\*\\* + 中English\n","text_elements":[]},
+            {"type":"image","url":"https://example.com/image.png","detail":"high"},
+            {"type":"localImage","path":"/tmp/capture.png","detail":null},
+            {"type":"audio","url":"data:audio/wav;base64,AA=="},
+            {"type":"localAudio","path":"/tmp/capture.wav"},
+            {"type":"skill","name":"example","path":"/tmp/example/SKILL.md"},
+            {"type":"mention","name":"source.rs","path":"/tmp/source.rs"}
+        ]);
+
+        for method in ["item/started", "item/completed"] {
+            let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+            let (tx, rx) = async_channel::unbounded();
+            let mut streamed_text = false;
+            let message = turn_item_message(
+                method,
+                json!({
+                    "type": "userMessage",
+                    "id": "user_attachment_1",
+                    "clientId": null,
+                    "content": content.clone()
+                }),
+            );
+
+            assert_eq!(
+                super::process_turn_message(
+                    &session,
+                    &message,
+                    "thr_1",
+                    "turn_1",
+                    &tx,
+                    &mut streamed_text,
+                )
+                .unwrap(),
+                None
+            );
+            assert!(rx.try_recv().is_err());
         }
     }
 

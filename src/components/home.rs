@@ -95,9 +95,15 @@ const THINKING_SHIMMER_ALPHA_LEVELS: usize = 32;
 const CONVERSATION_TOP_INSET: f32 = 78.0;
 const CONVERSATION_BOTTOM_INSET: f32 = 153.0;
 const CONVERSATION_BOTTOM_EPSILON: f32 = 0.5;
+const USER_MESSAGE_MAX_WIDTH_RATIO: f32 = 0.7;
+const USER_MESSAGE_HORIZONTAL_PADDING: f32 = 16.0;
+const USER_MESSAGE_VERTICAL_PADDING: f32 = 10.0;
+const USER_MESSAGE_TEXT_SIZE: f32 = 14.0;
+const USER_MESSAGE_LINE_HEIGHT: f32 = 22.75;
+const USER_MESSAGE_PARAGRAPH_GAP: f32 = 20.0;
 const USER_MESSAGE_BUBBLE_RADIUS: f32 = 22.0;
 const USER_MESSAGE_BUBBLE_SUPERELLIPSE: f32 = 1.5;
-const USER_MESSAGE_FOOTER_OFFSET: f32 = 3.0;
+const USER_MESSAGE_FOOTER_OFFSET: f32 = 4.0;
 const USER_MESSAGE_FOOTER_HEIGHT: f32 = 26.0;
 const USER_MESSAGE_FOOTER_SIDE_MARGIN: f32 = 4.0;
 const USER_MESSAGE_FOOTER_GAP: f32 = 8.0;
@@ -576,6 +582,67 @@ fn user_message_bubble_path(bounds: Bounds<Pixels>) -> gpui::Path<Pixels> {
     builder
         .build()
         .expect("user message superellipse should tessellate")
+}
+
+fn user_message_paragraphs(source: &str) -> Vec<String> {
+    let mut paragraphs = Vec::new();
+    let mut paragraph = String::new();
+    for line in source.split('\n') {
+        if line.trim().is_empty() {
+            if !paragraph.is_empty() {
+                paragraphs.push(std::mem::take(&mut paragraph));
+            }
+        } else {
+            if !paragraph.is_empty() {
+                paragraph.push('\n');
+            }
+            paragraph.push_str(line);
+        }
+    }
+    if !paragraph.is_empty() {
+        paragraphs.push(paragraph);
+    }
+    paragraphs
+}
+
+fn render_user_message_text(source: String) -> Div {
+    user_message_paragraphs(&source)
+        .into_iter()
+        .enumerate()
+        .fold(
+            div().relative().flex().flex_col(),
+            |content, (index, paragraph)| {
+                content.child(
+                    div()
+                        .when(index > 0, |paragraph| {
+                            paragraph.mt(px(USER_MESSAGE_PARAGRAPH_GAP))
+                        })
+                        .child(paragraph),
+                )
+            },
+        )
+}
+
+fn user_message_bubble(message: String, theme: Theme) -> Div {
+    div()
+        .max_w(relative(USER_MESSAGE_MAX_WIDTH_RATIO))
+        .px(px(USER_MESSAGE_HORIZONTAL_PADDING))
+        .py(px(USER_MESSAGE_VERTICAL_PADDING))
+        .relative()
+        .text_size(px(USER_MESSAGE_TEXT_SIZE))
+        .line_height(px(USER_MESSAGE_LINE_HEIGHT))
+        .text_color(theme.user_message_text)
+        .child(
+            canvas(
+                |bounds, _, _| user_message_bubble_path(bounds),
+                move |_, path, window, _| {
+                    window.paint_path(path, theme.user_message_surface);
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
+        .child(render_user_message_text(message))
 }
 
 fn thinking_shimmer_step(progress: f32) -> f32 {
@@ -1901,18 +1968,11 @@ fn conversation(
                 .gap(px(16.0))
                 .when(!user_message.is_empty(), |row| {
                     row.child(
-                        div().w_full().flex().justify_end().child(
-                            div()
-                                .max_w(px(600.0))
-                                .px(px(16.0))
-                                .py(px(10.0))
-                                .rounded(px(USER_MESSAGE_BUBBLE_RADIUS))
-                                .bg(theme.text.alpha(0.05))
-                                .text_size(px(14.0))
-                                .line_height(px(22.0))
-                                .text_color(theme.text)
-                                .child(user_message),
-                        ),
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_end()
+                            .child(user_message_bubble(user_message, theme)),
                     )
                 })
                 .child(answer),
@@ -1930,7 +1990,10 @@ fn conversation(
         .child(historical_transcript)
         .child(
             div()
-                .h(px(72.0))
+                .min_h(px(USER_MESSAGE_VERTICAL_PADDING * 2.0
+                    + USER_MESSAGE_LINE_HEIGHT
+                    + USER_MESSAGE_FOOTER_OFFSET
+                    + USER_MESSAGE_FOOTER_HEIGHT))
                 .w_full()
                 .flex()
                 .flex_col()
@@ -1941,30 +2004,7 @@ fn conversation(
                         .flex()
                         .flex_col()
                         .items_end()
-                        .child(
-                            div()
-                                .max_w(px(600.0))
-                                .px(px(16.0))
-                                .py(px(10.0))
-                                .relative()
-                                .text_size(px(14.0))
-                                .line_height(px(22.0))
-                                .text_color(theme.text)
-                                // CDP reports border-radius:22px plus
-                                // corner-shape:superellipse(1.5), which cannot be
-                                // represented by GPUI's circular rounded corners.
-                                .child(
-                                    canvas(
-                                        |bounds, _, _| user_message_bubble_path(bounds),
-                                        move |_, path, window, _| {
-                                            window.paint_path(path, theme.text.alpha(0.05));
-                                        },
-                                    )
-                                    .absolute()
-                                    .inset_0(),
-                                )
-                                .child(div().relative().child(user_message)),
-                        )
+                        .child(user_message_bubble(user_message, theme))
                         .child(
                             div()
                                 .mt(px(USER_MESSAGE_FOOTER_OFFSET))
@@ -1991,6 +2031,7 @@ fn conversation(
                                 .child(
                                     div()
                                         .id("user-message-copy")
+                                        .debug_selector(|| "USER_MESSAGE_COPY".to_owned())
                                         .size(px(26.0))
                                         .rounded(px(10.0))
                                         .opacity(if user_message_actions_visible_for_capture {
@@ -3995,15 +4036,18 @@ mod tests {
         TOOL_GROUP_ITEM_GAP, TOOL_GROUP_LINE_HEIGHT, TOOL_GROUP_TEXT_SIZE,
         TOOL_GROUP_TRANSITION_DURATION, USER_MESSAGE_BUBBLE_RADIUS,
         USER_MESSAGE_BUBBLE_SUPERELLIPSE, USER_MESSAGE_FOOTER_GAP, USER_MESSAGE_FOOTER_HEIGHT,
-        USER_MESSAGE_FOOTER_OFFSET, USER_MESSAGE_FOOTER_SIDE_MARGIN, USER_MESSAGE_TIME_LINE_HEIGHT,
-        USER_MESSAGE_TIME_SIZE, active_reasoning_body, activity_stream_units,
-        command_activity_row_count, command_activity_summaries, command_activity_summary,
-        completed_reasoning_body, completed_tool_group_summary, conversation_status,
-        format_reasoning_elapsed, generic_command_activity_summary, reasoning_activity_title,
-        reasoning_header_label, reasoning_transition_ease, scroll_should_follow_output,
-        strip_terminal_line_ending, thinking_shimmer_alpha, thinking_shimmer_band_left,
-        thinking_shimmer_progress, thinking_shimmer_step, toggle_reasoning_item,
-        toggle_tool_activity_group, tool_group_chevron_transition_ease, tool_group_reasoning_title,
+        USER_MESSAGE_FOOTER_OFFSET, USER_MESSAGE_FOOTER_SIDE_MARGIN,
+        USER_MESSAGE_HORIZONTAL_PADDING, USER_MESSAGE_LINE_HEIGHT, USER_MESSAGE_MAX_WIDTH_RATIO,
+        USER_MESSAGE_PARAGRAPH_GAP, USER_MESSAGE_TEXT_SIZE, USER_MESSAGE_TIME_LINE_HEIGHT,
+        USER_MESSAGE_TIME_SIZE, USER_MESSAGE_VERTICAL_PADDING, active_reasoning_body,
+        activity_stream_units, command_activity_row_count, command_activity_summaries,
+        command_activity_summary, completed_reasoning_body, completed_tool_group_summary,
+        conversation_status, format_reasoning_elapsed, generic_command_activity_summary,
+        reasoning_activity_title, reasoning_header_label, reasoning_transition_ease,
+        scroll_should_follow_output, strip_terminal_line_ending, thinking_shimmer_alpha,
+        thinking_shimmer_band_left, thinking_shimmer_progress, thinking_shimmer_step,
+        toggle_reasoning_item, toggle_tool_activity_group, tool_group_chevron_transition_ease,
+        tool_group_reasoning_title, user_message_paragraphs,
     };
     use crate::agent::{
         AgentContextCompaction, AgentImageView, CommandExecution, CommandExecutionAction,
@@ -5189,8 +5233,27 @@ mod tests {
 
     #[test]
     fn user_bubble_uses_the_live_cdp_corner_radius() {
+        assert_eq!(USER_MESSAGE_MAX_WIDTH_RATIO, 0.7);
+        assert_eq!(USER_MESSAGE_HORIZONTAL_PADDING, 16.0);
+        assert_eq!(USER_MESSAGE_VERTICAL_PADDING, 10.0);
+        assert_eq!(USER_MESSAGE_TEXT_SIZE, 14.0);
+        assert_eq!(USER_MESSAGE_LINE_HEIGHT, 22.75);
+        assert_eq!(USER_MESSAGE_PARAGRAPH_GAP, 20.0);
         assert_eq!(USER_MESSAGE_BUBBLE_RADIUS, 22.0);
         assert_eq!(USER_MESSAGE_BUBBLE_SUPERELLIPSE, 1.5);
+    }
+
+    #[test]
+    fn user_bubble_paragraph_layout_preserves_hard_breaks_and_collapses_blank_runs() {
+        assert_eq!(user_message_paragraphs("single line"), vec!["single line"]);
+        assert_eq!(
+            user_message_paragraphs("first\nsecond"),
+            vec!["first\nsecond"]
+        );
+        assert_eq!(
+            user_message_paragraphs("空白前\n\n\n空白后 Blank"),
+            vec!["空白前", "空白后 Blank"]
+        );
     }
 
     #[test]
@@ -5235,7 +5298,7 @@ mod tests {
 
     #[test]
     fn user_message_footer_matches_the_live_cdp_geometry() {
-        assert_eq!(USER_MESSAGE_FOOTER_OFFSET, 3.0);
+        assert_eq!(USER_MESSAGE_FOOTER_OFFSET, 4.0);
         assert_eq!(USER_MESSAGE_FOOTER_HEIGHT, 26.0);
         assert_eq!(USER_MESSAGE_FOOTER_SIDE_MARGIN, 4.0);
         assert_eq!(USER_MESSAGE_FOOTER_GAP, 8.0);
@@ -5260,11 +5323,12 @@ mod tests {
         window.update(|home, _, cx| home.submit_prompt_for_capture("clipboard prompt", cx));
         window.draw();
 
-        // The 736px conversation column is centered in this 900px test
-        // window. ChatGPT insets the trailing 26px action by 4px, so it
-        // occupies x=788..814 and y=123..149.
-        window.simulate_mouse_move(point(px(801.0), px(136.0)));
-        window.simulate_click(point(px(801.0), px(136.0)), MouseButton::Left);
+        let copy_bounds = window
+            .debug_bounds("USER_MESSAGE_COPY")
+            .expect("copy action should be laid out");
+        assert_eq!(copy_bounds.size, size(px(26.0), px(26.0)));
+        window.simulate_mouse_move(copy_bounds.center());
+        window.simulate_click(copy_bounds.center(), MouseButton::Left);
 
         assert_eq!(
             app.read_from_clipboard().and_then(|item| item.text()),
