@@ -322,6 +322,10 @@ fn main() {
         arg.strip_prefix("--context-compaction-ui-state=")
             .map(ToOwned::to_owned)
     });
+    let collaboration_ui_state = args.iter().find_map(|arg| {
+        arg.strip_prefix("--collaboration-ui-state=")
+            .map(ToOwned::to_owned)
+    });
     let approval_ui_kind = args
         .iter()
         .find_map(|arg| {
@@ -487,6 +491,7 @@ fn main() {
                             || file_change_ui_state.is_some()
                             || turn_diff_ui_state.is_some()
                             || context_compaction_ui_state.is_some()
+                            || collaboration_ui_state.is_some()
                             || permission_mode.is_some()
                             || permission_menu_open
                             || permission_menu_state.is_some()
@@ -573,6 +578,9 @@ fn main() {
                                 state.eq_ignore_ascii_case("running"),
                                 cx,
                             );
+                        }
+                        if let Some(state) = collaboration_ui_state.as_deref() {
+                            app.set_collaboration_for_capture(state, cx);
                         }
                         if let Some(state) = tool_group_state.as_deref() {
                             app.set_tool_group_for_capture(

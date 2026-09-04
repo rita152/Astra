@@ -9,8 +9,10 @@ use gpui::{
 
 use crate::{
     agent::{
-        AgentAccountRateLimits, AgentApprovalHandle, AgentBackend, AgentCommandApprovalChoice,
-        AgentConfigWarning, AgentConnectionEvent, AgentContextCompaction, AgentCreditsSnapshot,
+        AgentAccountRateLimits, AgentApprovalHandle, AgentBackend, AgentCollaboration,
+        AgentCollaborationStatus, AgentCollaborationTool, AgentCollaboratorState,
+        AgentCollaboratorStatus, AgentCommandApprovalChoice, AgentConfigWarning,
+        AgentConnectionEvent, AgentContextCompaction, AgentCreditsSnapshot,
         AgentEffectivePermissions, AgentEvent, AgentFileChange, AgentFileChangeStatus,
         AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemSpecialPath, AgentImageView,
         AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
@@ -20,8 +22,9 @@ use crate::{
         AgentReasoning, AgentRequest, AgentServerRequestFailureKind, AgentServerRequestKind,
         AgentServerRequestMetadata, AgentThreadStatus, AgentThreadTokenUsage, AgentUserInputAnswer,
         AgentUserInputHandle, AgentUserInputResponse, CodexAppServerBackend, CommandExecution,
-        CommandExecutionAction, CommandExecutionStatus, HistoryTurnStatus, ProjectId,
-        ThreadHistory, ThreadHistoryItem, normalize_user_message_for_display,
+        CommandExecutionAction, CommandExecutionStatus, HistoryTurnStatus,
+        LegacySubAgentActivityKind, ProjectId, ThreadHistory, ThreadHistoryItem,
+        normalize_user_message_for_display,
     },
     components::{
         approval::{
@@ -180,6 +183,7 @@ pub enum ConversationActivity {
     FileChange(FileChangeActivityPresentation),
     ImageView(AgentImageView),
     ContextCompaction(AgentContextCompaction),
+    Collaboration(AgentCollaboration),
     UserInput(UserInputRequestPresentation),
     ProtocolError {
         message: String,
@@ -1215,6 +1219,9 @@ impl ComposerView {
                             activities
                                 .push(ConversationActivity::ContextCompaction(compaction.clone()));
                         }
+                        ThreadHistoryItem::Collaboration(collaboration) => {
+                            upsert_collaboration_activity(&mut activities, collaboration.clone());
+                        }
                         ThreadHistoryItem::Unsupported { kind, .. } => {
                             activities.push(ConversationActivity::Warning {
                                 message: format!("历史包含当前 UI 尚未呈现的 {kind} 项"),
@@ -1796,6 +1803,12 @@ impl ComposerView {
                 }
                 AgentEvent::ContextCompactionUpdated(compaction) => {
                     upsert_context_compaction_activity(&mut self.conversation_activity, compaction);
+                    if self.conversation_phase != ConversationPhase::Stopping {
+                        self.conversation_phase = ConversationPhase::Streaming;
+                    }
+                }
+                AgentEvent::CollaborationUpdated(collaboration) => {
+                    upsert_collaboration_activity(&mut self.conversation_activity, collaboration);
                     if self.conversation_phase != ConversationPhase::Stopping {
                         self.conversation_phase = ConversationPhase::Streaming;
                     }
@@ -2705,6 +2718,73 @@ impl ComposerView {
                 completed: !running,
             },
         )];
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+
+    pub fn set_collaboration_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        let (status, collaborator_status, legacy_kind) = match state {
+            "completed" | "success" => (
+                AgentCollaborationStatus::Completed,
+                AgentCollaboratorStatus::Completed,
+                LegacySubAgentActivityKind::Completed,
+            ),
+            "failed" => (
+                AgentCollaborationStatus::Failed,
+                AgentCollaboratorStatus::Errored,
+                LegacySubAgentActivityKind::Completed,
+            ),
+            "interrupted" => (
+                AgentCollaborationStatus::Interrupted,
+                AgentCollaboratorStatus::Interrupted,
+                LegacySubAgentActivityKind::Interrupted,
+            ),
+            _ => (
+                AgentCollaborationStatus::InProgress,
+                AgentCollaboratorStatus::Running,
+                LegacySubAgentActivityKind::Started,
+            ),
+        };
+        let thread_id = "01a06b7a-14c2-73b3-9c62-b29e27bd8689".to_owned();
+        self.user_message = None;
+        self.user_message_time = None;
+        self.assistant_message.clear();
+        self.assistant_message_time = None;
+        self.conversation_phase = if status == AgentCollaborationStatus::InProgress {
+            ConversationPhase::Streaming
+        } else {
+            ConversationPhase::Complete
+        };
+        self.conversation_activity =
+            vec![ConversationActivity::Collaboration(AgentCollaboration {
+                id: "collaboration-ui-capture".to_owned(),
+                tool: if status == AgentCollaborationStatus::Failed {
+                    AgentCollaborationTool::SpawnAgent
+                } else {
+                    AgentCollaborationTool::LegacyActivity
+                },
+                status,
+                sender_thread_id: (status == AgentCollaborationStatus::Failed)
+                    .then(|| "parent-thread".to_owned())
+                    .unwrap_or_default(),
+                receiver_thread_ids: vec![thread_id.clone()],
+                agents_states: std::collections::BTreeMap::from([(
+                    thread_id,
+                    AgentCollaboratorState {
+                        status: collaborator_status,
+                        message: (status == AgentCollaborationStatus::Failed)
+                            .then(|| "Agent failed while collecting evidence.".to_owned()),
+                    },
+                )]),
+                prompt: (status == AgentCollaborationStatus::Failed)
+                    .then(|| "Collab evidence probe".to_owned()),
+                model: (status == AgentCollaborationStatus::Failed).then(|| "gpt-5.4".to_owned()),
+                reasoning_effort: (status == AgentCollaborationStatus::Failed)
+                    .then(|| "high".to_owned()),
+                legacy_agent_path: (status != AgentCollaborationStatus::Failed)
+                    .then(|| "/root/collab_evidence_probe".to_owned()),
+                legacy_kind: (status != AgentCollaborationStatus::Failed).then_some(legacy_kind),
+            })];
         cx.emit(ConversationChanged);
         cx.notify();
     }
@@ -4206,6 +4286,38 @@ fn upsert_context_compaction_activity(
         *existing = incoming;
     } else {
         activities.push(ConversationActivity::ContextCompaction(incoming));
+    }
+}
+
+fn collaborations_share_identity(
+    existing: &AgentCollaboration,
+    incoming: &AgentCollaboration,
+) -> bool {
+    match (existing.legacy_kind, incoming.legacy_kind) {
+        (Some(_), Some(_)) => existing
+            .receiver_thread_ids
+            .first()
+            .is_some_and(|thread_id| incoming.receiver_thread_ids.first() == Some(thread_id)),
+        (None, None) => existing.id == incoming.id,
+        _ => false,
+    }
+}
+
+fn upsert_collaboration_activity(
+    activities: &mut Vec<ConversationActivity>,
+    incoming: AgentCollaboration,
+) {
+    if let Some(existing) = activities.iter_mut().find_map(|activity| match activity {
+        ConversationActivity::Collaboration(existing)
+            if collaborations_share_identity(existing, &incoming) =>
+        {
+            Some(existing)
+        }
+        _ => None,
+    }) {
+        *existing = incoming;
+    } else {
+        activities.push(ConversationActivity::Collaboration(incoming));
     }
 }
 
@@ -5984,22 +6096,24 @@ mod tests {
     };
     use crate::agent::{
         AgentAccountRateLimits, AgentActivePermissionProfile, AgentAdditionalNetworkPermissions,
-        AgentApprovalControl, AgentApprovalHandle, AgentBackend, AgentCommandApprovalChoice,
-        AgentCommandApprovalRequest, AgentConfigWarning, AgentConnectionEvent,
-        AgentCreditsSnapshot, AgentEffectivePermissions, AgentEvent, AgentInterruptControl,
-        AgentInterruptHandle, AgentInterruptOutcome, AgentMcpServerStartupFailureReason,
-        AgentMcpServerStartupState, AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog,
-        AgentOptionalField, AgentPermissionMode, AgentPermissionProfile,
-        AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
-        AgentPermissionsApprovalControl, AgentPermissionsApprovalHandle,
-        AgentPermissionsApprovalRequest, AgentRateLimitWindow, AgentReasoning,
-        AgentReasoningEffort, AgentRequest, AgentRun, AgentServerRequestFailureKind,
-        AgentServerRequestId, AgentServerRequestKind, AgentServerRequestMetadata, AgentServiceTier,
-        AgentSpendControlLimit, AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus,
-        AgentThreadStatusState, AgentThreadTokenUsage, AgentTokenUsageBreakdown,
-        AgentUserInputAnswer, AgentUserInputControl, AgentUserInputHandle, AgentUserInputOption,
-        AgentUserInputQuestion, AgentUserInputRequest, AgentUserInputResponse, CommandExecution,
-        CommandExecutionAction, CommandExecutionStatus, HistoryItemDetail, HistoryTurnStatus,
+        AgentApprovalControl, AgentApprovalHandle, AgentBackend, AgentCollaboration,
+        AgentCollaborationStatus, AgentCollaborationTool, AgentCollaboratorState,
+        AgentCollaboratorStatus, AgentCommandApprovalChoice, AgentCommandApprovalRequest,
+        AgentConfigWarning, AgentConnectionEvent, AgentCreditsSnapshot, AgentEffectivePermissions,
+        AgentEvent, AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome,
+        AgentMcpServerStartupFailureReason, AgentMcpServerStartupState,
+        AgentMcpServerStartupStatus, AgentModel, AgentModelCatalog, AgentOptionalField,
+        AgentPermissionMode, AgentPermissionProfile, AgentPermissionRequestProfile,
+        AgentPermissionsApprovalChoice, AgentPermissionsApprovalControl,
+        AgentPermissionsApprovalHandle, AgentPermissionsApprovalRequest, AgentRateLimitWindow,
+        AgentReasoning, AgentReasoningEffort, AgentRequest, AgentRun,
+        AgentServerRequestFailureKind, AgentServerRequestId, AgentServerRequestKind,
+        AgentServerRequestMetadata, AgentServiceTier, AgentSpendControlLimit,
+        AgentThreadActiveFlag, AgentThreadSettings, AgentThreadStatus, AgentThreadStatusState,
+        AgentThreadTokenUsage, AgentTokenUsageBreakdown, AgentUserInputAnswer,
+        AgentUserInputControl, AgentUserInputHandle, AgentUserInputOption, AgentUserInputQuestion,
+        AgentUserInputRequest, AgentUserInputResponse, CommandExecution, CommandExecutionAction,
+        CommandExecutionStatus, HistoryItemDetail, HistoryTurnStatus, LegacySubAgentActivityKind,
         ThreadActivity, ThreadHistory, ThreadHistoryItem, ThreadSummary, ThreadTurn,
     };
     use crate::components::approval::{ApprovalCardEvent, ApprovalDecision, ApprovalScope};
@@ -6016,6 +6130,7 @@ mod tests {
         Bounds, Focusable, MouseButton, TestApp, WindowBounds, WindowOptions, point, px, size,
     };
     use std::{
+        collections::BTreeMap,
         path::PathBuf,
         sync::{
             Arc, Mutex,
@@ -6023,6 +6138,46 @@ mod tests {
         },
         time::Duration,
     };
+
+    fn legacy_collaboration(
+        id: &str,
+        thread_id: &str,
+        kind: LegacySubAgentActivityKind,
+    ) -> AgentCollaboration {
+        let (status, agent_status) = match kind {
+            LegacySubAgentActivityKind::Started | LegacySubAgentActivityKind::Interacted => (
+                AgentCollaborationStatus::InProgress,
+                AgentCollaboratorStatus::Running,
+            ),
+            LegacySubAgentActivityKind::Interrupted => (
+                AgentCollaborationStatus::Interrupted,
+                AgentCollaboratorStatus::Interrupted,
+            ),
+            LegacySubAgentActivityKind::Completed => (
+                AgentCollaborationStatus::Completed,
+                AgentCollaboratorStatus::Completed,
+            ),
+        };
+        AgentCollaboration {
+            id: id.into(),
+            tool: AgentCollaborationTool::LegacyActivity,
+            status,
+            sender_thread_id: String::new(),
+            receiver_thread_ids: vec![thread_id.into()],
+            agents_states: BTreeMap::from([(
+                thread_id.into(),
+                AgentCollaboratorState {
+                    status: agent_status,
+                    message: None,
+                },
+            )]),
+            prompt: None,
+            model: None,
+            reasoning_effort: None,
+            legacy_agent_path: Some(format!("/root/{thread_id}")),
+            legacy_kind: Some(kind),
+        }
+    }
 
     struct RecordingBackend {
         connection_events: async_channel::Receiver<AgentConnectionEvent>,
@@ -7281,6 +7436,170 @@ mod tests {
         assert_eq!(
             app.read_entity(&stale, |composer, _| composer.conversation_phase()),
             ConversationPhase::Starting
+        );
+    }
+
+    #[test]
+    fn collaboration_updates_fold_legacy_lifecycles_and_upsert_canonical_items() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+
+        app.update_entity(&composer, |composer, _| {
+            assert!(!composer.apply_agent_event_batch(vec![
+                AgentEvent::CollaborationUpdated(legacy_collaboration(
+                    "spawn_a",
+                    "agent_a",
+                    LegacySubAgentActivityKind::Started,
+                )),
+                AgentEvent::CollaborationUpdated(legacy_collaboration(
+                    "update_a",
+                    "agent_a",
+                    LegacySubAgentActivityKind::Interacted,
+                )),
+                AgentEvent::CollaborationUpdated(legacy_collaboration(
+                    "spawn_b",
+                    "agent_b",
+                    LegacySubAgentActivityKind::Started,
+                )),
+                AgentEvent::CollaborationUpdated(legacy_collaboration(
+                    "complete_a",
+                    "agent_a",
+                    LegacySubAgentActivityKind::Completed,
+                )),
+            ]));
+        });
+        let legacy = app.read_entity(&composer, |composer, _| {
+            composer.conversation_activity_snapshot()
+        });
+        assert_eq!(legacy.len(), 2);
+        let ConversationActivity::Collaboration(agent_a) = &legacy[0] else {
+            panic!("expected first legacy collaboration");
+        };
+        assert_eq!(agent_a.id, "complete_a");
+        assert_eq!(agent_a.status, AgentCollaborationStatus::Completed);
+        let ConversationActivity::Collaboration(agent_b) = &legacy[1] else {
+            panic!("expected second legacy collaboration");
+        };
+        assert_eq!(agent_b.receiver_thread_ids, ["agent_b"]);
+
+        let canonical = |status, agent_status| AgentCollaboration {
+            id: "canonical_1".into(),
+            tool: AgentCollaborationTool::Wait,
+            status,
+            sender_thread_id: "parent".into(),
+            receiver_thread_ids: vec!["agent_c".into()],
+            agents_states: BTreeMap::from([(
+                "agent_c".into(),
+                AgentCollaboratorState {
+                    status: agent_status,
+                    message: None,
+                },
+            )]),
+            prompt: None,
+            model: None,
+            reasoning_effort: None,
+            legacy_agent_path: None,
+            legacy_kind: None,
+        };
+        app.update_entity(&composer, |composer, _| {
+            assert!(!composer.apply_agent_event_batch(vec![
+                AgentEvent::CollaborationUpdated(canonical(
+                    AgentCollaborationStatus::InProgress,
+                    AgentCollaboratorStatus::Running,
+                )),
+                AgentEvent::CollaborationUpdated(canonical(
+                    AgentCollaborationStatus::Failed,
+                    AgentCollaboratorStatus::Errored,
+                )),
+            ]));
+        });
+        let activities = app.read_entity(&composer, |composer, _| {
+            composer.conversation_activity_snapshot()
+        });
+        assert_eq!(activities.len(), 3);
+        let ConversationActivity::Collaboration(canonical) = &activities[2] else {
+            panic!("expected canonical collaboration");
+        };
+        assert_eq!(canonical.status, AgentCollaborationStatus::Failed);
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer.conversation_phase()),
+            ConversationPhase::Streaming,
+            "an item-level failure must not terminate its parent turn"
+        );
+    }
+
+    #[test]
+    fn collaboration_history_hydrates_without_unsupported_warning() {
+        let mut app = TestApp::new();
+        let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+        let history = ThreadHistory {
+            thread: ThreadSummary {
+                thread_id: "parent".into(),
+                title: "Collaboration history".into(),
+                preview: String::new(),
+                cwd: PathBuf::from("/tmp/project"),
+                project_id: None,
+                section: None,
+                created_at: 1,
+                updated_at: 2,
+                recency_at: Some(2),
+                activity: ThreadActivity::Idle,
+            },
+            turns: vec![ThreadTurn {
+                turn_id: "turn_1".into(),
+                status: HistoryTurnStatus::InProgress,
+                items_view: HistoryItemDetail::Full,
+                items: vec![ThreadHistoryItem::Collaboration(legacy_collaboration(
+                    "spawn_a",
+                    "agent_a",
+                    LegacySubAgentActivityKind::Started,
+                ))],
+                started_at: Some(1),
+                completed_at: None,
+                duration_ms: None,
+                error: None,
+            }],
+            next_turn_cursor: None,
+            backwards_turn_cursor: None,
+        };
+        app.update_entity(&composer, |composer, cx| {
+            composer.hydrate_history(history, cx)
+        });
+
+        let activities = app.read_entity(&composer, |composer, _| {
+            composer.conversation_activity_snapshot()
+        });
+        assert_eq!(activities.len(), 1);
+        let ConversationActivity::Collaboration(collaboration) = &activities[0] else {
+            panic!("expected hydrated collaboration activity, got {activities:?}");
+        };
+        assert_eq!(collaboration.id, "spawn_a");
+        assert_eq!(collaboration.status, AgentCollaborationStatus::InProgress);
+
+        app.update_entity(&composer, |composer, _| {
+            assert!(
+                !composer.apply_agent_event_batch(vec![AgentEvent::CollaborationUpdated(
+                    legacy_collaboration(
+                        "complete_a",
+                        "agent_a",
+                        LegacySubAgentActivityKind::Completed,
+                    )
+                ),])
+            );
+        });
+        let resumed = app.read_entity(&composer, |composer, _| {
+            composer.conversation_activity_snapshot()
+        });
+        assert_eq!(resumed.len(), 1);
+        let ConversationActivity::Collaboration(collaboration) = &resumed[0] else {
+            panic!("expected updated collaboration activity, got {resumed:?}");
+        };
+        assert_eq!(collaboration.id, "complete_a");
+        assert_eq!(collaboration.status, AgentCollaborationStatus::Completed);
+        assert_eq!(
+            app.read_entity(&composer, |composer, _| composer.conversation_phase()),
+            ConversationPhase::Streaming,
+            "resumed item completion must not synthesize the parent turn terminal event"
         );
     }
 

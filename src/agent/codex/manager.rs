@@ -18,8 +18,8 @@ use super::{
     PermissionProfileListResponse, TURN_SCOPED_SERVER_METHODS, TurnOutcome,
     cleanup_pending_server_requests, ensure_server_method_is_defined,
     ensure_session_message_matches, is_integrated_server_request_method, parse_agent_notification,
-    parse_mcp_server_startup_status_updated, parse_thread_status_changed, process_turn_message,
-    request_id_from_value, thread_settings_update_request, thread_started_id,
+    parse_collaboration, parse_mcp_server_startup_status_updated, parse_thread_status_changed,
+    process_turn_message, request_id_from_value, thread_settings_update_request, thread_started_id,
     validate_remote_control_status_changed, validate_resume_goal_cleared,
 };
 use crate::agent::{
@@ -1172,6 +1172,13 @@ fn parse_history_item(value: &Value) -> Result<ThreadHistoryItem> {
                 completed: true,
             },
         )),
+        "collabAgentToolCall" | "subAgentActivity" => {
+            Ok(ThreadHistoryItem::Collaboration(parse_collaboration(
+                value
+                    .as_object()
+                    .context("collaboration history item 必须是对象")?,
+            )?))
+        }
         _ => Ok(ThreadHistoryItem::Unsupported { item_id, kind }),
     }
 }
@@ -3064,6 +3071,64 @@ mod tests {
                 completed: true,
             })
         );
+    }
+
+    #[test]
+    fn history_collaboration_items_are_first_class_and_strict() {
+        let canonical = parse_history_item(&json!({
+            "type": "collabAgentToolCall",
+            "id": "collab_history_1",
+            "tool": "wait",
+            "status": "completed",
+            "senderThreadId": "parent",
+            "receiverThreadIds": ["agent_a", "agent_b"],
+            "agentsStates": {
+                "agent_a": {"status": "completed", "message": "done"},
+                "agent_b": {"status": "errored", "message": null}
+            },
+            "prompt": null,
+            "model": null,
+            "reasoningEffort": null
+        }))
+        .unwrap();
+        let ThreadHistoryItem::Collaboration(canonical) = canonical else {
+            panic!("expected canonical collaboration history item");
+        };
+        assert_eq!(canonical.id, "collab_history_1");
+        assert_eq!(canonical.receiver_thread_ids, ["agent_a", "agent_b"]);
+        assert_eq!(
+            canonical.agents_states["agent_b"].status,
+            crate::agent::AgentCollaboratorStatus::Errored
+        );
+
+        let legacy = parse_history_item(&json!({
+            "type": "subAgentActivity",
+            "id": "legacy_history_1",
+            "kind": "completed",
+            "agentThreadId": "agent_a",
+            "agentPath": "/root/agent_a"
+        }))
+        .unwrap();
+        let ThreadHistoryItem::Collaboration(legacy) = legacy else {
+            panic!("expected legacy collaboration history item");
+        };
+        assert_eq!(legacy.receiver_thread_ids, ["agent_a"]);
+        assert_eq!(legacy.legacy_agent_path.as_deref(), Some("/root/agent_a"));
+        assert_eq!(
+            legacy.status,
+            crate::agent::AgentCollaborationStatus::Completed
+        );
+
+        let error = parse_history_item(&json!({
+            "type": "subAgentActivity",
+            "id": "legacy_history_bad",
+            "kind": "future",
+            "agentThreadId": "agent_a",
+            "agentPath": "/root/agent_a"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("item.kind 包含未知值"));
     }
 
     struct ChannelReader {

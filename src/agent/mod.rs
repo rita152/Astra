@@ -1,6 +1,11 @@
 mod codex;
 
-use std::{collections::BTreeSet, fmt, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use async_channel::Receiver;
 use serde_json::Value;
@@ -358,10 +363,76 @@ pub enum ThreadHistoryItem {
     FileChange(AgentFileChange),
     ImageView(AgentImageView),
     ContextCompaction(AgentContextCompaction),
+    Collaboration(AgentCollaboration),
     Unsupported {
         item_id: String,
         kind: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentCollaborationTool {
+    SpawnAgent,
+    SendInput,
+    ResumeAgent,
+    Wait,
+    CloseAgent,
+    SendMessage,
+    FollowupTask,
+    InterruptAgent,
+    ListAgents,
+    /// The persisted `subAgentActivity` item predates tool attribution.
+    LegacyActivity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentCollaborationStatus {
+    InProgress,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentCollaboratorStatus {
+    PendingInit,
+    Running,
+    Interrupted,
+    Completed,
+    Errored,
+    Shutdown,
+    NotFound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentCollaboratorState {
+    pub status: AgentCollaboratorStatus,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegacySubAgentActivityKind {
+    Started,
+    Interacted,
+    Interrupted,
+    Completed,
+}
+
+/// Agent-neutral form shared by the current `collabAgentToolCall` wire item
+/// and persisted legacy `subAgentActivity` items.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentCollaboration {
+    pub id: String,
+    pub tool: AgentCollaborationTool,
+    pub status: AgentCollaborationStatus,
+    pub sender_thread_id: String,
+    pub receiver_thread_ids: Vec<String>,
+    pub agents_states: BTreeMap<String, AgentCollaboratorState>,
+    pub prompt: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub legacy_agent_path: Option<String>,
+    pub legacy_kind: Option<LegacySubAgentActivityKind>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1157,6 +1228,7 @@ pub enum AgentEvent {
     FileChangeUpdated(AgentFileChange),
     ImageViewed(AgentImageView),
     ContextCompactionUpdated(AgentContextCompaction),
+    CollaborationUpdated(AgentCollaboration),
     FileChangePatchUpdated {
         item_id: String,
         changes: Vec<AgentFileChangeEntry>,

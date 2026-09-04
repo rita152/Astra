@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-const CDP_HTTP = "http://127.0.0.1:9222";
+const CDP_HTTP = process.env.CDP_HTTP ?? "http://127.0.0.1:9222";
 const CHATGPT_APP = "/Applications/ChatGPT.app";
 const APP_ASAR = path.join(CHATGPT_APP, "Contents", "Resources", "app.asar");
 const CODEX_BIN = path.join(CHATGPT_APP, "Contents", "Resources", "codex");

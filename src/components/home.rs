@@ -15,8 +15,9 @@ use gpui::{
 
 use crate::{
     agent::{
-        AgentBackend, AgentFileChangeStatus, AgentImageView, CodexAppServerBackend,
-        CommandExecution, CommandExecutionAction, CommandExecutionStatus,
+        AgentBackend, AgentCollaboration, AgentCollaborationStatus, AgentCollaboratorStatus,
+        AgentFileChangeStatus, AgentImageView, CodexAppServerBackend, CommandExecution,
+        CommandExecutionAction, CommandExecutionStatus, LegacySubAgentActivityKind,
     },
     components::{
         approval::{ApprovalCardCallback, render_approval_card},
@@ -71,6 +72,7 @@ pub struct HomeView {
     tool_group_scroll_handles: HashMap<String, ScrollHandle>,
     expanded_commands: HashSet<String>,
     command_scroll_handles: HashMap<String, ScrollHandle>,
+    expanded_collaborations: HashSet<String>,
     approval_focus: FocusHandle,
 }
 
@@ -83,6 +85,9 @@ impl gpui::EventEmitter<OpenDiffReview> for HomeView {}
 
 pub struct OpenImagePreview(pub PathBuf);
 impl gpui::EventEmitter<OpenImagePreview> for HomeView {}
+
+pub struct OpenSubAgentThread(pub String);
+impl gpui::EventEmitter<OpenSubAgentThread> for HomeView {}
 
 const SUGGESTION_PRESSED_SCALE: f32 = 0.99;
 const SUGGESTION_TRANSITION_DURATION: Duration = Duration::from_millis(150);
@@ -157,6 +162,10 @@ const NOTICE_WARNING_GAP: f32 = 16.0;
 const NOTICE_ERROR_CONTENT_GAP: f32 = 6.0;
 const NOTICE_WARNING_CONTENT_GAP: f32 = 8.0;
 const NOTICE_BUTTON_HEIGHT: f32 = 24.0;
+const COLLABORATION_ROW_HEIGHT: f32 = 20.0;
+const COLLABORATION_ICON_SIZE: f32 = 16.0;
+const COLLABORATION_TEXT_SIZE: f32 = 14.0;
+const COLLABORATION_DETAIL_MAX_WIDTH: f32 = 520.0;
 
 #[derive(Clone, Copy, Debug)]
 struct ReasoningDisclosureTransition {
@@ -735,6 +744,7 @@ impl HomeView {
             tool_group_scroll_handles: HashMap::new(),
             expanded_commands: HashSet::new(),
             command_scroll_handles: HashMap::new(),
+            expanded_collaborations: HashSet::new(),
             approval_focus: cx.focus_handle(),
         };
         view.observe_composer(composer, cx);
@@ -791,6 +801,7 @@ impl HomeView {
         self.tool_group_scroll_handles.clear();
         self.expanded_commands.clear();
         self.command_scroll_handles.clear();
+        self.expanded_collaborations.clear();
         let composer = self.composer.read(cx);
         let needs_shimmer = composer.conversation_phase() == ConversationPhase::Thinking
             || composer.has_active_context_compaction();
@@ -986,6 +997,23 @@ impl HomeView {
         self.composer.update(cx, |composer, cx| {
             composer.set_context_compaction_for_capture(running, cx)
         });
+        cx.notify();
+    }
+
+    pub fn set_collaboration_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.expanded_collaborations.clear();
+        let expanded = state.ends_with("-expanded");
+        let state = state.strip_suffix("-expanded").unwrap_or(state);
+        self.composer.update(cx, |composer, cx| {
+            composer.set_collaboration_for_capture(state, cx)
+        });
+        if expanded {
+            self.expanded_collaborations.insert(if state == "failed" {
+                "collaboration-ui-capture".to_owned()
+            } else {
+                "legacy-01a06b7a-14c2-73b3-9c62-b29e27bd8689".to_owned()
+            });
+        }
         cx.notify();
     }
 
@@ -1649,6 +1677,7 @@ impl Render for HomeView {
             self.tool_group_scroll_handles.clone(),
             self.expanded_commands.clone(),
             self.command_scroll_handles.clone(),
+            self.expanded_collaborations.clone(),
             self.suggestion(
                 0,
                 "Prove plugin upgrades never mutate an active run",
@@ -1692,6 +1721,7 @@ fn home(
     tool_group_scroll_handles: HashMap<String, ScrollHandle>,
     expanded_commands: HashSet<String>,
     command_scroll_handles: HashMap<String, ScrollHandle>,
+    expanded_collaborations: HashSet<String>,
     first_suggestion: impl IntoElement,
     second_suggestion: impl IntoElement,
 ) -> Div {
@@ -1794,6 +1824,7 @@ fn home(
                 tool_group_scroll_handles,
                 expanded_commands,
                 command_scroll_handles,
+                expanded_collaborations,
             ))
         })
         .when_some(pending_command_approval, |root, model| {
@@ -1916,6 +1947,7 @@ fn conversation(
     tool_group_scroll_handles: HashMap<String, ScrollHandle>,
     expanded_commands: HashSet<String>,
     command_scroll_handles: HashMap<String, ScrollHandle>,
+    expanded_collaborations: HashSet<String>,
 ) -> impl IntoElement {
     let has_active_reasoning = conversation_activity.iter().any(|activity| {
         matches!(activity, ConversationActivity::Reasoning(reasoning) if reasoning.is_active())
@@ -1955,6 +1987,7 @@ fn conversation(
                 tool_group_scroll_handles.clone(),
                 expanded_commands.clone(),
                 command_scroll_handles.clone(),
+                expanded_collaborations.clone(),
                 theme,
             )
             .into_any_element()
@@ -2116,6 +2149,7 @@ fn conversation(
                                 tool_group_scroll_handles,
                                 expanded_commands,
                                 command_scroll_handles,
+                                expanded_collaborations,
                                 theme,
                             ))
                         }
@@ -2262,6 +2296,7 @@ fn activity_stream(
     tool_group_scroll_handles: HashMap<String, ScrollHandle>,
     expanded_commands: HashSet<String>,
     command_scroll_handles: HashMap<String, ScrollHandle>,
+    expanded_collaborations: HashSet<String>,
     theme: Theme,
 ) -> Div {
     activity_stream_units(&activities)
@@ -2342,6 +2377,16 @@ fn activity_stream(
                     ConversationActivity::ContextCompaction(compaction) => stream.child(
                         context_compaction_activity(compaction, thinking_shimmer_progress, theme),
                     ),
+                    ConversationActivity::Collaboration(collaboration) => {
+                        let expanded = expanded_collaborations
+                            .contains(&collaboration_ui_identity(&collaboration));
+                        stream.child(collaboration_activity(
+                            home_entity.clone(),
+                            collaboration,
+                            expanded,
+                            theme,
+                        ))
+                    }
                     ConversationActivity::Command(command) => {
                         stream.child(command_execution_activity(
                             home_entity.clone(),
@@ -3860,6 +3905,307 @@ fn thinking_shimmer(theme: Theme, progress: f32) -> impl IntoElement {
     ))
 }
 
+fn collaboration_display_name(collaboration: &AgentCollaboration, thread_id: &str) -> String {
+    if let Some(path) = collaboration
+        .legacy_agent_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    {
+        let leaf = path
+            .rsplit('/')
+            .find(|part| !part.is_empty())
+            .unwrap_or(path);
+        let mut label = leaf.replace(['_', '-'], " ");
+        if let Some(first) = label.get_mut(0..1) {
+            first.make_ascii_uppercase();
+        }
+        return label;
+    }
+    if let Some(prompt) = collaboration
+        .prompt
+        .as_deref()
+        .and_then(|prompt| prompt.lines().find(|line| !line.trim().is_empty()))
+    {
+        let prompt = prompt.trim();
+        if prompt.chars().count() <= 48 {
+            return prompt.to_owned();
+        }
+    }
+    let short_id = thread_id.rsplit('-').next().unwrap_or(thread_id);
+    if short_id.is_empty() {
+        "子智能体".to_owned()
+    } else {
+        format!("子智能体 {short_id}")
+    }
+}
+
+fn collaboration_thread_ids(collaboration: &AgentCollaboration) -> Vec<String> {
+    let mut thread_ids = collaboration.receiver_thread_ids.clone();
+    for thread_id in collaboration.agents_states.keys() {
+        if !thread_ids.contains(thread_id) {
+            thread_ids.push(thread_id.clone());
+        }
+    }
+    if thread_ids.is_empty() {
+        thread_ids.push(String::new());
+    }
+    thread_ids
+}
+
+fn collaboration_ui_identity(collaboration: &AgentCollaboration) -> String {
+    if collaboration.legacy_kind.is_some()
+        && let Some(thread_id) = collaboration.receiver_thread_ids.first()
+    {
+        return format!("legacy-{thread_id}");
+    }
+    collaboration.id.clone()
+}
+
+fn collaboration_status_label(collaboration: &AgentCollaboration, thread_id: &str) -> &'static str {
+    if let Some(kind) = collaboration.legacy_kind {
+        return match kind {
+            LegacySubAgentActivityKind::Started => "开始工作",
+            LegacySubAgentActivityKind::Interacted => "已更新",
+            LegacySubAgentActivityKind::Interrupted => "已中断",
+            LegacySubAgentActivityKind::Completed => "已完成",
+        };
+    }
+    if collaboration.status == AgentCollaborationStatus::Failed {
+        return "失败";
+    }
+    if collaboration.status == AgentCollaborationStatus::Interrupted {
+        return "已中断";
+    }
+    match collaboration
+        .agents_states
+        .get(thread_id)
+        .map(|state| state.status)
+    {
+        Some(AgentCollaboratorStatus::PendingInit) => "正在启动",
+        Some(AgentCollaboratorStatus::Running) => "开始工作",
+        Some(AgentCollaboratorStatus::Interrupted) => "已中断",
+        Some(AgentCollaboratorStatus::Completed) => "已完成",
+        Some(AgentCollaboratorStatus::Errored) => "失败",
+        Some(AgentCollaboratorStatus::Shutdown) => "已关闭",
+        Some(AgentCollaboratorStatus::NotFound) => "未找到",
+        None if collaboration.status == AgentCollaborationStatus::Completed => "已完成",
+        None => "正在工作",
+    }
+}
+
+fn toggle_collaboration_item(home_entity: &Entity<HomeView>, item_id: &str, cx: &mut App) {
+    let item_id = item_id.to_owned();
+    home_entity.update(cx, |home, cx| {
+        if !home.expanded_collaborations.remove(&item_id) {
+            home.expanded_collaborations.insert(item_id);
+        }
+        cx.notify();
+    });
+}
+
+fn open_sub_agent_thread(home_entity: &Entity<HomeView>, thread_id: &str, cx: &mut App) {
+    let thread_id = thread_id.to_owned();
+    home_entity.update(cx, |_, cx| cx.emit(OpenSubAgentThread(thread_id)));
+}
+
+fn collaboration_activity(
+    home_entity: Entity<HomeView>,
+    collaboration: AgentCollaboration,
+    expanded: bool,
+    theme: Theme,
+) -> impl IntoElement {
+    let item_id = collaboration_ui_identity(&collaboration);
+    let receiver_thread_ids = collaboration_thread_ids(&collaboration);
+    let mut content = div()
+        .id(SharedString::from(format!(
+            "collaboration-activity-{item_id}"
+        )))
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .items_start()
+        .gap(px(4.0));
+
+    for (index, thread_id) in receiver_thread_ids.iter().enumerate() {
+        let name = collaboration_display_name(&collaboration, thread_id);
+        let status = collaboration_status_label(&collaboration, thread_id);
+        let accessible_label = if expanded {
+            format!("{name}{status}，关闭子智能体详情")
+        } else {
+            format!("{name}{status}，打开子智能体详情")
+        };
+        let click_home = home_entity.clone();
+        let key_home = home_entity.clone();
+        let click_item_id = item_id.clone();
+        let key_item_id = item_id.clone();
+        let failure = matches!(status, "失败" | "未找到");
+        let text_color = if failure {
+            theme.warning
+        } else {
+            theme.text.alpha(0.65)
+        };
+        content = content.child(
+            div()
+                .h(px(COLLABORATION_ROW_HEIGHT))
+                .w_full()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .font_family(".SystemUIFont")
+                .font_weight(FontWeight(430.0))
+                .text_size(px(COLLABORATION_TEXT_SIZE))
+                .line_height(px(COLLABORATION_ROW_HEIGHT))
+                .text_color(text_color)
+                .child(
+                    icon("subagent-activity", theme.text.into())
+                        .size(px(COLLABORATION_ICON_SIZE))
+                        .flex_none(),
+                )
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "collaboration-agent-{item_id}-{index}"
+                                )))
+                                .debug_selector(|| "collaboration-agent".to_owned())
+                                .focusable()
+                                .tab_stop(true)
+                                .role(Role::Button)
+                                .aria_expanded(expanded)
+                                .aria_label(accessible_label)
+                                .rounded(px(6.0))
+                                .cursor_pointer()
+                                .hover(move |label| label.text_color(theme.text))
+                                .focus_visible(|style| {
+                                    style.shadow(vec![
+                                        BoxShadow::new(px(0.0), px(0.0), rgba(0x3a83f7ff).into())
+                                            .spread_radius(px(2.0))
+                                            .inset(),
+                                    ])
+                                })
+                                .on_click(move |_, _, cx| {
+                                    toggle_collaboration_item(&click_home, &click_item_id, cx);
+                                })
+                                .on_key_down(move |event, _, cx| {
+                                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                        toggle_collaboration_item(&key_home, &key_item_id, cx);
+                                        cx.stop_propagation();
+                                    }
+                                })
+                                .child(name),
+                        )
+                        .child(status),
+                ),
+        );
+    }
+
+    content.when(expanded, |content| {
+        let mut detail = div()
+            .ml(px(22.0))
+            .mt(px(4.0))
+            .w_full()
+            .max_w(px(COLLABORATION_DETAIL_MAX_WIDTH))
+            .p(px(10.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .rounded(px(12.0))
+            .bg(theme.command_surface)
+            .shadow(vec![
+                BoxShadow::new(px(0.0), px(0.0), theme.command_border.into())
+                    .spread_radius(px(0.5)),
+            ])
+            .text_size(px(13.0))
+            .line_height(px(18.0))
+            .text_color(theme.text_secondary);
+        if let Some(prompt) = collaboration
+            .prompt
+            .as_deref()
+            .filter(|prompt| !prompt.trim().is_empty())
+        {
+            detail = detail.child(div().text_color(theme.text).child(prompt.to_owned()));
+        }
+        if let Some(metadata) = match (
+            collaboration.model.as_deref(),
+            collaboration.reasoning_effort.as_deref(),
+        ) {
+            (Some(model), Some(effort)) => Some(format!("{model} · {effort}")),
+            (Some(model), None) => Some(model.to_owned()),
+            (None, Some(effort)) => Some(effort.to_owned()),
+            (None, None) => None,
+        } {
+            detail = detail.child(metadata);
+        }
+        for thread_id in collaboration_thread_ids(&collaboration) {
+            let name = collaboration_display_name(&collaboration, &thread_id);
+            let status = collaboration_status_label(&collaboration, &thread_id);
+            let click_home = home_entity.clone();
+            let key_home = home_entity.clone();
+            let click_thread_id = thread_id.clone();
+            let key_thread_id = thread_id.clone();
+            let can_open = !thread_id.is_empty();
+            let receiver_label = format!("进入子任务 {name}，状态{status}");
+            let message = collaboration
+                .agents_states
+                .get(&thread_id)
+                .and_then(|state| state.message.clone());
+            detail = detail.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "collaboration-open-{thread_id}"
+                    )))
+                    .debug_selector(|| "collaboration-receiver".to_owned())
+                    .min_h(px(28.0))
+                    .px(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .rounded(px(8.0))
+                    .when(can_open, |row| {
+                        row.focusable()
+                            .tab_stop(true)
+                            .role(Role::Button)
+                            .aria_label(receiver_label)
+                            .cursor_pointer()
+                            .hover(move |row| row.bg(theme.sidebar_hover))
+                    })
+                    .on_click(move |_, _, cx| {
+                        if !click_thread_id.is_empty() {
+                            open_sub_agent_thread(&click_home, &click_thread_id, cx)
+                        }
+                    })
+                    .on_key_down(move |event, _, cx| {
+                        if !key_thread_id.is_empty()
+                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                        {
+                            open_sub_agent_thread(&key_home, &key_thread_id, cx);
+                            cx.stop_propagation();
+                        }
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_color(theme.text)
+                            .child(name)
+                            .child(status),
+                    )
+                    .when_some(message, |row, message| {
+                        row.child(div().truncate().child(message))
+                    }),
+            );
+        }
+        content.child(detail)
+    })
+}
+
 fn context_compaction_activity(
     compaction: crate::agent::AgentContextCompaction,
     shimmer_progress: f32,
@@ -4005,6 +4351,7 @@ fn message_action(
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         path::PathBuf,
         sync::{Arc, Mutex},
         time::Duration,
@@ -4023,7 +4370,7 @@ mod tests {
         COMMAND_CARD_TEXT_SIZE, CONVERSATION_BOTTOM_INSET, CONVERSATION_TOP_INSET,
         DISCLOSURE_FOCUS_PADDING, HomeView, NOTICE_BUTTON_HEIGHT, NOTICE_ERROR_CONTENT_GAP,
         NOTICE_ERROR_GAP, NOTICE_ICON_SIZE, NOTICE_LINE_HEIGHT, NOTICE_RADIUS, NOTICE_TEXT_SIZE,
-        NOTICE_WARNING_CONTENT_GAP, NOTICE_WARNING_GAP, OpenImagePreview,
+        NOTICE_WARNING_CONTENT_GAP, NOTICE_WARNING_GAP, OpenImagePreview, OpenSubAgentThread,
         REASONING_BODY_MAX_HEIGHT, REASONING_CHEVRON_SIZE, REASONING_HEADER_HEIGHT,
         REASONING_LINE_HEIGHT, REASONING_TEXT_SIZE, REASONING_TRANSITION_DURATION,
         RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT, RESPONSE_ACTION_FOOTER_HEIGHT,
@@ -4040,19 +4387,22 @@ mod tests {
         USER_MESSAGE_HORIZONTAL_PADDING, USER_MESSAGE_LINE_HEIGHT, USER_MESSAGE_MAX_WIDTH_RATIO,
         USER_MESSAGE_PARAGRAPH_GAP, USER_MESSAGE_TEXT_SIZE, USER_MESSAGE_TIME_LINE_HEIGHT,
         USER_MESSAGE_TIME_SIZE, USER_MESSAGE_VERTICAL_PADDING, active_reasoning_body,
-        activity_stream_units, command_activity_row_count, command_activity_summaries,
+        activity_stream_units, collaboration_display_name, collaboration_status_label,
+        collaboration_ui_identity, command_activity_row_count, command_activity_summaries,
         command_activity_summary, completed_reasoning_body, completed_tool_group_summary,
         conversation_status, format_reasoning_elapsed, generic_command_activity_summary,
         reasoning_activity_title, reasoning_header_label, reasoning_transition_ease,
         scroll_should_follow_output, strip_terminal_line_ending, thinking_shimmer_alpha,
         thinking_shimmer_band_left, thinking_shimmer_progress, thinking_shimmer_step,
-        toggle_reasoning_item, toggle_tool_activity_group, tool_group_chevron_transition_ease,
-        tool_group_reasoning_title, user_message_paragraphs,
+        toggle_collaboration_item, toggle_reasoning_item, toggle_tool_activity_group,
+        tool_group_chevron_transition_ease, tool_group_reasoning_title, user_message_paragraphs,
     };
     use crate::agent::{
-        AgentContextCompaction, AgentImageView, CommandExecution, CommandExecutionAction,
-        CommandExecutionStatus, HistoryItemDetail, HistoryTurnStatus, ThreadActivity,
-        ThreadHistory, ThreadHistoryItem, ThreadSummary, ThreadTurn,
+        AgentCollaboration, AgentCollaborationStatus, AgentCollaborationTool,
+        AgentCollaboratorState, AgentCollaboratorStatus, AgentContextCompaction, AgentImageView,
+        CommandExecution, CommandExecutionAction, CommandExecutionStatus, HistoryItemDetail,
+        HistoryTurnStatus, LegacySubAgentActivityKind, ThreadActivity, ThreadHistory,
+        ThreadHistoryItem, ThreadSummary, ThreadTurn,
     };
     use crate::components::{
         composer::{ConversationActivity, ConversationPhase, ReasoningActivityPresentation},
@@ -4103,6 +4453,42 @@ mod tests {
             terminal_process_id: None,
             status,
             exit_code: (status == CommandExecutionStatus::Completed).then_some(0),
+        }
+    }
+
+    fn collaboration(kind: LegacySubAgentActivityKind) -> AgentCollaboration {
+        let (status, agent_status) = match kind {
+            LegacySubAgentActivityKind::Started | LegacySubAgentActivityKind::Interacted => (
+                AgentCollaborationStatus::InProgress,
+                AgentCollaboratorStatus::Running,
+            ),
+            LegacySubAgentActivityKind::Interrupted => (
+                AgentCollaborationStatus::Interrupted,
+                AgentCollaboratorStatus::Interrupted,
+            ),
+            LegacySubAgentActivityKind::Completed => (
+                AgentCollaborationStatus::Completed,
+                AgentCollaboratorStatus::Completed,
+            ),
+        };
+        AgentCollaboration {
+            id: "collaboration_1".into(),
+            tool: AgentCollaborationTool::LegacyActivity,
+            status,
+            sender_thread_id: String::new(),
+            receiver_thread_ids: vec!["agent_1".into()],
+            agents_states: BTreeMap::from([(
+                "agent_1".into(),
+                AgentCollaboratorState {
+                    status: agent_status,
+                    message: None,
+                },
+            )]),
+            prompt: None,
+            model: None,
+            reasoning_effort: None,
+            legacy_agent_path: Some("/root/collab_evidence_probe".into()),
+            legacy_kind: Some(kind),
         }
     }
 
@@ -4233,6 +4619,163 @@ mod tests {
                 if compaction.id == "compact_1" && compaction.completed
         ));
         assert!(matches!(units[2], ActivityStreamUnit::ToolGroup(_)));
+    }
+
+    #[test]
+    fn collaboration_stays_standalone_and_maps_reference_labels() {
+        let command = |id: &str| {
+            ConversationActivity::Command(command(
+                id,
+                CommandExecutionAction::Unknown {
+                    command: "cargo test".into(),
+                },
+                CommandExecutionStatus::Completed,
+            ))
+        };
+        let running = collaboration(LegacySubAgentActivityKind::Started);
+        let activities = vec![
+            command("before"),
+            ConversationActivity::Collaboration(running.clone()),
+            command("after"),
+        ];
+        let units = activity_stream_units(&activities);
+        assert_eq!(units.len(), 3);
+        assert!(matches!(units[0], ActivityStreamUnit::ToolGroup(_)));
+        assert!(matches!(
+            &units[1],
+            ActivityStreamUnit::Standalone(ConversationActivity::Collaboration(item))
+                if item.id == "collaboration_1"
+        ));
+        assert!(matches!(units[2], ActivityStreamUnit::ToolGroup(_)));
+
+        assert_eq!(
+            collaboration_display_name(&running, "agent_1"),
+            "Collab evidence probe"
+        );
+        assert_eq!(collaboration_status_label(&running, "agent_1"), "开始工作");
+        assert_eq!(
+            collaboration_status_label(
+                &collaboration(LegacySubAgentActivityKind::Interacted),
+                "agent_1"
+            ),
+            "已更新"
+        );
+        assert_eq!(
+            collaboration_status_label(
+                &collaboration(LegacySubAgentActivityKind::Interrupted),
+                "agent_1"
+            ),
+            "已中断"
+        );
+        assert_eq!(
+            collaboration_status_label(
+                &collaboration(LegacySubAgentActivityKind::Completed),
+                "agent_1"
+            ),
+            "已完成"
+        );
+
+        let mut failed = running;
+        failed.tool = AgentCollaborationTool::SpawnAgent;
+        failed.status = AgentCollaborationStatus::Failed;
+        failed.legacy_kind = None;
+        failed.legacy_agent_path = None;
+        failed.agents_states.get_mut("agent_1").unwrap().status = AgentCollaboratorStatus::Errored;
+        assert_eq!(collaboration_status_label(&failed, "agent_1"), "失败");
+        assert_eq!(
+            collaboration_ui_identity(&collaboration(LegacySubAgentActivityKind::Started)),
+            collaboration_ui_identity(&collaboration(LegacySubAgentActivityKind::Completed)),
+            "legacy lifecycle item ids differ, so disclosure identity must follow the agent thread"
+        );
+        assert_eq!(collaboration_ui_identity(&failed), "collaboration_1");
+    }
+
+    #[test]
+    fn collaboration_disclosure_and_thread_navigation_share_pointer_keyboard_paths() {
+        let mut app = TestApp::new();
+        let home = app.new_entity(|cx| HomeView::new(ThemeMode::Dark, cx));
+        app.update(|cx| toggle_collaboration_item(&home, "collaboration_1", cx));
+        assert!(app.read_entity(&home, |home, _| {
+            home.expanded_collaborations.contains("collaboration_1")
+        }));
+        app.update(|cx| toggle_collaboration_item(&home, "collaboration_1", cx));
+        assert!(!app.read_entity(&home, |home, _| {
+            home.expanded_collaborations.contains("collaboration_1")
+        }));
+
+        let opened = Arc::new(Mutex::new(None));
+        let observed = opened.clone();
+        let _observer = app.new_entity(|cx| {
+            cx.subscribe(
+                &home,
+                move |_: &mut (), _, event: &OpenSubAgentThread, _| {
+                    *observed.lock().unwrap() = Some(event.0.clone());
+                },
+            )
+            .detach();
+        });
+        app.update(|cx| super::open_sub_agent_thread(&home, "agent_1", cx));
+        assert_eq!(*opened.lock().unwrap(), Some("agent_1".to_owned()));
+    }
+
+    #[test]
+    fn collaboration_row_handles_real_pointer_keyboard_and_receiver_activation() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(900.0), px(700.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| HomeView::new(ThemeMode::Light, cx),
+        );
+        window.update(|home, _, cx| home.set_collaboration_for_capture("running", cx));
+
+        let opened = Arc::new(Mutex::new(None));
+        let observed = opened.clone();
+        let home = window.root();
+        let _observer = app.new_entity(|cx| {
+            cx.subscribe(
+                &home,
+                move |_: &mut (), _, event: &OpenSubAgentThread, _| {
+                    *observed.lock().unwrap() = Some(event.0.clone());
+                },
+            )
+            .detach();
+        });
+
+        window.draw();
+        let disclosure = window
+            .debug_bounds("collaboration-agent")
+            .expect("collaboration disclosure must render");
+        window.simulate_click(disclosure.center(), MouseButton::Left);
+        assert!(window.read(|home, _| {
+            home.expanded_collaborations
+                .contains("legacy-01a06b7a-14c2-73b3-9c62-b29e27bd8689")
+        }));
+
+        window.simulate_keystrokes("space");
+        assert!(!window.read(|home, _| {
+            home.expanded_collaborations
+                .contains("legacy-01a06b7a-14c2-73b3-9c62-b29e27bd8689")
+        }));
+        window.simulate_keystrokes("enter");
+        window.draw();
+        assert!(window.read(|home, _| {
+            home.expanded_collaborations
+                .contains("legacy-01a06b7a-14c2-73b3-9c62-b29e27bd8689")
+        }));
+
+        let receiver = window
+            .debug_bounds("collaboration-receiver")
+            .expect("expanded collaboration receiver must render");
+        window.simulate_click(receiver.center(), MouseButton::Left);
+        assert_eq!(
+            *opened.lock().unwrap(),
+            Some("01a06b7a-14c2-73b3-9c62-b29e27bd8689".to_owned())
+        );
     }
 
     #[test]

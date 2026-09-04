@@ -26,7 +26,7 @@ use crate::{
             DiffFileVisualState, DiffReviewCallback, DiffReviewEvent, DiffReviewPresentation,
             captured_diff_review_fixture, render_diff_review_panel,
         },
-        home::{HomeView, OpenDiffReview, OpenImagePreview},
+        home::{HomeView, OpenDiffReview, OpenImagePreview, OpenSubAgentThread},
         icons::icon,
         sidebar::{NewConversation, OpenProjectCreation, OpenSettings, SelectThread, SidebarView},
     },
@@ -390,6 +390,10 @@ impl ChatApp {
             this.image_preview = Some(event.0.clone());
             this.image_preview_zoom = 1.0;
             cx.notify();
+        })
+        .detach();
+        cx.subscribe(&home, |this, _, event: &OpenSubAgentThread, cx| {
+            this.select_conversation(event.0.clone(), cx);
         })
         .detach();
         cx.subscribe(&home, |this, _, event: &ConversationThreadCreated, cx| {
@@ -817,6 +821,11 @@ impl ChatApp {
         self.home.update(cx, |home, cx| {
             home.set_context_compaction_for_capture(running, cx)
         });
+    }
+
+    pub fn set_collaboration_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.home
+            .update(cx, |home, cx| home.set_collaboration_for_capture(state, cx));
     }
 
     pub fn set_tool_group_for_capture(

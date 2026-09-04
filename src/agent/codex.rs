@@ -1,7 +1,7 @@
 mod manager;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::Write,
     path::{Path, PathBuf},
     process::Child,
@@ -25,9 +25,10 @@ use serde_json::{Value, json};
 use super::{
     AgentAccountRateLimits, AgentActivePermissionProfile, AgentAdditionalFileSystemPermissions,
     AgentAdditionalNetworkPermissions, AgentApprovalControl, AgentApprovalHandle, AgentBackend,
-    AgentCommandApprovalChoice, AgentCommandApprovalRequest, AgentConfigWarning,
-    AgentConnectionEvent, AgentCreditsSnapshot, AgentEffectivePermissions, AgentEvent,
-    AgentFileChange, AgentFileChangeEntry, AgentFileChangeKind, AgentFileChangeStatus,
+    AgentCollaboration, AgentCollaborationStatus, AgentCollaborationTool, AgentCollaboratorState,
+    AgentCollaboratorStatus, AgentCommandApprovalChoice, AgentCommandApprovalRequest,
+    AgentConfigWarning, AgentConnectionEvent, AgentCreditsSnapshot, AgentEffectivePermissions,
+    AgentEvent, AgentFileChange, AgentFileChangeEntry, AgentFileChangeKind, AgentFileChangeStatus,
     AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemPermissionEntry,
     AgentFileSystemSpecialPath, AgentImageView, AgentInterruptControl, AgentInterruptOutcome,
     AgentMcpServerStartupFailureReason, AgentMcpServerStartupState, AgentMcpServerStartupStatus,
@@ -40,10 +41,10 @@ use super::{
     AgentThreadStatusState, AgentThreadTokenUsage, AgentTokenUsageBreakdown, AgentUserInputControl,
     AgentUserInputHandle, AgentUserInputOption, AgentUserInputQuestion, AgentUserInputRequest,
     AgentUserInputResponse, CommandExecution, CommandExecutionAction, CommandExecutionStatus,
-    CreateProject, HistoryItemDetail, Page, PageRequest, Project, ProjectId,
-    ThreadHistoryItemEntry, ThreadId, ThreadListRequest, ThreadMetadataUpdate, ThreadSearchResult,
-    ThreadSection, ThreadSectionAppearance, ThreadSectionId, ThreadSummary, ThreadTurn,
-    UpdateProject, WorkspaceResult,
+    CreateProject, HistoryItemDetail, LegacySubAgentActivityKind, Page, PageRequest, Project,
+    ProjectId, ThreadHistoryItemEntry, ThreadId, ThreadListRequest, ThreadMetadataUpdate,
+    ThreadSearchResult, ThreadSection, ThreadSectionAppearance, ThreadSectionId, ThreadSummary,
+    ThreadTurn, UpdateProject, WorkspaceResult,
 };
 
 #[cfg(test)]
@@ -2040,6 +2041,16 @@ fn process_turn_message<W: Write + Send + 'static>(
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
+                "collabAgentToolCall" | "subAgentActivity" => {
+                    let collaboration = parse_collaboration(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::CollaborationUpdated(collaboration),
+                        "item/started collaboration",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
                 unsupported => {
                     return Err(turn_item_protocol_error(
                         message,
@@ -2219,6 +2230,16 @@ fn process_turn_message<W: Write + Send + 'static>(
                         events,
                         AgentEvent::ContextCompactionUpdated(compaction),
                         "item/completed contextCompaction",
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
+                "collabAgentToolCall" | "subAgentActivity" => {
+                    let collaboration = parse_collaboration(item)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::CollaborationUpdated(collaboration),
+                        "item/completed collaboration",
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
@@ -3059,6 +3080,200 @@ fn parse_context_compaction(
         id: required_item_string(item, "contextCompaction", "id")?,
         completed,
     })
+}
+
+fn parse_collaboration_tool(value: &str) -> Result<AgentCollaborationTool> {
+    Ok(match value {
+        "spawnAgent" => AgentCollaborationTool::SpawnAgent,
+        "sendInput" => AgentCollaborationTool::SendInput,
+        "resumeAgent" => AgentCollaborationTool::ResumeAgent,
+        "wait" => AgentCollaborationTool::Wait,
+        "closeAgent" => AgentCollaborationTool::CloseAgent,
+        "sendMessage" => AgentCollaborationTool::SendMessage,
+        "followupTask" => AgentCollaborationTool::FollowupTask,
+        "interruptAgent" => AgentCollaborationTool::InterruptAgent,
+        "listAgents" => AgentCollaborationTool::ListAgents,
+        unsupported => bail!("collabAgentToolCall item.tool 包含未知值 `{unsupported}`"),
+    })
+}
+
+fn parse_collaboration_status(value: &str) -> Result<AgentCollaborationStatus> {
+    Ok(match value {
+        "inProgress" => AgentCollaborationStatus::InProgress,
+        "completed" => AgentCollaborationStatus::Completed,
+        "failed" => AgentCollaborationStatus::Failed,
+        "interrupted" => AgentCollaborationStatus::Interrupted,
+        unsupported => bail!("collabAgentToolCall item.status 包含未知值 `{unsupported}`"),
+    })
+}
+
+fn parse_collaborator_status(value: &str) -> Result<AgentCollaboratorStatus> {
+    Ok(match value {
+        "pendingInit" => AgentCollaboratorStatus::PendingInit,
+        "running" => AgentCollaboratorStatus::Running,
+        "interrupted" => AgentCollaboratorStatus::Interrupted,
+        "completed" => AgentCollaboratorStatus::Completed,
+        "errored" => AgentCollaboratorStatus::Errored,
+        "shutdown" => AgentCollaboratorStatus::Shutdown,
+        "notFound" => AgentCollaboratorStatus::NotFound,
+        unsupported => bail!("collabAgentToolCall agent.status 包含未知值 `{unsupported}`"),
+    })
+}
+
+fn optional_nullable_item_string(
+    item: &serde_json::Map<String, Value>,
+    item_kind: &str,
+    field: &str,
+) -> Result<Option<String>> {
+    match item.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => bail!("{item_kind} item.{field} 必须是字符串或 null"),
+    }
+}
+
+fn required_item_strings(
+    item: &serde_json::Map<String, Value>,
+    item_kind: &str,
+    field: &str,
+) -> Result<Vec<String>> {
+    item.get(field)
+        .and_then(Value::as_array)
+        .with_context(|| format!("{item_kind} item.{field} 必须是字符串数组"))?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .with_context(|| format!("{item_kind} item.{field}[{index}] 必须是字符串"))
+        })
+        .collect()
+}
+
+fn parse_legacy_sub_agent_kind(value: &str) -> Result<LegacySubAgentActivityKind> {
+    Ok(match value {
+        "started" => LegacySubAgentActivityKind::Started,
+        "interacted" => LegacySubAgentActivityKind::Interacted,
+        "interrupted" => LegacySubAgentActivityKind::Interrupted,
+        "completed" => LegacySubAgentActivityKind::Completed,
+        unsupported => bail!("subAgentActivity item.kind 包含未知值 `{unsupported}`"),
+    })
+}
+
+pub(super) fn parse_collaboration(
+    item: &serde_json::Map<String, Value>,
+) -> Result<AgentCollaboration> {
+    let item_type = required_item_string(item, "collaboration", "type")?;
+    match item_type.as_str() {
+        "collabAgentToolCall" => {
+            let mut agents_states = BTreeMap::new();
+            let states = item
+                .get("agentsStates")
+                .and_then(Value::as_object)
+                .context("collabAgentToolCall item.agentsStates 必须是对象")?;
+            for (thread_id, state) in states {
+                let state = state.as_object().with_context(|| {
+                    format!("collabAgentToolCall item.agentsStates.{thread_id} 必须是对象")
+                })?;
+                let status = parse_collaborator_status(&required_item_string(
+                    state,
+                    "collabAgentToolCall agent state",
+                    "status",
+                )?)?;
+                let message = optional_nullable_item_string(
+                    state,
+                    "collabAgentToolCall agent state",
+                    "message",
+                )?;
+                agents_states.insert(
+                    thread_id.clone(),
+                    AgentCollaboratorState { status, message },
+                );
+            }
+
+            let reasoning_effort =
+                optional_nullable_item_string(item, "collabAgentToolCall", "reasoningEffort")?;
+            if reasoning_effort.as_deref().is_some_and(str::is_empty) {
+                bail!("collabAgentToolCall item.reasoningEffort 不能为空字符串");
+            }
+            Ok(AgentCollaboration {
+                id: required_item_string(item, "collabAgentToolCall", "id")?,
+                tool: parse_collaboration_tool(&required_item_string(
+                    item,
+                    "collabAgentToolCall",
+                    "tool",
+                )?)?,
+                status: parse_collaboration_status(&required_item_string(
+                    item,
+                    "collabAgentToolCall",
+                    "status",
+                )?)?,
+                sender_thread_id: required_item_string(
+                    item,
+                    "collabAgentToolCall",
+                    "senderThreadId",
+                )?,
+                receiver_thread_ids: required_item_strings(
+                    item,
+                    "collabAgentToolCall",
+                    "receiverThreadIds",
+                )?,
+                agents_states,
+                prompt: optional_nullable_item_string(item, "collabAgentToolCall", "prompt")?,
+                model: optional_nullable_item_string(item, "collabAgentToolCall", "model")?,
+                reasoning_effort,
+                legacy_agent_path: None,
+                legacy_kind: None,
+            })
+        }
+        "subAgentActivity" => {
+            let kind = parse_legacy_sub_agent_kind(&required_item_string(
+                item,
+                "subAgentActivity",
+                "kind",
+            )?)?;
+            let agent_thread_id = required_item_string(item, "subAgentActivity", "agentThreadId")?;
+            let (status, agent_status) = match kind {
+                LegacySubAgentActivityKind::Started | LegacySubAgentActivityKind::Interacted => (
+                    AgentCollaborationStatus::InProgress,
+                    AgentCollaboratorStatus::Running,
+                ),
+                LegacySubAgentActivityKind::Interrupted => (
+                    AgentCollaborationStatus::Interrupted,
+                    AgentCollaboratorStatus::Interrupted,
+                ),
+                LegacySubAgentActivityKind::Completed => (
+                    AgentCollaborationStatus::Completed,
+                    AgentCollaboratorStatus::Completed,
+                ),
+            };
+            Ok(AgentCollaboration {
+                id: required_item_string(item, "subAgentActivity", "id")?,
+                tool: AgentCollaborationTool::LegacyActivity,
+                status,
+                sender_thread_id: String::new(),
+                receiver_thread_ids: vec![agent_thread_id.clone()],
+                agents_states: BTreeMap::from([(
+                    agent_thread_id,
+                    AgentCollaboratorState {
+                        status: agent_status,
+                        message: None,
+                    },
+                )]),
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                legacy_agent_path: Some(required_item_string(
+                    item,
+                    "subAgentActivity",
+                    "agentPath",
+                )?),
+                legacy_kind: Some(kind),
+            })
+        }
+        unsupported => bail!("collaboration item.type 包含未知值 `{unsupported}`"),
+    }
 }
 
 fn optional_item_strings(
@@ -7882,6 +8097,206 @@ mod tests {
     }
 
     #[test]
+    fn collaboration_lifecycle_preserves_parallel_state_and_terminal_failure() {
+        let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+        let (tx, rx) = async_channel::unbounded();
+        let mut streamed_text = false;
+        let started = json!({
+            "type": "collabAgentToolCall",
+            "id": "collab_1",
+            "tool": "spawnAgent",
+            "status": "inProgress",
+            "senderThreadId": "thr_1",
+            "receiverThreadIds": ["agent_a", "agent_b"],
+            "agentsStates": {
+                "agent_a": {"status": "running", "message": null},
+                "agent_b": {"status": "pendingInit"}
+            },
+            "prompt": "Inspect in parallel",
+            "model": "gpt-test",
+            "reasoningEffort": "high"
+        });
+        let completed = json!({
+            "type": "collabAgentToolCall",
+            "id": "collab_1",
+            "tool": "spawnAgent",
+            "status": "failed",
+            "senderThreadId": "thr_1",
+            "receiverThreadIds": ["agent_a", "agent_b"],
+            "agentsStates": {
+                "agent_a": {"status": "completed", "message": "done"},
+                "agent_b": {"status": "errored", "message": "fixture failure"}
+            },
+            "prompt": "Inspect in parallel",
+            "model": "gpt-test",
+            "reasoningEffort": "high"
+        });
+
+        for (method, item) in [("item/started", started), ("item/completed", completed)] {
+            assert_eq!(
+                super::process_turn_message(
+                    &session,
+                    &turn_item_message(method, item),
+                    "thr_1",
+                    "turn_1",
+                    &tx,
+                    &mut streamed_text,
+                )
+                .unwrap(),
+                None
+            );
+        }
+
+        let AgentEvent::CollaborationUpdated(started) = rx.try_recv().unwrap() else {
+            panic!("expected started collaboration update");
+        };
+        assert_eq!(
+            started.status,
+            crate::agent::AgentCollaborationStatus::InProgress
+        );
+        assert_eq!(started.receiver_thread_ids, ["agent_a", "agent_b"]);
+        assert_eq!(
+            started.agents_states["agent_b"].status,
+            crate::agent::AgentCollaboratorStatus::PendingInit
+        );
+        assert_eq!(started.prompt.as_deref(), Some("Inspect in parallel"));
+
+        let AgentEvent::CollaborationUpdated(completed) = rx.try_recv().unwrap() else {
+            panic!("expected completed collaboration update");
+        };
+        assert_eq!(
+            completed.status,
+            crate::agent::AgentCollaborationStatus::Failed
+        );
+        assert_eq!(
+            completed.agents_states["agent_a"].status,
+            crate::agent::AgentCollaboratorStatus::Completed
+        );
+        assert_eq!(
+            completed.agents_states["agent_b"].message.as_deref(),
+            Some("fixture failure")
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(!streamed_text);
+    }
+
+    #[test]
+    fn every_collaboration_tool_and_legacy_kind_is_typed() {
+        for tool in [
+            "spawnAgent",
+            "sendInput",
+            "resumeAgent",
+            "wait",
+            "closeAgent",
+            "sendMessage",
+            "followupTask",
+            "interruptAgent",
+            "listAgents",
+        ] {
+            let item = json!({
+                "type": "collabAgentToolCall",
+                "id": format!("{tool}_1"),
+                "tool": tool,
+                "status": "completed",
+                "senderThreadId": "thr_1",
+                "receiverThreadIds": [],
+                "agentsStates": {},
+                "prompt": null,
+                "model": null,
+                "reasoningEffort": null
+            });
+            let parsed = super::parse_collaboration(item.as_object().unwrap()).unwrap();
+            assert_eq!(
+                parsed.status,
+                crate::agent::AgentCollaborationStatus::Completed
+            );
+            assert_eq!(parsed.id, format!("{tool}_1"));
+        }
+
+        for (kind, expected_status) in [
+            (
+                "started",
+                crate::agent::AgentCollaborationStatus::InProgress,
+            ),
+            (
+                "interacted",
+                crate::agent::AgentCollaborationStatus::InProgress,
+            ),
+            (
+                "interrupted",
+                crate::agent::AgentCollaborationStatus::Interrupted,
+            ),
+            (
+                "completed",
+                crate::agent::AgentCollaborationStatus::Completed,
+            ),
+        ] {
+            let item = json!({
+                "type": "subAgentActivity",
+                "id": format!("legacy_{kind}"),
+                "kind": kind,
+                "agentThreadId": "agent_a",
+                "agentPath": "/root/agent_a"
+            });
+            let parsed = super::parse_collaboration(item.as_object().unwrap()).unwrap();
+            assert_eq!(parsed.status, expected_status);
+            assert_eq!(parsed.receiver_thread_ids, ["agent_a"]);
+            assert_eq!(parsed.legacy_agent_path.as_deref(), Some("/root/agent_a"));
+        }
+    }
+
+    #[test]
+    fn malformed_collaboration_items_fail_with_turn_correlation() {
+        let cases = [
+            (
+                json!({
+                    "type":"collabAgentToolCall","id":"bad_1","tool":"futureTool",
+                    "status":"completed","senderThreadId":"thr_1","receiverThreadIds":[],
+                    "agentsStates":{}
+                }),
+                "item.tool 包含未知值",
+            ),
+            (
+                json!({
+                    "type":"collabAgentToolCall","id":"bad_1","tool":"wait",
+                    "status":"future","senderThreadId":"thr_1","receiverThreadIds":[],
+                    "agentsStates":{}
+                }),
+                "item.status 包含未知值",
+            ),
+            (
+                json!({
+                    "type":"collabAgentToolCall","id":"bad_1","tool":"wait",
+                    "status":"completed","senderThreadId":"thr_1","receiverThreadIds":[1],
+                    "agentsStates":{}
+                }),
+                "receiverThreadIds[0]",
+            ),
+            (
+                json!({
+                    "type":"collabAgentToolCall","id":"bad_1","tool":"wait",
+                    "status":"completed","senderThreadId":"thr_1","receiverThreadIds":[],
+                    "agentsStates":{"agent_a":{"status":"future"}}
+                }),
+                "agent.status 包含未知值",
+            ),
+            (
+                json!({
+                    "type":"subAgentActivity","id":"bad_1","kind":"future",
+                    "agentThreadId":"agent_a","agentPath":"/root/a"
+                }),
+                "item.kind 包含未知值",
+            ),
+        ];
+        for (item, expected) in cases {
+            assert_turn_message_fails(
+                &turn_item_message("item/completed", item),
+                &["item/completed", "bad_1", "thr_1", "turn_1", expected],
+            );
+        }
+    }
+
+    #[test]
     fn every_unsupported_thread_item_type_fails_for_started_and_completed() {
         for item_type in [
             "hookPrompt",
@@ -7889,8 +8304,6 @@ mod tests {
             "plan",
             "mcpToolCall",
             "dynamicToolCall",
-            "collabAgentToolCall",
-            "subAgentActivity",
             "webSearch",
             "sleep",
             "imageGeneration",
