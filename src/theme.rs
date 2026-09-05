@@ -98,7 +98,6 @@ pub struct Theme {
     pub button: Rgba,
     pub button_text: Rgba,
     pub profile_menu_shadow: Rgba,
-    pub settings_sidebar: Rgba,
     pub settings_panel: Rgba,
     pub settings_switch_off: Rgba,
     pub settings_search: Rgba,
@@ -200,8 +199,9 @@ impl Theme {
                 button_text: rgba(0xffffffff),
                 // chat-reference: --shadow-xl, 0 8px 16px -4px #0000001f.
                 profile_menu_shadow: rgba(0x0000001f),
-                settings_sidebar: rgba(0xf6f6f6ff),
-                settings_panel: rgba(0xfbfbfbff),
+                // Settings interaction surfaces intentionally reuse the main
+                // pane background so the two views cannot drift by theme.
+                settings_panel: rgba(0xffffffff),
                 settings_switch_off: rgba(0x1a1c1f1a),
                 settings_search: rgba(0xebebebff),
                 settings_accent: rgba(0x539af8ff),
@@ -273,8 +273,9 @@ impl Theme {
                 button: rgba(0xdfdfdfff),
                 button_text: rgba(0x2d2d2dff),
                 profile_menu_shadow: rgba(0x0000001f),
-                settings_sidebar: rgba(0x171717ff),
-                settings_panel: rgba(0x1f1f1fff),
+                // Settings interaction surfaces intentionally reuse the main
+                // pane background so the two views cannot drift by theme.
+                settings_panel: rgba(0x181818ff),
                 settings_switch_off: rgba(0xffffff1a),
                 settings_search: rgba(0x232323ff),
                 settings_accent: rgba(0x539af8ff),
@@ -310,6 +311,8 @@ mod tests {
 
         assert_eq!(light.surface, gpui::rgba(0xffffffff));
         assert_eq!(dark.surface, gpui::rgba(0x181818ff));
+        assert_eq!(light.settings_panel, light.surface);
+        assert_eq!(dark.settings_panel, dark.surface);
         for (theme, tint) in [(light, 255.0 / 255.0), (dark, 40.0 / 255.0)] {
             assert_eq!(theme.sidebar_surface.r, tint);
             assert_eq!(theme.sidebar_surface.g, tint);

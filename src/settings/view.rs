@@ -10796,7 +10796,14 @@ impl SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::for_mode(self.mode);
+        let viewport = window.viewport_size();
+        let theme = Theme::for_window(
+            self.mode,
+            window.is_window_active(),
+            f32::from(viewport.width),
+            f32::from(viewport.height),
+            window.scale_factor(),
+        );
         let viewport_width = f32::from(window.viewport_size().width);
         let selected =
             page(self.selected).unwrap_or_else(|| pages().next().expect("settings pages"));
@@ -10817,7 +10824,7 @@ impl Render for SettingsView {
                     .h_full()
                     .flex_none()
                     .relative()
-                    .bg(theme.settings_sidebar)
+                    .bg(theme.sidebar_surface)
                     .border_r_1()
                     .border_color(theme.border)
                     .flex()
@@ -10937,6 +10944,7 @@ impl Render for SettingsView {
                     .min_w(px(0.0))
                     .h_full()
                     .flex_1()
+                    .bg(theme.surface)
                     .overflow_y_scroll()
                     .track_scroll(&content_scroll)
                     .pl(px(41.0))
