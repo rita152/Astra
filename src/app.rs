@@ -59,6 +59,9 @@ pub struct ChatApp {
     settings: Entity<SettingsView>,
     showing_settings: bool,
     sidebar_collapsed: bool,
+    sidebar_resize_hovered: bool,
+    sidebar_resize_dragging: bool,
+    sidebar_resize_pointer_offset: f32,
     sidebar_reveal: f32,
     sidebar_animation_from: f32,
     sidebar_animation_to: f32,
@@ -181,6 +184,8 @@ const RIGHT_PANEL_ITEMS: &[(RightPanelMode, &str, &str, &str)] = &[
     (RightPanelMode::Browser, "浏览器", "⌘T", "panel-browser"),
     (RightPanelMode::Terminal, "终端", "⌃`", "panel-terminal"),
 ];
+const SIDEBAR_MIN_WIDTH: f32 = 240.0;
+const SIDEBAR_MAX_WIDTH: f32 = 480.0;
 const RIGHT_PANEL_MIN_WIDTH: f32 = 320.0;
 const RIGHT_PANEL_MAIN_MIN_WIDTH: f32 = 384.0;
 const SUBAGENT_PANEL_DEFAULT_WIDTH: f32 = 603.0;
@@ -231,6 +236,45 @@ fn clamp_right_panel_width(width: f32, viewport_width: f32, revealed_sidebar_wid
     )
 }
 
+fn panel_resize_handle(
+    id: &'static str,
+    left: f32,
+    line_visible: bool,
+    theme: Theme,
+    input_layer: impl IntoElement,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left(px(left))
+        .w(px(16.0))
+        .cursor_col_resize()
+        .child(input_layer)
+        .when(line_visible, |handle| {
+            handle.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(7.5))
+                    .w(px(1.0))
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_1().w_full().bg(linear_gradient(
+                        0.0,
+                        linear_color_stop(theme.text.alpha(0.0), 0.0),
+                        linear_color_stop(theme.text.alpha(0.25), 1.0),
+                    )))
+                    .child(div().flex_1().w_full().bg(linear_gradient(
+                        0.0,
+                        linear_color_stop(theme.text.alpha(0.25), 0.0),
+                        linear_color_stop(theme.text.alpha(0.0), 1.0),
+                    ))),
+            )
+        })
+}
 fn titlebar_interaction_area() -> impl IntoElement {
     div()
         .id("titlebar-interaction-area")
@@ -469,6 +513,9 @@ impl ChatApp {
             settings,
             showing_settings: false,
             sidebar_collapsed: false,
+            sidebar_resize_hovered: false,
+            sidebar_resize_dragging: false,
+            sidebar_resize_pointer_offset: 0.0,
             sidebar_reveal: 1.0,
             sidebar_animation_from: 1.0,
             sidebar_animation_to: 1.0,
@@ -1541,6 +1588,8 @@ impl ChatApp {
     }
 
     fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_resize_hovered = false;
+        self.sidebar_resize_dragging = false;
         self.sidebar_collapsed = !self.sidebar_collapsed;
         let target = if self.sidebar_collapsed { 0.0 } else { 1.0 };
 
@@ -2458,6 +2507,94 @@ impl ChatApp {
             )
     }
 
+    fn sidebar_resize_handle(
+        &self,
+        theme: Theme,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let entity = cx.entity();
+        let line_visible = self.sidebar_resize_hovered || self.sidebar_resize_dragging;
+        let input_layer = canvas(
+            |bounds, _, _| bounds,
+            move |bounds, _, window, _| {
+                let mouse_down_entity = entity.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, _, _, cx| {
+                    if event.button != MouseButton::Left || !bounds.contains(&event.position) {
+                        return;
+                    }
+                    mouse_down_entity.update(cx, |this, cx| {
+                        let divider_x = f32::from(bounds.origin.x) + 8.0;
+                        this.sidebar_resize_dragging = true;
+                        this.sidebar_resize_hovered = true;
+                        this.sidebar_resize_pointer_offset =
+                            divider_x - f32::from(event.position.x);
+                        cx.notify();
+                    });
+                });
+
+                let mouse_move_entity = entity.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, _, window, cx| {
+                    let pointer_inside = bounds.contains(&event.position);
+                    mouse_move_entity.update(cx, |this, cx| {
+                        let mut changed = false;
+                        if this.sidebar_resize_dragging {
+                            let viewport_width = f32::from(window.viewport_size().width);
+                            let reserved_right_width = if this.right_panel_open {
+                                RIGHT_PANEL_MIN_WIDTH
+                            } else {
+                                0.0
+                            };
+                            let max_width = (viewport_width
+                                - reserved_right_width
+                                - RIGHT_PANEL_MAIN_MIN_WIDTH)
+                                .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+                            let next_width = (f32::from(event.position.x)
+                                + this.sidebar_resize_pointer_offset)
+                                .clamp(SIDEBAR_MIN_WIDTH, max_width);
+                            this.sidebar
+                                .update(cx, |sidebar, cx| sidebar.set_width(next_width, cx));
+                            changed = true;
+                        }
+                        let next_hovered = pointer_inside || this.sidebar_resize_dragging;
+                        if this.sidebar_resize_hovered != next_hovered {
+                            this.sidebar_resize_hovered = next_hovered;
+                            changed = true;
+                        }
+                        if changed {
+                            cx.notify();
+                        }
+                    });
+                });
+
+                let mouse_up_entity = entity.clone();
+                window.on_mouse_event(move |event: &MouseUpEvent, _, _, cx| {
+                    if event.button != MouseButton::Left {
+                        return;
+                    }
+                    mouse_up_entity.update(cx, |this, cx| {
+                        if !this.sidebar_resize_dragging {
+                            return;
+                        }
+                        this.sidebar_resize_dragging = false;
+                        this.sidebar_resize_hovered = bounds.contains(&event.position);
+                        cx.notify();
+                    });
+                });
+            },
+        )
+        .absolute()
+        .inset_0();
+
+        panel_resize_handle(
+            "sidebar-resize-handle",
+            width - 8.0,
+            line_visible,
+            theme,
+            input_layer,
+        )
+    }
+
     fn right_panel_resize_handle(
         &self,
         theme: Theme,
@@ -2543,37 +2680,13 @@ impl ChatApp {
         .absolute()
         .inset_0();
 
-        div()
-            .id("right-panel-resize-handle")
-            .absolute()
-            .top_0()
-            .bottom_0()
-            .left(px(-8.0))
-            .w(px(16.0))
-            .cursor_col_resize()
-            .child(input_layer)
-            .when(line_visible, |handle| {
-                handle.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .left(px(7.5))
-                        .w(px(1.0))
-                        .flex()
-                        .flex_col()
-                        .child(div().flex_1().w_full().bg(linear_gradient(
-                            0.0,
-                            linear_color_stop(theme.text.alpha(0.0), 0.0),
-                            linear_color_stop(theme.text.alpha(0.25), 1.0),
-                        )))
-                        .child(div().flex_1().w_full().bg(linear_gradient(
-                            0.0,
-                            linear_color_stop(theme.text.alpha(0.25), 0.0),
-                            linear_color_stop(theme.text.alpha(0.0), 1.0),
-                        ))),
-                )
-            })
+        panel_resize_handle(
+            "right-panel-resize-handle",
+            -8.0,
+            line_visible,
+            theme,
+            input_layer,
+        )
     }
 
     fn subagent_right_panel(
@@ -3087,15 +3200,12 @@ impl Render for ChatApp {
         let default_right_panel_width = (window.viewport_size().width - px(773.09375))
             .min(px(1_418.218_8))
             .max(px(RIGHT_PANEL_MIN_WIDTH));
-        let right_panel_width = self
-            .right_panel_width
-            .map_or(default_right_panel_width, |width| {
-                px(clamp_right_panel_width(
-                    width,
-                    viewport_width,
-                    revealed_sidebar_width,
-                ))
-            });
+        let right_panel_width = px(clamp_right_panel_width(
+            self.right_panel_width
+                .unwrap_or(f32::from(default_right_panel_width)),
+            viewport_width,
+            revealed_sidebar_width,
+        ));
         div()
             .id(if self.showing_settings {
                 "app-shell-settings"
@@ -3349,6 +3459,9 @@ impl Render for ChatApp {
                         .text_color(theme.text)
                     .when(in_project, |header| header.child(icon("folder", theme.text.into()).size(px(16.0)).flex_none()))
                     .child(div().min_w(px(0.0)).truncate().child(title)))
+            })
+            .when(!self.showing_settings && sidebar_reveal == 1.0, |shell| {
+                shell.child(self.sidebar_resize_handle(theme, revealed_sidebar_width, cx))
             })
             // Keep the draggable titlebar behind its interactive controls so
             // their 28px hover hit areas receive pointer events.
@@ -4146,6 +4259,70 @@ mod tests {
             window.read(|chat, _| chat.right_panel_mode),
             Some(super::RightPanelMode::Browser)
         );
+    }
+
+    #[test]
+    fn sidebar_resize_handle_supports_full_hit_area_limits_and_collapse() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: size(px(1440.0), px(900.0)),
+                })),
+                ..Default::default()
+            },
+            |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
+        );
+        // Both edges of the 16px hit area work along its full height, with no
+        // jump when grabbing away from the divider's center.
+        for (offset, y) in [(-7.0, 10.0), (7.0, 450.0), (0.0, 890.0)] {
+            window.update(|chat, _, cx| {
+                chat.sidebar
+                    .update(cx, |sidebar, cx| sidebar.set_width(300.0, cx));
+            });
+            window.draw();
+            window.simulate_mouse_move(point(px(300.0 + offset), px(y)));
+            assert!(window.read(|chat, _| chat.sidebar_resize_hovered));
+            window.simulate_mouse_down(point(px(300.0 + offset), px(y)), MouseButton::Left);
+            window.simulate_mouse_move(point(px(380.0 + offset), px(y)));
+            window.simulate_mouse_up(point(px(380.0 + offset), px(y)), MouseButton::Left);
+            assert!((window.read(|chat, cx| chat.sidebar.read(cx).width()) - 380.0).abs() < 0.2);
+            assert!(!window.read(|chat, _| chat.sidebar_resize_dragging));
+        }
+        window.draw();
+        window.simulate_mouse_down(point(px(380.0), px(450.0)), MouseButton::Left);
+        window.simulate_mouse_move(point(px(1200.0), px(450.0)));
+        window.simulate_mouse_up(point(px(1200.0), px(450.0)), MouseButton::Left);
+        assert_eq!(
+            window.read(|chat, cx| chat.sidebar.read(cx).width()),
+            super::SIDEBAR_MAX_WIDTH
+        );
+        window.draw();
+        window.simulate_mouse_down(point(px(480.0), px(450.0)), MouseButton::Left);
+        window.simulate_mouse_move(point(px(10.0), px(450.0)));
+        window.simulate_mouse_up(point(px(10.0), px(450.0)), MouseButton::Left);
+        assert_eq!(
+            window.read(|chat, cx| chat.sidebar.read(cx).width()),
+            super::SIDEBAR_MIN_WIDTH
+        );
+        window.simulate_mouse_move(point(px(600.0), px(450.0)));
+        assert!(!window.read(|chat, _| chat.sidebar_resize_hovered));
+        window.update(|chat, win, cx| {
+            chat.sidebar
+                .update(cx, |sidebar, cx| sidebar.set_width(360.0, cx));
+            chat.toggle_sidebar(win, cx);
+            chat.toggle_sidebar(win, cx);
+            assert_eq!(chat.sidebar.read(cx).width(), 360.0);
+            assert!(!chat.sidebar_resize_dragging);
+            chat.open_right_panel(cx);
+        });
+        window.draw();
+        window.simulate_mouse_down(point(px(360.0), px(450.0)), MouseButton::Left);
+        window.simulate_mouse_move(point(px(420.0), px(450.0)));
+        window.simulate_mouse_up(point(px(420.0), px(450.0)), MouseButton::Left);
+        assert!((window.read(|chat, cx| chat.sidebar.read(cx).width()) - 420.0).abs() < 0.2);
+        assert!(window.read(|chat, _| chat.right_panel_open));
     }
 
     #[test]

@@ -66,7 +66,7 @@ const THREAD_ACTION_RAIL_INSETS: f32 = 51.0;
 const TITLE_FADE_IN: f32 = 8.0;
 const TITLE_FADE_OUT: f32 = 16.0;
 
-fn sidebar_thread_title_viewport_width(flat: bool, show_actions: bool) -> f32 {
+fn sidebar_thread_title_viewport_width(width: f32, flat: bool, show_actions: bool) -> f32 {
     let action_insets = if flat {
         RECENT_THREAD_TITLE_INSETS
     } else {
@@ -77,7 +77,7 @@ fn sidebar_thread_title_viewport_width(flat: bool, show_actions: bool) -> f32 {
     } else {
         action_insets - THREAD_ACTION_RAIL_INSETS
     };
-    (SIDEBAR_WIDTH - insets).max(0.0)
+    (width - insets).max(0.0)
 }
 
 fn faded_sidebar_text_color(color: Hsla, fade: f32) -> Hsla {
@@ -225,6 +225,7 @@ enum DeleteTarget {
 }
 
 pub struct SidebarView {
+    width: f32,
     mode: ThemeMode,
     store: Arc<WorkspaceStore>,
     snapshot: WorkspaceSnapshot,
@@ -293,6 +294,7 @@ impl SidebarView {
         })
         .detach();
         Self {
+            width: SIDEBAR_WIDTH,
             mode,
             store,
             snapshot,
@@ -337,7 +339,14 @@ impl SidebarView {
     }
 
     pub fn width(&self) -> f32 {
-        SIDEBAR_WIDTH
+        self.width
+    }
+
+    pub fn set_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        if (self.width - width).abs() > f32::EPSILON {
+            self.width = width;
+            cx.notify();
+        }
     }
 
     pub fn set_profile_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
@@ -849,7 +858,8 @@ impl SidebarView {
             .when(!hovered, |actions| actions.invisible())
             .child(pin)
             .child(archive_button);
-        let title_viewport_width = sidebar_thread_title_viewport_width(!indented, hovered);
+        let title_viewport_width =
+            sidebar_thread_title_viewport_width(self.width, !indented, hovered);
         let title_width = Self::thread_title_width(&thread.title, window);
         let title_scroll_distance = if hovered {
             (title_width - title_viewport_width).max(0.0)
@@ -976,7 +986,7 @@ impl SidebarView {
                     this.hovered_thread_id = Some(hover_id.clone());
                     this.start_marquee(
                         &marquee_title,
-                        sidebar_thread_title_viewport_width(!indented, true),
+                        sidebar_thread_title_viewport_width(this.width, !indented, true),
                         window,
                         cx,
                     );
@@ -2195,7 +2205,7 @@ impl SidebarView {
     }
 
     fn profile_menu(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
-        self.menu_shell("profile-menu", SIDEBAR_WIDTH - 16.0, theme)
+        self.menu_shell("profile-menu", self.width - 16.0, theme)
             .child(
                 Self::menu_item("profile-settings", "设置", "profile-settings", theme, true)
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -2222,7 +2232,7 @@ impl Render for SidebarView {
         let mut sidebar = div()
             .id("sidebar")
             .relative()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.width))
             .h_full()
             .flex_none()
             .pt(px(SIDEBAR_TITLEBAR_SAFE_TOP))
@@ -2256,7 +2266,7 @@ impl Render for SidebarView {
                 .iter()
                 .find(|project| project.project_id == project_id)
         {
-            let left = self.menu_origin.0.clamp(8.0, SIDEBAR_WIDTH - 198.0);
+            let left = self.menu_origin.0.clamp(8.0, self.width - 198.0);
             let top = self.menu_origin.1.max(42.0);
             sidebar = sidebar.child(deferred(
                 div()
@@ -2269,7 +2279,7 @@ impl Render for SidebarView {
         if let Some(thread_id) = self.thread_menu_id.as_deref()
             && let Some(thread) = self.snapshot.thread(thread_id)
         {
-            let left = self.menu_origin.0.clamp(8.0, SIDEBAR_WIDTH - 222.0);
+            let left = self.menu_origin.0.clamp(8.0, self.width - 222.0);
             let top = self.menu_origin.1.max(42.0);
             sidebar = sidebar.child(deferred(
                 div()
@@ -2301,7 +2311,7 @@ impl Render for SidebarView {
             sidebar = sidebar.child(deferred(
                 div()
                     .absolute()
-                    .left(px(SIDEBAR_WIDTH + 32.0))
+                    .left(px(self.width + 32.0))
                     .top(px(64.0))
                     .child(self.search_panel(theme, cx)),
             ));
