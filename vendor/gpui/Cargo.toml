@@ -44,6 +44,7 @@ path = "src/gpui.rs"
 doctest = false
 
 [dependencies]
+unicode-linebreak = "0.1.5"
 accesskit = { version = "0.24.0", features = ["enumn"] }
 anyhow = { version = "1.0.86" }
 async-task = { version = "4.7" }

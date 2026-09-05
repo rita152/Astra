@@ -22,6 +22,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 unicode-segmentation = "1"
+unicode-linebreak = "0.1.5"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2", features = ["font-kit"] }
 pulldown-cmark = { version = "0.13", default-features = false }

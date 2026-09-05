@@ -197,6 +197,14 @@ fn schedule_resumed_thread_screenshot(
                         std::process::exit(1);
                     }
                 }
+                let audit = app.read(cx).resumed_render_audit(&thread_id, cx);
+                if let Err(error) = std::fs::write(
+                    format!("{path}.render.json"),
+                    serde_json::to_vec_pretty(&audit).expect("capture audit is JSON"),
+                ) {
+                    eprintln!("failed to save resumed render audit: {error}");
+                    std::process::exit(1);
+                }
                 cx.quit();
             }
             Ok(false) if Instant::now() < deadline => schedule_resumed_thread_screenshot(

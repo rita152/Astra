@@ -1836,6 +1836,7 @@ mod tests {
                             ThreadHistoryItem::AssistantMessage {
                                 item_id: format!("{id}-assistant"),
                                 text: format!("answer {id}"),
+                                phase: None,
                             },
                         ]
                     } else {
@@ -1872,6 +1873,9 @@ mod tests {
                     command: "pwd".to_owned(),
                     output: "/tmp/workspace".to_owned(),
                     status: CommandExecutionStatus::Completed,
+                    actions: Vec::new(),
+                    cwd: None,
+                    exit_code: None,
                 },
             }])))
         }

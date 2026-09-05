@@ -4704,7 +4704,25 @@ impl Window {
         self.layout_engine
             .as_mut()
             .unwrap()
-            .request_measured_layout(style, rem_size, scale_factor, measure)
+            .request_measured_layout(style, rem_size, scale_factor, false, measure)
+    }
+
+    /// Keep shaped text advances fractional until the final absolute edge snap.
+    /// Ceil-per-leaf sizing otherwise turns a 14.000001px CJK glyph into 15px
+    /// in inline flex flow and accumulates both width and line-height errors.
+    pub(crate) fn request_text_layout<F>(&mut self, style: Style, measure: F) -> LayoutId
+    where
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+            + 'static,
+    {
+        self.invalidator.debug_assert_prepaint();
+
+        let rem_size = self.rem_size();
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .request_measured_layout(style, rem_size, scale_factor, true, measure)
     }
 
     /// Compute the layout for the given id within the given available space.

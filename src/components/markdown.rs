@@ -21,7 +21,6 @@ use two_face::{
     },
     syntax::extra_newlines,
 };
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     components::icons::icon,
@@ -35,6 +34,11 @@ pub struct MarkdownDocument {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MarkdownBlock {
+    Image {
+        destination: String,
+        alt: String,
+        dimensions: Option<(u32, u32)>,
+    },
     Paragraph(Vec<MarkdownInline>),
     Heading {
         level: u8,
@@ -233,7 +237,28 @@ fn append_block(node: RawNode, blocks: &mut Vec<MarkdownBlock>) {
     match node {
         RawNode::Rule => blocks.push(MarkdownBlock::HorizontalRule),
         RawNode::Element { tag, children } => match tag {
-            Tag::Paragraph => blocks.push(MarkdownBlock::Paragraph(raw_nodes_to_inlines(children))),
+            Tag::Paragraph => {
+                let mut pending = Vec::new();
+                for child in children {
+                    if let RawNode::Element {
+                        tag: Tag::Image { dest_url, .. },
+                        children,
+                    } = child
+                    {
+                        flush_pending_paragraph(&mut pending, blocks);
+                        let destination = dest_url.into_string();
+                        let dimensions = markdown_image_dimensions(&destination);
+                        blocks.push(MarkdownBlock::Image {
+                            destination,
+                            dimensions,
+                            alt: collect_raw_text(children),
+                        });
+                    } else {
+                        pending.push(child);
+                    }
+                }
+                flush_pending_paragraph(&mut pending, blocks);
+            }
             Tag::Heading { level, .. } => blocks.push(MarkdownBlock::Heading {
                 level: level as u8,
                 content: raw_nodes_to_inlines(children),
@@ -304,6 +329,35 @@ fn append_block(node: RawNode, blocks: &mut Vec<MarkdownBlock>) {
             }
         }
     }
+}
+
+// Markdown is reparsed during virtual-row rendering. Cache decoded dimensions
+// by file version so scrolling never rereads entire image files each frame.
+fn markdown_image_dimensions(destination: &str) -> Option<(u32, u32)> {
+    type Version = (Option<std::time::SystemTime>, u64);
+    type Cache = std::collections::HashMap<String, (Version, Option<(u32, u32)>)>;
+    static DIMENSIONS: OnceLock<std::sync::Mutex<Cache>> = OnceLock::new();
+    let path = Path::new(destination);
+    if !path.is_absolute() {
+        return None;
+    }
+    let metadata = path.metadata().ok()?;
+    let version = (metadata.modified().ok(), metadata.len());
+    let cache = DIMENSIONS.get_or_init(Default::default);
+    if let Some((cached_version, dimensions)) = cache.lock().ok()?.get(destination)
+        && *cached_version == version
+    {
+        return *dimensions;
+    }
+    let dimensions = crate::agent::generated_image_dimensions(path)
+        .ok()
+        .flatten();
+    let mut cache = cache.lock().ok()?;
+    if cache.len() >= 128 {
+        cache.clear();
+    }
+    cache.insert(destination.to_owned(), (version, dimensions));
+    dimensions
 }
 
 fn map_alignment(alignment: Alignment) -> MarkdownAlignment {
@@ -482,7 +536,7 @@ const CHATGPT_MARKDOWN_BODY_WEIGHT: FontWeight = crate::theme::UI_BODY_FONT_WEIG
 const CHATGPT_MARKDOWN_LAYOUT: MarkdownLayout = MarkdownLayout {
     base_size: 14.0,
     base_line_height: 22.75,
-    paragraph_space: 3.5,
+    paragraph_space: 4.0,
     heading_top: 14.0,
     list_padding: 22.75,
     list_item_padding: 5.25,
@@ -492,14 +546,13 @@ const CHATGPT_MARKDOWN_LAYOUT: MarkdownLayout = MarkdownLayout {
     quote_line_height: 21.0,
     quote_bar_width: 3.5,
     rule_margin: 24.5,
-    inline_code_size: 12.25,
-    // The browser's inline box is 18.6875px tall. GPUI boxes include
-    // padding in layout, so this keeps the visual box at that height while
-    // the containing line remains 22.75px.
-    inline_code_line_height: 14.5,
-    inline_code_padding_x: 4.2,
-    inline_code_padding_y: 2.1,
-    inline_code_radius: 7.5,
+    inline_code_size: 12.88,
+    // CDP 2026-09-05: inline code uses .92em Menlo, 1px 6px padding,
+    // and a 6px radius. Keep the painted box within the 22.75px text line.
+    inline_code_line_height: 18.0,
+    inline_code_padding_x: 6.0,
+    inline_code_padding_y: 1.0,
+    inline_code_radius: 6.0,
     code_margin: 17.5,
     code_radius: 20.0,
     code_header_size: 13.0,
@@ -664,6 +717,7 @@ fn block_margins(
     context: SequenceContext,
 ) -> (f32, f32) {
     let default = match block {
+        MarkdownBlock::Image { .. } => (12.0, 12.0),
         MarkdownBlock::Paragraph(_) => (0.0, layout.paragraph_space),
         MarkdownBlock::Heading { level: 1, .. } => (0.0, 7.0),
         MarkdownBlock::Heading { level: 2 | 3, .. } => (layout.heading_top, 3.5),
@@ -721,6 +775,53 @@ fn render_block(
     block_identity: u64,
 ) -> Div {
     match block {
+        MarkdownBlock::Image {
+            destination,
+            alt,
+            dimensions,
+        } => {
+            let path = std::path::PathBuf::from(destination);
+            // Local transcript artifacts use the native image cache; remote
+            // references keep the normal URL loading behavior.
+            let source = if path.is_absolute() {
+                gpui::ImageSource::from(path.clone())
+            } else {
+                gpui::ImageSource::from(SharedString::from(destination.clone()))
+            };
+            let destination = destination.clone();
+            div().child(
+                div()
+                    .id(markdown_element_id("markdown-image", &block_identity))
+                    .max_w_full()
+                    .flex()
+                    .items_start()
+                    .cursor_pointer()
+                    .role(gpui::Role::Button)
+                    .aria_label(format!("打开图片：{alt}"))
+                    .on_click(move |_, _, cx| {
+                        if path.is_absolute() {
+                            cx.open_with_system(&path);
+                        } else {
+                            cx.open_url(&destination);
+                        }
+                    })
+                    .child(
+                        gpui::img(source)
+                            .when_some(*dimensions, |image, (width, height)| {
+                                let scale = (160.0 / height.max(1) as f32).min(1.0);
+                                image
+                                    .w(px(width as f32 * scale))
+                                    .h(px(height as f32 * scale))
+                            })
+                            .max_w_full()
+                            .max_h(px(160.0))
+                            .rounded(px(10.0))
+                            .border_1()
+                            .border_color(style.palette.table_border_strong)
+                            .object_fit(gpui::ObjectFit::Contain),
+                    ),
+            )
+        }
         MarkdownBlock::Paragraph(content) => render_inline_block(
             content,
             style,
@@ -1073,6 +1174,11 @@ fn render_inline_boxes(
                 .link_destination
                 .as_deref()
                 .and_then(markdown_file_reference_path);
+            let github_reference = fragment
+                .link_destination
+                .as_deref()
+                .is_some_and(|url| url.starts_with("https://github.com/"));
+            let has_icon = file_reference.is_some() || github_reference;
             let color = if file_reference.is_some() {
                 style.palette.file_link
             } else if fragment.state.link {
@@ -1113,18 +1219,23 @@ fn render_inline_boxes(
                         .text_size(px(font_size))
                         .line_height(px(line_height))
                 })
-                .when(file_reference.is_some(), |element| {
+                .when(has_icon, |element| {
                     element.px(px(2.0)).flex().items_center()
                 })
                 .when(fragment.trailing_space, |element| {
-                    element.mr(px(style.layout.paragraph_space))
+                    element.mr(px(font_size * 0.25))
                 });
-            if let Some(file_reference) = file_reference {
+            if has_icon {
                 element = element.child(
-                    icon(markdown_file_reference_icon(file_reference), color.into())
-                        .size(px(16.0))
-                        .flex_none()
-                        .mr(px(3.0)),
+                    icon(
+                        file_reference
+                            .map(markdown_file_reference_icon)
+                            .unwrap_or("markdown-github"),
+                        color.into(),
+                    )
+                    .size(px(16.0))
+                    .flex_none()
+                    .mr(px(3.0)),
                 );
             }
             let text = if let Some(link_content) = fragment.link_content.as_deref()
@@ -1137,9 +1248,32 @@ fn render_inline_boxes(
                     fragment.state,
                 )
             } else {
-                StyledText::new(fragment.text)
+                let label = if file_reference.is_some() {
+                    markdown_file_reference_label(
+                        &fragment.text,
+                        fragment.link_destination.as_deref().unwrap_or_default(),
+                    )
+                } else {
+                    fragment.text
+                };
+                StyledText::new(label)
             };
-            let element = element.child(text);
+            let element =
+                if let Some([MarkdownInline::Code(code)]) = fragment.link_content.as_deref() {
+                    element.child(
+                        div()
+                            .font_family(UI_MONOSPACE_FONT_FAMILY)
+                            .text_size(px(style.layout.inline_code_size))
+                            .line_height(px(style.layout.inline_code_line_height))
+                            .px(px(style.layout.inline_code_padding_x))
+                            .py(px(style.layout.inline_code_padding_y))
+                            .rounded(px(style.layout.inline_code_radius))
+                            .bg(style.palette.inline_code_surface)
+                            .child(code.clone()),
+                    )
+                } else {
+                    element.child(text)
+                };
             if let Some(destination) = fragment.link_destination {
                 let link_id = markdown_element_id(
                     "markdown-link",
@@ -1174,7 +1308,14 @@ fn append_inline_fragments(
     for inline in inlines {
         match inline {
             MarkdownInline::Text(text) => {
-                for word in UnicodeSegmentation::split_word_bounds(text.as_str()) {
+                // Word boundaries allow closing CJK punctuation to start a
+                // line. Use Unicode line-break opportunities, as browser inline
+                // layout does, so punctuation stays with its preceding text.
+                let mut start = 0;
+                for (end, _) in unicode_linebreak::linebreaks(text) {
+                    let segment = &text[start..end];
+                    start = end;
+                    let word = segment.trim_end_matches(char::is_whitespace);
                     if word.chars().all(char::is_whitespace) {
                         if let Some(previous) = fragments.last_mut() {
                             previous.trailing_space = true;
@@ -1184,7 +1325,7 @@ fn append_inline_fragments(
                             text: word.to_owned(),
                             state,
                             hard_break: false,
-                            trailing_space: false,
+                            trailing_space: word.len() < segment.len(),
                             link_destination: None,
                             link_content: None,
                         });
@@ -1281,6 +1422,19 @@ fn markdown_file_reference_path(destination: &str) -> Option<&str> {
     )
 }
 
+fn markdown_file_reference_label(label: &str, destination: &str) -> String {
+    match destination.rsplit_once(':') {
+        Some((_, line))
+            if !line.is_empty()
+                && line.bytes().all(|byte| byte.is_ascii_digit())
+                && !label.contains("(line ") =>
+        {
+            format!("{label} (line {line})")
+        }
+        _ => label.to_owned(),
+    }
+}
+
 fn markdown_file_reference_icon(path: &str) -> &'static str {
     match Path::new(path)
         .extension()
@@ -1289,8 +1443,19 @@ fn markdown_file_reference_icon(path: &str) -> &'static str {
         .as_deref()
     {
         Some("py" | "pyi" | "pyw") => "markdown-file-python",
+        Some("rs") => "markdown-file-rust",
+        Some("json" | "jsonl") => "markdown-file-json",
         _ => "markdown-file-document",
     }
+}
+
+pub(super) fn render_tool_text(text: &str, theme: Theme, identity: &str) -> Div {
+    render_code_block(
+        None,
+        text,
+        MarkdownRenderStyle::new(theme),
+        markdown_hash(&identity),
+    )
 }
 
 fn render_code_block(
@@ -1810,7 +1975,7 @@ fn render_table(
         .min_w(px(style.layout.table_min_width))
         .flex_none()
         .grid()
-        .grid_cols_max_content(column_count as u16)
+        .grid_cols_auto(column_count as u16)
         .text_size(px(style.layout.table_size))
         .line_height(px(style.layout.table_line_height));
 
@@ -1962,6 +2127,100 @@ fn markdown_hash(value: &(impl Hash + ?Sized)) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    pub(super) struct FractionalInlineFlow;
+    impl gpui::Render for FractionalInlineFlow {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            div()
+                .flex()
+                .flex_col()
+                .items_start()
+                .text_size(px(13.25))
+                .child(
+                    div()
+                        .debug_selector(|| "fragmented-text".to_owned())
+                        .flex()
+                        .children((0..8).map(|_| div().child("a"))),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "continuous-text".to_owned())
+                        .child("aaaaaaaa"),
+                )
+        }
+    }
+    #[gpui::test]
+    fn fragmented_text_does_not_accumulate_per_character_pixel_rounding(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let window = cx.add_window(|_, _| FractionalInlineFlow);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let fragmented = visual.debug_bounds("fragmented-text").unwrap();
+        let continuous = visual.debug_bounds("continuous-text").unwrap();
+        assert!(
+            (f32::from(fragmented.size.width - continuous.size.width)).abs() <= 1.0,
+            "fragmented={fragmented:?}, continuous={continuous:?}"
+        );
+    }
+
+    struct StretchedTableGrid;
+    impl gpui::Render for StretchedTableGrid {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            div()
+                .w(px(736.0))
+                .grid()
+                .grid_cols_auto(2)
+                .child(
+                    div()
+                        .debug_selector(|| "first-column".to_owned())
+                        .child(div().w(px(308.0)).h(px(20.0))),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "second-column".to_owned())
+                        .child(div().w(px(305.0)).h(px(20.0))),
+                )
+        }
+    }
+    #[gpui::test]
+    fn table_columns_share_unused_width_without_equalizing_intrinsic_sizes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let window = cx.add_window(|_, _| StretchedTableGrid);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let a = visual.debug_bounds("first-column").unwrap();
+        let b = visual.debug_bounds("second-column").unwrap();
+        assert!((f32::from(a.size.width) - 369.5).abs() <= 1.0);
+        assert!((f32::from(b.size.width) - 366.5).abs() <= 1.0);
+        assert_eq!(a.size.width + b.size.width, px(736.0));
+    }
+
+    #[test]
+    fn standalone_images_preserve_media_and_neighboring_text() {
+        let doc = super::parse_markdown("before ![sample](/tmp/sample.png) after");
+        assert_eq!(doc.blocks.len(), 3);
+        assert!(
+            matches!(&doc.blocks[1], super::MarkdownBlock::Image { destination, alt, .. } if destination == "/tmp/sample.png" && alt == "sample")
+        );
+        assert_eq!(
+            super::markdown_file_reference_label("Renderer", "/tmp/main.rs:42"),
+            "Renderer (line 42)"
+        );
+        assert_eq!(
+            super::markdown_file_reference_label("Renderer (line 42)", "/tmp/main.rs:42"),
+            "Renderer (line 42)"
+        );
+    }
+
     use super::*;
     use crate::theme::ThemeMode;
     use gpui::rgba;
@@ -2356,5 +2615,99 @@ fn main() {}
         assert_eq!(dark.syntax_attribute, rgba(0xf9dc78ff));
         assert_eq!(dark.syntax_name, rgba(0x63a8f8ff));
         assert_eq!(dark.syntax_error, rgba(0xff8583ff));
+    }
+}
+
+#[cfg(test)]
+mod inline_line_break_regressions {
+    use super::*;
+    #[test]
+    fn chinese_closing_punctuation_is_not_a_standalone_flex_word() {
+        let mut fragments = Vec::new();
+        append_inline_fragments(
+            &[MarkdownInline::Text("仍需逐项做完整页面对照。".into())],
+            InlineState::default(),
+            &mut fragments,
+        );
+        assert_eq!(fragments.last().unwrap().text, "照。");
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|f| f.text.as_str())
+                .collect::<String>(),
+            "仍需逐项做完整页面对照。"
+        );
+    }
+    #[gpui::test]
+    fn intrinsic_code_width_tolerates_float_subtraction_error(cx: &mut gpui::TestAppContext) {
+        let window = cx.add_window(|_, _| super::tests::FractionalInlineFlow);
+        window
+            .update(cx, |_, window, _| {
+                for text in ["2277a4b", "22.75px"] {
+                    let run = gpui::TextRun {
+                        len: text.len(),
+                        font: gpui::font(UI_MONOSPACE_FONT_FAMILY),
+                        color: gpui::black(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let width = window
+                        .text_system()
+                        .shape_line(text.into(), px(12.88), &[run.clone()], None)
+                        .width();
+                    let lines = window
+                        .text_system()
+                        .shape_text(
+                            text.into(),
+                            px(12.88),
+                            &[run],
+                            Some(width - px(0.00001)),
+                            None,
+                        )
+                        .unwrap();
+                    assert!(
+                        lines[0].wrap_boundaries().is_empty(),
+                        "{text} must fit its intrinsic width"
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn shaped_paragraphs_respect_cjk_line_breaks(cx: &mut gpui::TestAppContext) {
+        let window = cx.add_window(|_, _| super::tests::FractionalInlineFlow);
+        window
+            .update(cx, |_, window, _| {
+                let run = |len| gpui::TextRun {
+                    len,
+                    font: ui_font(),
+                    color: gpui::black(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let width = window
+                    .text_system()
+                    .shape_line("对照".into(), px(14.0), &[run(6)], None)
+                    .width();
+                let lines = window
+                    .text_system()
+                    .shape_text(
+                        "对照。".into(),
+                        px(14.0),
+                        &[run(9)],
+                        Some(width + px(0.01)),
+                        None,
+                    )
+                    .unwrap();
+                let boundary = lines[0].wrap_boundaries()[0];
+                assert_eq!(
+                    lines[0].runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index,
+                    3
+                );
+            })
+            .unwrap();
     }
 }

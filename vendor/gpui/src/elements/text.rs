@@ -646,7 +646,7 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
-        window.request_measured_layout(Default::default(), {
+        window.request_text_layout(Default::default(), {
             let element_state = self.clone();
 
             move |known_dimensions, available_space, window, cx| {
@@ -764,7 +764,10 @@ impl TextLayout {
                 for line in &lines {
                     let line_size = line.size(line_height);
                     size.height += line_size.height;
-                    size.width = size.width.max(line_size.width).ceil();
+                    // Preserve shaped advances until final device-pixel layout.
+                    // Rounding each inline fragment up accumulates extra width
+                    // across rich Markdown and can wrap a final punctuation mark.
+                    size.width = size.width.max(line_size.width);
                 }
 
                 element_state.0.borrow_mut().replace(TextLayoutInner {

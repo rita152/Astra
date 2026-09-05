@@ -170,7 +170,7 @@ impl Theme {
                 // app over CDP. Keeping them semantic prevents theme colors
                 // from changing the Markdown node geometry.
                 markdown_inline_code_text: rgba(0x1a1c1fff),
-                markdown_inline_code_surface: rgba(0x1a1c1f0c),
+                markdown_inline_code_surface: rgba(0x1a1c1f18),
                 markdown_code_surface: rgba(0x1a1c1f0c),
                 markdown_code_header_surface: rgba(0xffffffff),
                 markdown_code_border: rgba(0x1a1c1f0c),
@@ -235,8 +235,8 @@ impl Theme {
                 sidebar_title_text: rgba(0xdfdfdfd9),
                 sidebar_text_muted: rgba(0xffffff7f),
                 text: rgba(0xdfdfdfff),
-                user_message_text: rgba(0xdfdfdfff),
-                user_message_surface: rgba(0xdfdfdf0d),
+                user_message_text: rgba(0xffffffff),
+                user_message_surface: rgba(0x323232d9),
                 sidebar_text: rgba(0xdfdfdfd9),
                 text_secondary: rgba(0xc3c3c3ff),
                 text_tertiary: rgba(0xffffff80),
@@ -245,7 +245,7 @@ impl Theme {
                 // CDP: color-mix(in srgb, #2c67c5 80%, #ffffff 20%).
                 markdown_file_link: rgba(0x5685d1ff),
                 markdown_inline_code_text: rgba(0xffffffff),
-                markdown_inline_code_surface: rgba(0xffffff0d),
+                markdown_inline_code_surface: rgba(0xffffff1b),
                 markdown_code_surface: rgba(0xffffff0d),
                 markdown_code_header_surface: rgba(0x181818ff),
                 markdown_code_border: rgba(0xffffff0b),

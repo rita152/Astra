@@ -12,7 +12,7 @@ use std::{fmt::Debug, ops::Range};
 use taffy::{
     TaffyTree, TraversePartialTree as _,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
-    prelude::{max_content, min_content},
+    prelude::{auto, max_content, min_content},
     style::AvailableSpace as TaffyAvailableSpace,
     tree::NodeId,
 };
@@ -30,6 +30,7 @@ type NodeMeasureFn = StackSafe<
 
 struct NodeContext {
     measure: NodeMeasureFn,
+    preserve_text_metrics: bool,
 }
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
@@ -90,6 +91,7 @@ impl TaffyLayoutEngine {
         style: Style,
         rem_size: Pixels,
         scale_factor: f32,
+        preserve_text_metrics: bool,
         measure: impl FnMut(
             Size<Option<Pixels>>,
             Size<AvailableSpace>,
@@ -105,6 +107,7 @@ impl TaffyLayoutEngine {
                 taffy_style,
                 NodeContext {
                     measure: StackSafe::new(Box::new(measure)),
+                    preserve_text_metrics,
                 },
             )
             .expect(EXPECT_MESSAGE)
@@ -266,7 +269,11 @@ impl TaffyLayoutEngine {
 
                     let measured_size: Size<Pixels> =
                         (node_context.measure)(known_dimensions, available_space, window, cx);
-                    snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                    if node_context.preserve_text_metrics {
+                        measured_size.map(|d| d.0.max(0.0) * scale_factor).into()
+                    } else {
+                        snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                    }
                 },
             )
             .expect(EXPECT_MESSAGE);
@@ -472,6 +479,11 @@ impl ToTaffy<taffy::style::Style> for Style {
                             template.repeat,
                             vec![minmax(min_content(), fr(1.0_f32))],
                         )]
+                    }
+                    // Auto tracks preserve intrinsic column widths while
+                    // sharing excess width (e.g. Markdown's 736px table floor).
+                    crate::GridTemplateMinSize::Auto => {
+                        vec![repeat(template.repeat, vec![minmax(max_content(), auto())])]
                     }
                     // grid-template-*: repeat(<number>, minmax(0, max-content))
                     crate::GridTemplateMinSize::MaxContent => {

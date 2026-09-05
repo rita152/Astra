@@ -968,6 +968,7 @@ pub struct FileChangeActivityPresentation {
     pub deletions: u32,
     pub status: AgentFileChangeStatus,
     pub review: DiffReviewPresentation,
+    pub file_kinds: Vec<AgentFileChangeKind>,
 }
 
 impl FileChangeActivityPresentation {
@@ -998,6 +999,7 @@ impl FileChangeActivityPresentation {
             deletions,
             status: AgentFileChangeStatus::Completed,
             review,
+            file_kinds: Vec::new(),
         }
     }
 
@@ -1039,6 +1041,11 @@ impl FileChangeActivityPresentation {
         )
         .with_review(review);
         presentation.status = change.status;
+        presentation.file_kinds = change
+            .changes
+            .iter()
+            .map(|entry| entry.kind.clone())
+            .collect();
         presentation
     }
 
@@ -1245,6 +1252,123 @@ pub fn render_file_change_activity(
     }
 
     activity
+}
+
+/// A work group already supplies the disclosure; each changed file has its
+/// own inline row and diff, in the original patch order.
+pub(super) fn render_grouped_file_change(
+    model: &FileChangeActivityPresentation,
+    expanded_ids: &std::collections::HashSet<String>,
+    theme: Theme,
+    callback: FileChangeActivityCallback,
+) -> Div {
+    let palette = FilePalette::for_theme(theme);
+    model.review.files.iter().enumerate().fold(
+        div().w_full().flex().flex_col().gap(px(4.0)),
+        |rows, (index, file)| {
+            let id = format!("{}:file:{index}", model.item_id);
+            let expanded = expanded_ids.contains(&id);
+            let click_id = id.clone();
+            let key_id = id.clone();
+            let click_callback = callback.clone();
+            let key_callback = callback.clone();
+            let (_, name) = split_directory_and_name(&file.path);
+            let verb = match model.file_kinds.get(index) {
+                Some(AgentFileChangeKind::Add) => "已创建",
+                Some(AgentFileChangeKind::Delete) => "已删除",
+                _ => "已编辑",
+            };
+            let label = format!("{verb} {name}");
+            let color = theme.text.alpha(0.60);
+            let hover: SharedString = id.clone().into();
+            rows.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .id(element_id("grouped-file-change", &id))
+                            .group(hover.clone())
+                            .h(px(21.0))
+                            .min_w(px(0.0))
+                            .max_w_full()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .focusable()
+                            .tab_stop(true)
+                            .role(Role::Button)
+                            .aria_expanded(expanded)
+                            .aria_label(format!(
+                                "{label}，{}文件更改",
+                                if expanded { "折叠" } else { "展开" }
+                            ))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .text_color(color)
+                            .focus_visible(|s| s.border_1().border_color(rgba(0x3a83f7ff)))
+                            .on_click(move |_, window, cx| {
+                                click_callback.emit(
+                                    FileChangeActivityEvent::ToggleDetails {
+                                        item_id: click_id.clone(),
+                                    },
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .on_key_down(move |e, window, cx| {
+                                if matches!(e.keystroke.key.as_str(), "enter" | "space") {
+                                    key_callback.emit(
+                                        FileChangeActivityEvent::ToggleDetails {
+                                            item_id: key_id.clone(),
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                }
+                            })
+                            .child(
+                                icon("message-edit", color.into())
+                                    .size(px(16.0))
+                                    .flex_none(),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(14.0))
+                                    .line_height(px(21.0))
+                                    .child(label),
+                            )
+                            .child(change_counts(file.additions, file.deletions, palette))
+                            .child(
+                                icon("settings-chevron-right", color.into())
+                                    .size(px(12.0))
+                                    .opacity(if expanded { 1.0 } else { 0.0 })
+                                    .group_hover(hover, |s| s.opacity(1.0))
+                                    .with_transformation(gpui::Transformation::rotate(
+                                        gpui::radians(if expanded {
+                                            std::f32::consts::FRAC_PI_2
+                                        } else {
+                                            0.0
+                                        }),
+                                    )),
+                            ),
+                    )
+                    .when(expanded, |row| {
+                        row.child(render_inline_file_change_file(
+                            &model.item_id,
+                            index,
+                            file,
+                            palette,
+                        ))
+                    }),
+            )
+        },
+    )
 }
 
 fn render_inline_file_change_file(

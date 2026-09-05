@@ -27,6 +27,7 @@ use crate::{
             COMPOSER_CORNER_RADIUS, ComposerView, ConversationActivity, ConversationChanged,
             ConversationPhase, ConversationThreadCreated, ConversationTranscriptTurn,
             ModelCatalogLoadFinished, ReasoningActivityPresentation, RequestFullAccessConfirmation,
+            ResumedTurnPresentation,
         },
         file_change::{
             DiffReviewPresentation, FileApprovalCallback, FileApprovalEvent,
@@ -62,6 +63,7 @@ pub struct HomeView {
     thinking_shimmer_cycle: u64,
     thinking_shimmer_running: bool,
     response_feedback: i8,
+    response_feedback_menu: Option<u64>,
     user_message_actions_visible_for_capture: bool,
     conversation_rows: Arc<Vec<ConversationListRow>>,
     conversation_phase: ConversationPhase,
@@ -79,6 +81,9 @@ pub struct HomeView {
     tool_group_transition_running: bool,
     tool_group_scroll_handles: HashMap<String, ScrollHandle>,
     expanded_commands: HashSet<String>,
+    expanded_resumed_turns: HashSet<String>,
+    expanded_file_summaries: HashSet<String>,
+    resumed_turn_focus: HashMap<String, FocusHandle>,
     command_scroll_handles: HashMap<String, ScrollHandle>,
     expanded_collaborations: HashSet<String>,
     approval_focus: FocusHandle,
@@ -140,8 +145,8 @@ const USER_MESSAGE_FOOTER_GAP: f32 = 8.0;
 const USER_MESSAGE_TIME_SIZE: f32 = 12.0;
 const USER_MESSAGE_TIME_LINE_HEIGHT: f32 = 16.0;
 const RESPONSE_ACTION_ICON_SIZE: f32 = 16.0;
-const RESPONSE_ACTION_FOOTER_OFFSET: f32 = 6.0;
-const RESPONSE_ACTION_FOOTER_HEIGHT: f32 = 20.0;
+const RESPONSE_ACTION_FOOTER_OFFSET: f32 = 3.0;
+const RESPONSE_ACTION_FOOTER_HEIGHT: f32 = 26.0;
 const RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT: f32 = -4.0;
 const RESPONSE_ACTION_GAP: f32 = 2.0;
 const RESPONSE_TIME_MARGIN: f32 = 6.0;
@@ -247,13 +252,16 @@ impl ToolGroupDisclosureTransition {
 struct ToolActivityGroupPresentation {
     id: String,
     reasoning: Vec<ReasoningActivityPresentation>,
+    activities: Vec<ConversationActivity>,
     commands: Vec<CommandExecution>,
     file_changes: Vec<crate::components::file_change::FileChangeActivityPresentation>,
 }
 
 impl ToolActivityGroupPresentation {
     fn is_active(&self) -> bool {
-        self.reasoning
+        self.activities.iter().any(|activity| matches!(activity,
+            ConversationActivity::McpToolCall(call) if call.status == AgentMcpToolCallStatus::InProgress))
+            || self.reasoning
             .iter()
             .any(ReasoningActivityPresentation::is_active)
             || self
@@ -275,9 +283,16 @@ enum ActivityStreamUnit {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ConversationListRow {
+    FileSummary(DiffReviewPresentation),
+    ResumedWork {
+        id: String,
+        label: String,
+        expanded: bool,
+    },
     HistoricalUser {
         turn_index: usize,
         message: String,
+        time: Option<String>,
     },
     CurrentUser {
         message: String,
@@ -302,6 +317,7 @@ enum ConversationListRow {
 struct PendingToolActivityGroup {
     id: Option<String>,
     reasoning: Vec<ReasoningActivityPresentation>,
+    activities: Vec<ConversationActivity>,
     commands: Vec<CommandExecution>,
     file_changes: Vec<crate::components::file_change::FileChangeActivityPresentation>,
 }
@@ -310,7 +326,7 @@ fn flush_pending_tool_activity_group(
     pending: &mut PendingToolActivityGroup,
     units: &mut Vec<ActivityStreamUnit>,
 ) {
-    if pending.commands.is_empty() && pending.file_changes.is_empty() {
+    if pending.activities.is_empty() {
         // ChatGPT does not render completed reasoning as an independent
         // "思考了 …" row. It is presentation context for an adjacent tool
         // block and remains invisible when no command belongs to the group.
@@ -324,6 +340,7 @@ fn flush_pending_tool_activity_group(
         ToolActivityGroupPresentation {
             id,
             reasoning: std::mem::take(&mut pending.reasoning),
+            activities: std::mem::take(&mut pending.activities),
             commands: std::mem::take(&mut pending.commands),
             file_changes: std::mem::take(&mut pending.file_changes),
         },
@@ -354,10 +371,20 @@ fn activity_stream_units(activities: &[ConversationActivity]) -> Vec<ActivityStr
             ConversationActivity::Command(command) => {
                 pending.id.get_or_insert_with(|| command.id.clone());
                 pending.commands.push(command.clone());
+                pending.activities.push(activity.clone());
             }
             ConversationActivity::FileChange(change) => {
                 pending.id.get_or_insert_with(|| change.item_id.clone());
                 pending.file_changes.push(change.clone());
+                pending.activities.push(activity.clone());
+            }
+            ConversationActivity::WebSearch { item_id, .. } => {
+                pending.id.get_or_insert_with(|| item_id.clone());
+                pending.activities.push(activity.clone());
+            }
+            ConversationActivity::McpToolCall(call) if is_computer_use_call(call) => {
+                pending.id.get_or_insert_with(|| call.id.clone());
+                pending.activities.push(activity.clone());
             }
             standalone => {
                 flush_pending_tool_activity_group(&mut pending, &mut units);
@@ -366,6 +393,27 @@ fn activity_stream_units(activities: &[ConversationActivity]) -> Vec<ActivityStr
         }
     }
     flush_pending_tool_activity_group(&mut pending, &mut units);
+    let mut merged = Vec::new();
+    for unit in units {
+        if let ActivityStreamUnit::Standalone(ConversationActivity::ImageView(image)) = unit {
+            match merged.last_mut() {
+                Some(ActivityStreamUnit::Standalone(ConversationActivity::ImageView(first))) => {
+                    let images = vec![first.clone(), image];
+                    *merged.last_mut().unwrap() =
+                        ActivityStreamUnit::Standalone(ConversationActivity::ImageViews(images));
+                }
+                Some(ActivityStreamUnit::Standalone(ConversationActivity::ImageViews(images))) => {
+                    images.push(image)
+                }
+                _ => merged.push(ActivityStreamUnit::Standalone(
+                    ConversationActivity::ImageView(image),
+                )),
+            }
+        } else {
+            merged.push(unit);
+        }
+    }
+    let mut units = merged;
     units.extend(active_reasoning.into_iter().map(|reasoning| {
         ActivityStreamUnit::Standalone(ConversationActivity::Reasoning(reasoning))
     }));
@@ -524,7 +572,7 @@ fn generic_command_activity_summary(
     let text = match command.status {
         CommandExecutionStatus::InProgress => format!("正在运行 {display_command}"),
         CommandExecutionStatus::Completed => format!("已运行 {display_command}"),
-        CommandExecutionStatus::Failed => format!("运行失败 {display_command}"),
+        CommandExecutionStatus::Failed => format!("已运行 {display_command}"),
     };
     CommandActivitySummary {
         icon: "panel-terminal",
@@ -553,15 +601,57 @@ fn completed_tool_group_summary(group: &ToolActivityGroupPresentation) -> Comman
         (false, false, true) => "运行了命令",
         (false, false, false) => "已工作",
     };
+    let mut surfaces = group
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            ConversationActivity::McpToolCall(call) => computer_use_surface_label(call),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    surfaces.sort_by_key(|name| name.to_lowercase());
+    surfaces.dedup();
+    let uses_computer = !surfaces.is_empty();
+    let searches_web = group
+        .activities
+        .iter()
+        .any(|a| matches!(a, ConversationActivity::WebSearch { .. }));
+    let text = if uses_computer {
+        let suffix = if surfaces.iter().any(|s| s == "浏览器") {
+            ""
+        } else {
+            " 集成"
+        };
+        let operations = if text == "已工作" {
+            String::new()
+        } else {
+            text.strip_prefix("已")
+                .unwrap_or(text)
+                .replace("编辑了文件", "编辑了多个文件")
+        };
+        format!("已使用 {}{suffix}{operations}", surfaces.join("和"))
+    } else {
+        text.to_owned()
+    };
     CommandActivitySummary {
-        icon: if edits_files {
+        icon: if uses_computer {
+            if surfaces.iter().any(|s| s == "浏览器") {
+                "activity-computer-use"
+            } else {
+                "activity-native-app"
+            }
+        } else if edits_files {
             "message-edit"
         } else if reads_files {
             "activity-read"
         } else {
             "panel-terminal"
         },
-        text: text.to_owned(),
+        text: if searches_web {
+            format!("{}已搜索网页", if text == "已工作" { "" } else { &text })
+        } else {
+            text
+        },
         reads_files,
         runs_command,
     }
@@ -577,7 +667,21 @@ fn tool_group_row_count(group: &ToolActivityGroupPresentation) -> usize {
         .iter()
         .map(command_activity_row_count)
         .sum::<usize>()
-        + group.file_changes.len()
+        + group
+            .file_changes
+            .iter()
+            .map(|change| change.review.files.len())
+            .sum::<usize>()
+        + group
+            .activities
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    ConversationActivity::McpToolCall(_) | ConversationActivity::WebSearch { .. }
+                )
+            })
+            .count()
 }
 
 fn strip_terminal_line_ending(output: &str) -> &str {
@@ -742,7 +846,7 @@ fn user_message_bubble(message: String, theme: Theme, window: &mut Window) -> Di
         .text_size(px(USER_MESSAGE_TEXT_SIZE))
         .line_height(px(USER_MESSAGE_LINE_HEIGHT))
         .font_family(".SystemUIFont")
-        .font_weight(FontWeight::NORMAL)
+        .font_weight(FontWeight(430.0))
         .text_color(theme.user_message_text)
         .child(
             canvas(
@@ -852,6 +956,7 @@ impl HomeView {
             thinking_shimmer_cycle: 0,
             thinking_shimmer_running: false,
             response_feedback: 0,
+            response_feedback_menu: None,
             user_message_actions_visible_for_capture: false,
             conversation_rows: Arc::new(Vec::new()),
             conversation_phase: ConversationPhase::Empty,
@@ -869,6 +974,9 @@ impl HomeView {
             tool_group_transition_running: false,
             tool_group_scroll_handles: HashMap::new(),
             expanded_commands: HashSet::new(),
+            expanded_resumed_turns: HashSet::new(),
+            expanded_file_summaries: HashSet::new(),
+            resumed_turn_focus: HashMap::new(),
             command_scroll_handles: HashMap::new(),
             expanded_collaborations: HashSet::new(),
             approval_focus: cx.focus_handle(),
@@ -896,11 +1004,31 @@ impl HomeView {
             assistant_message,
             assistant_message_time,
             &conversation_activity,
+            self.composer.read(cx).resumed_turn(),
+            &self.expanded_resumed_turns,
         ));
         self.conversation_phase = phase;
+        for row in self.conversation_rows.iter() {
+            if let ConversationListRow::ResumedWork { id, .. } = row {
+                self.resumed_turn_focus
+                    .entry(id.clone())
+                    .or_insert_with(|| cx.focus_handle());
+            }
+        }
         self.conversation_activity = Arc::new(conversation_activity);
         self.conversation_cache_dirty = true;
         sync_list_item_count(&self.conversation_list, self.conversation_rows.len());
+    }
+
+    fn toggle_resumed_turn(&mut self, id: &str, cx: &mut Context<Self>) {
+        let offset = self.conversation_list.logical_scroll_top();
+        if !self.expanded_resumed_turns.remove(id) {
+            self.expanded_resumed_turns.insert(id.to_owned());
+        }
+        self.refresh_conversation_cache(cx);
+        self.conversation_list.remeasure();
+        self.conversation_list.scroll_to(offset);
+        cx.notify();
     }
 
     fn observe_composer(&mut self, composer: Entity<ComposerView>, cx: &mut Context<Self>) {
@@ -1561,6 +1689,9 @@ impl HomeView {
             .filter_map(|unit| match unit {
                 ActivityStreamUnit::Standalone(ConversationActivity::ImageView(image)) => {
                     Some(image)
+                }
+                ActivityStreamUnit::Standalone(ConversationActivity::ImageViews(images)) => {
+                    images.first()
                 }
                 _ => None,
             })
@@ -2432,6 +2563,8 @@ fn conversation_list_rows(
     assistant_message: String,
     assistant_message_time: Option<String>,
     conversation_activity: &[ConversationActivity],
+    resumed_turn: Option<ResumedTurnPresentation>,
+    expanded_resumed_turns: &HashSet<String>,
 ) -> Vec<ConversationListRow> {
     let has_active_reasoning = conversation_activity.iter().any(|activity| {
         matches!(activity, ConversationActivity::Reasoning(reasoning) if reasoning.is_active())
@@ -2443,25 +2576,42 @@ fn conversation_list_rows(
             rows.push(ConversationListRow::HistoricalUser {
                 turn_index,
                 message: turn.user_message,
+                time: turn.user_message_time,
             });
         }
         if turn.activities.is_empty() {
             if !turn.assistant_message.is_empty() {
                 rows.push(ConversationListRow::AssistantMarkdown {
                     id: format!("historical-assistant-{turn_index}"),
-                    text: turn.assistant_message,
+                    text: turn.assistant_message.clone(),
                 });
             }
         } else {
             let turn_show_thinking = conversation_status(turn.phase).is_some();
-            rows.extend(
-                activity_stream_units(&turn.activities)
-                    .into_iter()
-                    .map(|unit| ConversationListRow::Activity {
-                        unit,
-                        show_thinking_tail: turn_show_thinking,
-                    }),
+            append_turn_activity_rows(
+                &mut rows,
+                &turn.activities,
+                turn_show_thinking,
+                turn.phase,
+                turn.resumed.as_ref(),
+                expanded_resumed_turns,
             );
+        }
+        if turn.resumed.is_some()
+            && matches!(
+                turn.phase,
+                ConversationPhase::Complete | ConversationPhase::Failed
+            )
+            && !turn.assistant_message.is_empty()
+        {
+            if let Some(review) = resumed_file_summary(&turn.activities, turn.resumed.as_ref()) {
+                rows.push(ConversationListRow::FileSummary(review));
+            } else {
+                rows.push(ConversationListRow::CurrentResponseFooter {
+                    message: turn.assistant_message,
+                    completed_at: turn.assistant_message_time,
+                });
+            }
         }
     }
     rows.push(ConversationListRow::CurrentUser {
@@ -2476,13 +2626,13 @@ fn conversation_list_rows(
             });
         }
     } else {
-        rows.extend(
-            activity_stream_units(conversation_activity)
-                .into_iter()
-                .map(|unit| ConversationListRow::Activity {
-                    unit,
-                    show_thinking_tail,
-                }),
+        append_turn_activity_rows(
+            &mut rows,
+            conversation_activity,
+            show_thinking_tail,
+            phase,
+            resumed_turn.as_ref(),
+            expanded_resumed_turns,
         );
     }
     if show_thinking_tail {
@@ -2493,12 +2643,110 @@ fn conversation_list_rows(
         ConversationPhase::Complete | ConversationPhase::Failed
     ) && !assistant_message.is_empty()
     {
-        rows.push(ConversationListRow::CurrentResponseFooter {
-            message: assistant_message,
-            completed_at: assistant_message_time,
-        });
+        if let Some(review) = resumed_file_summary(conversation_activity, resumed_turn.as_ref()) {
+            rows.push(ConversationListRow::FileSummary(review));
+        } else {
+            rows.push(ConversationListRow::CurrentResponseFooter {
+                message: assistant_message,
+                completed_at: assistant_message_time,
+            });
+        }
     }
     rows
+}
+
+// Rollout file edits retain their original patch order. Combine repeated paths
+// for the turn summary while retaining every patch's lines for review.
+fn resumed_file_summary(
+    activities: &[ConversationActivity],
+    turn: Option<&ResumedTurnPresentation>,
+) -> Option<DiffReviewPresentation> {
+    let turn = turn?;
+    let mut files: Vec<crate::components::file_change::DiffFilePresentation> = Vec::new();
+    for activity in activities {
+        if let ConversationActivity::FileChange(change) = activity
+            && change.status == AgentFileChangeStatus::Completed
+        {
+            for file in &change.review.files {
+                if let Some(existing) = files.iter_mut().find(|entry| entry.path == file.path) {
+                    existing.additions += file.additions;
+                    existing.deletions += file.deletions;
+                    existing.lines.extend(file.lines.clone());
+                } else {
+                    files.push(file.clone());
+                }
+            }
+        }
+    }
+    (!files.is_empty()).then(|| {
+        DiffReviewPresentation::new(format!("resumed-summary-{}", turn.id), "本轮更改", files)
+    })
+}
+
+fn resumed_work_label(duration_ms: Option<i64>) -> String {
+    match duration_ms.filter(|duration| *duration >= 0) {
+        Some(ms) => {
+            let seconds = ms / 1000;
+            if seconds >= 3600 {
+                format!(
+                    "用时 {}小时 {}分钟 {}秒",
+                    seconds / 3600,
+                    seconds / 60 % 60,
+                    seconds % 60
+                )
+            } else if seconds >= 60 {
+                format!("用时 {}分钟 {}秒", seconds / 60, seconds % 60)
+            } else {
+                format!("用时 {seconds}秒")
+            }
+        }
+        None => "工作过程".to_owned(),
+    }
+}
+
+fn append_turn_activity_rows(
+    rows: &mut Vec<ConversationListRow>,
+    activities: &[ConversationActivity],
+    show_thinking_tail: bool,
+    phase: ConversationPhase,
+    resumed: Option<&ResumedTurnPresentation>,
+    expanded_turns: &HashSet<String>,
+) {
+    let units = activity_stream_units(activities);
+    let final_start = resumed.and_then(|turn| units.iter().position(|unit| {
+        matches!(unit, ActivityStreamUnit::Standalone(ConversationActivity::AssistantMessage { item_id, .. })
+            if turn.final_message_ids.contains(item_id))
+    }));
+    // Keep errors, interrupted turns, approvals and unfinished work visible.
+    // Only a completed prefix preceding an identified answer is collapsible.
+    if let (ConversationPhase::Complete, Some(turn), Some(final_start)) =
+        (phase, resumed, final_start)
+        && final_start > 0
+    {
+        let expanded = expanded_turns.contains(&turn.id);
+        rows.push(ConversationListRow::ResumedWork {
+            id: turn.id.clone(),
+            label: resumed_work_label(turn.duration_ms),
+            expanded,
+        });
+        rows.extend(units.into_iter().enumerate().filter_map(|(index, unit)| {
+            (expanded
+                || index >= final_start
+                || matches!(
+                    &unit,
+                    ActivityStreamUnit::Standalone(ConversationActivity::QuestionReply { .. })
+                ))
+            .then_some(ConversationListRow::Activity {
+                unit,
+                show_thinking_tail,
+            })
+        }));
+    } else {
+        rows.extend(units.into_iter().map(|unit| ConversationListRow::Activity {
+            unit,
+            show_thinking_tail,
+        }));
+    }
 }
 
 fn conversation(
@@ -2526,16 +2774,49 @@ fn conversation(
             return div().into_any_element();
         };
         let (row, top_gap, bottom_gap) = match row {
+            ConversationListRow::FileSummary(review) => (
+                resumed_file_summary_card(review, home_entity.clone(), theme, _cx)
+                    .into_any_element(),
+                0.0,
+                44.0,
+            ),
+            ConversationListRow::ResumedWork {
+                id,
+                label,
+                expanded,
+            } => (
+                resumed_work_header(
+                    home_entity.clone(),
+                    home_entity
+                        .read(_cx)
+                        .resumed_turn_focus
+                        .get(&id)
+                        .expect("resumed header focus")
+                        .clone(),
+                    id,
+                    label,
+                    expanded,
+                    theme,
+                )
+                .into_any_element(),
+                0.0,
+                16.0,
+            ),
             ConversationListRow::HistoricalUser {
                 turn_index,
                 message,
+                time,
             } => (
                 div()
                     .id(("transcript-turn-user", turn_index))
                     .w_full()
-                    .flex()
-                    .justify_end()
-                    .child(user_message_bubble(message, theme, window))
+                    .child(current_user_message(
+                        message,
+                        time.unwrap_or_default(),
+                        false,
+                        theme,
+                        window,
+                    ))
                     .into_any_element(),
                 0.0,
                 16.0,
@@ -2597,11 +2878,23 @@ fn conversation(
                     response_feedback,
                     home_entity.clone(),
                     theme,
+                    _cx,
                 )
                 .into_any_element(),
                 0.0,
                 3.0,
             ),
+        };
+        // The response toolbar owns its 3px top inset. A normal activity gap
+        // here double-counts spacing and shifts the entire bottom-anchored
+        // answer upward by 16px in a resumed thread.
+        let bottom_gap = if matches!(
+            rows.get(index + 1),
+            Some(ConversationListRow::CurrentResponseFooter { .. })
+        ) {
+            0.0
+        } else {
+            bottom_gap
         };
         div()
             .w_full()
@@ -2636,6 +2929,82 @@ fn conversation(
         // the Composer's top edge.
         .overflow_hidden()
         .child(conversation_rows)
+}
+
+fn resumed_work_header(
+    home: Entity<HomeView>,
+    focus: FocusHandle,
+    id: String,
+    label: String,
+    expanded: bool,
+    theme: Theme,
+) -> Div {
+    let click_home = home.clone();
+    let click_id = id.clone();
+    let mut muted = theme.text;
+    muted.a = 0.6;
+    div()
+        .w_full()
+        .pb(px(4.0))
+        .border_b_1()
+        .border_color(theme.border)
+        .flex()
+        .flex_col()
+        .items_start()
+        .child(
+            div()
+                .id(SharedString::from(format!("resumed-work-{id}")))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .h(px(23.0))
+                .max_w_full()
+                .rounded(px(6.0))
+                .focusable()
+                .track_focus(&focus)
+                .tab_stop(true)
+                .role(Role::Button)
+                .aria_label(format!(
+                    "{label}，{}工作过程",
+                    if expanded { "折叠" } else { "展开" }
+                ))
+                .aria_expanded(expanded)
+                .cursor_pointer()
+                .text_size(px(14.0))
+                .line_height(px(21.0))
+                .text_color(muted)
+                .hover(|style| style.text_color(theme.text))
+                .focus_visible(|style| {
+                    style.shadow(vec![
+                        BoxShadow::new(px(0.0), px(0.0), theme.accent.into())
+                            .spread_radius(px(2.0))
+                            .inset(),
+                    ])
+                })
+                .on_click(move |_, window, cx| {
+                    window.focus(&focus, cx);
+                    cx.stop_propagation();
+                    click_home.update(cx, |home, cx| home.toggle_resumed_turn(&click_id, cx));
+                })
+                .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        cx.stop_propagation();
+                        home.update(cx, |home, cx| home.toggle_resumed_turn(&id, cx));
+                    }
+                })
+                .child(label)
+                .child(
+                    icon(
+                        if expanded {
+                            "chevron-down"
+                        } else {
+                            "settings-chevron-right"
+                        },
+                        muted.into(),
+                    )
+                    .size(px(12.0)),
+                ),
+        )
 }
 
 fn current_user_message(
@@ -2716,14 +3085,245 @@ fn current_user_message(
         )
 }
 
+fn resumed_file_summary_card(
+    review: DiffReviewPresentation,
+    home: Entity<HomeView>,
+    theme: Theme,
+    cx: &gpui::App,
+) -> Div {
+    let expanded = home
+        .read(cx)
+        .expanded_file_summaries
+        .contains(&review.review_id);
+    let open_home = home.clone();
+    let open_review = review.clone();
+    let review_home = home.clone();
+    let review_button = review.clone();
+    let added = if theme.surface.r > 0.5 {
+        rgba(0x00a33aff)
+    } else {
+        rgba(0x40c977ff)
+    };
+    let removed = if theme.surface.r > 0.5 {
+        rgba(0xe02e2aff)
+    } else {
+        rgba(0xfa423eff)
+    };
+    let counts = |additions, deletions| {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .text_size(px(13.0))
+            .line_height(px(19.5))
+            .child(div().text_color(added).child(format!("+{additions}")))
+            .child(div().text_color(removed).child(format!("-{deletions}")))
+    };
+    let card_surface = if theme.surface.r > 0.5 {
+        rgba(0xffffffff)
+    } else {
+        rgba(0x232323ff)
+    };
+    let row_surface = if theme.surface.r > 0.5 {
+        rgba(0xffffffff)
+    } else {
+        rgba(0x1c1c1cff)
+    };
+    let icon_surface = if theme.surface.r > 0.5 {
+        rgba(0xf7f7f7ff)
+    } else {
+        rgba(0x151515ff)
+    };
+    let mut card = div()
+        .w_full()
+        .rounded(px(12.5))
+        .overflow_hidden()
+        .border_1()
+        .border_color(theme.border)
+        .bg(card_surface)
+        .text_color(theme.text)
+        .text_size(px(14.0))
+        .line_height(px(21.0))
+        .child(
+            div()
+                .id(SharedString::from(format!("{}-review", review.review_id)))
+                .h(px(65.5))
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .role(Role::Button)
+                .aria_label("审查已更改的文件")
+                .focusable()
+                .tab_stop(true)
+                .cursor_pointer()
+                .hover(move |s| s.bg(theme.sidebar_hover))
+                .on_click(move |_, _, cx| {
+                    open_home.update(cx, |_, cx| cx.emit(OpenDiffReview(open_review.clone())));
+                })
+                .child(
+                    div()
+                        .size(px(40.0))
+                        .rounded(px(12.5))
+                        .bg(icon_surface)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            icon("resumed-file-summary", theme.text_secondary.into())
+                                .size(px(24.0)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(format!("已编辑 {} 个文件", review.files.len())),
+                        )
+                        .child(counts(review.total_additions(), review.total_deletions())),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "{}-review-button",
+                            review.review_id
+                        )))
+                        .h(px(28.0))
+                        .px(px(8.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .role(Role::Button)
+                        .aria_label("审核")
+                        .on_click(move |_, _, cx| {
+                            review_home
+                                .update(cx, |_, cx| cx.emit(OpenDiffReview(review_button.clone())));
+                            cx.stop_propagation();
+                        })
+                        .child("审核"),
+                ),
+        )
+        .child(div().h(px(1.0)).bg(theme.border));
+    for (index, file) in review
+        .files
+        .iter()
+        .enumerate()
+        .take(if expanded { usize::MAX } else { 3 })
+    {
+        let click_home = home.clone();
+        let mut single = DiffReviewPresentation::new(
+            format!("{}-{index}", review.review_id),
+            "本轮更改",
+            vec![file.clone()],
+        );
+        single.show_file_tree = false;
+        card = card.child(
+            div()
+                .id(SharedString::from(format!(
+                    "{}-file-{index}",
+                    review.review_id
+                )))
+                .h(px(36.0))
+                .bg(row_surface)
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .cursor_pointer()
+                .role(Role::Button)
+                .aria_label(format!("审核 {}", file.path))
+                .hover(move |s| s.bg(theme.sidebar_hover))
+                .on_click(move |_, _, cx| {
+                    click_home.update(cx, |_, cx| cx.emit(OpenDiffReview(single.clone())))
+                })
+                .child(div().flex_1().min_w(px(0.0)).truncate().child(
+                    gpui::StyledText::new(file.path.clone()).with_highlights(
+                        file.path.rfind('/').map(|index| {
+                            (
+                                0..index + 1,
+                                gpui::HighlightStyle {
+                                    color: Some(theme.text_secondary.into()),
+                                    ..Default::default()
+                                },
+                            )
+                        }),
+                    ),
+                ))
+                .child(counts(file.additions, file.deletions)),
+        );
+    }
+    if review.files.len() > 3 {
+        let id = review.review_id;
+        card = card.child(
+            div()
+                .id(SharedString::from(format!("{id}-expand")))
+                .h(px(36.0))
+                .bg(row_surface)
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .role(Role::Button)
+                .aria_label(if expanded {
+                    "收起文件列表".to_owned()
+                } else {
+                    format!("再显示 {} 个文件", review.files.len() - 3)
+                })
+                .cursor_pointer()
+                .hover(move |s| s.bg(theme.sidebar_hover))
+                .on_click(move |_, _, cx| {
+                    home.update(cx, |home, cx| {
+                        if !home.expanded_file_summaries.remove(&id) {
+                            home.expanded_file_summaries.insert(id.clone());
+                        }
+                        home.conversation_list.remeasure();
+                        cx.notify();
+                    })
+                })
+                .child(if expanded {
+                    "收起文件列表".to_owned()
+                } else {
+                    format!("再显示 {} 个文件", review.files.len() - 3)
+                })
+                .child(
+                    icon(
+                        if expanded {
+                            "settings-chevron-up"
+                        } else {
+                            "chevron-down"
+                        },
+                        theme.text.into(),
+                    )
+                    .size(px(12.0)),
+                ),
+        );
+    }
+    card
+}
+
 fn current_response_footer(
     assistant_message: String,
     completed_at: Option<String>,
     response_feedback: i8,
     home_entity: Entity<HomeView>,
     theme: Theme,
+    cx: &App,
 ) -> Div {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::hash::DefaultHasher::new();
+    assistant_message.hash(&mut hash);
+    let feedback_id = hash.finish();
+    let feedback_open = home_entity.read(cx).response_feedback_menu == Some(feedback_id);
+    let feedback_home = home_entity.clone();
     div()
+        .group("response-footer")
         .relative()
         .left(px(RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT))
         .mt(px(RESPONSE_ACTION_FOOTER_OFFSET))
@@ -2747,24 +3347,53 @@ fn current_response_footer(
                     home_entity.clone(),
                     theme,
                 ))
-                .child(message_action(
-                    "message-thumb-up",
-                    "response-thumb-up",
-                    1,
-                    response_feedback == 1,
-                    assistant_message.clone(),
-                    home_entity.clone(),
-                    theme,
-                ))
-                .child(message_action(
-                    "message-thumb-down",
-                    "response-thumb-down",
-                    2,
-                    response_feedback == -1,
-                    assistant_message.clone(),
-                    home_entity.clone(),
-                    theme,
-                ))
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "response-feedback-{feedback_id}"
+                        )))
+                        .size(px(26.0))
+                        .rounded(px(10.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .role(Role::Button)
+                        .aria_label("评价回复")
+                        .cursor_pointer()
+                        .hover(move |button| button.bg(theme.sidebar_hover))
+                        .on_click(move |_, _, cx| {
+                            feedback_home.update(cx, |home, cx| {
+                                home.response_feedback_menu = if feedback_open {
+                                    None
+                                } else {
+                                    Some(feedback_id)
+                                };
+                                cx.notify();
+                            })
+                        })
+                        .child(icon("message-feedback", theme.text_tertiary.into()).size(px(16.0))),
+                )
+                .when(feedback_open, |actions| {
+                    actions
+                        .child(message_action(
+                            "message-thumb-up",
+                            "response-thumb-up",
+                            1,
+                            response_feedback == 1,
+                            assistant_message.clone(),
+                            home_entity.clone(),
+                            theme,
+                        ))
+                        .child(message_action(
+                            "message-thumb-down",
+                            "response-thumb-down",
+                            2,
+                            response_feedback == -1,
+                            assistant_message.clone(),
+                            home_entity.clone(),
+                            theme,
+                        ))
+                })
                 .child(message_action(
                     "message-branch",
                     "response-branch",
@@ -2779,6 +3408,8 @@ fn current_response_footer(
             footer.child(
                 div()
                     .ml(px(RESPONSE_TIME_MARGIN))
+                    .opacity(0.0)
+                    .group_hover("response-footer", |time| time.opacity(1.0))
                     .h_full()
                     .flex()
                     .items_center()
@@ -2932,7 +3563,23 @@ fn render_activity_stream_unit(
                 } else {
                     expanded_tool_groups.contains(&image.id)
                 };
-                image_view_activity(home_entity, image, expanded, show_thinking_tail, theme)
+                image_view_activity(
+                    home_entity,
+                    vec![image],
+                    expanded,
+                    show_thinking_tail,
+                    theme,
+                )
+                .into_any_element()
+            }
+            ConversationActivity::ImageViews(images) => {
+                let id = &images[0].id;
+                let expanded = if show_thinking_tail {
+                    !collapsed_active_tool_groups.contains(id)
+                } else {
+                    expanded_tool_groups.contains(id)
+                };
+                image_view_activity(home_entity, images, expanded, show_thinking_tail, theme)
                     .into_any_element()
             }
             ConversationActivity::ImageGeneration(image) => {
@@ -2949,6 +3596,44 @@ fn render_activity_stream_unit(
                 collaboration_activity(home_entity, collaboration, expanded, theme)
                     .into_any_element()
             }
+            ConversationActivity::WebSearch {
+                item_id,
+                query,
+                results,
+            } => web_search_activity(item_id, query, results, theme).into_any_element(),
+            ConversationActivity::QuestionReply {
+                item_id,
+                question,
+                answer,
+            } => div()
+                .w_full()
+                .flex()
+                .justify_end()
+                .child(
+                    div()
+                        .id(SharedString::from(format!("question-reply-{item_id}")))
+                        .w(px(515.2))
+                        .max_w_full()
+                        .min_w(px(0.0))
+                        .px(px(16.0))
+                        .py(px(10.0))
+                        .rounded(px(22.0))
+                        .bg(theme.user_message_surface)
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .text_size(px(14.0))
+                        .line_height(px(22.75))
+                        .text_color(theme.user_message_text)
+                        .child(
+                            div()
+                                .text_color(theme.user_message_text.alpha(0.65))
+                                .truncate()
+                                .child(question),
+                        )
+                        .child(answer),
+                )
+                .into_any_element(),
             ConversationActivity::McpToolCall(tool_call) => {
                 mcp_tool_call_activity(tool_call, theme).into_any_element()
             }
@@ -3340,27 +4025,24 @@ fn image_generation_activity(
 
 fn image_view_activity(
     home_entity: Entity<HomeView>,
-    image: AgentImageView,
+    images: Vec<AgentImageView>,
     expanded: bool,
     active_turn: bool,
     theme: Theme,
 ) -> impl IntoElement {
+    let image = &images[0];
     let item_id = image.id.clone();
-    let path = image.path.clone();
+    let count = images.len();
     let click_home = home_entity.clone();
-    let preview_home = home_entity.clone();
     let key_home = home_entity.clone();
-    let preview_key_home = home_entity.clone();
     let click_item_id = item_id.clone();
     let key_item_id = item_id.clone();
     let hover_group: SharedString = format!("image-view-header-{item_id}").into();
     let label = if expanded {
-        "已查看 1 张图像，折叠图像"
+        format!("已查看 {count} 张图像，折叠图像")
     } else {
-        "已查看 1 张图像，展开图像"
+        format!("已查看 {count} 张图像，展开图像")
     };
-    let thumbnail_path = path.clone();
-    let thumbnail_key_path = path.clone();
 
     div()
         .id(SharedString::from(format!("image-view-{item_id}")))
@@ -3435,7 +4117,7 @@ fn image_view_activity(
                                 .font_family(".SystemUIFont")
                                 .font_weight(FontWeight::NORMAL)
                                 .text_color(theme.text.alpha(0.40))
-                                .child("已查看 1 张图像"),
+                                .child(format!("已查看 {count} 张图像")),
                         ),
                 )
                 .child(
@@ -3452,8 +4134,14 @@ fn image_view_activity(
                 ),
         )
         .when(expanded, |activity| {
-            activity.child(
-                div().pt(px(8.0)).pb(px(4.0)).flex().gap(px(8.0)).child(
+            activity.child(div().pt(px(8.0)).pb(px(4.0)).flex().gap(px(8.0)).children(
+                images.into_iter().map(|image| {
+                    let item_id = image.id;
+                    let path = image.path;
+                    let thumbnail_path = path.clone();
+                    let thumbnail_key_path = path.clone();
+                    let preview_home = home_entity.clone();
+                    let preview_key_home = home_entity.clone();
                     div()
                         .id(SharedString::from(format!(
                             "image-view-thumbnail-{item_id}"
@@ -3494,9 +4182,9 @@ fn image_view_activity(
                                 .size_full()
                                 .rounded(px(6.0))
                                 .object_fit(ObjectFit::Cover),
-                        ),
-                ),
-            )
+                        )
+                }),
+            ))
         })
 }
 
@@ -4065,6 +4753,17 @@ fn tool_activity_group(
     command_scroll_handles: &HashMap<String, ScrollHandle>,
     theme: Theme,
 ) -> Div {
+    if let [ConversationActivity::Command(command)] = group.activities.as_slice() {
+        if command_activity_row_count(command) == 1 {
+            return command_execution_activity(
+                home_entity,
+                command.clone(),
+                expanded_commands,
+                command_scroll_handles,
+                theme,
+            );
+        }
+    }
     let group_id = group.id.clone();
     let active = group.is_active();
     let reasoning_title = active.then(|| tool_group_reasoning_title(&group)).flatten();
@@ -4131,46 +4830,55 @@ fn tool_activity_group(
     let show_top_fade = scroll_top > 0.5;
     let show_bottom_fade = has_overflow && (max_scroll <= 0.5 || scroll_top + 0.5 < max_scroll);
 
-    let activity_rows = group.commands.into_iter().fold(
+    // Render the transport order, including interleaved edits and computer use.
+    let activity_rows = group.activities.into_iter().fold(
         div()
             .w_full()
             .flex_none()
             .flex()
             .flex_col()
             .gap(px(TOOL_GROUP_ITEM_GAP)),
-        |rows, command| {
-            rows.child(command_execution_activity(
+        |rows, activity| match activity {
+            ConversationActivity::Command(command) => rows.child(command_execution_activity(
                 home_entity.clone(),
                 command,
                 expanded_commands,
                 command_scroll_handles,
                 theme,
-            ))
-        },
-    );
-    let activity_rows = group
-        .file_changes
-        .into_iter()
-        .fold(activity_rows, |rows, file_change| {
-            let expanded = expanded_commands.contains(&file_change.item_id);
-            let target = home_entity.clone();
-            let callback = FileChangeActivityCallback::new(move |event, _, cx| {
-                target.update(cx, move |home, cx| {
-                    home.handle_file_change_activity_event(event, cx)
+            )),
+            ConversationActivity::FileChange(file_change) => {
+                let target = home_entity.clone();
+                let callback = FileChangeActivityCallback::new(move |event, _, cx| {
+                    target.update(cx, move |home, cx| {
+                        home.handle_file_change_activity_event(event, cx)
+                    });
                 });
-            });
-            rows.child(
-                div()
-                    .w_full()
-                    .flex_none()
-                    .child(render_file_change_activity(
+                rows.child(div().w_full().flex_none().child(
+                    crate::components::file_change::render_grouped_file_change(
                         &file_change,
-                        expanded,
+                        expanded_commands,
                         theme,
                         callback,
-                    )),
-            )
-        });
+                    ),
+                ))
+            }
+            ConversationActivity::WebSearch {
+                item_id,
+                query,
+                results,
+            } => rows.child(web_search_activity(item_id, query, results, theme)),
+            ConversationActivity::McpToolCall(call) => {
+                let expanded = expanded_commands.contains(&call.id);
+                rows.child(computer_use_activity(
+                    home_entity.clone(),
+                    call,
+                    expanded,
+                    theme,
+                ))
+            }
+            _ => rows,
+        },
+    );
 
     div()
         .w_full()
@@ -4234,11 +4942,7 @@ fn tool_activity_group(
                         .gap(px(TOOL_GROUP_ICON_TEXT_GAP))
                         .text_color(theme.text.alpha(0.60))
                         .when(has_header_icon, |content| {
-                            content.child(
-                                icon(summary.icon, theme.text.alpha(0.60).into())
-                                    .size(px(TOOL_GROUP_ICON_SIZE))
-                                    .flex_none(),
-                            )
+                            content.child(activity_group_icon(summary.icon, theme))
                         })
                         .child(
                             div()
@@ -4267,76 +4971,82 @@ fn tool_activity_group(
                         ))),
                 ),
         )
-        .child(
-            div()
-                .w_full()
-                .max_h(px(TOOL_GROUP_BODY_MAX_HEIGHT * visibility))
-                .overflow_hidden()
-                .opacity(visibility)
-                .when(visibility <= f32::EPSILON, |body| body.invisible())
-                .child(
-                    div()
-                        .relative()
-                        .w_full()
-                        .max_h(px(TOOL_GROUP_BODY_MAX_HEIGHT))
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("tool-activity-body-{group_id}")))
-                                .ml(px(-8.0))
-                                .pl(px(8.0))
-                                .w_full()
-                                .max_h(px(TOOL_GROUP_BODY_MAX_HEIGHT))
-                                .overflow_scroll()
-                                .restrict_scroll_to_axis()
-                                .scrollbar_width(px(0.0))
-                                .track_scroll(&scroll_handle)
-                                .pt(px(TOOL_GROUP_ITEM_GAP))
-                                .on_scroll_wheel(move |event, window, cx| {
-                                    if nested_scroll_consumed(&nested_scroll_handle, event, window)
-                                    {
-                                        cx.stop_propagation();
-                                    }
-                                    let home = scroll_home.clone();
-                                    window.on_next_frame(move |_, cx| {
-                                        home.update(cx, |_, cx| cx.notify());
-                                    });
-                                })
-                                .child(activity_rows),
-                        )
-                        .when(show_top_fade, |body| {
-                            body.child(
+        .when(visibility > f32::EPSILON, |group| {
+            group.child(
+                div()
+                    .w_full()
+                    .max_h(px(TOOL_GROUP_BODY_MAX_HEIGHT * visibility))
+                    .overflow_hidden()
+                    .opacity(visibility)
+                    .when(visibility <= f32::EPSILON, |body| body.invisible())
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .max_h(px(TOOL_GROUP_BODY_MAX_HEIGHT))
+                            .child(
                                 div()
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
+                                    .id(SharedString::from(format!(
+                                        "tool-activity-body-{group_id}"
+                                    )))
+                                    .ml(px(-8.0))
+                                    .pl(px(8.0))
                                     .w_full()
-                                    .h(px(TOOL_GROUP_EDGE_FADE_DISTANCE))
-                                    .bg(linear_gradient(
-                                        0.0,
-                                        linear_color_stop(theme.surface.alpha(0.0), 0.0),
-                                        linear_color_stop(theme.surface, 1.0),
-                                    )),
+                                    .max_h(px(TOOL_GROUP_BODY_MAX_HEIGHT))
+                                    .overflow_scroll()
+                                    .restrict_scroll_to_axis()
+                                    .scrollbar_width(px(0.0))
+                                    .track_scroll(&scroll_handle)
+                                    .pt(px(TOOL_GROUP_ITEM_GAP))
+                                    .on_scroll_wheel(move |event, window, cx| {
+                                        if nested_scroll_consumed(
+                                            &nested_scroll_handle,
+                                            event,
+                                            window,
+                                        ) {
+                                            cx.stop_propagation();
+                                        }
+                                        let home = scroll_home.clone();
+                                        window.on_next_frame(move |_, cx| {
+                                            home.update(cx, |_, cx| cx.notify());
+                                        });
+                                    })
+                                    .child(activity_rows),
                             )
-                        })
-                        .when(show_bottom_fade, |body| {
-                            body.child(
-                                div()
-                                    .absolute()
-                                    .bottom_0()
-                                    .left_0()
-                                    .w_full()
-                                    .h(px(TOOL_GROUP_EDGE_FADE_DISTANCE))
-                                    .bg(linear_gradient(
-                                        180.0,
-                                        linear_color_stop(theme.surface.alpha(0.0), 0.0),
-                                        linear_color_stop(theme.surface, 1.0),
-                                    )),
-                            )
-                        }),
-                ),
-        )
+                            .when(show_top_fade, |body| {
+                                body.child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .w_full()
+                                        .h(px(TOOL_GROUP_EDGE_FADE_DISTANCE))
+                                        .bg(linear_gradient(
+                                            0.0,
+                                            linear_color_stop(theme.surface.alpha(0.0), 0.0),
+                                            linear_color_stop(theme.surface, 1.0),
+                                        )),
+                                )
+                            })
+                            .when(show_bottom_fade, |body| {
+                                body.child(
+                                    div()
+                                        .absolute()
+                                        .bottom_0()
+                                        .left_0()
+                                        .w_full()
+                                        .h(px(TOOL_GROUP_EDGE_FADE_DISTANCE))
+                                        .bg(linear_gradient(
+                                            180.0,
+                                            linear_color_stop(theme.surface.alpha(0.0), 0.0),
+                                            linear_color_stop(theme.surface, 1.0),
+                                        )),
+                                )
+                            }),
+                    ),
+            )
+        })
 }
-
 fn toggle_command_activity(
     home_entity: &Entity<HomeView>,
     item_id: &str,
@@ -4566,6 +5276,11 @@ fn command_activity(
         format!("{}，折叠详情", summary.text)
     } else {
         format!("{}，展开详情", summary.text)
+    };
+    let accessible_label = if command.status == CommandExecutionStatus::Failed {
+        format!("{accessible_label}，命令失败")
+    } else {
+        accessible_label
     };
     let click_home = home_entity.clone();
     let click_item_id = item_id.clone();
@@ -5103,6 +5818,253 @@ fn collaboration_activity(
     })
 }
 
+fn web_search_activity(
+    item_id: String,
+    query: String,
+    _results: serde_json::Value,
+    theme: Theme,
+) -> impl IntoElement {
+    div()
+        .id(SharedString::from(format!("web-search-{item_id}")))
+        .h(px(21.0))
+        .min_w(px(0.0))
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .text_color(theme.text.alpha(0.60))
+        .child(
+            icon("search", theme.text.alpha(0.60).into())
+                .size(px(16.0))
+                .flex_none(),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(14.0))
+                .line_height(px(21.0))
+                .child(format!("已搜索网页 ：{query}")),
+        )
+}
+
+fn activity_group_icon(name: &'static str, theme: Theme) -> gpui::AnyElement {
+    if name == "activity-native-app" {
+        gpui::img(gpui::ImageSource::Resource(gpui::Resource::Embedded(
+            "icons/activity-app-placeholder.png".into(),
+        )))
+        .size(px(TOOL_GROUP_ICON_SIZE))
+        .flex_none()
+        .object_fit(ObjectFit::Contain)
+        .into_any_element()
+    } else {
+        icon(name, theme.text.alpha(0.60).into())
+            .size(px(TOOL_GROUP_ICON_SIZE))
+            .flex_none()
+            .into_any_element()
+    }
+}
+
+fn is_computer_use_call(call: &AgentMcpToolCall) -> bool {
+    call.server == "cua_repl" && matches!(call.tool.as_str(), "js" | "js_reset")
+}
+
+fn computer_use_surface_label(call: &AgentMcpToolCall) -> Option<String> {
+    let metadata = call.result.as_ref()?.get("_meta")?;
+    let surface = metadata.get("codex/toolSurface");
+    if surface
+        .and_then(|s| s.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        == Some("browserUse")
+        || metadata
+            .get("codex/browserUse")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        return Some("浏览器".into());
+    }
+    let surface = surface?;
+    if surface.get("kind").and_then(serde_json::Value::as_str) != Some("computerUse") {
+        return None;
+    }
+    Some(
+        surface
+            .get("app")
+            .and_then(|a| a.get("appId").or_else(|| a.get("name")))
+            .and_then(serde_json::Value::as_str)
+            .map(|name| {
+                name.split('-')
+                    .map(|part| {
+                        let mut chars = part.chars();
+                        chars
+                            .next()
+                            .map(|c| c.to_uppercase().chain(chars).collect::<String>())
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_else(|| "Computer Use".into()),
+    )
+}
+
+fn tool_image_format(bytes: &[u8], mime: Option<&str>) -> gpui::ImageFormat {
+    // Older Computer Use results sometimes label JPEG screenshots as image/png.
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        gpui::ImageFormat::Png
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        gpui::ImageFormat::Jpeg
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        gpui::ImageFormat::Gif
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        gpui::ImageFormat::Webp
+    } else {
+        mime.and_then(gpui::ImageFormat::from_mime_type)
+            .unwrap_or(gpui::ImageFormat::Png)
+    }
+}
+
+fn computer_use_activity(
+    home: Entity<HomeView>,
+    call: AgentMcpToolCall,
+    expanded: bool,
+    theme: Theme,
+) -> Div {
+    let label = mcp_tool_call_label(&call);
+    let id = call.id.clone();
+    let click_id = id.clone();
+    let click_home = home.clone();
+    let hover: SharedString = format!("computer-use-{id}").into();
+    let color = theme.text.alpha(0.60);
+    let icon_name = if computer_use_surface_label(&call)
+        .is_some_and(|s| s != "浏览器" && s != "Computer Use")
+    {
+        "activity-native-app"
+    } else {
+        "activity-computer-use"
+    };
+    let mut body = div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .pt(px(4.0));
+    if expanded {
+        if let Some(parts) = call
+            .result
+            .as_ref()
+            .and_then(|r| r.get("content"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for (index, part) in parts.iter().enumerate() {
+                if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                    body = body.child(crate::components::markdown::render_tool_text(
+                        text,
+                        theme,
+                        &format!("{id}-{index}"),
+                    ));
+                } else if part.get("type").and_then(serde_json::Value::as_str) == Some("image") {
+                    use base64::Engine as _;
+                    if let Some(bytes) = part
+                        .get("data")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+                    {
+                        let format = tool_image_format(
+                            &bytes,
+                            part.get("mimeType").and_then(serde_json::Value::as_str),
+                        );
+                        let (width, height) =
+                            crate::agent::encoded_image_dimensions(&bytes).unwrap_or((160, 160));
+                        let height_scale = (160.0 / height.max(1) as f32).min(1.0);
+                        body = body.child(
+                            gpui::img(Arc::new(gpui::Image::from_bytes(format, bytes)))
+                                .w(px(width as f32 * height_scale))
+                                .h(px(height as f32 * height_scale))
+                                .max_w_full()
+                                .object_fit(ObjectFit::Contain)
+                                .rounded(px(10.0)),
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(error) = call.error {
+            body = body.child(div().text_color(theme.warning).child(error));
+        }
+    }
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex_none()
+        .flex()
+        .flex_col()
+        .items_start()
+        .child(
+            div()
+                .id(SharedString::from(format!("computer-use-{id}")))
+                .group(hover.clone())
+                .h(px(21.0))
+                .max_w_full()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .rounded(px(6.0))
+                .focusable()
+                .tab_stop(true)
+                .role(Role::Button)
+                .aria_expanded(expanded)
+                .aria_label(format!(
+                    "{label}，{}详情",
+                    if expanded { "折叠" } else { "展开" }
+                ))
+                .focus_visible(|s| s.border_1().border_color(rgba(0x3a83f7ff)))
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    toggle_command_activity(&click_home, &click_id, &ScrollHandle::new(), cx)
+                })
+                .on_key_down(move |e, _, cx| {
+                    if matches!(e.keystroke.key.as_str(), "enter" | "space") {
+                        toggle_command_activity(&home, &id, &ScrollHandle::new(), cx);
+                        cx.stop_propagation();
+                    }
+                })
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(activity_group_icon(icon_name, theme))
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(14.0))
+                                .line_height(px(21.0))
+                                .font_family(".SystemUIFont")
+                                .font_weight(FontWeight::NORMAL)
+                                .text_color(color)
+                                .child(label),
+                        ),
+                )
+                .child(
+                    icon("settings-chevron-right", color.into())
+                        .size(px(12.0))
+                        .flex_none()
+                        .opacity(if expanded { 1.0 } else { 0.0 })
+                        .group_hover(hover, |s| s.opacity(1.0))
+                        .with_transformation(Transformation::rotate(radians(if expanded {
+                            std::f32::consts::FRAC_PI_2
+                        } else {
+                            0.0
+                        }))),
+                ),
+        )
+        .when(expanded, |row| row.child(body))
+}
+
 fn humanize_mcp_tool_name(tool: &str) -> String {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -5135,6 +6097,16 @@ fn humanize_mcp_tool_name(tool: &str) -> String {
 }
 
 fn mcp_tool_call_label(tool_call: &AgentMcpToolCall) -> String {
+    if is_computer_use_call(tool_call) {
+        if let Some(title) = tool_call
+            .arguments
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            return title.to_owned();
+        }
+    }
     tool_call
         .app_context
         .as_ref()
@@ -5257,7 +6229,7 @@ fn context_compaction_activity(
         .font_family(".SystemUIFont")
         .text_color(color)
         .child(icon("context-compaction", color.into()).size(px(20.0)))
-        .when(compaction.completed, |row| row.child("上下文已压缩"))
+        .when(compaction.completed, |row| row.child("上下文已自动压缩"))
         .when(!compaction.completed, |row| {
             row.child(shimmer_label(
                 "正在压缩上下文",
@@ -6345,6 +7317,9 @@ mod tests {
                     command: "cargo check".to_owned(),
                     output: "Finished dev profile".to_owned(),
                     status: CommandExecutionStatus::Completed,
+                    actions: Vec::new(),
+                    cwd: None,
+                    exit_code: None,
                 },
             ],
             started_at: Some(1_000),
@@ -6433,6 +7408,9 @@ mod tests {
             },
             output: "Finished dev profile".to_owned(),
             status: CommandExecutionStatus::Completed,
+            actions: Vec::new(),
+            cwd: None,
+            exit_code: None,
         }));
         let history = ThreadHistory {
             thread: ThreadSummary {
@@ -6807,6 +7785,18 @@ mod tests {
     }
 
     #[test]
+    fn computer_use_screenshot_bytes_override_incorrect_historical_mime() {
+        assert_eq!(
+            super::tool_image_format(&[0xff, 0xd8, 0xff, 0xe0], Some("image/png")),
+            gpui::ImageFormat::Jpeg
+        );
+        assert_eq!(
+            super::tool_image_format(b"\x89PNG\r\n\x1a\n", Some("image/jpeg")),
+            gpui::ImageFormat::Png
+        );
+    }
+
+    #[test]
     fn generated_image_preview_and_failure_retry_respond_to_real_clicks() {
         let suffix = std::process::id();
         let path = std::env::temp_dir().join(format!("gpui-generated-card-{suffix}.png"));
@@ -7016,8 +8006,8 @@ mod tests {
 
     #[test]
     fn assistant_footer_matches_the_live_cdp_geometry() {
-        assert_eq!(RESPONSE_ACTION_FOOTER_OFFSET, 6.0);
-        assert_eq!(RESPONSE_ACTION_FOOTER_HEIGHT, 20.0);
+        assert_eq!(RESPONSE_ACTION_FOOTER_OFFSET, 3.0);
+        assert_eq!(RESPONSE_ACTION_FOOTER_HEIGHT, 26.0);
         assert_eq!(RESPONSE_ACTION_FOOTER_ELECTRON_SHIFT, -4.0);
         assert_eq!(RESPONSE_ACTION_GAP, 2.0);
         assert_eq!(RESPONSE_TIME_MARGIN, 6.0);
@@ -7473,4 +8463,329 @@ mod tests {
             ));
         });
     }
+}
+
+#[cfg(test)]
+mod resumed_history_tests {
+    use super::*;
+
+    struct HeaderHarness {
+        home: Entity<HomeView>,
+        focus: FocusHandle,
+    }
+
+    impl Render for HeaderHarness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let expanded = self.home.read(cx).expanded_resumed_turns.contains("turn");
+            resumed_work_header(
+                self.home.clone(),
+                self.focus.clone(),
+                "turn".into(),
+                "用时 1秒".into(),
+                expanded,
+                Theme::for_mode(ThemeMode::Dark),
+            )
+        }
+    }
+
+    #[test]
+    fn resumed_header_keyboard_toggles_with_a_persistent_focus_handle() {
+        use gpui::{AppContext, TestApp};
+        let mut app = TestApp::new();
+        let mut window = app.open_window_with_options(Default::default(), |_, cx| HeaderHarness {
+            home: cx.new(|cx| HomeView::new(ThemeMode::Dark, cx)),
+            focus: cx.focus_handle(),
+        });
+        window.update(|header, window, cx| window.focus(&header.focus, cx));
+        window.draw();
+        window.simulate_keystroke("enter");
+        assert!(
+            window.read(|header, cx| header.home.read(cx).expanded_resumed_turns.contains("turn"))
+        );
+        window.draw();
+        window.simulate_keystroke("space");
+        assert!(
+            !window.read(|header, cx| header.home.read(cx).expanded_resumed_turns.contains("turn"))
+        );
+    }
+
+    fn message(id: &str) -> ConversationActivity {
+        ConversationActivity::AssistantMessage {
+            item_id: id.into(),
+            text: id.into(),
+        }
+    }
+
+    #[test]
+    fn resumed_summary_merges_repeated_paths_and_excludes_failed_edits() {
+        use crate::components::file_change::FileChangeActivityPresentation;
+        let first = FileChangeActivityPresentation::edited("one", "src/main.rs", 2, 1);
+        let second = FileChangeActivityPresentation::edited("two", "src/main.rs", 3, 2);
+        let mut failed = FileChangeActivityPresentation::edited("failed", "secret.rs", 50, 0);
+        failed.status = AgentFileChangeStatus::Failed;
+        let activities = [first, second, failed]
+            .into_iter()
+            .map(ConversationActivity::FileChange)
+            .collect::<Vec<_>>();
+        let turn = ResumedTurnPresentation {
+            id: "turn".into(),
+            duration_ms: None,
+            final_message_ids: vec![],
+        };
+        let summary = resumed_file_summary(&activities, Some(&turn)).unwrap();
+        assert_eq!(summary.files.len(), 1);
+        assert_eq!(
+            (summary.total_additions(), summary.total_deletions()),
+            (5, 3)
+        );
+        assert!(resumed_file_summary(&activities, None).is_none());
+    }
+
+    #[test]
+    fn completed_history_hides_only_the_process_prefix_and_expands_in_order() {
+        let activities = vec![
+            message("commentary"),
+            message("answer"),
+            message("attachment"),
+        ];
+        let resumed = ResumedTurnPresentation {
+            id: "turn".into(),
+            duration_ms: Some(91_000),
+            final_message_ids: vec!["answer".into()],
+        };
+        let mut rows = Vec::new();
+        append_turn_activity_rows(
+            &mut rows,
+            &activities,
+            false,
+            ConversationPhase::Complete,
+            Some(&resumed),
+            &HashSet::new(),
+        );
+        assert!(
+            matches!(&rows[0], ConversationListRow::ResumedWork { label, expanded: false, .. } if label == "用时 1分钟 31秒")
+        );
+        assert_eq!(rows.len(), 3);
+        assert!(
+            matches!(&rows[1], ConversationListRow::Activity { unit: ActivityStreamUnit::Standalone(ConversationActivity::AssistantMessage { item_id, .. }), .. } if item_id == "answer")
+        );
+        let mut expanded = Vec::new();
+        append_turn_activity_rows(
+            &mut expanded,
+            &activities,
+            false,
+            ConversationPhase::Complete,
+            Some(&resumed),
+            &HashSet::from(["turn".into()]),
+        );
+        assert_eq!(expanded.len(), 4);
+        assert!(
+            matches!(&expanded[1], ConversationListRow::Activity { unit: ActivityStreamUnit::Standalone(ConversationActivity::AssistantMessage { item_id, .. }), .. } if item_id == "commentary")
+        );
+    }
+
+    #[test]
+    fn incomplete_failed_and_unidentified_history_stays_visible() {
+        let activities = vec![message("commentary"), message("answer")];
+        let resumed = ResumedTurnPresentation {
+            id: "turn".into(),
+            duration_ms: None,
+            final_message_ids: vec!["answer".into()],
+        };
+        for phase in [
+            ConversationPhase::Streaming,
+            ConversationPhase::Stopped,
+            ConversationPhase::Failed,
+        ] {
+            let mut rows = Vec::new();
+            append_turn_activity_rows(
+                &mut rows,
+                &activities,
+                false,
+                phase,
+                Some(&resumed),
+                &HashSet::new(),
+            );
+            assert_eq!(rows.len(), 2);
+            assert!(
+                rows.iter()
+                    .all(|row| matches!(row, ConversationListRow::Activity { .. }))
+            );
+        }
+        let mut rows = Vec::new();
+        append_turn_activity_rows(
+            &mut rows,
+            &activities,
+            false,
+            ConversationPhase::Complete,
+            None,
+            &HashSet::new(),
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(resumed_work_label(None), "工作过程");
+        assert_eq!(resumed_work_label(Some(3_849_000)), "用时 1小时 4分钟 9秒");
+    }
+}
+
+#[cfg(test)]
+mod resume_activity_regression_tests {
+    use super::*;
+
+    fn computer_call(id: &str, title: &str, surface: serde_json::Value) -> AgentMcpToolCall {
+        AgentMcpToolCall {
+            id: id.into(),
+            server: "cua_repl".into(),
+            tool: "js".into(),
+            status: AgentMcpToolCallStatus::Completed,
+            arguments: serde_json::json!({"title": title, "code": "await cua.getState()"}),
+            app_context: None,
+            plugin_id: Some("unified-computer-use@openai-bundled".into()),
+            result: Some(
+                serde_json::json!({"content": [], "_meta": {"codex/toolSurface": surface}}),
+            ),
+            error: None,
+            legacy_resource_uri: None,
+            read_only_hint: Some(true),
+            duration_ms: Some(300),
+            progress: vec![],
+        }
+    }
+
+    #[test]
+    fn computer_use_keeps_its_title_and_chronological_place_inside_command_groups() {
+        let call = computer_call(
+            "computer",
+            "枚举应用以准备独立 GPUI 界面验收",
+            serde_json::json!({"kind":"browserUse"}),
+        );
+        assert_eq!(
+            mcp_tool_call_label(&call),
+            "枚举应用以准备独立 GPUI 界面验收"
+        );
+        let command = |id: &str| {
+            ConversationActivity::Command(CommandExecution {
+                id: id.into(),
+                command: "pwd".into(),
+                actions: vec![],
+                cwd: "/tmp".into(),
+                output: String::new(),
+                terminal_process_id: None,
+                status: CommandExecutionStatus::Completed,
+                exit_code: Some(0),
+            })
+        };
+        let activities = vec![
+            command("before"),
+            ConversationActivity::McpToolCall(call),
+            command("after"),
+        ];
+        let units = activity_stream_units(&activities);
+        let [ActivityStreamUnit::ToolGroup(group)] = units.as_slice() else {
+            panic!("computer use must not split the group")
+        };
+        assert_eq!(group.activities, activities);
+        assert_eq!(
+            completed_tool_group_summary(group).text,
+            "已使用 浏览器运行了命令"
+        );
+    }
+
+    #[test]
+    fn surface_metadata_and_missing_metadata_do_not_erase_computer_calls() {
+        let app = computer_call(
+            "app",
+            "连接独立 GPUI Capture",
+            serde_json::json!({"kind":"computerUse","app":{"kind":"appId","appId":"com.openai.gpui-chat-clone.capture"}}),
+        );
+        assert_eq!(
+            computer_use_surface_label(&app).as_deref(),
+            Some("Com.openai.gpui Chat Clone.capture")
+        );
+        let mut reset = computer_call("reset", "", serde_json::Value::Null);
+        reset.tool = "js_reset".into();
+        reset.arguments = serde_json::json!({});
+        assert_eq!(mcp_tool_call_label(&reset), "Js reset");
+        let units = activity_stream_units(&[
+            ConversationActivity::McpToolCall(app),
+            ConversationActivity::McpToolCall(reset),
+        ]);
+        let [ActivityStreamUnit::ToolGroup(group)] = units.as_slice() else {
+            panic!("reset belongs to the surrounding group")
+        };
+        assert_eq!(group.activities.len(), 2);
+        assert_eq!(
+            completed_tool_group_summary(group).text,
+            "已使用 Com.openai.gpui Chat Clone.capture 集成"
+        );
+    }
+
+    #[test]
+    fn adjacent_image_inspections_share_a_disclosure_without_losing_paths() {
+        let images = vec![
+            AgentImageView {
+                id: "a".into(),
+                path: "/tmp/a.png".into(),
+            },
+            AgentImageView {
+                id: "b".into(),
+                path: "/tmp/b.png".into(),
+            },
+        ];
+        let units = activity_stream_units(
+            &images
+                .iter()
+                .cloned()
+                .map(ConversationActivity::ImageView)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            units,
+            vec![ActivityStreamUnit::Standalone(
+                ConversationActivity::ImageViews(images)
+            )]
+        );
+    }
+}
+
+/// Semantic companion to resumed-thread screenshots. Uses the same grouping
+/// function as the live view; no rollout-file access or alternate renderer.
+#[cfg(feature = "screenshot")]
+pub(crate) fn resumed_activity_audit(activities: &[ConversationActivity]) -> serde_json::Value {
+    fn item(activity: &ConversationActivity) -> serde_json::Value {
+        use serde_json::json;
+        match activity {
+            ConversationActivity::Command(c) => {
+                json!({"type":"command","id":c.id,"labels":command_activity_summaries(c).iter().map(|s|s.text.clone()).collect::<Vec<_>>()})
+            }
+            ConversationActivity::McpToolCall(c) => {
+                json!({"type":"mcp","id":c.id,"label":mcp_tool_call_label(c)})
+            }
+            ConversationActivity::FileChange(c) => {
+                json!({"type":"fileChange","id":c.item_id,"files":c.review.files.iter().map(|f|&f.path).collect::<Vec<_>>()})
+            }
+            ConversationActivity::ImageView(i) => json!({"type":"imageView","id":i.id}),
+            ConversationActivity::ImageViews(images) => {
+                json!({"type":"imageViews","ids":images.iter().map(|i|&i.id).collect::<Vec<_>>()})
+            }
+            ConversationActivity::AssistantMessage { item_id, text } => {
+                json!({"type":"assistant","id":item_id,"text":text})
+            }
+            ConversationActivity::QuestionReply {
+                item_id,
+                question,
+                answer,
+            } => json!({"type":"questionReply","id":item_id,"question":question,"answer":answer}),
+            ConversationActivity::WebSearch { item_id, query, .. } => {
+                json!({"type":"webSearch","id":item_id,"query":query})
+            }
+            ConversationActivity::ContextCompaction(c) => {
+                json!({"type":"contextCompaction","id":c.id})
+            }
+            other => json!({"type":"other","description":format!("{other:?}")}),
+        }
+    }
+    serde_json::Value::Array(activity_stream_units(activities).iter().map(|unit| match unit {
+        ActivityStreamUnit::ToolGroup(g) => serde_json::json!({"type":"toolGroup","label":completed_tool_group_summary(g).text,"items":g.activities.iter().map(item).collect::<Vec<_>>()}),
+        ActivityStreamUnit::Standalone(a) => item(a),
+    }).collect())
 }

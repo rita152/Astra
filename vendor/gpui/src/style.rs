@@ -150,6 +150,8 @@ pub enum GridTemplateMinSize {
     MinContent,
     /// The column or row size can be determined by the max content
     MaxContent,
+    /// Content-sized tracks stretch to share any remaining container width.
+    Auto,
 }
 
 /// A simplified representation of the grid-template-* value

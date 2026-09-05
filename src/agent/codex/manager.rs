@@ -29,11 +29,11 @@ use crate::agent::{
     AgentInterruptControl, AgentInterruptHandle, AgentInterruptOutcome, AgentModel,
     AgentModelCatalog, AgentOptionalField, AgentPermissionMode, AgentPermissionProfile,
     AgentRequest, AgentRun, AgentServerRequestId, AgentThreadActiveFlag, AgentThreadSettings,
-    CommandExecutionStatus, CreateProject, FilterValue, HistoryItemDetail, HistoryTurnStatus, Page,
-    PageRequest, Project, ProjectChange, ProjectId, SortDirection, ThreadActivity,
-    ThreadHistoryItem, ThreadHistoryItemEntry, ThreadId, ThreadListRequest, ThreadMetadataUpdate,
-    ThreadSearchResult, ThreadSection, ThreadSectionAppearance, ThreadSectionId, ThreadSummary,
-    ThreadTurn, UpdateProject, WorkspaceError, WorkspaceResult, normalize_user_message_for_display,
+    CreateProject, FilterValue, HistoryItemDetail, HistoryTurnStatus, Page, PageRequest, Project,
+    ProjectChange, ProjectId, SortDirection, ThreadActivity, ThreadHistoryItem,
+    ThreadHistoryItemEntry, ThreadId, ThreadListRequest, ThreadMetadataUpdate, ThreadSearchResult,
+    ThreadSection, ThreadSectionAppearance, ThreadSectionId, ThreadSummary, ThreadTurn,
+    UpdateProject, WorkspaceError, WorkspaceResult, normalize_user_message_for_display,
 };
 
 trait ManagedProcess: Send + Sync {
@@ -1047,15 +1047,6 @@ fn parse_thread_summary(value: &Value) -> Result<ThreadSummary> {
     })
 }
 
-fn parse_command_status(value: &str) -> Result<CommandExecutionStatus> {
-    match value {
-        "inProgress" => Ok(CommandExecutionStatus::InProgress),
-        "completed" => Ok(CommandExecutionStatus::Completed),
-        "failed" | "declined" => Ok(CommandExecutionStatus::Failed),
-        other => bail!("commandExecution.status 包含未知值 `{other}`"),
-    }
-}
-
 fn parse_file_change_status(value: &str) -> Result<AgentFileChangeStatus> {
     match value {
         "inProgress" => Ok(AgentFileChangeStatus::InProgress),
@@ -1137,29 +1128,48 @@ fn parse_history_item(value: &Value) -> Result<ThreadHistoryItem> {
                 .join("\n");
             Ok(ThreadHistoryItem::UserMessage {
                 item_id,
-                text: normalize_user_message_for_display(&text),
+                // The answer envelope contains JSON escaping, not Markdown.
+                // Preserve it for the resumed question/answer presentation.
+                text: if text
+                    .trim_start()
+                    .starts_with("<send_user_message_question_reply>")
+                {
+                    text.trim().to_owned()
+                } else {
+                    normalize_user_message_for_display(&text)
+                },
             })
         }
         "agentMessage" => Ok(ThreadHistoryItem::AssistantMessage {
             item_id,
             text: string_field(value, "text", "agentMessage item")?,
+            phase: optional_nullable_string_field(value, "phase", "agentMessage item")?,
         }),
         "reasoning" => Ok(ThreadHistoryItem::Reasoning {
             item_id,
             summary: string_array_field(value, "summary", "reasoning item")?,
             content: string_array_field(value, "content", "reasoning item")?,
         }),
-        "commandExecution" => Ok(ThreadHistoryItem::Command {
-            item_id,
-            command: string_field(value, "command", "commandExecution item")?,
-            output: optional_nullable_string_field(
-                value,
-                "aggregatedOutput",
-                "commandExecution item",
-            )?
-            .unwrap_or_default(),
-            status: parse_command_status(&string_field(value, "status", "commandExecution item")?)?,
-        }),
+        "commandExecution" => {
+            // Older persisted items can omit cwd/actions. When present, retain
+            // the same semantic action labels and shell status as live items.
+            let mut item = value
+                .as_object()
+                .context("commandExecution item 必须是对象")?
+                .clone();
+            item.entry("commandActions").or_insert_with(|| json!([]));
+            item.entry("cwd").or_insert_with(|| json!(""));
+            let execution = super::parse_command_execution(&item)?;
+            Ok(ThreadHistoryItem::Command {
+                item_id,
+                command: execution.command,
+                output: execution.output,
+                status: execution.status,
+                actions: execution.actions,
+                cwd: (!execution.cwd.is_empty()).then_some(execution.cwd),
+                exit_code: execution.exit_code,
+            })
+        }
         "fileChange" => Ok(ThreadHistoryItem::FileChange(parse_history_file_change(
             value, item_id,
         )?)),
@@ -1191,6 +1201,12 @@ fn parse_history_item(value: &Value) -> Result<ThreadHistoryItem> {
         "mcpToolCall" => Ok(ThreadHistoryItem::McpToolCall(parse_mcp_tool_call(
             value.as_object().context("mcpToolCall item 必须是对象")?,
         )?)),
+        "webSearch" => Ok(ThreadHistoryItem::WebSearch {
+            item_id,
+            query: string_field(value, "query", "webSearch item")?,
+            action: value.get("action").cloned().unwrap_or(Value::Null),
+            results: value.get("results").cloned().unwrap_or(Value::Null),
+        }),
         _ => Ok(ThreadHistoryItem::Unsupported { item_id, kind }),
     }
 }
@@ -3035,6 +3051,31 @@ mod tests {
     };
 
     const WAIT: Duration = Duration::from_secs(3);
+
+    #[test]
+    fn history_retains_message_phase_and_semantic_command_actions() {
+        let message = parse_history_item(
+            &json!({"type":"agentMessage", "id":"answer", "text":"done", "phase":"final_answer"}),
+        )
+        .unwrap();
+        assert!(
+            matches!(message, ThreadHistoryItem::AssistantMessage { phase: Some(phase), .. } if phase == "final_answer")
+        );
+        let command = parse_history_item(&json!({
+            "type":"commandExecution", "id":"read", "command":"/bin/zsh -lc 'cat src/main.rs'",
+            "commandActions":[{"type":"read", "command":"cat src/main.rs", "name":"main.rs", "path":"src/main.rs"}],
+            "cwd":"/tmp/project", "aggregatedOutput":"source", "status":"completed", "exitCode":0
+        })).unwrap();
+        assert!(
+            matches!(command, ThreadHistoryItem::Command { command, actions, cwd: Some(cwd), exit_code: Some(0), .. }
+            if command == "cat src/main.rs" && cwd == "/tmp/project" && matches!(&actions[0], crate::agent::CommandExecutionAction::Read { name, .. } if name == "main.rs"))
+        );
+        let failed = parse_history_item(&json!({"type":"commandExecution", "id":"failed", "command":"false", "status":"completed", "exitCode":1})).unwrap();
+        assert!(
+            matches!(failed, ThreadHistoryItem::Command { status: crate::agent::CommandExecutionStatus::Failed, actions, cwd: None, .. } if actions.is_empty())
+        );
+        assert!(parse_history_item(&json!({"type":"commandExecution", "id":"bad", "command":"pwd", "status":"completed", "commandActions":{}})).is_err());
+    }
 
     #[test]
     fn history_user_message_matches_live_text_with_attachment_content() {
@@ -5093,5 +5134,40 @@ mod tests {
         }
         assert_eq!(process.terminate_calls.load(Ordering::Acquire), 1);
         assert!(process.waited.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod resumed_rendering_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn question_reply_json_escaping_survives_history_normalization() {
+        let text = "<send_user_message_question_reply>\n[{\"questionItemId\":\"[\\\"request_user_input_async\\\",\\\"call_1\\\",0]\",\"question\":\"哪里？\",\"answer\":\"左侧栏\"}]\n</send_user_message_question_reply>";
+        let item = parse_history_item(
+            &json!({"type":"userMessage","id":"reply","content":[{"type":"text","text":text}]}),
+        )
+        .unwrap();
+        let ThreadHistoryItem::UserMessage { text: actual, .. } = item else {
+            panic!("user reply")
+        };
+        assert_eq!(actual, text);
+    }
+
+    #[test]
+    fn resumed_web_search_preserves_query_actions_and_results() {
+        let value = json!({"type":"webSearch","id":"search","query":"字体","action":{"type":"search","queries":["字体"]},"results":[{"url":"https://example.test/","title":"字体"}]});
+        let ThreadHistoryItem::WebSearch {
+            query,
+            action,
+            results,
+            ..
+        } = parse_history_item(&value).unwrap()
+        else {
+            panic!("search must not become an unsupported warning")
+        };
+        assert_eq!(query, "字体");
+        assert_eq!(action, value["action"]);
+        assert_eq!(results, value["results"]);
     }
 }

@@ -10,8 +10,8 @@ use std::{
 use async_channel::Receiver;
 use serde_json::Value;
 
-pub(crate) use codex::generated_image_dimensions;
 pub use codex::{CodexAppServerBackend, CodexAppServerManager};
+pub(crate) use codex::{encoded_image_dimensions, generated_image_dimensions};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentReasoningEffort {
@@ -349,6 +349,8 @@ pub enum ThreadHistoryItem {
     AssistantMessage {
         item_id: String,
         text: String,
+        /// Distinguishes progress commentary from the final resumed answer.
+        phase: Option<String>,
     },
     Reasoning {
         item_id: String,
@@ -360,6 +362,9 @@ pub enum ThreadHistoryItem {
         command: String,
         output: String,
         status: CommandExecutionStatus,
+        actions: Vec<CommandExecutionAction>,
+        cwd: Option<String>,
+        exit_code: Option<i64>,
     },
     FileChange(AgentFileChange),
     ImageView(AgentImageView),
@@ -367,6 +372,12 @@ pub enum ThreadHistoryItem {
     ContextCompaction(AgentContextCompaction),
     Collaboration(AgentCollaboration),
     McpToolCall(AgentMcpToolCall),
+    WebSearch {
+        item_id: String,
+        query: String,
+        action: Value,
+        results: Value,
+    },
     Unsupported {
         item_id: String,
         kind: String,

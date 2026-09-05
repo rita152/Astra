@@ -1,6 +1,6 @@
 # GPUI Codex chat clone
 
-这是一个纯 GPUI、组件化的 Codex 桌面界面。应用不嵌入 HTML/WebView，也不把截图或 PNG/JPEG 用作产品 UI；侧栏、工作区、Composer、设置、审批和 Diff Review 均由 GPUI 原生组件、系统字体与 SVG 绘制。
+这是一个纯 GPUI、组件化的 Codex 桌面界面。应用不嵌入 HTML/WebView，也不把整屏截图用作产品 UI；侧栏、工作区、Composer、设置、审批和 Diff Review 均由 GPUI 原生组件、系统字体与图标资源绘制。
 
 ## 启动
 
@@ -32,10 +32,29 @@ target/release/gpui-chat-clone \
   --screenshot=artifacts/resumed-thread-light.png
 ```
 
-该路径会等待线程历史、侧栏和模型目录完成 hydration，并额外等待三个实际绘制的稳定帧；历史加载失败或超时会以非零状态退出，截图输出目录会自动创建。
+该路径会等待线程历史、侧栏和模型目录完成 hydration，并额外等待三个实际绘制的稳定帧；历史加载失败或超时会以非零状态退出，截图输出目录会自动创建，并在 PNG 旁写入 `.png.render.json`，记录同一渲染路径的全部轮次、工具组与 item id，供逐项核对。
 `<thread-id>` 可直接使用 ChatGPT App 侧栏 DOM 中的 `local:<uuid>`，也可使用 Codex app-server 的原始 UUID。
 窗口宽高使用逻辑像素；PNG 的物理像素尺寸会跟随当前显示器缩放倍率。
 `--resume-scroll-from-bottom` 为可选的逻辑像素距离，用于让 light/dark 捕获稳定落在同一段历史内容；省略时截图停在会话底部。
+
+已完成的恢复轮次将最后一条最终答复之前的过程消息与工具活动收进“用时 …”折叠区，支持点击、Tab 聚焦和 Enter／Space 展开；展开后的工具仍按独立虚拟列表项渲染。历史缺少消息 `phase` 时只将最后一条未标注的助手消息视为最终答复；运行中、失败和中断轮次保持活动可见。
+
+恢复轮次的已完成文件补丁会按路径汇总为文件卡，默认显示前三项，支持展开全部文件及打开真实 diff 审核。Markdown 本地图片保留缩略图和打开原图入口；文件链接保留行号与类型图标，表格按内容分配列宽并填满最小正文宽度。
+
+真实恢复线程的双主题对照可使用以下脚本。manifest 是包含 `id`、`title`、`slug` 的 JSON 数组；CDP 脚本仅在专用 ChatGPT 调试实例中导航已有线程、切换主题和展开控件，不发送提示词。参考视口为 1440×900、DPR 1，脚本将侧栏拖到 240px；GPUI 也须在 1× 显示器上捕获，不能缩放图片后宣称像素对齐。
+
+```bash
+python3 scripts/capture_resume_reference.py --manifest /path/to/manifest.json
+cargo build --features screenshot
+mkdir -p 'target/GPUI Capture.app/Contents/MacOS'
+cp scripts/gpui_capture_info.plist 'target/GPUI Capture.app/Contents/Info.plist'
+cp target/debug/gpui-chat-clone 'target/GPUI Capture.app/Contents/MacOS/gpui-chat-clone'
+codesign --force --sign - 'target/GPUI Capture.app'
+python3 scripts/capture_resume_gpui.py \
+  --manifest /path/to/manifest.json --output artifacts/resume-alignment/actual
+```
+
+对单个真实线程做逐条诊断时，可先运行 `scripts/capture_resume_activity_audit.py --output <目录>` 捕获当前 ChatGPT 线程全部五轮的双主题活动，再用 `scripts/audit_resume_rendering.py --jsonl <只读 rollout 路径> --history <thread/read 响应 JSON> --dom <捕获的 dom-audit.json> --native <GPUI 截图的 .png.render.json> --output <审计结果 JSON>` 建立每条记录的对应关系。JSONL 仅用于离线诊断；应用恢复仍通过 app-server 读取。
 
 图像生成组件可用同一条确定性截图路径复核。`running`、`completed`、`failed`、`load-error` 分别固定加载、成功、额度失败和文件加载失败状态；成功态传入真实输出文件：
 

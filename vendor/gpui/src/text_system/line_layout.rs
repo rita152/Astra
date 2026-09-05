@@ -9,8 +9,6 @@ use std::{
     sync::Arc,
 };
 
-use super::LineWrapper;
-
 /// A laid out and styled line of text
 #[derive(Default, Debug)]
 pub struct LineLayout {
@@ -202,7 +200,9 @@ impl LineLayout {
             glyph_ix: 0,
         };
         let mut last_boundary_x = px(0.);
-        let mut prev_ch = '\0';
+        let break_opportunities = unicode_linebreak::linebreaks(text)
+            .map(|(index, _)| index)
+            .collect::<std::collections::HashSet<_>>();
         let mut glyphs = self
             .runs
             .iter()
@@ -224,18 +224,12 @@ impl LineLayout {
                 continue;
             }
 
-            // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
-            // but there are some differences, so we have to duplicate the code here.
-            if LineWrapper::is_word_char(ch) {
-                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
-            } else {
-                if ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
+            // Browser paragraph wrapping uses Unicode line-break rules. Word
+            // classification alone permits a closing CJK mark at line start.
+            let byte_index = self.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+            if first_non_whitespace_ix.is_some() && break_opportunities.contains(&byte_index) {
+                last_candidate_ix = Some(boundary);
+                last_candidate_x = x;
             }
 
             if ch != ' ' && first_non_whitespace_ix.is_none() {
@@ -245,7 +239,10 @@ impl LineLayout {
             let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
             let width = next_x - last_boundary_x;
 
-            if width > wrap_width && boundary > last_boundary {
+            // Intrinsic flex measurement can subtract padding from a fractional
+            // advance with a few ULPs of error. Do not create a second line for
+            // a word that fits its own measured width.
+            if width > wrap_width + px(0.0001) && boundary > last_boundary {
                 // When used line_clamp, we should limit the number of lines.
                 if let Some(max_lines) = max_lines
                     && boundaries.len() >= max_lines.saturating_sub(1)
@@ -262,7 +259,6 @@ impl LineLayout {
                 }
                 boundaries.push(last_boundary);
             }
-            prev_ch = ch;
         }
 
         boundaries
@@ -1136,5 +1132,14 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+    #[test]
+    fn paragraph_wrap_keeps_closing_cjk_punctuation_with_preceding_glyph() {
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(14., 3), glyph_at(28., 6)]);
+        layout.width = px(42.);
+        layout.len = "对照。".len();
+        let boundaries = layout.compute_wrap_boundaries("对照。", px(28.), None);
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(boundaries[0].glyph_ix, 1);
     }
 }

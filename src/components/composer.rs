@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
-use chrono::Local;
+use chrono::{Datelike, Local};
 use gpui::{
     Animation, AnimationExt, BoxShadow, Context, Div, Entity, FocusHandle, Focusable, KeyDownEvent,
     MouseButton, Render, SharedString, Transformation, Window, deferred, div, hsla,
@@ -142,6 +142,69 @@ pub struct ConversationTranscriptTurn {
     pub assistant_message: String,
     pub assistant_message_time: Option<String>,
     pub activities: Vec<ConversationActivity>,
+    pub resumed: Option<ResumedTurnPresentation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumedTurnPresentation {
+    pub id: String,
+    pub duration_ms: Option<i64>,
+    pub final_message_ids: Vec<String>,
+}
+
+fn resumed_question_replies(text: &str) -> Option<Vec<(String, String)>> {
+    let json = text
+        .trim()
+        .strip_prefix("<send_user_message_question_reply>")?
+        .trim()
+        .strip_suffix("</send_user_message_question_reply>")?
+        .trim();
+    let values: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
+    values
+        .iter()
+        .map(|v| {
+            Some((
+                v.get("question")?.as_str()?.to_owned(),
+                v.get("answer")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect()
+}
+
+fn resumed_final_message_ids(items: &[ThreadHistoryItem]) -> Vec<String> {
+    // A clarification can itself be marked final_answer within a continued
+    // persisted turn. The last final answer terminates the work disclosure;
+    // using the first one exposes all later tool activity by default.
+    let explicit: Vec<_> = items
+        .iter()
+        .rev()
+        .filter_map(|item| match item {
+            ThreadHistoryItem::AssistantMessage {
+                item_id,
+                phase: Some(phase),
+                ..
+            } if phase == "final_answer" => Some(item_id.clone()),
+            _ => None,
+        })
+        .take(1)
+        .collect();
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    // Older rollouts predate `phase`. Only their last assistant item can be
+    // treated as a final answer; earlier commentary remains in the disclosure.
+    items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            ThreadHistoryItem::AssistantMessage {
+                item_id,
+                phase: None,
+                ..
+            } => Some(vec![item_id.clone()]),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,10 +249,21 @@ pub enum ConversationActivity {
     PermissionsApproval(PermissionApprovalPresentation),
     FileChange(FileChangeActivityPresentation),
     ImageView(AgentImageView),
+    ImageViews(Vec<AgentImageView>),
     ImageGeneration(AgentImageGeneration),
     ContextCompaction(AgentContextCompaction),
     Collaboration(AgentCollaboration),
     McpToolCall(AgentMcpToolCall),
+    WebSearch {
+        item_id: String,
+        query: String,
+        results: serde_json::Value,
+    },
+    QuestionReply {
+        item_id: String,
+        question: String,
+        answer: String,
+    },
     UserInput(UserInputRequestPresentation),
     ProtocolError {
         message: String,
@@ -245,6 +319,26 @@ const STREAM_DISCONNECTED_MESSAGE: &str = "Codex 事件流意外断开";
 
 fn current_local_time_label() -> String {
     Local::now().format("%H:%M").to_string()
+}
+
+fn history_time_label(timestamp: Option<i64>) -> Option<String> {
+    let timestamp = timestamp?;
+    let date = chrono::DateTime::from_timestamp(timestamp, 0)?.with_timezone(&Local);
+    let time = date.format("%H:%M");
+    if date.date_naive() == Local::now().date_naive() {
+        Some(time.to_string())
+    } else {
+        let weekday = [
+            "星期一",
+            "星期二",
+            "星期三",
+            "星期四",
+            "星期五",
+            "星期六",
+            "星期日",
+        ][date.weekday().num_days_from_monday() as usize];
+        Some(format!("{weekday}{time}"))
+    }
 }
 
 fn permission_presentation_data(
@@ -577,6 +671,7 @@ pub struct ComposerView {
     assistant_message_time: Option<String>,
     conversation_phase: ConversationPhase,
     transcript: Vec<ConversationTranscriptTurn>,
+    resumed_turn: Option<ResumedTurnPresentation>,
     cwd: PathBuf,
     project_id: Option<ProjectId>,
     history_loading: bool,
@@ -713,6 +808,7 @@ impl ComposerView {
             assistant_message_time: None,
             conversation_phase: ConversationPhase::Empty,
             transcript: Vec::new(),
+            resumed_turn: None,
             cwd: std::env::current_dir().unwrap_or_default(),
             project_id: None,
             history_loading: false,
@@ -1176,10 +1272,20 @@ impl ComposerView {
                 let mut activities = Vec::new();
                 for item in &turn.items {
                     match item {
-                        ThreadHistoryItem::UserMessage { text, .. } => {
-                            user_messages.push(normalize_user_message_for_display(text));
+                        ThreadHistoryItem::UserMessage { item_id, text } => {
+                            if let Some(replies) = resumed_question_replies(text) {
+                                activities.extend(replies.into_iter().map(|(question, answer)| {
+                                    ConversationActivity::QuestionReply {
+                                        item_id: item_id.clone(),
+                                        question,
+                                        answer,
+                                    }
+                                }));
+                            } else {
+                                user_messages.push(normalize_user_message_for_display(text));
+                            }
                         }
-                        ThreadHistoryItem::AssistantMessage { item_id, text } => {
+                        ThreadHistoryItem::AssistantMessage { item_id, text, .. } => {
                             assistant_messages.push(text.clone());
                             activities.push(ConversationActivity::AssistantMessage {
                                 item_id: item_id.clone(),
@@ -1207,17 +1313,20 @@ impl ComposerView {
                             command,
                             output,
                             status,
+                            actions,
+                            cwd,
+                            exit_code,
                         } => activities.push(ConversationActivity::Command(CommandExecution {
                             id: item_id.clone(),
                             command: command.clone(),
-                            actions: vec![CommandExecutionAction::Unknown {
-                                command: command.clone(),
-                            }],
-                            cwd: history.thread.cwd.display().to_string(),
+                            actions: actions.clone(),
+                            cwd: cwd
+                                .clone()
+                                .unwrap_or_else(|| history.thread.cwd.display().to_string()),
                             output: output.clone(),
                             terminal_process_id: None,
                             status: *status,
-                            exit_code: None,
+                            exit_code: *exit_code,
                         })),
                         ThreadHistoryItem::FileChange(change) => {
                             activities.push(ConversationActivity::FileChange(
@@ -1249,6 +1358,18 @@ impl ComposerView {
                         ThreadHistoryItem::McpToolCall(tool_call) => {
                             activities.push(ConversationActivity::McpToolCall(tool_call.clone()));
                         }
+                        ThreadHistoryItem::WebSearch {
+                            item_id,
+                            query,
+                            results,
+                            ..
+                        } => {
+                            activities.push(ConversationActivity::WebSearch {
+                                item_id: item_id.clone(),
+                                query: query.clone(),
+                                results: results.clone(),
+                            });
+                        }
                         ThreadHistoryItem::Unsupported { kind, .. } => {
                             activities.push(ConversationActivity::Warning {
                                 message: format!("历史包含当前 UI 尚未呈现的 {kind} 项"),
@@ -1261,6 +1382,19 @@ impl ComposerView {
                         message: error.clone(),
                     });
                 }
+                let final_message_ids = resumed_final_message_ids(&turn.items);
+                let final_messages: Vec<_> = turn
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ThreadHistoryItem::AssistantMessage { item_id, text, .. }
+                            if final_message_ids.contains(item_id) =>
+                        {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect();
                 ConversationTranscriptTurn {
                     phase: match turn.status {
                         HistoryTurnStatus::InProgress => ConversationPhase::Streaming,
@@ -1269,10 +1403,19 @@ impl ComposerView {
                         HistoryTurnStatus::Failed => ConversationPhase::Failed,
                     },
                     user_message: user_messages.join("\n\n"),
-                    user_message_time: None,
-                    assistant_message: assistant_messages.join("\n\n"),
-                    assistant_message_time: None,
+                    user_message_time: history_time_label(turn.started_at),
+                    assistant_message: if final_messages.is_empty() {
+                        assistant_messages.join("\n\n")
+                    } else {
+                        final_messages.join("\n\n")
+                    },
+                    assistant_message_time: history_time_label(turn.completed_at),
                     activities,
+                    resumed: Some(ResumedTurnPresentation {
+                        id: turn.turn_id.clone(),
+                        duration_ms: turn.duration_ms,
+                        final_message_ids,
+                    }),
                 }
             })
             .collect();
@@ -1283,6 +1426,7 @@ impl ComposerView {
             self.assistant_message = last.assistant_message;
             self.assistant_message_time = last.assistant_message_time;
             self.conversation_activity = last.activities;
+            self.resumed_turn = last.resumed;
         } else {
             self.conversation_phase = ConversationPhase::Empty;
             self.user_message = None;
@@ -1290,6 +1434,7 @@ impl ComposerView {
             self.assistant_message.clear();
             self.assistant_message_time = None;
             self.conversation_activity.clear();
+            self.resumed_turn = None;
         }
         cx.emit(ConversationChanged);
         cx.notify();
@@ -1306,7 +1451,12 @@ impl ComposerView {
             assistant_message: std::mem::take(&mut self.assistant_message),
             assistant_message_time: self.assistant_message_time.take(),
             activities: std::mem::take(&mut self.conversation_activity),
+            resumed: self.resumed_turn.take(),
         });
+    }
+
+    pub fn resumed_turn(&self) -> Option<ResumedTurnPresentation> {
+        self.resumed_turn.clone()
     }
 
     pub fn conversation_render_snapshot(
@@ -9121,5 +9271,69 @@ mod tests {
         window.draw();
         window.simulate_keystrokes("down right escape escape");
         assert!(!window.read(|composer, _| composer.menu_open));
+    }
+}
+
+#[cfg(test)]
+mod resumed_phase_tests {
+    use super::*;
+
+    fn message(id: &str, phase: Option<&str>) -> ThreadHistoryItem {
+        ThreadHistoryItem::AssistantMessage {
+            item_id: id.into(),
+            text: id.into(),
+            phase: phase.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn explicit_final_phase_wins_over_later_commentary() {
+        assert_eq!(
+            resumed_final_message_ids(&[
+                message("progress", Some("commentary")),
+                message("answer", Some("final_answer")),
+                message("later", Some("commentary"))
+            ]),
+            vec!["answer"]
+        );
+        assert!(resumed_final_message_ids(&[message("progress", Some("commentary"))]).is_empty());
+    }
+
+    #[test]
+    fn clarification_does_not_end_a_continued_turns_work_disclosure() {
+        assert_eq!(
+            resumed_final_message_ids(&[
+                message("clarification", Some("final_answer")),
+                message("continued-work", Some("commentary")),
+                message("actual-answer", Some("final_answer")),
+            ]),
+            vec!["actual-answer"]
+        );
+    }
+
+    #[test]
+    fn legacy_history_uses_its_last_unphased_message() {
+        assert_eq!(
+            resumed_final_message_ids(&[message("progress", None), message("answer", None)]),
+            vec!["answer"]
+        );
+        assert!(resumed_final_message_ids(&[]).is_empty());
+    }
+    #[test]
+    fn answered_clarification_retains_question_and_answer_separately() {
+        let input = r#"<send_user_message_question_reply>
+[{"question":"哪个区域？","answer":"左侧栏"}]
+</send_user_message_question_reply>"#;
+        assert_eq!(
+            super::resumed_question_replies(input),
+            Some(vec![("哪个区域？".into(), "左侧栏".into())])
+        );
+        assert_eq!(super::resumed_question_replies("普通消息"), None);
+        assert_eq!(
+            super::resumed_question_replies(
+                "<send_user_message_question_reply>invalid</send_user_message_question_reply>"
+            ),
+            None
+        );
     }
 }

@@ -706,6 +706,29 @@ impl ChatApp {
     }
 
     #[cfg(feature = "screenshot")]
+    pub fn resumed_render_audit(&self, thread_id: &str, cx: &gpui::App) -> serde_json::Value {
+        let composer = self.conversation_hosts[&ConversationKey::Thread(thread_id.to_owned())]
+            .composer
+            .read(cx);
+        let mut turns = composer
+            .transcript_render_snapshot()
+            .into_iter()
+            .map(|turn| {
+                serde_json::json!({
+                    "id":turn.resumed.map(|r|r.id), "user_message":turn.user_message,
+                    "units":crate::components::home::resumed_activity_audit(&turn.activities)
+                })
+            })
+            .collect::<Vec<_>>();
+        let (_, user, _, _, _, activities) = composer.conversation_render_snapshot();
+        turns.push(
+            serde_json::json!({"id":composer.resumed_turn().map(|r|r.id), "user_message":user,
+            "units":crate::components::home::resumed_activity_audit(&activities)}),
+        );
+        serde_json::json!({"thread_id":thread_id,"turns":turns})
+    }
+
+    #[cfg(feature = "screenshot")]
     pub fn set_conversation_scroll_from_bottom_for_capture(
         &mut self,
         distance: f32,
@@ -3042,6 +3065,21 @@ impl Render for ChatApp {
         let sidebar_width = self.sidebar.read(cx).width();
         let sidebar_reveal = self.sidebar_reveal.clamp(0.0, 1.0);
         let revealed_sidebar_width = sidebar_width * sidebar_reveal;
+        let resumed_title = match &self.active_conversation {
+            ConversationKey::Thread(id) if !self.showing_settings => {
+                self.workspace_store.snapshot().thread(id).map(|thread| {
+                    (
+                        thread.title.clone(),
+                        crate::workspace::project_id_for_thread(
+                            thread,
+                            &self.workspace_store.snapshot().projects,
+                        )
+                        .is_some(),
+                    )
+                })
+            }
+            _ => None,
+        };
         // CDP at both 2560×1410 and the project's 1440×900 target showed a
         // persisted 1418.21875 px panel, clamped to leave the main thread at
         // its measured 773.09375 px right edge on narrower windows.
@@ -3295,6 +3333,22 @@ impl Render for ChatApp {
                                 ),
                         ),
                 )
+            })
+            .when_some(resumed_title, |shell, (title, in_project)| {
+                // The resumed thread has its own opaque sticky header. Paint
+                // it over the virtual list's overdraw band, just as Electron
+                // masks scrolling Markdown beneath its 46px titlebar.
+                shell.child(div()
+                    .id("resumed-thread-header")
+                    .absolute().top_0().left(px(revealed_sidebar_width))
+                    .right(if self.right_panel_open { right_panel_width } else { px(0.0) })
+                    .h(px(46.0)).bg(theme.surface).border_b_1().border_color(theme.border)
+                    .pl(px(if sidebar_reveal < 0.5 { 184.0 } else { 14.0 })).pr(px(100.0))
+                    .flex().items_center().gap(px(12.0))
+                        .text_size(px(14.0)).line_height(px(20.0)).font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                    .when(in_project, |header| header.child(icon("folder", theme.text.into()).size(px(16.0)).flex_none()))
+                    .child(div().min_w(px(0.0)).truncate().child(title)))
             })
             // Keep the draggable titlebar behind its interactive controls so
             // their 28px hover hit areas receive pointer events.
@@ -4359,6 +4413,7 @@ mod tests {
                     ThreadHistoryItem::AssistantMessage {
                         item_id: format!("assistant-{thread_id}"),
                         text: format!("answer {message}"),
+                        phase: None,
                     },
                 ],
                 started_at: Some(1),

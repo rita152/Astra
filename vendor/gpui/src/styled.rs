@@ -776,6 +776,15 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sizes columns to their content and stretches them to fill the grid.
+    fn grid_cols_auto(mut self, cols: u16) -> Self {
+        self.style().grid_cols = Some(GridTemplate {
+            repeat: cols,
+            min_size: GridTemplateMinSize::Auto,
+        });
+        self
+    }
+
     /// Sets the grid rows of this element.
     fn grid_rows(mut self, rows: u16) -> Self {
         self.style().grid_rows = Some(GridTemplate {

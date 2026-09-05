@@ -3299,17 +3299,21 @@ fn materialize_image_generation_result(item_id: &str, encoded: &str) -> Result<P
 
 pub(crate) fn generated_image_dimensions(path: &Path) -> Result<Option<(u32, u32)>> {
     let bytes = fs::read(path).with_context(|| format!("无法读取生成的图像 {}", path.display()))?;
+    Ok(encoded_image_dimensions(&bytes))
+}
+
+pub(crate) fn encoded_image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.len() >= 24 {
-        return Ok(Some((
+        return Some((
             u32::from_be_bytes(bytes[16..20].try_into().expect("four PNG width bytes")),
             u32::from_be_bytes(bytes[20..24].try_into().expect("four PNG height bytes")),
-        )));
+        ));
     }
     if bytes.starts_with(b"GIF8") && bytes.len() >= 10 {
-        return Ok(Some((
+        return Some((
             u16::from_le_bytes([bytes[6], bytes[7]]).into(),
             u16::from_le_bytes([bytes[8], bytes[9]]).into(),
-        )));
+        ));
     }
     if bytes.starts_with(b"\xff\xd8") {
         let mut offset = 2usize;
@@ -3347,15 +3351,15 @@ pub(crate) fn generated_image_dimensions(path: &Path) -> Result<Option<(u32, u32
                     | 0xcf
             ) && segment_length >= 7
             {
-                return Ok(Some((
+                return Some((
                     u16::from_be_bytes([bytes[offset + 5], bytes[offset + 6]]).into(),
                     u16::from_be_bytes([bytes[offset + 3], bytes[offset + 4]]).into(),
-                )));
+                ));
             }
             offset += segment_length;
         }
     }
-    Ok(None)
+    None
 }
 
 pub(super) fn parse_image_generation(
