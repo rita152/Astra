@@ -440,8 +440,8 @@ fn main() {
         })
         .run(move |cx: &mut App| {
             cx.set_window_appearance(Some(match mode {
-                ThemeMode::Light => WindowAppearance::VibrantLight,
-                ThemeMode::Dark => WindowAppearance::VibrantDark,
+                ThemeMode::Light => WindowAppearance::Light,
+                ThemeMode::Dark => WindowAppearance::Dark,
             }));
             cx.bind_keys([gpui::KeyBinding::new(
                 "escape",
@@ -490,6 +490,10 @@ fn main() {
                         window.on_next_frame(|window, _| window.zoom_window());
                     }
                     let app = cx.new(|cx| {
+                        cx.observe_window_activation(window, |_, _, cx| cx.notify())
+                            .detach();
+                        cx.observe_window_bounds(window, |_, _, cx| cx.notify())
+                            .detach();
                         let mut app = ChatApp::new(mode, sidebar_bottom, cx);
                         if permission_ui_capture {
                             app.enable_permission_ui_for_capture(cx);

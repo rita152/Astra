@@ -109,16 +109,37 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// Electron disables its native backdrop for inactive macOS windows and
+    /// windows whose physical dimensions reach 3840 × 2160 (either orientation).
+    /// Paint the same surface-under beneath the 70% tint in those states.
+    pub fn for_window(mode: ThemeMode, active: bool, width: f32, height: f32, scale: f32) -> Self {
+        let mut theme = Self::for_mode(mode);
+        if cfg!(target_os = "macos")
+            && (!active
+                || (width.max(height) * scale >= 3840.0 && width.min(height) * scale >= 2160.0))
+        {
+            // Use the captured Chromium composite, including its 8-bit paint
+            // rounding: 70% white over #f6f6f6 is #fdfdfd in the app's PNG;
+            // 70% #282828 over #141414 is #222222.
+            theme.sidebar_surface = match mode {
+                ThemeMode::Light => rgba(0xfdfdfdff),
+                ThemeMode::Dark => rgba(0x222222ff),
+            };
+        }
+        theme
+    }
+
     pub fn for_mode(mode: ThemeMode) -> Self {
         match mode {
             ThemeMode::Light => Self {
                 surface: rgba(0xffffffff),
-                // CDP: --color-surface-tertiary resolves to pure white, then
-                // Electron mixes it at 70% over the native window material.
-                // ChatGPT's renderer uses 70% white over macOS menu vibrancy. GPUI's
-                // color pipeline needs this minute cool compensation to reproduce the
-                // same final `(244, 244, 245)` light-sidebar composite on macOS.
-                sidebar_surface: rgba(0xfdfdffb3),
+                // Live ChatGPT CDP: color(srgb 1 1 1 / 0.7), composited once
+                // over Electron's macOS Menu material. Preserve the exact alpha
+                // and neutral white instead of compensating for one backdrop.
+                sidebar_surface: Rgba {
+                    a: 0.7,
+                    ..rgba(0xffffffff)
+                },
                 // Opaque secondary surface used where a sticky overlay must
                 // mask scrolling content instead of resampling the material.
                 surface_under: rgba(0xf6f6f6ff),
@@ -190,9 +211,11 @@ impl Theme {
             },
             ThemeMode::Dark => Self {
                 surface: rgba(0x181818ff),
-                // Preserve the original #282828 material color while using a
-                // stronger alpha for reliable contrast over bright desktops.
-                sidebar_surface: rgba(0x282828d1),
+                // Live ChatGPT CDP: color(srgb 0.156863 0.156863 0.156863 / 0.7).
+                sidebar_surface: Rgba {
+                    a: 0.7,
+                    ..rgba(0x282828ff)
+                },
                 surface_under: rgba(0x222222ff),
                 elevated: rgba(0x363636ff),
                 // Resolved result of elevated-secondary/90 over #181818.
@@ -265,45 +288,9 @@ impl Theme {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{FontWeight, Rgba};
+    use gpui::FontWeight;
 
     use super::{Theme, ThemeMode, UI_CJK_FALLBACK_FAMILY, UI_FONT_FAMILY, ui_font};
-
-    fn composite(foreground: Rgba, background: Rgba) -> Rgba {
-        let alpha = foreground.a + background.a * (1.0 - foreground.a);
-        let channel = |foreground_channel: f32, background_channel: f32| {
-            (foreground_channel * foreground.a
-                + background_channel * background.a * (1.0 - foreground.a))
-                / alpha
-        };
-
-        Rgba {
-            r: channel(foreground.r, background.r),
-            g: channel(foreground.g, background.g),
-            b: channel(foreground.b, background.b),
-            a: alpha,
-        }
-    }
-
-    fn relative_luminance(color: Rgba) -> f32 {
-        let linear = |channel: f32| {
-            if channel <= 0.04045 {
-                channel / 12.92
-            } else {
-                ((channel + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
-    }
-
-    fn contrast_ratio(a: Rgba, b: Rgba) -> f32 {
-        let (lighter, darker) = if relative_luminance(a) > relative_luminance(b) {
-            (relative_luminance(a), relative_luminance(b))
-        } else {
-            (relative_luminance(b), relative_luminance(a))
-        };
-        (lighter + 0.05) / (darker + 0.05)
-    }
 
     #[test]
     fn global_ui_font_uses_the_chatgpt_macos_stack() {
@@ -317,18 +304,18 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_surfaces_keep_reduced_transparency() {
+    fn shell_surfaces_match_chatgpt_computed_colors() {
         let dark = Theme::for_mode(ThemeMode::Dark);
         let light = Theme::for_mode(ThemeMode::Light);
 
-        assert!((dark.sidebar_surface.a - 209.0 / 255.0).abs() < f32::EPSILON);
-        assert_eq!(light.sidebar_surface.r, 253.0 / 255.0);
-        assert_eq!(light.sidebar_surface.g, 253.0 / 255.0);
-        assert_eq!(light.sidebar_surface.b, 1.0);
-        assert!((light.sidebar_surface.a - 179.0 / 255.0).abs() < f32::EPSILON);
-        assert!(dark.sidebar_surface.a < 1.0);
-        assert!(light.sidebar_surface.a < 1.0);
-        assert!((light.sidebar_surface.a - 0.70).abs() < 0.005);
+        assert_eq!(light.surface, gpui::rgba(0xffffffff));
+        assert_eq!(dark.surface, gpui::rgba(0x181818ff));
+        for (theme, tint) in [(light, 255.0 / 255.0), (dark, 40.0 / 255.0)] {
+            assert_eq!(theme.sidebar_surface.r, tint);
+            assert_eq!(theme.sidebar_surface.g, tint);
+            assert_eq!(theme.sidebar_surface.b, tint);
+            assert_eq!(theme.sidebar_surface.a, 0.7);
+        }
     }
 
     #[test]
@@ -343,25 +330,43 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_text_remains_legible_when_native_material_samples_white() {
-        let white = Rgba {
-            r: 1.0,
-            g: 1.0,
-            b: 1.0,
-            a: 1.0,
-        };
-
+    #[cfg(target_os = "macos")]
+    fn native_sidebar_material_follows_focus_and_physical_window_size() {
         for mode in [ThemeMode::Light, ThemeMode::Dark] {
-            let theme = Theme::for_mode(mode);
-            let sidebar = composite(theme.sidebar_surface, white);
-            let primary_contrast = contrast_ratio(composite(theme.sidebar_text, sidebar), sidebar);
-            let muted_contrast =
-                contrast_ratio(composite(theme.sidebar_text_muted, sidebar), sidebar);
-            let icon_contrast =
-                contrast_ratio(composite(theme.sidebar_icon_muted, sidebar), sidebar);
-            assert!(primary_contrast >= 4.5, "{mode:?}: {primary_contrast}");
-            assert!(muted_contrast >= 3.0, "{mode:?}: {muted_contrast}");
-            assert!(icon_contrast >= 3.0, "{mode:?}: {icon_contrast}");
+            assert_eq!(
+                Theme::for_window(mode, true, 1440.0, 900.0, 2.0)
+                    .sidebar_surface
+                    .a,
+                0.7
+            );
+            assert_eq!(
+                Theme::for_window(mode, false, 1440.0, 900.0, 2.0)
+                    .sidebar_surface
+                    .a,
+                1.0
+            );
+            assert_eq!(
+                Theme::for_window(mode, true, 1920.0, 1080.0, 2.0)
+                    .sidebar_surface
+                    .a,
+                1.0
+            );
+            assert_eq!(
+                Theme::for_window(mode, true, 1080.0, 1920.0, 2.0)
+                    .sidebar_surface
+                    .a,
+                1.0
+            );
+            assert_eq!(
+                Theme::for_window(mode, true, 1920.0, 1079.0, 2.0)
+                    .sidebar_surface
+                    .a,
+                0.7
+            );
         }
+        let dark = Theme::for_window(ThemeMode::Dark, false, 1440.0, 900.0, 2.0);
+        assert!((dark.sidebar_surface.r - 34.0 / 255.0).abs() < 1e-6);
+        let light = Theme::for_window(ThemeMode::Light, false, 1440.0, 900.0, 2.0);
+        assert!((light.sidebar_surface.r - 253.0 / 255.0).abs() < 1e-6);
     }
 }

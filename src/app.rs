@@ -372,8 +372,8 @@ impl ChatApp {
         cx.subscribe(&settings, |this, _, event: &ChangeTheme, cx| {
             this.mode = event.0;
             cx.set_window_appearance(Some(match event.0 {
-                ThemeMode::Light => WindowAppearance::VibrantLight,
-                ThemeMode::Dark => WindowAppearance::VibrantDark,
+                ThemeMode::Light => WindowAppearance::Light,
+                ThemeMode::Dark => WindowAppearance::Dark,
             }));
             this.sidebar.update(cx, |sidebar, cx| {
                 sidebar.set_mode(event.0, cx);
@@ -3013,7 +3013,14 @@ impl ChatApp {
 
 impl Render for ChatApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::for_mode(self.mode);
+        let viewport = window.viewport_size();
+        let theme = Theme::for_window(
+            self.mode,
+            window.is_window_active(),
+            f32::from(viewport.width),
+            f32::from(viewport.height),
+            window.scale_factor(),
+        );
         if !(self.startup_model_catalog_resolved
             && self.startup_sidebar_resolved
             && self.startup_minimum_duration_elapsed)
