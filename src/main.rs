@@ -444,6 +444,10 @@ fn main() {
     });
 
     #[cfg(feature = "screenshot")]
+    if components::markdown::capture_markdown(&args) {
+        return;
+    }
+    #[cfg(feature = "screenshot")]
     if typography::capture_specimen(&args) {
         return;
     }

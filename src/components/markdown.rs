@@ -499,6 +499,7 @@ struct MarkdownLayout {
     quote_bar_width: f32,
     rule_margin: f32,
     inline_code_size: f32,
+    inline_code_flow_height: f32,
     inline_code_line_height: f32,
     inline_code_padding_x: f32,
     inline_code_padding_y: f32,
@@ -523,7 +524,6 @@ struct MarkdownLayout {
     table_header_last_padding_right: f32,
     table_body_last_padding_bottom: f32,
     table_min_width: f32,
-    table_breakout_width: f32,
     table_cell_max_width: f32,
 }
 
@@ -547,9 +547,12 @@ const CHATGPT_MARKDOWN_LAYOUT: MarkdownLayout = MarkdownLayout {
     quote_bar_width: 3.5,
     rule_margin: 24.5,
     inline_code_size: 12.88,
-    // CDP 2026-09-05: inline code uses .92em Menlo, 1px 6px padding,
-    // and a 6px radius. Keep the painted box within the 22.75px text line.
-    inline_code_line_height: 18.0,
+    // CDP 2026-09-05: the 22.75px inherited line box becomes 23.75px
+    // whenever inline code or an inline mention contributes its 1px vertical
+    // padding. Its painted inline box is only 17px tall, so model the flow
+    // height separately instead of stretching the gray capsule.
+    inline_code_flow_height: 23.75,
+    inline_code_line_height: 15.0,
     inline_code_padding_x: 6.0,
     inline_code_padding_y: 1.0,
     inline_code_radius: 6.0,
@@ -573,7 +576,6 @@ const CHATGPT_MARKDOWN_LAYOUT: MarkdownLayout = MarkdownLayout {
     table_header_last_padding_right: 35.0,
     table_body_last_padding_bottom: 21.0,
     table_min_width: 736.0,
-    table_breakout_width: 1024.0,
     table_cell_max_width: 576.0,
 };
 
@@ -1156,6 +1158,10 @@ fn render_inline_boxes(
     base_weight: FontWeight,
     inline_identity: u64,
 ) -> Div {
+    // ChatGPT uses .92em here; table cells inherit a smaller font than prose.
+    let scale = font_size / style.layout.base_size;
+    let code_size = style.layout.inline_code_size * scale;
+    let code_paint_height = (style.layout.inline_code_line_height * scale).round();
     let mut fragments = Vec::new();
     append_inline_fragments(inlines, InlineState::default(), &mut fragments);
     fragments.into_iter().enumerate().fold(
@@ -1179,6 +1185,11 @@ fn render_inline_boxes(
                 .as_deref()
                 .is_some_and(|url| url.starts_with("https://github.com/"));
             let has_icon = file_reference.is_some() || github_reference;
+            let linked_inline_code = matches!(
+                fragment.link_content.as_deref(),
+                Some([MarkdownInline::Code(_)])
+            );
+            let expands_line_box = fragment.state.code || has_icon || linked_inline_code;
             let color = if file_reference.is_some() {
                 style.palette.file_link
             } else if fragment.state.link {
@@ -1204,15 +1215,12 @@ fn render_inline_boxes(
                 .when(fragment.state.strikethrough, |element| {
                     element.line_through()
                 })
-                .when(fragment.state.code, |element| {
+                .when(expands_line_box, |element| {
                     element
-                        .font_family(UI_MONOSPACE_FONT_FAMILY)
-                        .text_size(px(style.layout.inline_code_size))
-                        .line_height(px(style.layout.inline_code_line_height))
-                        .px(px(style.layout.inline_code_padding_x))
-                        .py(px(style.layout.inline_code_padding_y))
-                        .rounded(px(style.layout.inline_code_radius))
-                        .bg(style.palette.inline_code_surface)
+                        .h(px(line_height + style.layout.inline_code_flow_height
+                            - style.layout.base_line_height))
+                        .flex()
+                        .items_center()
                 })
                 .when(!fragment.state.code, |element| {
                     element
@@ -1254,26 +1262,31 @@ fn render_inline_boxes(
                         fragment.link_destination.as_deref().unwrap_or_default(),
                     )
                 } else {
-                    fragment.text
+                    fragment.text.clone()
                 };
                 StyledText::new(label)
             };
-            let element =
-                if let Some([MarkdownInline::Code(code)]) = fragment.link_content.as_deref() {
-                    element.child(
-                        div()
-                            .font_family(UI_MONOSPACE_FONT_FAMILY)
-                            .text_size(px(style.layout.inline_code_size))
-                            .line_height(px(style.layout.inline_code_line_height))
-                            .px(px(style.layout.inline_code_padding_x))
-                            .py(px(style.layout.inline_code_padding_y))
-                            .rounded(px(style.layout.inline_code_radius))
-                            .bg(style.palette.inline_code_surface)
-                            .child(code.clone()),
-                    )
-                } else {
-                    element.child(text)
+            let element = if fragment.state.code || linked_inline_code {
+                let code = match fragment.link_content.as_deref() {
+                    Some([MarkdownInline::Code(code)]) => code.clone(),
+                    _ => fragment.text,
                 };
+                element.child(
+                    div()
+                        .font_family(UI_MONOSPACE_FONT_FAMILY)
+                        .font_weight(weight)
+                        .text_color(color)
+                        .text_size(px(code_size))
+                        .line_height(px(code_paint_height))
+                        .px(px(style.layout.inline_code_padding_x))
+                        .py(px(style.layout.inline_code_padding_y))
+                        .rounded(px(style.layout.inline_code_radius))
+                        .bg(style.palette.inline_code_surface)
+                        .child(code),
+                )
+            } else {
+                element.child(text)
+            };
             if let Some(destination) = fragment.link_destination {
                 let link_id = markdown_element_id(
                     "markdown-link",
@@ -1964,81 +1977,157 @@ fn render_table(
     style: MarkdownRenderStyle,
     block_identity: u64,
 ) -> Div {
-    let column_count = alignments
-        .len()
-        .max(header.len())
-        .max(rows.iter().map(Vec::len).max().unwrap_or(0))
-        .max(1)
-        .min(u16::MAX as usize);
-    let scroll_id = markdown_element_id("markdown-table-scroll", &block_identity);
-    let mut table = div()
-        .min_w(px(style.layout.table_min_width))
-        .flex_none()
-        .grid()
-        .grid_cols_auto(column_count as u16)
-        .text_size(px(style.layout.table_size))
-        .line_height(px(style.layout.table_line_height));
+    div().w_full().min_w(px(0.0)).child(MarkdownTable {
+        alignments: alignments.to_vec(),
+        header: header.to_vec(),
+        rows: rows.to_vec(),
+        style,
+        block_identity,
+    })
+}
 
-    if !header.is_empty() {
-        table = append_table_row(
-            table,
+#[derive(IntoElement)]
+struct MarkdownTable {
+    alignments: Vec<MarkdownAlignment>,
+    header: Vec<MarkdownTableCell>,
+    rows: Vec<Vec<MarkdownTableCell>>,
+    style: MarkdownRenderStyle,
+    block_identity: u64,
+}
+
+impl gpui::RenderOnce for MarkdownTable {
+    fn render(self, window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
+        let Self {
+            alignments,
             header,
-            alignments,
+            rows,
             style,
-            true,
-            false,
-            markdown_hash(&(block_identity, "header")),
-            column_count,
-        );
-    }
-    for (index, row) in rows.iter().enumerate() {
-        table = append_table_row(
-            table,
-            row,
-            alignments,
-            style,
-            false,
-            index + 1 == rows.len(),
-            markdown_hash(&(block_identity, index)),
-            column_count,
-        );
-    }
-
-    // ChatGPT lets tables break out beyond the prose column into a centered
-    // 1024px scroller. The table itself is intrinsic-width with a prose-width
-    // floor, so short columns stay compact while wide content scrolls.
-    div().w_full().min_w(px(0.0)).flex().justify_center().child(
-        div()
-            .id(scroll_id)
-            .w(px(style.layout.table_breakout_width))
+            block_identity,
+        } = self;
+        let column_count = alignments
+            .len()
+            .max(header.len())
+            .max(rows.iter().map(Vec::len).max().unwrap_or(0))
+            .max(1)
+            .min(u16::MAX as usize);
+        let mut widths = vec![0.0_f32; column_count];
+        for (row_index, cells) in std::iter::once(&header).chain(rows.iter()).enumerate() {
+            for (index, cell) in cells.iter().enumerate().take(column_count) {
+                let header = row_index == 0;
+                let padding = if index + 1 < column_count {
+                    style.layout.table_cell_padding_right
+                } else if header {
+                    style.layout.table_header_last_padding_right
+                } else {
+                    0.0
+                };
+                let mut content = render_inline_block(
+                    &cell.content,
+                    style,
+                    style.layout.table_size,
+                    if header {
+                        style.layout.table_header_line_height
+                    } else {
+                        style.layout.table_line_height
+                    },
+                    if header {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        CHATGPT_MARKDOWN_BODY_WEIGHT
+                    },
+                    markdown_hash(&(block_identity, "measure", row_index, index)),
+                )
+                .w_auto()
+                .font(ui_font())
+                .into_any_element();
+                let measured = content.layout_as_root(
+                    gpui::size(
+                        gpui::AvailableSpace::MaxContent,
+                        gpui::AvailableSpace::MaxContent,
+                    ),
+                    window,
+                    cx,
+                );
+                widths[index] = widths[index].max(
+                    (f32::from(measured.width) + padding).min(style.layout.table_cell_max_width),
+                );
+            }
+        }
+        // CSS automatic table layout apportions spare width by intrinsic column
+        // width. Grid's auto tracks add an equal amount to every column instead.
+        let total: f32 = widths.iter().sum();
+        if total > 0.0 && total < style.layout.table_min_width {
+            for width in &mut widths {
+                *width *= style.layout.table_min_width / total;
+            }
+        }
+        let scroll_id = markdown_element_id("markdown-table-scroll", &block_identity);
+        let mut table = div()
+            .debug_selector(move || format!("markdown-table-{block_identity}"))
+            .min_w(px(style.layout.table_min_width))
             .flex_none()
-            .min_w(px(0.0))
-            .overflow_x_scroll()
-            .restrict_scroll_to_axis()
-            .scrollbar_width(px(0.0))
-            .child(div().w_full().flex().child(table.mx_auto())),
-    )
+            .grid()
+            .grid_cols_auto(column_count as u16)
+            .text_size(px(style.layout.table_size))
+            .line_height(px(style.layout.table_line_height));
+
+        if !header.is_empty() {
+            table = append_table_row(
+                table,
+                &header,
+                style,
+                true,
+                false,
+                markdown_hash(&(block_identity, "header")),
+                column_count,
+                &widths,
+            );
+        }
+        for (index, row) in rows.iter().enumerate() {
+            table = append_table_row(
+                table,
+                row,
+                style,
+                false,
+                index + 1 == rows.len(),
+                markdown_hash(&(block_identity, index)),
+                column_count,
+                &widths,
+            );
+        }
+
+        // Keep the scroll viewport inside the available column. A fixed-width
+        // scroller clips both ends on narrow windows and makes columns unreachable.
+        div().w_full().min_w(px(0.0)).flex().justify_center().child(
+            div()
+                .id(scroll_id)
+                .debug_selector(move || format!("markdown-table-viewport-{block_identity}"))
+                .w_full()
+                .min_w(px(0.0))
+                .overflow_x_scroll()
+                .restrict_scroll_to_axis()
+                .scrollbar_width(px(0.0))
+                .child(table),
+        )
+    }
 }
 
 fn append_table_row(
     mut table: Div,
     cells: &[MarkdownTableCell],
-    alignments: &[MarkdownAlignment],
     style: MarkdownRenderStyle,
     is_header: bool,
     is_last_row: bool,
     row_identity: u64,
     column_count: usize,
+    widths: &[f32],
 ) -> Div {
     for index in 0..column_count {
         let cell = cells.get(index);
-        let alignment = alignments
-            .get(index)
-            .copied()
-            .unwrap_or(MarkdownAlignment::None);
         let mut element = div()
+            .debug_selector(move || format!("markdown-table-cell-{row_identity}-{index}"))
+            .w(px(widths[index]))
             .min_w(px(0.0))
-            .max_w(px(style.layout.table_cell_max_width))
             .h_full()
             .pr(px(if index + 1 == column_count {
                 if is_header {
@@ -2076,15 +2165,11 @@ fn append_table_row(
                             .border_color(style.palette.table_border_subtle)
                     })
             });
-        element = match alignment {
-            MarkdownAlignment::Center => element.text_align(TextAlign::Center),
-            MarkdownAlignment::Right => element.text_align(TextAlign::Right),
-            MarkdownAlignment::None | MarkdownAlignment::Left => {
-                element.text_align(TextAlign::Left)
-            }
-        };
+        // The desktop reference left-aligns headers and values even when the
+        // Markdown delimiter row contains center/right alignment markers.
+        element = element.text_align(TextAlign::Left);
         if let Some(cell) = cell {
-            element = element.child(render_inline_block(
+            let content = render_inline_block(
                 &cell.content,
                 style,
                 style.layout.table_size,
@@ -2099,7 +2184,8 @@ fn append_table_row(
                     CHATGPT_MARKDOWN_BODY_WEIGHT
                 },
                 markdown_hash(&(row_identity, index)),
-            ));
+            );
+            element = element.child(content.justify_start());
         }
         table = table.child(element);
     }
@@ -2115,6 +2201,85 @@ fn rgba_transparent() -> Rgba {
     }
 }
 
+/// Runs the production Markdown renderer without requiring an app-server session.
+#[cfg(feature = "screenshot")]
+pub fn capture_markdown(args: &[String]) -> bool {
+    use gpui::{
+        App, AppContext, Bounds, Context, Render, Window, WindowBounds, WindowOptions, size,
+    };
+    let Some(path) = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--markdown-file="))
+    else {
+        return false;
+    };
+    let source = std::fs::read_to_string(path).expect("read Markdown capture source");
+    let dark = args.iter().any(|arg| arg == "--theme=dark");
+    let width = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--window-width=")?.parse::<f32>().ok())
+        .unwrap_or(1000.0);
+    let output = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--screenshot=").map(str::to_owned));
+    struct Capture {
+        source: String,
+        dark: bool,
+    }
+    impl Render for Capture {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let theme = Theme::for_mode(if self.dark {
+                crate::theme::ThemeMode::Dark
+            } else {
+                crate::theme::ThemeMode::Light
+            });
+            div()
+                .size_full()
+                .bg(if self.dark {
+                    gpui::rgb(0x181818)
+                } else {
+                    gpui::rgb(0xffffff)
+                })
+                .font(ui_font())
+                .p(px(32.0))
+                .child(
+                    div()
+                        .id("markdown-capture-scroll")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .restrict_scroll_to_axis()
+                        .child(div().w_full().max_w(px(736.0)).mx_auto().child(
+                            render_assistant_markdown(&self.source, theme, "markdown-capture"),
+                        )),
+                )
+        }
+    }
+    crate::typography::configure();
+    gpui_platform::application()
+        .with_assets(crate::Assets {
+            base: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"),
+        })
+        .run(move |cx: &mut App| {
+            crate::typography::initialize_fonts(cx);
+            let bounds = Bounds::centered(None, size(px(width), px(700.0)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    if let Some(output) = output {
+                        crate::schedule_screenshot(window, output, 4);
+                    }
+                    cx.new(|_| Capture { source, dark })
+                },
+            )
+            .expect("open Markdown capture");
+            cx.activate(true);
+        });
+    true
+}
+
 fn markdown_element_id(prefix: &str, value: &impl Hash) -> SharedString {
     format!("{prefix}-{:016x}", markdown_hash(value)).into()
 }
@@ -2127,6 +2292,60 @@ fn markdown_hash(value: &(impl Hash + ?Sized)) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    pub(super) struct InlineCodeLineBoxes;
+    impl gpui::Render for InlineCodeLineBoxes {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            let theme = Theme::for_mode(ThemeMode::Light);
+            div()
+                .flex()
+                .flex_col()
+                .items_start()
+                .child(
+                    render_assistant_markdown("plain", theme, "plain-line")
+                        .debug_selector(|| "plain-line".to_owned()),
+                )
+                .child(
+                    render_assistant_markdown("`code`", theme, "code-line")
+                        .debug_selector(|| "code-line".to_owned()),
+                )
+                .child(
+                    render_assistant_markdown("[src](/tmp/src.rs)", theme, "mention-line")
+                        .debug_selector(|| "mention-line".to_owned()),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn inline_code_and_mentions_contribute_chatgpt_line_box_height(cx: &mut gpui::TestAppContext) {
+        assert_eq!(CHATGPT_MARKDOWN_LAYOUT.base_line_height, 22.75);
+        assert_eq!(CHATGPT_MARKDOWN_LAYOUT.inline_code_flow_height, 23.75);
+        assert_eq!(
+            CHATGPT_MARKDOWN_LAYOUT.inline_code_line_height
+                + CHATGPT_MARKDOWN_LAYOUT.inline_code_padding_y * 2.0,
+            17.0
+        );
+
+        let window = cx.add_window(|_, _| InlineCodeLineBoxes);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        let plain = visual.debug_bounds("plain-line").unwrap();
+        let code = visual.debug_bounds("code-line").unwrap();
+        let mention = visual.debug_bounds("mention-line").unwrap();
+        assert!(
+            (f32::from(code.size.height - plain.size.height) - 1.0).abs() <= 0.01,
+            "plain={plain:?} code={code:?} mention={mention:?}"
+        );
+        assert!(
+            (f32::from(mention.size.height - plain.size.height) - 1.0).abs() <= 0.01,
+            "plain={plain:?} code={code:?} mention={mention:?}"
+        );
+    }
+
     pub(super) struct FractionalInlineFlow;
     impl gpui::Render for FractionalInlineFlow {
         fn render(
@@ -2164,6 +2383,71 @@ mod tests {
         assert!(
             (f32::from(fragmented.size.width - continuous.size.width)).abs() <= 1.0,
             "fragmented={fragmented:?}, continuous={continuous:?}"
+        );
+    }
+
+    struct NarrowMarkdownTable;
+    impl gpui::Render for NarrowMarkdownTable {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let document = parse_markdown(
+                "| Key | Description |\n| --- | --- |\n| `id` | A substantially longer description |\n| next | Text |",
+            );
+            let MarkdownBlock::Table {
+                alignments,
+                header,
+                rows,
+            } = &document.blocks[0]
+            else {
+                unreachable!()
+            };
+            div().w(px(360.0)).child(render_table(
+                alignments,
+                header,
+                rows,
+                MarkdownRenderStyle::new(Theme::for_mode(ThemeMode::Light)),
+                42,
+            ))
+        }
+    }
+
+    #[gpui::test]
+    fn table_keeps_its_scroll_viewport_inside_a_narrow_parent(cx: &mut gpui::TestAppContext) {
+        let window = cx.add_window(|_, _| NarrowMarkdownTable);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let viewport = visual.debug_bounds("markdown-table-viewport-42").unwrap();
+        let table = visual.debug_bounds("markdown-table-42").unwrap();
+        assert_eq!(viewport.size.width, px(360.0));
+        assert!((f32::from(table.size.width) - 736.0).abs() <= 1.0);
+        assert_eq!(viewport.origin.x, table.origin.x);
+        let header_id = markdown_hash(&(42_u64, "header"));
+        let a = visual
+            .debug_bounds(Box::leak(
+                format!("markdown-table-cell-{header_id}-0").into_boxed_str(),
+            ))
+            .unwrap();
+        let b = visual
+            .debug_bounds(Box::leak(
+                format!("markdown-table-cell-{header_id}-1").into_boxed_str(),
+            ))
+            .unwrap();
+        assert!(b.size.width > a.size.width * 2.0, "short={a:?}, long={b:?}");
+        assert!((f32::from(a.size.width + b.size.width - table.size.width)).abs() <= 1.0);
+        visual.simulate_event(gpui::ScrollWheelEvent {
+            position: gpui::point(px(180.0), px(40.0)),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(-300.0), px(0.0))),
+            touch_phase: gpui::TouchPhase::Moved,
+            modifiers: Default::default(),
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let scrolled = visual.debug_bounds("markdown-table-42").unwrap();
+        assert!(
+            scrolled.origin.x < table.origin.x,
+            "before={table:?}, after={scrolled:?}"
         );
     }
 

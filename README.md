@@ -56,6 +56,8 @@ python3 scripts/capture_resume_gpui.py \
 
 对单个真实线程做逐条诊断时，可先运行 `scripts/capture_resume_activity_audit.py --output <目录>` 捕获当前 ChatGPT 线程全部五轮的双主题活动，再用 `scripts/audit_resume_rendering.py --jsonl <只读 rollout 路径> --history <thread/read 响应 JSON> --dom <捕获的 dom-audit.json> --native <GPUI 截图的 .png.render.json> --output <审计结果 JSON>` 建立每条记录的对应关系。JSONL 仅用于离线诊断；应用恢复仍通过 app-server 读取。
 
+仅验收 Markdown 排版时，截图构建支持 `--markdown-file=/absolute/path/to/sample.txt`，直接使用生产 Markdown 渲染器打开独立窗口，无需等待 app-server。可组合 `--theme=light` / `--theme=dark`、`--window-width=480` 和 `--screenshot=artifacts/markdown.png`；省略 `--screenshot` 可手动检查表格横向滚动、链接和窄窗布局。仍使用上面的 `GPUI Capture.app` 独立 bundle 验收。
+
 图像生成组件可用同一条确定性截图路径复核。`running`、`completed`、`failed`、`load-error` 分别固定加载、成功、额度失败和文件加载失败状态；成功态传入真实输出文件：
 
 ```bash
