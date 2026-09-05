@@ -594,6 +594,7 @@ struct PromptTextElement {
     placeholder_color: gpui::Hsla,
     caret_visible: bool,
     font_size: f32,
+    font_weight: FontWeight,
     line_height: f32,
 }
 
@@ -691,11 +692,11 @@ impl Element for PromptTextElement {
         } else {
             self.text_color
         };
-        // CDP reports the Codex composer as system-ui 14/20 at weight 400.
+        // Live CDP: composer system-ui 14/20 at 430; inline controls stay 400.
         // Pin the weight here because this text is shaped and painted manually;
         // otherwise an ancestor's text style can silently change the glyph run.
         let mut font = window.text_style().font();
-        font.weight = FontWeight::NORMAL;
+        font.weight = self.font_weight;
         let run = TextRun {
             len: text.len(),
             font,
@@ -866,6 +867,11 @@ impl PromptInput {
                             placeholder_color,
                             caret_visible: progress < 0.55,
                             font_size: if inline { 13.0 } else { PROMPT_FONT_SIZE },
+                            font_weight: if inline {
+                                FontWeight::NORMAL
+                            } else {
+                                crate::theme::UI_BODY_FONT_WEIGHT
+                            },
                             line_height: PROMPT_LINE_HEIGHT,
                         })
                     }

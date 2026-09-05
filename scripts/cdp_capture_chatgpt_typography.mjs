@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const CDP_HTTP = "http://127.0.0.1:9222";
+const CDP_HTTP = process.env.CHATGPT_CDP_HTTP || "http://127.0.0.1:9222";
 const outputDir = path.resolve(
   process.argv.find((argument) => argument.startsWith("--artifact-dir="))
     ?.slice("--artifact-dir=".length) ||
@@ -16,7 +16,7 @@ const target = targets.find(
     candidate.title === "ChatGPT" &&
     candidate.url === "app://-/index.html",
 );
-if (!target) throw new Error("ChatGPT app target not found on CDP port 9222");
+if (!target) throw new Error(`ChatGPT app target not found at ${CDP_HTTP}`);
 
 const socket = new WebSocket(target.webSocketDebuggerUrl);
 await new Promise((resolve, reject) => {

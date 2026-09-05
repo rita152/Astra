@@ -2065,11 +2065,9 @@ fn home(
                             )
                             .child(
                                 div()
-                                    .relative()
-                                    .top(px(2.0))
-                                    .left(px(-6.5))
-                                    .text_size(px(29.2))
-                                    .font_weight(gpui::FontWeight(350.0))
+                                    .text_size(px(28.0))
+                                    .line_height(px(33.6))
+                                    .font_weight(gpui::FontWeight::NORMAL)
                                     .text_color(theme.text)
                                     .child("你想让我们在 coda 中构建什么？"),
                             ),
@@ -4673,7 +4671,7 @@ fn command_activity(
                                 .items_center()
                                 .text_size(px(COMMAND_CARD_HEADER_SIZE))
                                 .line_height(px(COMMAND_CARD_HEADER_LINE_HEIGHT))
-                                .font_weight(FontWeight::LIGHT)
+                                .font_weight(FontWeight::NORMAL)
                                 .font_family(".SystemUIFont")
                                 .text_color(theme.command_text)
                                 .child("Shell"),
@@ -4684,7 +4682,7 @@ fn command_activity(
                                 .pt(px(8.0))
                                 .text_size(px(COMMAND_CARD_TEXT_SIZE))
                                 .line_height(px(COMMAND_CARD_LINE_HEIGHT))
-                                .font_weight(FontWeight::LIGHT)
+                                .font_weight(FontWeight::NORMAL)
                                 .font_family(UI_MONOSPACE_FONT_FAMILY)
                                 .text_color(theme.command_text)
                                 .child(
@@ -4725,7 +4723,7 @@ fn command_activity(
                                 .p(px(8.0))
                                 .text_size(px(COMMAND_CARD_TEXT_SIZE))
                                 .line_height(px(COMMAND_CARD_LINE_HEIGHT))
-                                .font_weight(FontWeight::LIGHT)
+                                .font_weight(FontWeight::MEDIUM)
                                 .font_family(UI_MONOSPACE_FONT_FAMILY)
                                 .text_color(theme.command_text)
                                 .child(output),
@@ -4742,7 +4740,7 @@ fn command_activity(
                                 .gap(px(4.0))
                                 .text_size(px(14.0))
                                 .line_height(px(21.0))
-                                .font_weight(FontWeight::LIGHT)
+                                .font_weight(FontWeight::NORMAL)
                                 .text_color(status_color)
                                 .child(icon(status_icon, status_color.into()).size(px(12.0)))
                                 .child(status_label),

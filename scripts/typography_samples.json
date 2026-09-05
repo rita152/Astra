@@ -1,0 +1,102 @@
+[
+  {
+    "text": "Hamburgefontsiv GPUI 0123456789",
+    "size": 14,
+    "weight": 400,
+    "height": 21
+  },
+  {
+    "text": "Hamburgefontsiv GPUI 0123456789",
+    "size": 14,
+    "weight": 430,
+    "height": 21
+  },
+  {
+    "text": "Hamburgefontsiv GPUI 0123456789",
+    "size": 14,
+    "weight": 500,
+    "height": 21
+  },
+  {
+    "text": "Hamburgefontsiv GPUI 0123456789",
+    "size": 14,
+    "weight": 600,
+    "height": 21
+  },
+  {
+    "text": "新对话 字体渲染 设置与项目",
+    "size": 14,
+    "weight": 400,
+    "height": 21
+  },
+  {
+    "text": "新对话 字体渲染 设置与项目",
+    "size": 14,
+    "weight": 430,
+    "height": 21
+  },
+  {
+    "text": "新对话 字体渲染 设置与项目",
+    "size": 14,
+    "weight": 500,
+    "height": 21
+  },
+  {
+    "text": "新对话 字体渲染 设置与项目",
+    "size": 14,
+    "weight": 600,
+    "height": 21
+  },
+  {
+    "text": "修正 GPUI 全局字体渲染 ChatGPT",
+    "size": 14,
+    "weight": 430,
+    "height": 22.75
+  },
+  {
+    "text": "let value = 42; // Menlo -> Rust",
+    "size": 12,
+    "weight": 400,
+    "height": 20,
+    "mono": true
+  },
+  {
+    "text": "let value = 42; // Menlo -> Rust",
+    "size": 12,
+    "weight": 430,
+    "height": 20,
+    "mono": true
+  },
+  {
+    "text": "let value = 42; // Menlo -> Rust",
+    "size": 12,
+    "weight": 600,
+    "height": 20,
+    "mono": true
+  },
+  {
+    "text": "项目 GPUI / 本地 main",
+    "size": 13,
+    "weight": 400,
+    "height": 18
+  },
+  {
+    "text": "你想让我们构建什么？",
+    "size": 28,
+    "weight": 400,
+    "height": 33.6
+  },
+  {
+    "text": "Emoji 😀 中文 Hello 🌍",
+    "size": 14,
+    "weight": 430,
+    "height": 21
+  },
+  {
+    "text": "Codex",
+    "size": 17,
+    "weight": 600,
+    "height": 24,
+    "brand": true
+  }
+]

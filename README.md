@@ -73,6 +73,26 @@ cargo test
 cargo check --all-targets
 ```
 
+macOS 字体渲染对照使用本机 ChatGPT 的真实 CDP 样式。应用按 CSS 的灰度抗锯齿、430 默认字重、中文回退和分数行高绘制；显式 400/500/600 字重仍分别保留。`vendor/gpui` 与 `vendor/gpui_macos` 固定于 Cargo 中同一 Zed revision，仅在文本选择、字体缓存、栅格化和行高/基线处保留兼容修正，升级 GPUI 时须同时复核这些改动。品牌标题从本机 `/Applications/ChatGPT.app` 或 `~/Applications/ChatGPT.app` 读取原始 OpenAI Sans 字体到内存；仓库不分发该字体，未安装时使用系统字体回退。
+
+字体专用验证（`CHATGPT_CDP_HTTP` 指向已开启的本机调试端口）：
+
+```bash
+cargo test -p gpui_macos --lib --features font-kit typography_
+cargo build --features screenshot
+CHATGPT_CDP_HTTP=http://127.0.0.1:9222 \
+  node scripts/cdp_capture_chatgpt_typography.mjs --artifact-dir=artifacts/typography/live
+CHATGPT_CDP_HTTP=http://127.0.0.1:9222 \
+  node scripts/cdp_capture_typography_specimen.mjs artifacts/typography 1
+target/debug/gpui-chat-clone --typography-specimen \
+  --screenshot=artifacts/typography/gpui-1x.png
+python3 scripts/compare_typography.py \
+  artifacts/typography/electron-1x.png artifacts/typography/gpui-1x.png \
+  --output=artifacts/typography/comparison-1x.json
+```
+
+样本是两端实时绘制的相同文字，覆盖 light/dark、中英文、代码、emoji 和品牌字形；比较只计算字形像素，不以大块空白背景稀释误差，不缩放图片或搜索平移来提高分数。2× 对照需将 CDP 样本最后参数改为 `2`，并通过 `--typography-display=<显示器索引>` 在真实 Retina 屏捕获 GPUI，比较时传 `--dpr=2`。`--typography-native-smoothing` 仅供 screenshot feature 下隔离默认笔画增厚行为的 A/B 验证。
+
 设置页的完整视觉矩阵包含 21 个页面、light/dark 两种主题，共 42 对 1440×900 截图：
 
 ```bash

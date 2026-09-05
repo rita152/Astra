@@ -930,7 +930,7 @@ impl SettingsView {
                             } else {
                                 31.0
                             }))
-                            .font_weight(gpui::FontWeight(300.0))
+                            .font_weight(gpui::FontWeight::NORMAL)
                             .text_color(theme.text)
                             .child(page.label),
                     )
@@ -1023,11 +1023,7 @@ impl SettingsView {
         } else {
             gpui::rgba(0x8d8e8fff)
         };
-        let normal_weight = if is_dark {
-            gpui::FontWeight(300.0)
-        } else {
-            gpui::FontWeight(350.0)
-        };
+        let normal_weight = crate::theme::UI_BODY_FONT_WEIGHT;
         let activity_heading_offset = if is_dark { 10.0 } else { 9.0 };
         // The profile body is capped and centered, while its toolbar spans the
         // settings panel with 20px insets. Derive the toolbar geometry from the
@@ -2628,7 +2624,7 @@ impl SettingsView {
                 div()
                     .text_size(px(24.0))
                     .line_height(px(28.8))
-                    .font_weight(gpui::FontWeight(300.0))
+                    .font_weight(gpui::FontWeight::NORMAL)
                     .child(page.label),
             )
             .child(
@@ -2985,7 +2981,7 @@ impl SettingsView {
                 div()
                     .text_size(px(24.0))
                     .line_height(px(28.8))
-                    .font_weight(gpui::FontWeight(300.0))
+                    .font_weight(gpui::FontWeight::NORMAL)
                     .child(page.label),
             )
             .child(
@@ -2993,9 +2989,6 @@ impl SettingsView {
                     .mt(px(6.0))
                     .text_size(px(14.0))
                     .line_height(px(21.0))
-                    .when(self.mode == ThemeMode::Dark, |intro| {
-                        intro.font_weight(gpui::FontWeight(300.0))
-                    })
                     .text_color(theme.settings_description)
                     .child(page.intro),
             )
@@ -7195,10 +7188,7 @@ impl SettingsView {
             ThemeMode::Light => CHRONICLE_INNER_LIGHT_TILES,
             ThemeMode::Dark => CHRONICLE_INNER_DARK_TILES,
         };
-        let chronicle_text_weight = match self.mode {
-            ThemeMode::Light => gpui::FontWeight(350.0),
-            ThemeMode::Dark => gpui::FontWeight(200.0),
-        };
+        let chronicle_text_weight = crate::theme::UI_BODY_FONT_WEIGHT;
         let (active_dot, inactive_dot) = match self.mode {
             ThemeMode::Light => (gpui::rgba(0xffffffff), gpui::rgba(0xffffff80)),
             ThemeMode::Dark => (gpui::rgba(0x181818ff), gpui::rgba(0x18181880)),
@@ -7438,7 +7428,7 @@ impl SettingsView {
                                     .font_family(UI_FONT_FAMILY)
                                     .text_size(px(24.0))
                                     .line_height(px(31.0))
-                                    .font_weight(gpui::FontWeight(300.0))
+                                    .font_weight(gpui::FontWeight::NORMAL)
                                     .child(page.label),
                             )
                             .child(
@@ -8358,10 +8348,7 @@ impl SettingsView {
             ThemeMode::Dark => gpui::rgba(0xffffff29),
             ThemeMode::Light => gpui::rgba(0x1a1c1f29),
         };
-        let subtitle_weight = match self.mode {
-            ThemeMode::Light => gpui::FontWeight(350.0),
-            ThemeMode::Dark => gpui::FontWeight(300.0),
-        };
+        let subtitle_weight = crate::theme::UI_BODY_FONT_WEIGHT;
         let subtitle_color = match self.mode {
             ThemeMode::Light => gpui::rgba(0xb0b1b2ff),
             ThemeMode::Dark => gpui::rgba(0x5a5a5aff),
@@ -8490,7 +8477,7 @@ impl SettingsView {
                                     .top(px(-1.0))
                                     .text_size(px(24.0))
                                     .line_height(px(31.0))
-                                    .font_weight(gpui::FontWeight(300.0))
+                                    .font_weight(gpui::FontWeight::NORMAL)
                                     .child(page.label),
                             )
                             .child(
@@ -9667,7 +9654,7 @@ impl SettingsView {
                     .text_size(px(14.0))
                     .line_height(px(18.0))
                     .font_family(UI_FONT_FAMILY)
-                    .font_weight(gpui::FontWeight(300.0))
+                    .font_weight(crate::theme::UI_BODY_FONT_WEIGHT)
                     .text_color(if danger { danger_text } else { theme.text })
                     .whitespace_nowrap();
                 if let Some((path, size)) = icon {

@@ -1,0 +1,72 @@
+[package]
+name = "gpui_macos"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+
+[lib]
+path = "src/gpui_macos.rs"
+
+[features]
+default = ["gpui/default"]
+test-support = ["gpui/test-support", "gpui_apple/test-support"]
+runtime_shaders = ["gpui_apple/runtime_shaders"]
+font-kit = ["dep:font-kit"]
+screen-capture = ["gpui/screen-capture"]
+
+[dependencies]
+unicode-segmentation = "1"
+gpui = { default-features = false, git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+accesskit = { version = "0.24.0", features = ["enumn"] }
+accesskit_macos = { version = "0.26.0" }
+anyhow = { version = "1.0.86" }
+async-task = { version = "4.7" }
+block = { version = "0.1" }
+block2 = { version = "0.6" }
+cocoa = { version = "=0.26.0" }
+collections = { version = "0.1.0", git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2" }
+core-foundation = { version = "0.10" }
+core-foundation-sys = { version = "0.8.6" }
+core-graphics = { version = "0.24" }
+core-text = { version = "21" }
+ctor = { version = "1.0.12" }
+dispatch2 = "0.3.1"
+# WARNING: If you change this, you must also publish a new version of zed-font-kit to crates.io
+font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "94b0f28166665e8fd2f53ff6d268a14955c82269", package = "zed-font-kit", version = "0.14.1-zed", optional = true }
+foreign-types = { version = "0.5" }
+futures = { version = "0.3.32" }
+gpui_apple = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2" }
+gpui_util = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2" }
+image = { version = "0.25.1", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "rayon", "tga", "tiff", "webp"] }
+itertools = { version = "0.14.0" }
+libc = { version = "0.2" }
+log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
+mach2 = { version = "0.5" }
+media = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2" }
+metal = { version = "0.33" }
+objc = { version = "0.2" }
+objc2 = { version = "0.6" }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSButton", "NSControl", "NSGraphics", "NSResponder", "NSView", "NSWindow", "objc2-core-foundation"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSArray", "NSAttributedString", "NSBundle", "NSCoder", "NSData", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSGeometry", "NSNotification", "NSNull", "NSObjCRuntime", "NSObject", "NSProcessInfo", "NSRange", "NSRunLoop", "NSSet", "NSString", "NSURL", "NSUndoManager", "NSValue", "objc2-core-foundation", "std"] }
+objc2-user-notifications = { version = "0.3" }
+parking_lot = { version = "0.12.1" }
+pathfinder_geometry = { version = "0.5" }
+raw-window-handle = { version = "0.6" }
+semver = { version = "1.0", features = ["serde"] }
+smallvec = { version = "1.6", features = ["union", "const_new"] }
+strum = { version = "0.27.2", features = ["derive"] }
+uuid = { version = "1.1.2", features = ["v4", "v5", "v7", "serde"] }
+
+# The macOS test-only window implementation depends on test-only APIs from both
+# GPUI and the extracted renderer. A dependency does not inherit this crate's
+# `cfg(test)`, so dev-dependencies enable those APIs only for test builds.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui = { default-features = false, git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2", features = ["test-support"] }
+gpui_apple = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2", features = ["test-support"] }

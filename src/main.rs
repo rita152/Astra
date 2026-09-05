@@ -3,6 +3,7 @@ mod app;
 mod components;
 mod settings;
 mod theme;
+mod typography;
 mod workspace;
 
 use std::{borrow::Cow, fs, path::PathBuf};
@@ -434,11 +435,17 @@ fn main() {
             .map(|slug| Box::leak(slug.to_owned().into_boxed_str()) as &'static str)
     });
 
+    #[cfg(feature = "screenshot")]
+    if typography::capture_specimen(&args) {
+        return;
+    }
+    typography::configure();
     application()
         .with_assets(Assets {
             base: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"),
         })
         .run(move |cx: &mut App| {
+            typography::initialize_fonts(cx);
             cx.set_window_appearance(Some(match mode {
                 ThemeMode::Light => WindowAppearance::Light,
                 ThemeMode::Dark => WindowAppearance::Dark,

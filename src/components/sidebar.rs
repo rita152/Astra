@@ -57,7 +57,7 @@ const SEARCH_INPUT_HEIGHT: f32 = 38.0;
 const SEARCH_RESULT_HEIGHT: f32 = 31.0;
 const MAX_VISIBLE_PROJECT_THREADS: usize = 5;
 const MAX_VISIBLE_RECENTS: usize = 10;
-const SIDEBAR_BODY_FONT_WEIGHT: gpui::FontWeight = gpui::FontWeight::NORMAL;
+const SIDEBAR_BODY_FONT_WEIGHT: gpui::FontWeight = crate::theme::UI_BODY_FONT_WEIGHT;
 const MARQUEE_HOVER_DELAY: Duration = Duration::from_millis(350);
 const MARQUEE_SPEED: f32 = 28.0;
 const PROJECT_THREAD_TITLE_INSETS: f32 = 120.0;
@@ -2107,6 +2107,7 @@ impl SidebarView {
                             .items_center()
                             .gap(px(6.0))
                             .text_size(px(17.0))
+                            .font(crate::typography::brand_font(cx))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme.sidebar_title_text)
                             .child("Codex")

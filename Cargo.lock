@@ -1979,7 +1979,6 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
-source = "git+https://github.com/zed-industries/zed?rev=a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2#a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -2142,7 +2141,6 @@ dependencies = [
 [[package]]
 name = "gpui_macos"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2#a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -2181,6 +2179,7 @@ dependencies = [
  "semver",
  "smallvec",
  "strum",
+ "unicode-segmentation",
  "uuid",
  "zed-font-kit",
 ]

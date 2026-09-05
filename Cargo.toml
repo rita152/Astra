@@ -3,6 +3,12 @@ name = "gpui-chat-clone"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["vendor/gpui_macos"]
+exclude = ["vendor/gpui"]
+default-members = ["."]
+resolver = "3"
+
 [features]
 default = []
 screenshot = ["gpui/test-support", "gpui_platform/test-support"]
@@ -34,6 +40,12 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "a58fff13
 # inhabited byte type, avoiding Rust's future-incompatibility diagnostic.
 [patch.crates-io]
 block = { path = "vendor/block" }
+
+# Preserve CoreText system-font variations and native fallback descriptors.
+# Based on the same Zed revision as the rest of GPUI; see the text backend.
+[patch."https://github.com/zed-industries/zed"]
+gpui = { path = "vendor/gpui" }
+gpui_macos = { path = "vendor/gpui_macos" }
 
 # GPUI's layout, text, and Metal submission paths are too expensive at Cargo's
 # default opt-level=0 on a fullscreen drawable. Keep local code debuggable while

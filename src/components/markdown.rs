@@ -477,7 +477,7 @@ struct MarkdownLayout {
 /// Chromium selects PingFangSC-Medium for Chinese at that weight, so using
 /// GPUI's 400-weight `NORMAL` produces visibly lighter paragraphs even when
 /// the font family, size, and line height all match.
-const CHATGPT_MARKDOWN_BODY_WEIGHT: FontWeight = FontWeight(430.0);
+const CHATGPT_MARKDOWN_BODY_WEIGHT: FontWeight = crate::theme::UI_BODY_FONT_WEIGHT;
 
 const CHATGPT_MARKDOWN_LAYOUT: MarkdownLayout = MarkdownLayout {
     base_size: 14.0,

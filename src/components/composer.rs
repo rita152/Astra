@@ -5757,7 +5757,7 @@ impl ComposerView {
                         column.text_size(px(13.0))
                     })
                     .when(mode == PermissionMode::Custom, |column| {
-                        column.font_weight(gpui::FontWeight(350.0))
+                        column.font_weight(crate::theme::UI_BODY_FONT_WEIGHT)
                     })
                     .line_height(px(18.5625))
                     // Chromium fits the 21-CJK warning detail exactly in its
@@ -5768,7 +5768,7 @@ impl ComposerView {
                     .child(
                         div()
                             .when(mode == PermissionMode::Custom, |text| {
-                                text.font_weight(gpui::FontWeight(350.0))
+                                text.font_weight(crate::theme::UI_BODY_FONT_WEIGHT)
                             })
                             .text_color(color)
                             .child(title),
@@ -5776,7 +5776,7 @@ impl ComposerView {
                     .child(
                         div()
                             .when(mode == PermissionMode::Custom, |text| {
-                                text.font_weight(gpui::FontWeight(350.0))
+                                text.font_weight(crate::theme::UI_BODY_FONT_WEIGHT)
                             })
                             .text_color(if warning {
                                 theme.warning
@@ -5838,7 +5838,7 @@ impl ComposerView {
             ])
             .font(ui_font())
             .text_size(px(13.0))
-            .font_weight(gpui::FontWeight::LIGHT)
+            .font_weight(crate::theme::UI_BODY_FONT_WEIGHT)
             .text_color(theme.text)
             .track_focus(&self.permission_menu_focus)
             .on_key_down(cx.listener(Self::handle_permission_menu_key))

@@ -1,4 +1,4 @@
-use gpui::{Font, FontFallbacks, Rgba, font, rgba};
+use gpui::{Font, FontFallbacks, FontWeight, Rgba, font, rgba};
 
 /// ChatGPT's computed CSS uses `-apple-system, system-ui, "Segoe UI", sans-serif`.
 /// On macOS CDP reports `.SF NS` for Latin glyphs and PingFang SC for Simplified
@@ -9,9 +9,12 @@ pub const UI_CJK_FALLBACK_FAMILY: &str = "PingFang SC";
 // CDP's platform-font probe resolves ChatGPT's `ui-monospace` stack to Menlo
 // (PostScript face Menlo-Regular) on macOS.
 pub const UI_MONOSPACE_FONT_FAMILY: &str = "Menlo";
+/// Live ChatGPT body/`font-normal` token; explicit 400-weight controls stay 400.
+pub const UI_BODY_FONT_WEIGHT: FontWeight = FontWeight(430.0);
 
 pub fn ui_font() -> Font {
     let mut font = font(UI_FONT_FAMILY);
+    font.weight = UI_BODY_FONT_WEIGHT;
     font.fallbacks = Some(FontFallbacks::from_fonts(vec![
         UI_CJK_FALLBACK_FAMILY.to_owned(),
     ]));
@@ -47,7 +50,7 @@ pub struct Theme {
     pub control_soft: Rgba,
     pub sidebar_hover: Rgba,
     pub sidebar_icon_muted: Rgba,
-    /// Product-title foreground, kept separate for the OpenAI Sans substitute.
+    /// Product-title foreground for the locally loaded OpenAI Sans face.
     pub sidebar_title_text: Rgba,
     /// Secondary sidebar foreground measured from the ChatGPT desktop app.
     pub sidebar_text_muted: Rgba,
@@ -86,7 +89,7 @@ pub struct Theme {
     pub command_surface: Rgba,
     /// Shell/tool card outline measured from ChatGPT's `border-strong`.
     pub command_border: Rgba,
-    /// Shell foreground adjusted for GPUI/CoreText's heavier small-text coverage.
+    /// Shell `text-codex-description`: primary text at 70% opacity.
     pub command_text: Rgba,
     /// Precomposited tertiary text used by Shell prefixes and status labels.
     pub command_muted: Rgba,
@@ -188,7 +191,7 @@ impl Theme {
                 markdown_rule: rgba(0x1a1c1f1e),
                 command_surface: rgba(0x0000000d),
                 command_border: rgba(0x00000028),
-                command_text: rgba(0x1a1c1f99),
+                command_text: rgba(0x1a1c1fb3),
                 command_muted: rgba(0x898989ff),
                 home_mark: rgba(0xb8b9baff),
                 border: rgba(0x1a1c1f14),
@@ -263,7 +266,7 @@ impl Theme {
                 // CDP: rgba(255, 255, 255, .05) and .157 respectively.
                 command_surface: rgba(0xffffff0d),
                 command_border: rgba(0xffffff28),
-                command_text: rgba(0xdfdfdf99),
+                command_text: rgba(0xdfdfdfb3),
                 command_muted: rgba(0x929292ff),
                 home_mark: rgba(0x565656ff),
                 border: rgba(0xffffff14),
@@ -289,15 +292,13 @@ impl Theme {
 
 #[cfg(test)]
 mod tests {
-    use gpui::FontWeight;
-
     use super::{Theme, ThemeMode, UI_CJK_FALLBACK_FAMILY, UI_FONT_FAMILY, ui_font};
 
     #[test]
     fn global_ui_font_uses_the_chatgpt_macos_stack() {
         let font = ui_font();
         assert_eq!(font.family.as_ref(), UI_FONT_FAMILY);
-        assert_eq!(font.weight, FontWeight::NORMAL);
+        assert_eq!(font.weight, super::UI_BODY_FONT_WEIGHT);
         assert_eq!(
             font.fallbacks.expect("CJK fallback").fallback_list(),
             &[UI_CJK_FALLBACK_FAMILY.to_owned()]
