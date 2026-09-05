@@ -5,6 +5,7 @@ import path from 'node:path';
 const endpoint = process.env.CHATGPT_CDP_HTTP || 'http://127.0.0.1:9222';
 const output = path.resolve(process.argv[2] || 'artifacts/typography-specimen');
 const dpr = Number(process.argv[3] || 1);
+const translucent = process.argv.includes('--translucent');
 const samples = JSON.parse(fs.readFileSync(new URL('./typography_samples.json', import.meta.url)));
 const targets = await (await fetch(`${endpoint}/json/list`)).json();
 const target = targets.find(t => t.type === 'page' && t.title === 'ChatGPT' && t.url === 'app://-/index.html');
@@ -32,9 +33,16 @@ async function evaluate(expression) {
 }
 try {
   await send('Emulation.setDeviceMetricsOverride', {width:1000,height:620,deviceScaleFactor:dpr,mobile:false});
+  if (translucent) await send('Emulation.setDefaultBackgroundColorOverride', {color:{r:0,g:0,b:0,a:0}});
   const metadata = await evaluate(`(async () => {
     const samples = ${JSON.stringify(samples)};
+    const translucent = ${translucent};
     const bodyStyle = getComputedStyle(document.body);
+    if (translucent) {
+      const style=document.createElement('style');style.id='gpui-typography-translucent-style';
+      style.textContent='html,body {background:transparent!important} body > :not(#gpui-typography-specimen) {visibility:hidden!important} #gpui-typography-specimen {visibility:visible!important}';
+      document.head.append(style);
+    }
     const root = document.createElement('div');
     root.id = 'gpui-typography-specimen';
     root.style.cssText = 'position:fixed;inset:0;width:1000px;height:620px;z-index:2147483647;pointer-events:none;';
@@ -44,8 +52,8 @@ try {
       const panel = document.createElement('div');
       panel.style.cssText = 'position:absolute;top:0;width:500px;height:620px;';
       panel.style.left = dark ? '500px' : '0px';
-      panel.style.background = dark ? '#181818' : '#ffffff';
-      panel.style.color = dark ? '#dfdfdf' : '#1a1c1f';
+      panel.style.background = translucent ? (dark ? 'rgba(40,40,40,.7)' : 'rgba(255,255,255,.7)') : (dark ? '#181818' : '#ffffff');
+      panel.style.color = translucent ? (dark ? 'rgba(223,223,223,.85)' : 'rgba(26,28,31,.85)') : (dark ? '#dfdfdf' : '#1a1c1f');
       root.append(panel);
       samples.forEach((sample,index) => {
         const row = document.createElement('div');
@@ -58,7 +66,7 @@ try {
     }
     await document.fonts.ready;
     await new Promise(requestAnimationFrame);
-    return {fixture:true,dpr:devicePixelRatio,smoothing:bodyStyle.webkitFontSmoothing,bodyWeight:bodyStyle.fontWeight,rows:rows.map(({dark,index,row})=>{
+    return {fixture:true,translucent,dpr:devicePixelRatio,smoothing:bodyStyle.webkitFontSmoothing,bodyWeight:bodyStyle.fontWeight,rows:rows.map(({dark,index,row})=>{
       const range=document.createRange();range.selectNodeContents(row);const r=range.getBoundingClientRect();
       return {dark,index,text:row.textContent,rect:{x:r.x,y:r.y,width:r.width,height:r.height},style:row.style.cssText};
     })};
@@ -75,7 +83,8 @@ try {
   fs.writeFileSync(path.join(output,`electron-${dpr}x.json`),JSON.stringify(metadata,null,2)+'\n');
   console.log(`Saved ${output}/electron-${dpr}x.png`);
 } finally {
-  await evaluate(`document.getElementById('gpui-typography-specimen')?.remove()`);
+  await evaluate(`document.getElementById('gpui-typography-specimen')?.remove();document.getElementById('gpui-typography-translucent-style')?.remove()`);
+  if (translucent) await send('Emulation.setDefaultBackgroundColorOverride', {});
   await send('Emulation.clearDeviceMetricsOverride');
   socket.close();
 }

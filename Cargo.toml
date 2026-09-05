@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["vendor/gpui_macos"]
+members = ["vendor/gpui_macos", "vendor/gpui_apple"]
 exclude = ["vendor/gpui"]
 default-members = ["."]
 resolver = "3"
@@ -46,6 +46,7 @@ block = { path = "vendor/block" }
 [patch."https://github.com/zed-industries/zed"]
 gpui = { path = "vendor/gpui" }
 gpui_macos = { path = "vendor/gpui_macos" }
+gpui_apple = { path = "vendor/gpui_apple" }
 
 # GPUI's layout, text, and Metal submission paths are too expensive at Cargo's
 # default opt-level=0 on a fullscreen drawable. Keep local code debuggable while

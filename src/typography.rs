@@ -143,7 +143,10 @@ pub fn capture_specimen(args: &[String]) -> bool {
         #[serde(default)]
         brand: bool,
     }
-    struct Specimen(Vec<Sample>);
+    struct Specimen {
+        samples: Vec<Sample>,
+        translucent: bool,
+    }
     impl Render for Specimen {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div()
@@ -156,9 +159,16 @@ pub fn capture_specimen(args: &[String]) -> bool {
                         .top(px(0.0))
                         .w(px(500.0))
                         .h_full()
-                        .bg(rgba(if dark { 0x181818ff } else { 0xffffffff }))
-                        .text_color(rgba(if dark { 0xdfdfdfff } else { 0x1a1c1fff }))
-                        .children(self.0.iter().enumerate().map(|(index, sample)| {
+                        .bg(if self.translucent {
+                            rgba(if dark { 0x282828ff } else { 0xffffffff }).opacity(0.7)
+                        } else {
+                            rgba(if dark { 0x181818ff } else { 0xffffffff })
+                        })
+                        .text_color(
+                            rgba(if dark { 0xdfdfdfff } else { 0x1a1c1fff })
+                                .opacity(if self.translucent { 0.85 } else { 1.0 }),
+                        )
+                        .children(self.samples.iter().enumerate().map(|(index, sample)| {
                             let mut font = crate::theme::ui_font();
                             if sample.brand {
                                 font = brand_font(cx);
@@ -188,6 +198,7 @@ pub fn capture_specimen(args: &[String]) -> bool {
             .parse::<usize>()
             .ok()
     });
+    let translucent = args.iter().any(|arg| arg == "--typography-translucent");
     gpui_platform::application().run(move |cx: &mut App| {
         initialize_fonts(cx);
         let display_id = display_index.map(|index| {
@@ -202,17 +213,23 @@ pub fn capture_specimen(args: &[String]) -> bool {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 display_id,
                 titlebar: None,
+                window_background: if translucent {
+                    gpui::WindowBackgroundAppearance::Transparent
+                } else {
+                    gpui::WindowBackgroundAppearance::Opaque
+                },
                 ..Default::default()
             },
             move |window, cx| {
                 if let Some(output) = output {
                     crate::schedule_screenshot(window, output, 3);
                 }
-                cx.new(|_| {
-                    Specimen(
-                        serde_json::from_str(include_str!("../scripts/typography_samples.json"))
-                            .expect("typography samples"),
-                    )
+                cx.new(|_| Specimen {
+                    samples: serde_json::from_str(include_str!(
+                        "../scripts/typography_samples.json"
+                    ))
+                    .expect("typography samples"),
+                    translucent,
                 })
             },
         )
