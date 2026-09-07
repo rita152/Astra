@@ -142,6 +142,24 @@ CHATGPT_CDP_HTTP=http://127.0.0.1:9222 node scripts/cdp_capture_terminal.mjs art
 cargo test components::terminal::tests
 ```
 
+## 文件查看与编辑
+
+右侧功能区的“文件”、底部添加菜单中的“文件”或 `Cmd+P` 可打开当前聊天工作目录的文件树。支持展开目录、筛选路径、方向键导航、Enter 打开、多文件标签，以及点击聊天中的本地文件链接并定位到对应行。收起面板或切换聊天会保留各自的标签、选区和撤销记录。
+
+文本直接在原生 GPUI 编辑器中修改，提供语法高亮、行号、自动换行、长文件滚动、跨行选择、中英文输入及复制粘贴。停止输入约 400 ms 后自动保存；`Cmd+S` 立即保存，`Cmd+Z` / `Cmd+Shift+Z` 或右下角按钮撤销／重做，并同步到磁盘。Markdown 默认显示预览，可切换源代码编辑；常见栅格图片支持面板内查看。
+
+文件访问和保存在线程外执行，保持原有 UTF-8 BOM、CRLF 和权限。保存前检查磁盘内容，外部修改发生冲突时保留编辑并提示复制、重新加载或重试；没有本地编辑时自动刷新外部变更。文本上限为 2 MB、单行 64 KB，二进制和非 UTF-8 文件提供外部打开入口。当前仅访问本机文件系统。
+
+参考样式与自动保存交互来自独立 ChatGPT 调试实例的实时 CDP。先打开该实例的文件面板，可再次采集包含 shadow DOM 的尺寸、字体、颜色及截图：
+
+```bash
+CHATGPT_CDP_HTTP=http://127.0.0.1:9222 \
+  node scripts/cdp_capture_file_panel.mjs artifacts/file-panel
+cargo test components::file_ -- --test-threads=1
+```
+
+独立原生验收沿用 `GPUI Capture.app`，截图构建可附加 `--file-panel-root=/absolute/test/workspace` 和 `--open-file=/absolute/test/workspace/example.rs`，以真实可编辑测试文件验证保存、撤销和冲突。请使用专用测试文件，因为编辑会自动写回磁盘。
+
 ## Codex app-server 协议
 
 当前全部 JSON-RPC 方法及实际接入状态统一维护在 [`docs/APP_SERVER_INTEGRATION.md`](docs/APP_SERVER_INTEGRATION.md)。升级 Codex CLI 时直接核对并更新该总表。

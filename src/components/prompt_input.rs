@@ -51,6 +51,7 @@ pub struct PromptInput {
     kind: PromptInputKind,
     placeholder: SharedString,
     secret: bool,
+    accessible_name: Option<SharedString>,
     focus_handle: FocusHandle,
     content: SharedString,
     selected_range: Range<usize>,
@@ -72,6 +73,7 @@ impl PromptInput {
             kind: PromptInputKind::Composer,
             placeholder: "随心输入".into(),
             secret: false,
+            accessible_name: None,
             focus_handle: cx.focus_handle(),
             content: "".into(),
             selected_range: 0..0,
@@ -95,6 +97,10 @@ impl PromptInput {
         input.placeholder = placeholder.into();
         input.secret = secret;
         input
+    }
+
+    pub fn set_accessible_name(&mut self, name: impl Into<SharedString>) {
+        self.accessible_name = Some(name.into());
     }
 
     pub fn set_mode(&mut self, mode: ThemeMode, cx: &mut Context<Self>) {
@@ -835,6 +841,13 @@ impl PromptInput {
             .pt(px(top_padding))
             .flex()
             .items_start()
+            .when_some(self.accessible_name.clone(), |input, name| {
+                input
+                    .role(gpui::Role::TextInput)
+                    .aria_label(name)
+                    .aria_value(self.content.clone())
+                    .aria_placeholder(self.placeholder.clone())
+            })
             .key_context("PromptInput")
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)

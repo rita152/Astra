@@ -1306,9 +1306,23 @@ fn render_inline_boxes(
                         .id(link_id)
                         .cursor_pointer()
                         .hover(|element| element.underline())
-                        .on_click(move |_, _, cx| {
+                        .on_click(move |_, window, cx| {
                             if let Some(file_reference) = &file_reference {
-                                cx.open_with_system(Path::new(file_reference));
+                                let line = destination
+                                    .rsplit_once(":")
+                                    .and_then(|(_, n)| n.parse().ok())
+                                    .or_else(|| {
+                                        destination
+                                            .rsplit_once("#L")
+                                            .and_then(|(_, n)| n.parse().ok())
+                                    });
+                                window.dispatch_action(
+                                    Box::new(super::file_panel::OpenWorkspaceFile {
+                                        path: file_reference.clone(),
+                                        line,
+                                    }),
+                                    cx,
+                                );
                             } else {
                                 cx.open_url(&destination);
                             }
@@ -1435,6 +1449,10 @@ fn markdown_file_reference_path(destination: &str) -> Option<&str> {
     if !Path::new(destination).is_absolute() {
         return None;
     }
+    let destination = destination
+        .rsplit_once("#L")
+        .filter(|(_, line)| !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(destination, |(path, _)| path);
     Some(
         destination
             .rsplit_once(':')
@@ -1946,6 +1964,33 @@ fn highlighted_code_text(
         })
         .collect();
     StyledText::new(code.to_owned()).with_runs(runs)
+}
+
+// Share the same syntax classifier and semantic palette with the native file editor.
+pub fn file_editor_runs(
+    code: &str,
+    language: Option<&str>,
+    theme: Theme,
+) -> Vec<(Range<usize>, TextRun)> {
+    let mut font = ui_font();
+    font.family = UI_MONOSPACE_FONT_FAMILY.into();
+    let mut palette = MarkdownRenderStyle::new(theme).palette;
+    palette.text = theme.file_editor_text;
+    highlighted_code_spans(code, language)
+        .unwrap_or_else(|| {
+            vec![CodeHighlightSpan {
+                range: 0..code.len(),
+                style: CodeSyntaxStyle::PLAIN,
+            }]
+        })
+        .into_iter()
+        .map(|s| {
+            (
+                s.range.clone(),
+                code_text_run(s.range.len(), font.clone(), s.style, palette),
+            )
+        })
+        .collect()
 }
 
 fn code_syntax_color(token: CodeSyntaxToken, palette: MarkdownPalette) -> Rgba {

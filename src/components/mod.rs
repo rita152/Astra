@@ -1,6 +1,9 @@
 pub mod approval;
 pub mod composer;
 pub mod file_change;
+pub mod file_editor;
+pub mod file_io;
+pub mod file_panel;
 pub mod home;
 pub mod icons;
 pub mod markdown;

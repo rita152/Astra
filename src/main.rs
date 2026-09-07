@@ -485,6 +485,8 @@ fn main() {
             ]);
             // Register terminal bindings after the application-wide Escape fallback.
             components::terminal::init(cx);
+            components::file_editor::init(cx);
+            cx.bind_keys([gpui::KeyBinding::new("cmd-p", app::OpenFiles, None)]);
             let bounds = Bounds::centered(None, size(px(window_width), px(window_height)), cx);
             let initial_bounds = if start_maximized {
                 WindowBounds::Maximized(bounds)
@@ -550,6 +552,17 @@ fn main() {
                         }
                         if let Some(name) = bottom_panel_append.as_deref() {
                             app.append_bottom_panel_item_for_capture(name, cx);
+                        }
+                        #[cfg(feature = "screenshot")]
+                        if let Some(root) = args
+                            .iter()
+                            .find_map(|a| a.strip_prefix("--file-panel-root="))
+                        {
+                            let path = args
+                                .iter()
+                                .find_map(|a| a.strip_prefix("--open-file="))
+                                .map(PathBuf::from);
+                            app.capture_files(PathBuf::from(root), path, cx);
                         }
                         if right_panel_open {
                             app.open_right_panel(cx);
@@ -673,6 +686,12 @@ fn main() {
                             app.resume_thread_for_capture(thread_id.to_owned(), cx);
                         }
                         app
+                    });
+                    let closing_app = app.downgrade();
+                    window.on_window_should_close(cx, move |window, cx| {
+                        closing_app
+                            .update(cx, |app, cx| app.request_window_close(window, cx))
+                            .unwrap_or(true)
                     });
                     #[cfg(feature = "screenshot")]
                     if let Some(path) = screenshot_path.clone() {

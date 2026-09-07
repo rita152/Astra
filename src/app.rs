@@ -13,7 +13,10 @@ use gpui::{
     canvas, deferred, div, hsla, linear_color_stop, linear_gradient, prelude::*, px, radians, rgba,
 };
 
-gpui::actions!(permission_ui, [DismissPermissionUi, ToggleTerminal]);
+gpui::actions!(
+    permission_ui,
+    [DismissPermissionUi, ToggleTerminal, OpenFiles]
+);
 
 use crate::{
     agent::{
@@ -29,6 +32,7 @@ use crate::{
             DiffFileVisualState, DiffReviewCallback, DiffReviewEvent, DiffReviewPresentation,
             captured_diff_review_fixture, render_diff_review_panel,
         },
+        file_panel::{FilePanel, OpenWorkspaceFile},
         home::{
             HomeView, OpenDiffReview, OpenImagePreview, OpenSubAgentPanel, RetryImageGeneration,
         },
@@ -79,6 +83,8 @@ pub struct ChatApp {
     bottom_panel_focus: FocusHandle,
     bottom_panel_focus_pending: bool,
     terminal_panels: HashMap<ConversationKey, Entity<TerminalPanel>>,
+    file_panels: HashMap<ConversationKey, Entity<FilePanel>>,
+    file_close_prompt_open: bool,
     terminal_return_focus_pending: bool,
     right_panel_open: bool,
     right_panel_mode: Option<RightPanelMode>,
@@ -151,6 +157,7 @@ enum ProjectCreationStep {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RightPanelMode {
+    Files,
     SideChat,
     Browser,
     Terminal,
@@ -189,6 +196,7 @@ const RIGHT_PANEL_ITEMS: &[(RightPanelMode, &str, &str, &str)] = &[
     (RightPanelMode::SideChat, "侧边聊天", "⌥⌘S", "side-chat"),
     (RightPanelMode::Browser, "浏览器", "⌘T", "panel-browser"),
     (RightPanelMode::Terminal, "终端", "⌃`", "panel-terminal"),
+    (RightPanelMode::Files, "文件", "⌘P", "panel-files"),
 ];
 const SIDEBAR_MIN_WIDTH: f32 = 240.0;
 const SIDEBAR_MAX_WIDTH: f32 = 480.0;
@@ -421,6 +429,9 @@ impl ChatApp {
         .detach();
         cx.subscribe(&settings, |this, _, event: &ChangeTheme, cx| {
             this.mode = event.0;
+            for panel in this.file_panels.values() {
+                panel.update(cx, |panel, cx| panel.set_mode(event.0, cx));
+            }
             for panel in this.terminal_panels.values() {
                 panel.update(cx, |panel, cx| panel.set_mode(event.0, cx));
             }
@@ -541,6 +552,8 @@ impl ChatApp {
             bottom_panel_focus: cx.focus_handle().tab_stop(true),
             bottom_panel_focus_pending: false,
             terminal_panels: HashMap::new(),
+            file_panels: HashMap::new(),
+            file_close_prompt_open: false,
             terminal_return_focus_pending: false,
             right_panel_open: false,
             right_panel_mode: None,
@@ -587,6 +600,9 @@ impl ChatApp {
             composer.set_workspace_context(cwd, project_id, thread_id, cx);
         });
         self.active_conversation = key;
+        if self.right_panel_open && self.right_panel_mode == Some(RightPanelMode::Files) {
+            self.ensure_files(cx);
+        }
         if self.right_panel_open && self.right_panel_mode == Some(RightPanelMode::Terminal) {
             self.ensure_terminal(cx);
         }
@@ -853,6 +869,9 @@ impl ChatApp {
         let real_key = ConversationKey::Thread(thread_id);
         if self.active_conversation == draft_key {
             self.active_conversation = real_key.clone();
+        }
+        if let Some(panel) = self.file_panels.remove(&draft_key) {
+            self.file_panels.insert(real_key.clone(), panel);
         }
         if let Some(panel) = self.terminal_panels.remove(&draft_key) {
             self.terminal_panels.insert(real_key.clone(), panel);
@@ -1405,6 +1424,11 @@ impl ChatApp {
         let Some((mode, _, _, _)) = BOTTOM_PANEL_ITEMS.get(index) else {
             return;
         };
+        if *mode == BottomPanelMode::Files {
+            self.close_bottom_panel_menu(cx);
+            self.open_files(cx);
+            return;
+        }
         self.bottom_panel_tabs.push(*mode);
         self.bottom_panel_active_tab = Some(self.bottom_panel_tabs.len() - 1);
         self.bottom_panel_hovered_tab = None;
@@ -1505,8 +1529,99 @@ impl ChatApp {
         self.right_panel_focus_pending = false;
     }
 
+    pub fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self
+            .file_panels
+            .values()
+            .any(|p| p.read(cx).has_unsaved(cx))
+        {
+            return true;
+        }
+        if self.file_close_prompt_open {
+            return false;
+        }
+        self.file_close_prompt_open = true;
+        for panel in self.file_panels.values() {
+            panel.update(cx, |p, cx| p.save_all(cx));
+        }
+        let mut window_cx = window.to_async(cx);
+        cx.spawn(async move |this, cx| {
+            // Finish queued automatic saves before deciding whether closing needs a prompt.
+            for _ in 0..40 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                let pending = this
+                    .read_with(cx, |s, cx| {
+                        s.file_panels.values().any(|p| p.read(cx).has_unsaved(cx))
+                    })
+                    .unwrap_or(false);
+                if !pending {
+                    let _ = window_cx.update(|w, _| w.remove_window());
+                    return;
+                }
+            }
+            let answer = window_cx.update(|w, cx| {
+                w.prompt(
+                    gpui::PromptLevel::Warning,
+                    "文件仍有未保存的编辑",
+                    Some("自动保存未完成或遇到冲突。返回编辑以保留当前内容。"),
+                    &["返回编辑", "放弃未保存的编辑并关闭"],
+                    cx,
+                )
+            });
+            if let Ok(answer) = answer
+                && answer.await.ok() == Some(1)
+            {
+                let _ = window_cx.update(|w, _| w.remove_window());
+            } else {
+                let _ = this.update(cx, |s, _| s.file_close_prompt_open = false);
+            }
+        })
+        .detach();
+        false
+    }
+
+    fn ensure_files(&mut self, cx: &mut Context<Self>) {
+        let key = self.active_conversation.clone();
+        if !self.file_panels.contains_key(&key) {
+            let cwd = self
+                .conversation_hosts
+                .get(&key)
+                .map(|h| h.cwd.clone())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let panel = cx.new(|cx| FilePanel::new(cwd, self.mode, cx));
+            self.file_panels.insert(key.clone(), panel);
+        }
+        self.file_panels[&key].update(cx, |p, cx| p.focus(cx));
+        self.right_panel_focus_pending = false;
+    }
+
+    fn open_files(&mut self, cx: &mut Context<Self>) {
+        self.right_panel_open = true;
+        self.select_right_panel_item(3, cx);
+        self.file_panels[&self.active_conversation].update(cx, |p, cx| p.show_picker(cx));
+    }
+
+    #[cfg(feature = "screenshot")]
+    pub fn capture_files(&mut self, root: PathBuf, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        let panel = cx.new(|cx| FilePanel::new(root, self.mode, cx));
+        if let Some(path) = path {
+            panel.update(cx, |p, cx| p.open_path(path, None, cx));
+        }
+        self.file_panels
+            .insert(self.active_conversation.clone(), panel);
+        self.right_panel_open = true;
+        self.select_right_panel_item(3, cx);
+    }
+
     pub fn open_right_panel(&mut self, cx: &mut Context<Self>) {
         self.right_panel_open = true;
+        if self.right_panel_mode == Some(RightPanelMode::Files) {
+            self.ensure_files(cx);
+            cx.notify();
+            return;
+        }
         if self.right_panel_mode == Some(RightPanelMode::Terminal) {
             self.ensure_terminal(cx);
             cx.notify();
@@ -1525,9 +1640,14 @@ impl ChatApp {
     fn close_right_panel(&mut self, cx: &mut Context<Self>) {
         if self.right_panel_open {
             self.right_panel_open = false;
-            self.terminal_return_focus_pending =
-                self.right_panel_mode == Some(RightPanelMode::Terminal);
-            if self.right_panel_mode != Some(RightPanelMode::Terminal) {
+            self.terminal_return_focus_pending = matches!(
+                self.right_panel_mode,
+                Some(RightPanelMode::Terminal | RightPanelMode::Files)
+            );
+            if !matches!(
+                self.right_panel_mode,
+                Some(RightPanelMode::Terminal | RightPanelMode::Files)
+            ) {
                 self.right_panel_mode = None;
             }
             self.subagent_panel = None;
@@ -1553,8 +1673,12 @@ impl ChatApp {
         let Some((mode, _, _, _)) = RIGHT_PANEL_ITEMS.get(index) else {
             return;
         };
-        self.right_panel_mode = Some(*mode);
-        if *mode == RightPanelMode::Terminal {
+        let mode = *mode;
+        self.right_panel_mode = Some(mode);
+        if mode == RightPanelMode::Files {
+            self.ensure_files(cx);
+        }
+        if mode == RightPanelMode::Terminal {
             self.ensure_terminal(cx);
         }
         self.subagent_panel = None;
@@ -3088,6 +3212,25 @@ impl ChatApp {
                 .child(render_diff_review_panel(&review, theme, callback));
         }
 
+        if self.right_panel_mode == Some(RightPanelMode::Files) {
+            if let Some(panel) = self.file_panels.get(&self.active_conversation) {
+                return div()
+                    .id("right-panel")
+                    .w(panel_width)
+                    .min_w(panel_width)
+                    .h_full()
+                    .flex_none()
+                    .relative()
+                    .border_l_1()
+                    .border_color(theme.border)
+                    .bg(theme.surface)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(panel.clone())
+                    .child(self.right_panel_resize_handle(theme, cx));
+            }
+        }
+
         if self.right_panel_mode == Some(RightPanelMode::Terminal) {
             if let Some(terminal) = self.terminal_panels.get(&self.active_conversation) {
                 return div()
@@ -3311,6 +3454,15 @@ impl Render for ChatApp {
                     this.subagent_panel_menu_open = false;
                     cx.notify();
                 }
+            }))
+            .on_action(cx.listener(|this, _: &OpenFiles, _, cx| {
+                this.open_files(cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, event: &OpenWorkspaceFile, _, cx| {
+                this.open_files(cx);
+                this.file_panels[&this.active_conversation].update(cx, |p,cx| p.open_path(PathBuf::from(&event.path),event.line,cx));
+                cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &ToggleTerminal, _, cx| {
                 if this.right_panel_open && this.right_panel_mode == Some(RightPanelMode::Terminal) { this.close_right_panel(cx); }
