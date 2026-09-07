@@ -27,6 +27,9 @@ use crate::{
     theme::{Theme, UI_MONOSPACE_FONT_FAMILY, ui_font},
 };
 
+mod preview;
+pub use preview::MarkdownPreview;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MarkdownDocument {
     pub blocks: Vec<MarkdownBlock>,
@@ -1223,7 +1226,7 @@ fn render_inline_boxes(
                 })
                 .when(expands_line_box, |element| {
                     element
-                        .h(px(line_height + style.layout.inline_code_flow_height
+                        .min_h(px(line_height + style.layout.inline_code_flow_height
                             - style.layout.base_line_height))
                         .flex()
                         .items_center()
@@ -1279,6 +1282,9 @@ fn render_inline_boxes(
                 };
                 element.child(
                     div()
+                        .min_w(px(0.0))
+                        .max_w_full()
+                        .whitespace_normal()
                         .font_family(UI_MONOSPACE_FONT_FAMILY)
                         .font_weight(weight)
                         .text_color(color)
@@ -1291,7 +1297,12 @@ fn render_inline_boxes(
                         .child(code),
                 )
             } else {
-                element.child(text)
+                element.child(
+                    div()
+                        .min_w(px(0.0))
+                        .when(has_icon, |e| e.flex_1())
+                        .child(text),
+                )
             };
             if let Some(destination) = fragment.link_destination {
                 let link_id = markdown_element_id(
@@ -2066,63 +2077,16 @@ impl gpui::RenderOnce for MarkdownTable {
             style,
             block_identity,
         } = self;
-        let column_count = alignments
-            .len()
-            .max(header.len())
-            .max(rows.iter().map(Vec::len).max().unwrap_or(0))
-            .max(1)
-            .min(u16::MAX as usize);
-        let mut widths = vec![0.0_f32; column_count];
-        for (row_index, cells) in std::iter::once(&header).chain(rows.iter()).enumerate() {
-            for (index, cell) in cells.iter().enumerate().take(column_count) {
-                let header = row_index == 0;
-                let padding = if index + 1 < column_count {
-                    style.layout.table_cell_padding_right
-                } else if header {
-                    style.layout.table_header_last_padding_right
-                } else {
-                    0.0
-                };
-                let mut content = render_inline_block(
-                    &cell.content,
-                    style,
-                    style.layout.table_size,
-                    if header {
-                        style.layout.table_header_line_height
-                    } else {
-                        style.layout.table_line_height
-                    },
-                    if header {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        CHATGPT_MARKDOWN_BODY_WEIGHT
-                    },
-                    markdown_hash(&(block_identity, "measure", row_index, index)),
-                )
-                .w_auto()
-                .font(ui_font())
-                .into_any_element();
-                let measured = content.layout_as_root(
-                    gpui::size(
-                        gpui::AvailableSpace::MaxContent,
-                        gpui::AvailableSpace::MaxContent,
-                    ),
-                    window,
-                    cx,
-                );
-                widths[index] = widths[index].max(
-                    (f32::from(measured.width) + padding).min(style.layout.table_cell_max_width),
-                );
-            }
-        }
-        // CSS automatic table layout apportions spare width by intrinsic column
-        // width. Grid's auto tracks add an equal amount to every column instead.
-        let total: f32 = widths.iter().sum();
-        if total > 0.0 && total < style.layout.table_min_width {
-            for width in &mut widths {
-                *width *= style.layout.table_min_width / total;
-            }
-        }
+        let widths = table_column_widths(
+            &alignments,
+            &header,
+            &rows,
+            style,
+            block_identity,
+            window,
+            cx,
+        );
+        let column_count = widths.len();
         let scroll_id = markdown_element_id("markdown-table-scroll", &block_identity);
         let table_width = widths.iter().sum::<f32>().max(style.layout.table_min_width);
         let mut table = div()
@@ -2179,6 +2143,77 @@ impl gpui::RenderOnce for MarkdownTable {
                 .child(table),
         )
     }
+}
+
+fn table_column_widths(
+    alignments: &[MarkdownAlignment],
+    header: &[MarkdownTableCell],
+    rows: &[Vec<MarkdownTableCell>],
+    style: MarkdownRenderStyle,
+    block_identity: u64,
+    window: &mut gpui::Window,
+    cx: &mut gpui::App,
+) -> Vec<f32> {
+    let column_count = alignments
+        .len()
+        .max(header.len())
+        .max(rows.iter().map(Vec::len).max().unwrap_or(0))
+        .max(1)
+        .min(u16::MAX as usize);
+    let mut widths = vec![0.0_f32; column_count];
+    for (row_index, cells) in std::iter::once(header)
+        .chain(rows.iter().map(Vec::as_slice))
+        .enumerate()
+    {
+        for (index, cell) in cells.iter().enumerate().take(column_count) {
+            let header = row_index == 0;
+            let padding = if index + 1 < column_count {
+                style.layout.table_cell_padding_right
+            } else if header {
+                style.layout.table_header_last_padding_right
+            } else {
+                0.0
+            };
+            let mut content = render_inline_block(
+                &cell.content,
+                style,
+                style.layout.table_size,
+                if header {
+                    style.layout.table_header_line_height
+                } else {
+                    style.layout.table_line_height
+                },
+                if header {
+                    FontWeight::SEMIBOLD
+                } else {
+                    CHATGPT_MARKDOWN_BODY_WEIGHT
+                },
+                markdown_hash(&(block_identity, "measure", row_index, index)),
+            )
+            .w_auto()
+            .font(ui_font())
+            .into_any_element();
+            let measured = content.layout_as_root(
+                gpui::size(
+                    gpui::AvailableSpace::MaxContent,
+                    gpui::AvailableSpace::MaxContent,
+                ),
+                window,
+                cx,
+            );
+            widths[index] = widths[index]
+                .max((f32::from(measured.width) + padding).min(style.layout.table_cell_max_width));
+        }
+    }
+    // CSS automatic table layout apportions spare width by intrinsic column
+    // width. Grid's auto tracks add an equal amount to every column instead.
+    let total: f32 = widths.iter().sum();
+    if total > 0.0 && total < style.layout.table_min_width {
+        for width in &mut widths {
+            *width *= style.layout.table_min_width / total;
+        }
+    }
+    widths
 }
 
 fn append_table_row(

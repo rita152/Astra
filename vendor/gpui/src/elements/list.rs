@@ -1547,7 +1547,11 @@ impl Element for List {
         {
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
-                    size_hint: None,
+                    // Width changes invalidate the measurement, not the height
+                    // estimate. Dropping hints also discards with_uniform_item_height
+                    // on the first frame and clamps wheel deltas to the tiny
+                    // measured prefix of a virtual list.
+                    size_hint: item.size_hint(),
                     focus_handle: item.focus_handle(),
                 }),
                 (),

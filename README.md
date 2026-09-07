@@ -94,7 +94,7 @@ cargo test
 cargo check --all-targets
 ```
 
-macOS 字体渲染对照使用本机 ChatGPT 的真实 CDP 样式。应用按 CSS 的灰度抗锯齿、430 默认字重、中文回退和分数行高绘制；显式 400/500/600 字重仍分别保留。`vendor/gpui`、`vendor/gpui_macos` 与 `vendor/gpui_apple` 固定于 Cargo 中同一 Zed revision，在文本选择、字体缓存、栅格化、行高/基线及 Metal 透明度合成处保留兼容修正，升级 GPUI 时须同时复核这些改动。品牌标题从本机 `/Applications/ChatGPT.app` 或 `~/Applications/ChatGPT.app` 读取原始 OpenAI Sans 字体到内存；仓库不分发该字体，未安装时使用系统字体回退。
+macOS 字体渲染对照使用本机 ChatGPT 的真实 CDP 样式。应用按 CSS 的灰度抗锯齿、430 默认字重、中文回退和分数行高绘制；显式 400/500/600 字重仍分别保留。`vendor/gpui`、`vendor/gpui_macos` 与 `vendor/gpui_apple` 固定于 Cargo 中同一 Zed revision，在文本选择、字体缓存、栅格化、行高/基线、虚拟列表高度估算及 Metal 透明度合成处保留兼容修正，升级 GPUI 时须同时复核这些改动。品牌标题从本机 `/Applications/ChatGPT.app` 或 `~/Applications/ChatGPT.app` 读取原始 OpenAI Sans 字体到内存；仓库不分发该字体，未安装时使用系统字体回退。
 
 字体专用验证（`CHATGPT_CDP_HTTP` 指向已开启的本机调试端口）：
 
@@ -148,6 +148,8 @@ cargo test components::terminal::tests
 
 文本直接在原生 GPUI 编辑器中修改，提供语法高亮、行号、自动换行、长文件滚动、跨行选择、中英文输入及复制粘贴。停止输入约 400 ms 后自动保存；`Cmd+S` 立即保存，`Cmd+Z` / `Cmd+Shift+Z` 或右下角按钮撤销／重做，并同步到磁盘。Markdown 默认显示预览，可切换源代码编辑；常见栅格图片支持面板内查看。
 
+Markdown 文件按内容版本在线程外解析，预览只布局可见块，大表格进一步按行渲染并复用列宽。每个文件保留独立的预览位置，表格各行共享横向滚动；方向键、Page Up／Down、`Cmd+↑`／`Cmd+↓` 可导航预览。长行内代码和文件链接在窄栏中换行，内容裁剪在文件区域内。
+
 文件访问和保存在线程外执行，保持原有 UTF-8 BOM、CRLF 和权限。保存前检查磁盘内容，外部修改发生冲突时保留编辑并提示复制、重新加载或重试；没有本地编辑时自动刷新外部变更。文本上限为 2 MB、单行 64 KB，二进制和非 UTF-8 文件提供外部打开入口。当前仅访问本机文件系统。
 
 参考样式与自动保存交互来自独立 ChatGPT 调试实例的实时 CDP。先打开该实例的文件面板，可再次采集包含 shadow DOM 的尺寸、字体、颜色及截图：
@@ -156,6 +158,13 @@ cargo test components::terminal::tests
 CHATGPT_CDP_HTTP=http://127.0.0.1:9222 \
   node scripts/cdp_capture_file_panel.mjs artifacts/file-panel
 cargo test components::file_ -- --test-threads=1
+```
+
+滚动性能可用固定文件重复测量（GPUI 测试窗口中的滚轮事件与布局绘制耗时，不等同于屏幕帧率）：
+
+```bash
+GPUI_MARKDOWN_BENCH_FILE=docs/APP_SERVER_INTEGRATION.md \
+  cargo test markdown_preview_scroll_timings -- --ignored --nocapture
 ```
 
 独立原生验收沿用 `GPUI Capture.app`，截图构建可附加 `--file-panel-root=/absolute/test/workspace` 和 `--open-file=/absolute/test/workspace/example.rs`，以真实可编辑测试文件验证保存、撤销和冲突。请使用专用测试文件，因为编辑会自动写回磁盘。

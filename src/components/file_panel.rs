@@ -13,6 +13,7 @@ use super::{
     file_editor::{EditorEvent, FileEditor},
     file_io::{self, FileEntry, TextFile},
     icons::icon,
+    markdown::{MarkdownPreview, parse_markdown},
     prompt_input::{PromptChanged, PromptInput, PromptSubmitted},
 };
 use crate::theme::{Theme, ThemeMode};
@@ -35,6 +36,9 @@ struct Document {
     revision: u64,
     image: bool,
     preview: bool,
+    markdown: Option<Entity<MarkdownPreview>>,
+    markdown_revision: Option<u64>,
+    markdown_pending_revision: Option<u64>,
 }
 impl Document {
     fn dirty(&self, cx: &App) -> bool {
@@ -129,6 +133,9 @@ impl FilePanel {
         for d in &self.documents {
             if let Some(e) = &d.editor {
                 e.update(cx, |e, cx| e.set_mode(mode, cx));
+            }
+            if let Some(preview) = &d.markdown {
+                preview.update(cx, |preview, cx| preview.set_mode(mode, cx));
             }
         }
         cx.notify();
@@ -314,6 +321,9 @@ impl FilePanel {
                 path.extension().and_then(|e| e.to_str()),
                 Some("md" | "markdown")
             ),
+            markdown: None,
+            markdown_revision: None,
+            markdown_pending_revision: None,
         });
         if image {
             cx.notify();
@@ -339,7 +349,9 @@ impl FilePanel {
                         let editor =
                             cx.new(|cx| FileEditor::new(file.text.clone(), language, s.mode, cx));
                         cx.subscribe(&editor, move |s, _, e: &EditorEvent, cx| {
-                            if let Some(d) = s.documents.iter_mut().find(|d| d.id == id) {
+                            if matches!(e, EditorEvent::Changed)
+                                && let Some(d) = s.documents.iter_mut().find(|d| d.id == id)
+                            {
                                 d.revision += 1;
                             }
                             match e {
@@ -380,6 +392,57 @@ impl FilePanel {
                 {
                     s.save(id, cx);
                 }
+            });
+        })
+        .detach();
+    }
+
+    fn prepare_preview(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(d) = self
+            .documents
+            .iter_mut()
+            .find(|d| Some(d.id) == self.active)
+        else {
+            return;
+        };
+        if !d.preview
+            || d.markdown_revision == Some(d.revision)
+            || d.markdown_pending_revision == Some(d.revision)
+        {
+            return;
+        }
+        let Some(editor) = &d.editor else { return };
+        let (id, revision) = (d.id, d.revision);
+        let window = window.window_handle();
+        let source = editor.read(cx).buffer.text.clone();
+        d.markdown_pending_revision = Some(revision);
+        let task = cx
+            .background_executor()
+            .spawn(async move { parse_markdown(&source) });
+        cx.spawn(async move |this, cx| {
+            let document = task.await;
+            let _ = this.update(cx, |s, cx| {
+                let Some(d) = s.documents.iter_mut().find(|d| d.id == id) else {
+                    return;
+                };
+                if d.markdown_pending_revision == Some(revision) {
+                    d.markdown_pending_revision = None;
+                }
+                // Editing, undo, or disk refresh may have overtaken this parse.
+                if d.revision == revision {
+                    if let Some(preview) = &d.markdown {
+                        preview.update(cx, |preview, cx| preview.set_document(document, cx));
+                    } else {
+                        d.markdown = Some(cx.new(|cx| MarkdownPreview::new(document, s.mode, cx)));
+                    }
+                    d.markdown_revision = Some(revision);
+                    if d.preview && s.active == Some(id) {
+                        // Replacing the document changes the rendered element tree.
+                        // Invalidate cached paint ranges once, not on wheel frames.
+                        let _ = cx.update_window(window, |_, window, _| window.refresh());
+                    }
+                }
+                cx.notify();
             });
         })
         .detach();
@@ -465,6 +528,7 @@ impl FilePanel {
                                 e.update(cx, |e, cx| e.reload(file.text.clone(), cx));
                             }
                             d.saved = Some(file);
+                            d.revision += 1;
                             cx.notify();
                         }
                     }
@@ -618,16 +682,24 @@ impl FilePanel {
 }
 impl Render for FilePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.prepare_preview(window, cx);
         let theme = Theme::for_mode(self.mode);
         if self.focus_filter {
             self.filter.read(cx).focus_handle(cx).focus(window, cx);
             self.focus_filter = false;
         }
         if self.focus_editor {
-            if let Some(e) = self.current().and_then(|d| d.editor.as_ref()) {
-                e.read(cx).focus_handle(cx).focus(window, cx);
+            let focus = self.current().and_then(|d| {
+                if d.preview {
+                    d.markdown.as_ref().map(|p| p.read(cx).focus_handle(cx))
+                } else {
+                    d.editor.as_ref().map(|e| e.read(cx).focus_handle(cx))
+                }
+            });
+            if let Some(focus) = focus {
+                focus.focus(window, cx);
+                self.focus_editor = false;
             }
-            self.focus_editor = false;
         }
         let tabs = div()
             .id("file-tabs")
@@ -787,11 +859,12 @@ impl Render for FilePanel {
                     .w(px(92.))
                     .gap(px(4.))
                     .child(if preview { "查看源代码" } else { "预览" })
-                    .on_click(cx.listener(move |s, _, _, cx| {
+                    .on_click(cx.listener(move |s, _, window, cx| {
                         if let Some(d) = s.documents.iter_mut().find(|d| d.id == id) {
                             d.preview = !d.preview;
-                            s.focus_editor = !d.preview;
+                            s.focus_editor = true;
                         }
+                        window.refresh();
                         cx.notify();
                     })),
                 );
@@ -813,10 +886,13 @@ impl Render for FilePanel {
         );
         let mut content = div()
             .id("file-content")
+            .debug_selector(|| "file-content".into())
             .min_w(px(0.))
+            .min_h(px(0.))
             .flex_1()
             .h_full()
             .relative()
+            .overflow_hidden()
             .flex()
             .flex_col();
         if let Some(d) = self.current() {
@@ -879,29 +955,37 @@ impl Render for FilePanel {
                 );
             } else if d.image {
                 content = content.child(
-                    div().flex_1().min_h(px(0.)).p(px(16.)).child(
-                        gpui::img(d.path.clone())
-                            .size_full()
-                            .object_fit(ObjectFit::Contain),
-                    ),
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .min_h(px(0.))
+                        .overflow_hidden()
+                        .p(px(16.))
+                        .child(
+                            gpui::img(d.path.clone())
+                                .size_full()
+                                .object_fit(ObjectFit::Contain),
+                        ),
                 );
             } else if let Some(editor) = &d.editor {
                 if d.preview {
+                    let body = div().flex_1().min_w(px(0.)).min_h(px(0.)).overflow_hidden();
+                    content = content.child(if let Some(preview) = &d.markdown {
+                        body.child(preview.clone())
+                    } else {
+                        body.p(px(24.))
+                            .text_color(theme.text_tertiary)
+                            .child("正在加载预览…")
+                    });
+                } else {
                     content = content.child(
                         div()
-                            .id(("file-markdown", id))
                             .flex_1()
+                            .min_w(px(0.))
                             .min_h(px(0.))
-                            .overflow_y_scroll()
-                            .p(px(24.))
-                            .child(super::markdown::render_assistant_markdown(
-                                &editor.read(cx).buffer.text,
-                                theme,
-                                &format!("file-{id}"),
-                            )),
+                            .overflow_hidden()
+                            .child(editor.clone()),
                     );
-                } else {
-                    content = content.child(div().flex_1().min_h(px(0.)).child(editor.clone()));
                 }
                 if editor.read(cx).can_undo() || editor.read(cx).can_redo() {
                     content = content.child(
@@ -1004,6 +1088,8 @@ impl Render for FilePanel {
             .max_w(gpui::relative(0.48))
             .min_w(px(140.))
             .h_full()
+            .min_h(px(0.))
+            .overflow_hidden()
             .flex_none()
             .border_l_1()
             .border_color(theme.border)
@@ -1113,6 +1199,9 @@ impl Render for FilePanel {
         let mut panel = div()
             .id("files-panel")
             .size_full()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .overflow_hidden()
             .flex()
             .flex_col()
             .bg(theme.surface)
@@ -1124,7 +1213,9 @@ impl Render for FilePanel {
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.))
                     .min_h(px(0.))
+                    .overflow_hidden()
                     .flex()
                     .child(content)
                     .when(self.tree_open, |b| b.child(tree)),
@@ -1280,6 +1371,139 @@ fn file_icon(path: &std::path::Path) -> &'static str {
 mod tests {
     use super::*;
     use gpui::{Bounds, point, size};
+
+    #[test]
+    #[ignore = "manual scroll benchmark; run with --ignored --nocapture"]
+    fn markdown_preview_scroll_timings() {
+        let root = std::env::temp_dir().join(format!("gpui-preview-bench-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("preview.md");
+        let source = std::env::var("GPUI_MARKDOWN_BENCH_FILE")
+            .ok()
+            .map(|path| std::fs::read_to_string(path).unwrap())
+            .unwrap_or_else(|| {
+                "## Preview\n\n正文 with **bold** and `inline_code`.\n\n\
+                 | Column | Details |\n| --- | --- |\n| A | A longer table cell |\n\n\
+                 ```rust\nfn preview() { println!(\"hello\"); }\n```\n\n"
+                    .repeat(120)
+            });
+        std::fs::write(&path, &source).unwrap();
+        let mut app = gpui::TestApp::new();
+        let mut window = app.open_window_with_options(
+            gpui::WindowOptions {
+                window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(667.), px(900.)),
+                ))),
+                ..Default::default()
+            },
+            |_, cx| FilePanel::new(root.clone(), ThemeMode::Light, cx),
+        );
+        window.update(|p, _, cx| p.open_path(path.clone(), None, cx));
+        app.run_until_parked();
+        window.draw();
+        app.run_until_parked();
+        window.draw();
+        let mut frames = Vec::new();
+        for _ in 0..20 {
+            let start = std::time::Instant::now();
+            window.simulate_scroll(point(px(200.), px(450.)), point(px(0.), px(-60.)));
+            window.draw();
+            frames.push(start.elapsed().as_secs_f64() * 1000.);
+        }
+        frames.sort_by(f64::total_cmp);
+        println!(
+            "Markdown preview: {} bytes, 20 wheel + draw samples; median={:.2} ms, p95={:.2} ms",
+            source.len(),
+            frames[10],
+            frames[18]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn markdown_preview_survives_tab_switches_and_tracks_edits_and_disk_refresh() {
+        let root = std::env::temp_dir().join(format!("gpui-preview-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.md");
+        let second = root.join("second.md");
+        std::fs::write(&first, "# First\n\nOriginal").unwrap();
+        std::fs::write(&second, "# Second").unwrap();
+        let mut app = gpui::TestApp::new();
+        app.update(super::super::file_editor::init);
+        let mut window =
+            app.open_window(|_, cx| FilePanel::new(root.clone(), ThemeMode::Light, cx));
+        window.update(|p, _, cx| p.open_path(first.clone(), None, cx));
+        window.draw();
+        app.run_until_parked();
+        window.draw();
+        let original = window.read(|p, _| p.current().unwrap().markdown.clone().unwrap());
+        window.update(|p, _, cx| p.open_path(second, None, cx));
+        window.draw();
+        app.run_until_parked();
+        window.update(|p, _, cx| p.open_path(first.clone(), None, cx));
+        window.draw();
+        window.read(|p, _| assert_eq!(p.current().unwrap().markdown.as_ref(), Some(&original)));
+
+        window.update(|p, _, cx| {
+            let d = p
+                .documents
+                .iter_mut()
+                .find(|d| Some(d.id) == p.active)
+                .unwrap();
+            d.preview = false;
+            p.focus_editor = true;
+            cx.notify();
+        });
+        window.draw();
+        window.simulate_keystroke("cmd-a");
+        window.simulate_input("# Edited\n\nNew preview");
+        window.read(|p, _| {
+            let d = p.current().unwrap();
+            assert_ne!(d.markdown_revision, Some(d.revision));
+        });
+        window.update(|p, window, cx| {
+            p.documents
+                .iter_mut()
+                .find(|d| Some(d.id) == p.active)
+                .unwrap()
+                .preview = true;
+            p.prepare_preview(window, cx);
+            // Completing the parse must not steal focus from the file picker.
+            p.show_picker(cx);
+        });
+        window.draw();
+        app.run_until_parked();
+        window.draw();
+        window.update(|p, w, cx| {
+            let d = p.current().unwrap();
+            assert_eq!(d.markdown_revision, Some(d.revision));
+            assert_eq!(d.markdown.as_ref(), Some(&original));
+            assert!(p.filter.read(cx).focus_handle(cx).is_focused(w));
+        });
+        app.advance_clock(Duration::from_millis(450));
+        app.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "# Edited\n\nNew preview"
+        );
+        std::fs::write(&first, "# Changed on disk").unwrap();
+        window.update(|p, _, cx| p.refresh_active(cx));
+        window.draw();
+        app.run_until_parked();
+        window.draw();
+        window.read(|p, cx| {
+            let d = p.current().unwrap();
+            assert_eq!(d.markdown_revision, Some(d.revision));
+            assert_eq!(d.markdown.as_ref(), Some(&original));
+            assert_eq!(
+                d.editor.as_ref().unwrap().read(cx).buffer.text,
+                "# Changed on disk"
+            );
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn automatic_saves_undo_and_conflicts_preserve_the_correct_contents() {
         let root = std::env::temp_dir().join(format!("gpui-panel-test-{}", std::process::id()));
