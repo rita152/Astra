@@ -458,6 +458,7 @@ fn main() {
         })
         .run(move |cx: &mut App| {
             typography::initialize_fonts(cx);
+            cx.bind_keys([gpui::KeyBinding::new("ctrl-`", app::ToggleTerminal, None)]);
             cx.set_window_appearance(Some(match mode {
                 ThemeMode::Light => WindowAppearance::Light,
                 ThemeMode::Dark => WindowAppearance::Dark,
@@ -482,6 +483,8 @@ fn main() {
                 gpui::KeyBinding::new("end", End, Some("PromptInput")),
                 gpui::KeyBinding::new("enter", Submit, Some("PromptInput")),
             ]);
+            // Register terminal bindings after the application-wide Escape fallback.
+            components::terminal::init(cx);
             let bounds = Bounds::centered(None, size(px(window_width), px(window_height)), cx);
             let initial_bounds = if start_maximized {
                 WindowBounds::Maximized(bounds)

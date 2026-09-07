@@ -7,4 +7,5 @@ pub mod markdown;
 pub mod permissions_approval;
 pub mod prompt_input;
 pub mod sidebar;
+pub mod terminal;
 pub mod user_input_request;

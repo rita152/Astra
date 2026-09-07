@@ -131,6 +131,17 @@ python3 scripts/verify_settings_matrix.py
 REFRESH_REFERENCES=1 scripts/compare_all.sh
 ```
 
+## 内置终端
+
+打开右侧功能区后选择“终端”，或使用 `Ctrl+反引号` 显示/收起终端。终端在当前聊天的工作目录启动本机 `$SHELL` 登录会话，支持 ANSI 颜色、中文、shell 历史与 Tab 补全、Ctrl-C 中断、滚动回看、拖动选择及 `Cmd+C` / `Cmd+V` 复制粘贴。`Cmd+K` 清屏；顶部 `+` 新建独立终端，标签关闭按钮结束对应 shell。收起面板保留进程，切换聊天保留各自的终端；应用退出后不恢复 shell 进程。
+
+终端通过本机 PTY 运行，界面由 GPUI 原生网格绘制，不经过 Codex app-server 的命令执行方法。参考样式来自独立 ChatGPT 调试实例的 CDP 实测。打开该实例的右侧终端后，可重新捕获样式及无副作用的输出样本：
+
+```bash
+CHATGPT_CDP_HTTP=http://127.0.0.1:9222 node scripts/cdp_capture_terminal.mjs artifacts/terminal
+cargo test components::terminal::tests
+```
+
 ## Codex app-server 协议
 
 当前全部 JSON-RPC 方法及实际接入状态统一维护在 [`docs/APP_SERVER_INTEGRATION.md`](docs/APP_SERVER_INTEGRATION.md)。升级 Codex CLI 时直接核对并更新该总表。

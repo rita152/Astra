@@ -13,7 +13,7 @@ use gpui::{
     canvas, deferred, div, hsla, linear_color_stop, linear_gradient, prelude::*, px, radians, rgba,
 };
 
-gpui::actions!(permission_ui, [DismissPermissionUi]);
+gpui::actions!(permission_ui, [DismissPermissionUi, ToggleTerminal]);
 
 use crate::{
     agent::{
@@ -34,6 +34,7 @@ use crate::{
         },
         icons::icon,
         sidebar::{NewConversation, OpenProjectCreation, OpenSettings, SelectThread, SidebarView},
+        terminal::TerminalPanel,
     },
     settings::{ChangeTheme, CloseSettings, SettingsView},
     theme::{Theme, ThemeMode, UI_FONT_FAMILY, ui_font},
@@ -77,6 +78,8 @@ pub struct ChatApp {
     bottom_panel_keyboard_focus: bool,
     bottom_panel_focus: FocusHandle,
     bottom_panel_focus_pending: bool,
+    terminal_panels: HashMap<ConversationKey, Entity<TerminalPanel>>,
+    terminal_return_focus_pending: bool,
     right_panel_open: bool,
     right_panel_mode: Option<RightPanelMode>,
     right_panel_focused_item: usize,
@@ -418,6 +421,9 @@ impl ChatApp {
         .detach();
         cx.subscribe(&settings, |this, _, event: &ChangeTheme, cx| {
             this.mode = event.0;
+            for panel in this.terminal_panels.values() {
+                panel.update(cx, |panel, cx| panel.set_mode(event.0, cx));
+            }
             cx.set_window_appearance(Some(match event.0 {
                 ThemeMode::Light => WindowAppearance::Light,
                 ThemeMode::Dark => WindowAppearance::Dark,
@@ -534,6 +540,8 @@ impl ChatApp {
             bottom_panel_keyboard_focus: false,
             bottom_panel_focus: cx.focus_handle().tab_stop(true),
             bottom_panel_focus_pending: false,
+            terminal_panels: HashMap::new(),
+            terminal_return_focus_pending: false,
             right_panel_open: false,
             right_panel_mode: None,
             right_panel_focused_item: 0,
@@ -579,6 +587,9 @@ impl ChatApp {
             composer.set_workspace_context(cwd, project_id, thread_id, cx);
         });
         self.active_conversation = key;
+        if self.right_panel_open && self.right_panel_mode == Some(RightPanelMode::Terminal) {
+            self.ensure_terminal(cx);
+        }
         self.home
             .update(cx, |home, cx| home.set_composer(composer, cx));
         cx.notify();
@@ -842,6 +853,9 @@ impl ChatApp {
         let real_key = ConversationKey::Thread(thread_id);
         if self.active_conversation == draft_key {
             self.active_conversation = real_key.clone();
+        }
+        if let Some(panel) = self.terminal_panels.remove(&draft_key) {
+            self.terminal_panels.insert(real_key.clone(), panel);
         }
         self.conversation_hosts.insert(real_key, host);
         #[cfg(not(test))]
@@ -1475,8 +1489,29 @@ impl ChatApp {
         cx.notify();
     }
 
+    fn ensure_terminal(&mut self, cx: &mut Context<Self>) {
+        self.terminal_return_focus_pending = false;
+        let key = self.active_conversation.clone();
+        if !self.terminal_panels.contains_key(&key) {
+            let cwd = self
+                .conversation_hosts
+                .get(&key)
+                .map(|host| host.cwd.clone())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let panel = cx.new(|cx| TerminalPanel::new(cwd, self.mode, cx));
+            self.terminal_panels.insert(key.clone(), panel);
+        }
+        self.terminal_panels[&key].update(cx, |panel, cx| panel.focus(cx));
+        self.right_panel_focus_pending = false;
+    }
+
     pub fn open_right_panel(&mut self, cx: &mut Context<Self>) {
         self.right_panel_open = true;
+        if self.right_panel_mode == Some(RightPanelMode::Terminal) {
+            self.ensure_terminal(cx);
+            cx.notify();
+            return;
+        }
         self.right_panel_mode = None;
         self.subagent_panel = None;
         self.subagent_panel_menu_open = false;
@@ -1490,7 +1525,11 @@ impl ChatApp {
     fn close_right_panel(&mut self, cx: &mut Context<Self>) {
         if self.right_panel_open {
             self.right_panel_open = false;
-            self.right_panel_mode = None;
+            self.terminal_return_focus_pending =
+                self.right_panel_mode == Some(RightPanelMode::Terminal);
+            if self.right_panel_mode != Some(RightPanelMode::Terminal) {
+                self.right_panel_mode = None;
+            }
             self.subagent_panel = None;
             self.subagent_panel_menu_open = false;
             self.diff_review = None;
@@ -1515,6 +1554,9 @@ impl ChatApp {
             return;
         };
         self.right_panel_mode = Some(*mode);
+        if *mode == RightPanelMode::Terminal {
+            self.ensure_terminal(cx);
+        }
         self.subagent_panel = None;
         self.subagent_panel_menu_open = false;
         self.diff_review = None;
@@ -3046,6 +3088,25 @@ impl ChatApp {
                 .child(render_diff_review_panel(&review, theme, callback));
         }
 
+        if self.right_panel_mode == Some(RightPanelMode::Terminal) {
+            if let Some(terminal) = self.terminal_panels.get(&self.active_conversation) {
+                return div()
+                    .id("right-panel")
+                    .w(panel_width)
+                    .min_w(panel_width)
+                    .h_full()
+                    .flex_none()
+                    .relative()
+                    .border_l_1()
+                    .border_color(theme.border)
+                    .bg(theme.surface)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(terminal.clone())
+                    .child(self.right_panel_resize_handle(theme, cx));
+            }
+        }
+
         let toolbar = div()
             .h(px(46.0))
             .w_full()
@@ -3155,6 +3216,15 @@ impl ChatApp {
 
 impl Render for ChatApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.terminal_return_focus_pending {
+            if let Some(host) = self.conversation_hosts.get(&self.active_conversation) {
+                host.composer
+                    .read(cx)
+                    .prompt_focus_handle(cx)
+                    .focus(window, cx);
+            }
+            self.terminal_return_focus_pending = false;
+        }
         let viewport = window.viewport_size();
         let theme = Theme::for_window(
             self.mode,
@@ -3241,6 +3311,11 @@ impl Render for ChatApp {
                     this.subagent_panel_menu_open = false;
                     cx.notify();
                 }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTerminal, _, cx| {
+                if this.right_panel_open && this.right_panel_mode == Some(RightPanelMode::Terminal) { this.close_right_panel(cx); }
+                else { this.right_panel_open = true; this.select_right_panel_item(2, cx); }
+                cx.stop_propagation();
             }))
             .on_key_down(cx.listener(Self::handle_project_creation_key))
             .on_action(cx.listener(|this, _: &DismissPermissionUi, _, cx| {
@@ -4016,6 +4091,40 @@ mod tests {
         simulate_next_frame(&mut app, &window, 400);
         assert_eq!(window.read(|app, _| app.sidebar_reveal), 1.0);
         assert!(!window.read(|app, _| app.sidebar_animation_running));
+    }
+
+    #[test]
+    fn terminal_shortcut_restores_focus_and_preserves_the_session() {
+        let mut app = TestApp::new();
+        app.update(|cx| {
+            crate::components::terminal::init(cx);
+            cx.bind_keys([gpui::KeyBinding::new("ctrl-`", super::ToggleTerminal, None)]);
+        });
+        let mut window = app.open_window(|_, cx| ChatApp::new(ThemeMode::Dark, false, cx));
+        window.update(|chat, window, cx| {
+            chat.complete_startup_for_capture(cx);
+            chat.conversation_hosts[&chat.active_conversation]
+                .composer
+                .read(cx)
+                .prompt_focus_handle(cx)
+                .focus(window, cx);
+        });
+        window.draw();
+        window.simulate_keystroke("ctrl-`");
+        window.draw();
+        let terminal =
+            window.read(|chat, _| chat.terminal_panels[&chat.active_conversation].entity_id());
+        assert!(window.read(|chat, _| chat.right_panel_open));
+        window.simulate_keystroke("ctrl-`");
+        window.draw();
+        assert!(!window.read(|chat, _| chat.right_panel_open));
+        window.simulate_keystroke("ctrl-`");
+        window.draw();
+        assert!(window.read(|chat, _| chat.right_panel_open));
+        assert_eq!(
+            window.read(|chat, _| chat.terminal_panels[&chat.active_conversation].entity_id()),
+            terminal
+        );
     }
 
     #[test]
