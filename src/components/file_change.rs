@@ -5,19 +5,16 @@
 //! desktop CDP captures in
 //! `artifacts/chatgpt-p0-ui-cdp-audit-2026-08-30/{24..45}-*.{json,png}`.
 
-use std::{
-    path::{Component, Path, PathBuf},
-    rc::Rc,
-};
+use std::path::{Component, Path, PathBuf};
 
 use gpui::{
-    App, BoxShadow, Div, FontWeight, Role, ScrollHandle, SharedString, Stateful, Window, div,
-    point, prelude::*, px, rgba,
+    BoxShadow, Div, FontWeight, Role, ScrollHandle, SharedString, Stateful, div, point, prelude::*,
+    px, rgba,
 };
 
 use crate::{
     agent::{AgentFileChange, AgentFileChangeEntry, AgentFileChangeKind, AgentFileChangeStatus},
-    components::icons::icon,
+    components::{callback::UiCallback, icons::icon},
     theme::{Theme, ThemeMode, UI_FONT_FAMILY, UI_MONOSPACE_FONT_FAMILY},
 };
 
@@ -393,18 +390,7 @@ pub enum FileApprovalEvent {
     KeyboardFocusChanged(Option<FileApprovalKeyboardFocus>),
 }
 
-#[derive(Clone)]
-pub struct FileApprovalCallback(Rc<dyn Fn(FileApprovalEvent, &mut Window, &mut App) + 'static>);
-
-impl FileApprovalCallback {
-    pub fn new(callback: impl Fn(FileApprovalEvent, &mut Window, &mut App) + 'static) -> Self {
-        Self(Rc::new(callback))
-    }
-
-    fn emit(&self, event: FileApprovalEvent, window: &mut Window, cx: &mut App) {
-        (self.0)(event, window, cx);
-    }
-}
+pub type FileApprovalCallback = UiCallback<FileApprovalEvent>;
 
 #[derive(Clone, Copy)]
 struct FilePalette {
@@ -1104,22 +1090,7 @@ pub enum FileChangeActivityEvent {
     ToggleDetails { item_id: String },
 }
 
-#[derive(Clone)]
-pub struct FileChangeActivityCallback(
-    Rc<dyn Fn(FileChangeActivityEvent, &mut Window, &mut App) + 'static>,
-);
-
-impl FileChangeActivityCallback {
-    pub fn new(
-        callback: impl Fn(FileChangeActivityEvent, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        Self(Rc::new(callback))
-    }
-
-    fn emit(&self, event: FileChangeActivityEvent, window: &mut Window, cx: &mut App) {
-        (self.0)(event, window, cx);
-    }
-}
+pub type FileChangeActivityCallback = UiCallback<FileChangeActivityEvent>;
 
 pub fn render_file_change_activity(
     model: &FileChangeActivityPresentation,
@@ -1877,18 +1848,7 @@ pub enum DiffReviewEvent {
     OpenLocation(String),
 }
 
-#[derive(Clone)]
-pub struct DiffReviewCallback(Rc<dyn Fn(DiffReviewEvent, &mut Window, &mut App) + 'static>);
-
-impl DiffReviewCallback {
-    pub fn new(callback: impl Fn(DiffReviewEvent, &mut Window, &mut App) + 'static) -> Self {
-        Self(Rc::new(callback))
-    }
-
-    fn emit(&self, event: DiffReviewEvent, window: &mut Window, cx: &mut App) {
-        (self.0)(event, window, cx);
-    }
-}
+pub type DiffReviewCallback = UiCallback<DiffReviewEvent>;
 
 /// Render the native Review panel contents. The parent App shell owns panel
 /// placement; this component owns the captured tab, review toolbar, summary,
@@ -2439,7 +2399,7 @@ fn split_directory_and_name(path: &str) -> (&str, &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::{cell::RefCell, rc::Rc};
 
     use gpui::{
         Bounds, Context, IntoElement, MouseButton, Render, ScrollDelta, ScrollWheelEvent, TestApp,
@@ -2799,7 +2759,7 @@ mod tests {
             .map(|index| review_diff_row_top(index).round() as i32)
             .collect::<Vec<_>>();
         assert_eq!(raster_tops, vec![2, 24, 45, 67, 88, 110, 132, 153, 175]);
-        assert_eq!(review_diff_row_top(55), 1189.65625);
+        assert_eq!(review_diff_row_top(55), 1_189.656_3);
         assert_eq!(
             review_diff_row_top(55) + REVIEW_DIFF_LINE_HEIGHT + REVIEW_DIFF_BOTTOM_PADDING,
             review_diff_rows_height(56)
@@ -2994,7 +2954,7 @@ mod tests {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
                     origin: point(px(0.0), px(0.0)),
-                    size: size(px(1357.640625), px(1410.0)),
+                    size: size(px(1_357.640_6), px(1410.0)),
                 })),
                 ..Default::default()
             },
@@ -3019,7 +2979,7 @@ mod tests {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
                     origin: point(px(0.0), px(0.0)),
-                    size: size(px(1357.640625), px(1410.0)),
+                    size: size(px(1_357.640_6), px(1410.0)),
                 })),
                 ..Default::default()
             },

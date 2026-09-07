@@ -1,6 +1,8 @@
 mod agent;
 mod app;
 mod components;
+mod conversation;
+mod media;
 mod settings;
 mod theme;
 mod typography;
@@ -17,16 +19,17 @@ use std::time::{Duration, Instant};
 const RESUMED_THREAD_STABLE_FRAMES: usize = 3;
 
 use anyhow::Result;
-use app::ChatApp;
-use components::prompt_input::{
-    Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft,
-    SelectRight, Submit,
-};
 use gpui::{
     App, AppContext, AssetSource, Bounds, SharedString, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowOptions, px, size,
 };
 use gpui_platform::application;
+
+use app::ChatApp;
+use components::prompt_input::{
+    Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft,
+    SelectRight, Submit,
+};
 use theme::ThemeMode;
 
 #[cfg(target_os = "macos")]

@@ -1,0 +1,97 @@
+//! Conversation state owned independently of the GPUI input view.
+
+use std::{collections::HashMap, path::PathBuf};
+
+use super::{
+    activity::ConversationActivity,
+    transcript::{ConversationPhase, ConversationTranscriptTurn, ResumedTurnPresentation},
+};
+use crate::agent::{
+    AgentAccountRateLimits, AgentApprovalHandle, AgentConnectionEvent, AgentEffectivePermissions,
+    AgentInterruptHandle, AgentMcpServerStartupStatus, AgentModel, AgentPermissionsApprovalHandle,
+    AgentServerRequestMetadata, AgentThreadStatus, AgentThreadTokenUsage, AgentUserInputHandle,
+    ProjectId,
+};
+
+pub(crate) struct ConversationState {
+    pub(crate) user_message: Option<String>,
+    pub(crate) user_images: Vec<crate::agent::UserMessageImage>,
+    pub(crate) user_message_time: Option<String>,
+    pub(crate) assistant_message: String,
+    pub(crate) activities: Vec<ConversationActivity>,
+    pub(crate) assistant_message_time: Option<String>,
+    pub(crate) phase: ConversationPhase,
+    pub(crate) transcript: Vec<ConversationTranscriptTurn>,
+    pub(crate) resumed_turn: Option<ResumedTurnPresentation>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) project_id: Option<ProjectId>,
+    pub(crate) history_loading: bool,
+    pub(crate) history_error: Option<String>,
+    pub(crate) cycle: u64,
+    pub(crate) active_turn: Option<AgentInterruptHandle>,
+    pub(crate) pending_connection_events: HashMap<String, Vec<AgentConnectionEvent>>,
+    pub(crate) approval_responders: HashMap<String, AgentApprovalHandle>,
+    pub(crate) user_input_responders: HashMap<String, AgentUserInputHandle>,
+    pub(crate) permissions_approval_responders: HashMap<String, AgentPermissionsApprovalHandle>,
+    pub(crate) server_request_contexts: HashMap<String, AgentServerRequestMetadata>,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) mcp_server_startup_statuses:
+        HashMap<(Option<String>, String), AgentMcpServerStartupStatus>,
+    pub(crate) thread_statuses: HashMap<String, AgentThreadStatus>,
+    pub(crate) thread_token_usages: HashMap<String, AgentThreadTokenUsage>,
+    pub(crate) account_rate_limits: Option<AgentAccountRateLimits>,
+    pub(crate) models: Vec<AgentModel>,
+    pub(crate) model_catalog_error: Option<String>,
+    pub(crate) selected_model: String,
+    pub(crate) selected_effort: String,
+    pub(crate) selected_service_tier: Option<String>,
+    pub(crate) actual_model: Option<String>,
+    pub(crate) model_status: Option<String>,
+    pub(crate) safety_buffering: bool,
+    pub(crate) slider_index: usize,
+    pub(crate) effective_permissions: Option<AgentEffectivePermissions>,
+    pub(crate) permission_error: Option<String>,
+}
+
+impl Default for ConversationState {
+    fn default() -> Self {
+        Self {
+            user_message: None,
+            user_images: Vec::new(),
+            user_message_time: None,
+            assistant_message: String::new(),
+            activities: Vec::new(),
+            assistant_message_time: None,
+            phase: ConversationPhase::Empty,
+            transcript: Vec::new(),
+            resumed_turn: None,
+            cwd: std::env::current_dir().unwrap_or_default(),
+            project_id: None,
+            history_loading: false,
+            history_error: None,
+            cycle: 0,
+            active_turn: None,
+            pending_connection_events: HashMap::new(),
+            approval_responders: HashMap::new(),
+            user_input_responders: HashMap::new(),
+            permissions_approval_responders: HashMap::new(),
+            server_request_contexts: HashMap::new(),
+            thread_id: None,
+            mcp_server_startup_statuses: HashMap::new(),
+            thread_statuses: HashMap::new(),
+            thread_token_usages: HashMap::new(),
+            account_rate_limits: None,
+            models: Vec::new(),
+            model_catalog_error: None,
+            selected_model: String::new(),
+            selected_effort: String::new(),
+            selected_service_tier: None,
+            actual_model: None,
+            model_status: None,
+            safety_buffering: false,
+            slider_index: 0,
+            effective_permissions: None,
+            permission_error: None,
+        }
+    }
+}

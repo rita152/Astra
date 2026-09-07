@@ -1,6 +1,6 @@
 # Codex app-server 协议接入总表
 
-> 当前 Codex CLI 版本：`codex-cli 0.153.0`；`imageGeneration` 另以桌面 ChatGPT 内嵌 `0.153.0-alpha.5` 的真实会话交叉验证；协议事实来源：本机执行 `codex app-server generate-json-schema --experimental` 生成的 schema；运行时事实来源：`src/agent/codex.rs`、`src/agent/codex/manager.rs`、`src/agent/mod.rs`、`src/workspace.rs`、`src/components/sidebar.rs`、`src/components/composer.rs`、`src/components/home.rs`、`src/app.rs`。
+> 当前 Codex CLI 版本：`codex-cli 0.153.0`；`imageGeneration` 另以桌面 ChatGPT 内嵌 `0.153.0-alpha.5` 的真实会话交叉验证；协议事实来源：本机执行 `codex app-server generate-json-schema --experimental` 生成的 schema；运行时事实来源：`src/agent/codex/`、`src/agent/` 的领域模块、`src/workspace.rs` 与 `src/workspace/`、`src/conversation/`、`src/components/`、`src/app.rs` 与 `src/app/`。
 
 客户端初始化时启用 experimental API。下表是当前协议的唯一维护来源，完整列出 248 个 JSON-RPC 方法：155 个客户端请求、11 个服务端请求、1 个客户端通知、81 个服务端通知。
 
@@ -9,6 +9,8 @@
 状态口径：“已接入”表示本表声明的产品语义已形成真实协议收发、领域映射和必要 UI／副作用的完整闭环，不等于消费 schema 的每个可选字段；已知有效变体或安全相关字段尚未承接时标记为“部分接入”。
 
 ## 运行时生命周期
+
+代码定位：中立类型由 `src/agent/mod.rs` 统一导出，定义按职责位于同目录的 `backend`、`catalog`、`thread`、`activity`、`status`、`events`、`requests` 和 `message` 模块。Codex wire 编解码位于 `src/agent/codex/` 的 `catalog`、`items`、`notifications`、`permissions`、`requests` 与 `workspace_protocol`；`methods` 维护方法覆盖和校验。`session` 管理轮次会话，`registry` 管理服务端请求及响应决策，`dispatch` 派发轮次事件，`transport` 负责进程 JSONL 通信。应用级连接 generation、启动与退出回收由 `manager.rs` 管理，共享连接、传输、事件订阅、turn 路由、目录和工作区请求各在 `manager/` 对应子模块中维护。工作区分页读取与偏好持久化分别位于 `src/workspace/loaders.rs` 和 `preferences.rs`；通用图片尺寸读取位于 `src/media.rs`。UI 会话事件归约、活动更新、历史恢复和流式批处理位于 `src/conversation/`，由 `ComposerView` 的运行时驱动衔接 GPUI。本次职责拆分不改变下表的接入范围、wire 参数或兼容行为。
 
 `ChatApp` 创建并持有一个应用级 `Arc<CodexAppServerManager>` 和 `Arc<WorkspaceStore>`，通过 agent-neutral `AgentBackend` 注入 UI。`Project`、`ThreadSummary`、`ThreadHistory`、分页、能力集和 `Unsupported` 均位于中立领域层，Codex JSON-RPC method 与原始错误不会进入 UI。`WorkspaceStore` 是 sidebar 唯一的项目／会话数据来源，所有选择和变更使用稳定 `project_id`／`thread_id`；本地只持久化版本化 UI 偏好（包括 pinned section id 与折叠状态），以同目录临时文件、flush/sync、原子 rename 写入，不保存项目或会话影子真相。
 

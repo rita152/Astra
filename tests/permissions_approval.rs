@@ -11,7 +11,13 @@ mod icons_impl;
 #[path = "../src/theme.rs"]
 mod theme;
 
+#[path = "../src/components/callback.rs"]
+mod callback_impl;
+
 mod components {
+    pub mod callback {
+        pub use crate::callback_impl::*;
+    }
     pub mod icons {
         pub use crate::icons_impl::*;
     }

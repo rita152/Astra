@@ -164,6 +164,60 @@ cargo test components::file_ -- --test-threads=1
 
 当前全部 JSON-RPC 方法及实际接入状态统一维护在 [`docs/APP_SERVER_INTEGRATION.md`](docs/APP_SERVER_INTEGRATION.md)。升级 Codex CLI 时直接核对并更新该总表。
 
+## 架构与渐进重构
+
+应用以 `AgentBackend` 作为 coding agent 的应用边界，按领域契约、协议适配、工作区数据、会话状态和 GPUI 展示分层。`ChatApp` 在入口装配共享服务并注入各视图；会话事件归约与历史恢复集中在 `conversation`，输入框和活动视图按功能组织。各批迁移同步移动原有测试，保留既有协议与界面行为。
+
+当前模块职责：
+
+| 位置 | 职责与依赖边界 |
+|---|---|
+| `src/agent/mod.rs` | 只维护模块声明与领域、后端入口的导出 |
+| `src/agent/{backend,catalog,thread,activity,status,events,requests,message}.rs` | 后端契约、模型配置、历史、活动、状态、事件、交互请求与消息规范化；不依赖 GPUI、组件或具体适配器 |
+| `src/agent/codex.rs` | Codex 适配器模块入口 |
+| `src/agent/codex/{catalog,items,methods,notifications,permissions,requests,workspace_protocol}.rs` | Codex wire 类型、方法覆盖与校验、请求编码、通知及历史解码 |
+| `src/agent/codex/{transport,session,registry,dispatch}.rs` | JSONL 进程通信、轮次会话、服务端请求注册与响应校验、轮次事件派发 |
+| `src/agent/codex/manager.rs`、`manager/` | 应用级连接 generation、启动与退出回收；子模块分别管理共享连接、传输、事件订阅、turn 路由、目录及工作区请求 |
+| `src/workspace.rs` | 工作区状态、通知合并、异步操作及订阅；通过 `AgentBackend` 访问后端 |
+| `src/workspace/{loaders,preferences}.rs` | 分页读取与历史补全、UI 偏好版本处理与原子写入；统一处理游标循环和加载错误 |
+| `src/conversation/` | 会话状态、活动模型、事件归约、流式批处理、历史恢复、模型选择和轮次生命周期；不持有 GPUI Entity 或 Context |
+| `src/components/composer.rs`、`composer/` | 输入框入口；运行时 UI 驱动、选项菜单、权限与审批交互、听写、布局、渲染及截图夹具分别维护 |
+| `src/components/home.rs`、`home/` | 会话视图协调；时间线、消息、工具活动、推理、协作、媒体与请求按功能绘制；具名上下文承载共享渲染数据 |
+| `src/app.rs`、`app/` | 服务装配与应用壳；会话 host、侧栏、底部／右侧面板、图片预览、项目创建、文件和终端面板分别维护；面板状态有独立类型 |
+| `src/settings/view.rs`、`view/` | 设置导航与路由、共享控件及各功能页面；Chronicle 插画坐标作为嵌入资源位于 `assets/illustrations/` |
+| `src/components/callback.rs`、`src/media.rs` | 通用 UI 回调封装和共享图片尺寸读取；通用媒体工具不经 Codex 适配器导出 |
+
+执行顺序及验收结果（2026-09-07）：
+
+| 阶段 | 完成范围 | 验收条件 | 状态 |
+|---|---|---|---|
+| 1. 建立领域边界 | 按职责拆分领域模块；通用图片工具移出 Codex；清理无调用方的旧进程入口 | 领域模块无 GPUI 或具体适配器依赖；现有调用方与测试通过 | 已完成 |
+| 2. 分离工作区数据访问 | 提取偏好持久化、分页加载和测试；历史使用 `Page<ThreadTurn>`，合并重复分页循环 | 覆盖空页、重复及循环游标、失败传播、通道关闭、历史按需补全与偏好原子写入 | 已完成 |
+| 3. 拆分 Codex 适配器 | 分离协议编解码、transport、turn session、请求注册表、共享连接生命周期及测试驱动 | 握手、乱序响应、generation 隔离、中断、请求清理和退出回收测试通过；协议接入范围保持一致 | 已完成 |
+| 4. 提取会话状态 | 从 Composer 提取 transcript、活动更新、事件批处理、历史恢复和轮次状态；视图保留输入及 UI 驱动 | 流式输出、审批、断连、恢复、线程切换与历史折叠测试通过 | 已完成 |
+| 5. 按功能拆分界面 | 拆分 Home 活动展示、Composer 交互、App 面板及设置页；使用渲染上下文、面板状态及控件参数结构体 | 同主题、尺寸、内容和滚动位置核对视觉；独立 Capture 实例验证点击、键盘、滚动、拖动和文本选择 | 已完成 |
+| 6. 清理代码风格与冗余 | 统一相关导入与命名；合并重复回调；精简分支和重复克隆；为大型 MCP 枚举载荷使用 Box；UI 线程内共享列表使用 Rc | 格式、测试、普通与 screenshot 编译通过；第一方代码严格 Clippy 零告警；未扩大 lint 抑制，未改动 vendor 或依赖 | 已完成 |
+
+六个阶段均已完成。后续新 agent 通过 `AgentBackend` 接入，新增协议编解码留在对应适配器；共享抽象和 Cargo workspace 拆分以第二个实际适配器的需求为依据。
+
+重构验证命令：
+
+```bash
+cargo fmt --check
+cargo test
+cargo clippy --all-targets --all-features --no-deps -p gpui-chat-clone -- -D warnings
+cargo check --all-targets
+cargo check --all-targets --features screenshot
+cargo build --features screenshot
+git diff --check
+```
+
+当前自动化结果为 409 项测试通过、0 项失败、1 项按原配置忽略。忽略项会调用已登录的本机 Codex CLI 发起真实模型请求；本轮未执行。Clippy 对第一方包的全部 target 与 feature 使用 `-D warnings`；依赖及 vendor 不在此次零告警结论范围内。
+
+界面回归使用保留的旧版可执行文件和最新构建，均通过独立 bundle ID 的 `GPUI Capture.app` 验收。有效截图为 66 组：21 个设置页面 × 两种主题、10 种会话夹具 × 两种主题，以及 Markdown 两种宽度 × 两种主题。对应图片保持相同物理尺寸，未缩放或平移；47 组整图逐像素一致。其余 19 组差异全部落在窗口激活态影响的半透明侧栏、异步工作区列表或模型名称区域，排除这些明确标记的动态区域后，66 组的功能内容区域均逐像素一致。设置正文包含从源码迁出的 Chronicle 插画；三组资源的 3,846 条坐标和颜色记录与迁移前逐项相同。
+
+Computer Use 另对旧版与新版复核了工具组／命令详情点击、工具区滚动与 Tab 焦点、右侧面板拖动、终端／文件快捷键、输入文字及全选、中文与 emoji 粘贴、模型菜单与 Escape、设置正文滚动及页面切换。会话流、中断、审批、线程切换和键盘折叠的状态逻辑由原有自动化测试覆盖；本轮未发送真实模型提示。专用验收实例已关闭。截图和逐项比较记录保存在本机 `artifacts/refactor-validation/{before-final,after-final}/` 与 `comparison.json`，不作为新的 Markdown 文档维护。
+
 ## 项目文档
 
-仓库只维护三份 Markdown：本 README 负责快速入口，[`AGENTS.md`](AGENTS.md) 记录项目背景与文档地图，[`docs/APP_SERVER_INTEGRATION.md`](docs/APP_SERVER_INTEGRATION.md) 以唯一总表记录 Codex app-server 当前全量方法及接入状态。
+仓库只维护三份 Markdown：本 README 负责快速入口与架构重构进度，[`AGENTS.md`](AGENTS.md) 记录项目背景与文档地图，[`docs/APP_SERVER_INTEGRATION.md`](docs/APP_SERVER_INTEGRATION.md) 以唯一总表记录 Codex app-server 当前全量方法及接入状态。

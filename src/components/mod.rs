@@ -1,4 +1,5 @@
 pub mod approval;
+pub mod callback;
 pub mod composer;
 pub mod file_change;
 pub mod file_editor;

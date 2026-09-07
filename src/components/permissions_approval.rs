@@ -10,15 +10,12 @@
 //! `serverRequest/resolved`, but is no longer interactive. Cancellation and
 //! transport failures stay visible with an explicit terminal status.
 
-use std::{path::Path, rc::Rc};
+use std::path::Path;
 
-use gpui::{
-    App, BoxShadow, Div, FontWeight, Role, SharedString, Stateful, Window, div, prelude::*, px,
-    rgba,
-};
+use gpui::{BoxShadow, Div, FontWeight, Role, SharedString, Stateful, div, prelude::*, px, rgba};
 
 use crate::{
-    components::icons::icon,
+    components::{callback::UiCallback, icons::icon},
     theme::{Theme, ThemeMode},
 };
 
@@ -524,22 +521,7 @@ pub enum PermissionApprovalEvent {
     KeyboardFocusChanged(Option<PermissionApprovalKeyboardFocus>),
 }
 
-#[derive(Clone)]
-pub struct PermissionApprovalCallback(
-    Rc<dyn Fn(PermissionApprovalEvent, &mut Window, &mut App) + 'static>,
-);
-
-impl PermissionApprovalCallback {
-    pub fn new(
-        callback: impl Fn(PermissionApprovalEvent, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        Self(Rc::new(callback))
-    }
-
-    fn emit(&self, event: PermissionApprovalEvent, window: &mut Window, cx: &mut App) {
-        (self.0)(event, window, cx);
-    }
-}
+pub type PermissionApprovalCallback = UiCallback<PermissionApprovalEvent>;
 
 #[derive(Clone, Copy)]
 struct PermissionPalette {

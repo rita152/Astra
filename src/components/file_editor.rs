@@ -1,14 +1,16 @@
-use crate::theme::{Theme, ThemeMode, UI_MONOSPACE_FONT_FAMILY, ui_font};
+use std::{
+    ops::Range,
+    time::{Duration, Instant},
+};
+
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementInputHandler, EntityInputHandler,
     FocusHandle, Focusable, KeyDownEvent, MouseButton, Pixels, Point, ShapedLine, TextRun,
     UTF16Selection, Window, canvas, div, fill, point, prelude::*, px, size,
 };
-use std::{
-    ops::Range,
-    time::{Duration, Instant},
-};
 use unicode_segmentation::UnicodeSegmentation;
+
+use crate::theme::{Theme, ThemeMode, UI_MONOSPACE_FONT_FAMILY, ui_font};
 
 const FONT_SIZE: f32 = 12.;
 const LINE_HEIGHT: f32 = 22.;
@@ -101,7 +103,7 @@ impl Buffer {
             self.restore(s);
         }
     }
-    fn from_utf16(&self, offset: usize) -> usize {
+    fn byte_offset_from_utf16(&self, offset: usize) -> usize {
         from_utf16(&self.text, offset)
     }
     fn to_utf16(&self, offset: usize) -> usize {
@@ -865,7 +867,8 @@ impl EntityInputHandler for FileEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let r = self.buffer.from_utf16(r.start)..self.buffer.from_utf16(r.end);
+        let r =
+            self.buffer.byte_offset_from_utf16(r.start)..self.buffer.byte_offset_from_utf16(r.end);
         *adjusted = Some(self.buffer.to_utf16(r.start)..self.buffer.to_utf16(r.end));
         Some(self.buffer.text[r].into())
     }
@@ -899,7 +902,10 @@ impl EntityInputHandler for FileEditor {
     ) {
         let checkpoint = self.marked.is_none();
         let r = r
-            .map(|r| self.buffer.from_utf16(r.start)..self.buffer.from_utf16(r.end))
+            .map(|r| {
+                self.buffer.byte_offset_from_utf16(r.start)
+                    ..self.buffer.byte_offset_from_utf16(r.end)
+            })
             .or(self.marked.take())
             .unwrap_or(self.buffer.selection());
         if !self.accepts(&r, text, cx) {
@@ -926,7 +932,10 @@ impl EntityInputHandler for FileEditor {
     ) {
         let checkpoint = self.marked.is_none();
         let r = r
-            .map(|r| self.buffer.from_utf16(r.start)..self.buffer.from_utf16(r.end))
+            .map(|r| {
+                self.buffer.byte_offset_from_utf16(r.start)
+                    ..self.buffer.byte_offset_from_utf16(r.end)
+            })
             .or(self.marked.take())
             .unwrap_or(self.buffer.selection());
         if !self.accepts(&r, text, cx) {
@@ -950,7 +959,7 @@ impl EntityInputHandler for FileEditor {
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let b = self.bounds?;
-        let p = self.buffer.from_utf16(r.start);
+        let p = self.buffer.byte_offset_from_utf16(r.start);
         let index = self.row_for(p);
         let row = self.rows.get(index)?;
         Some(Bounds::new(

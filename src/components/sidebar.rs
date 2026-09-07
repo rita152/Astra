@@ -787,13 +787,16 @@ impl SidebarView {
     fn thread_row(
         &self,
         thread: &ThreadSummary,
-        indented: bool,
-        pinned: bool,
-        archived: bool,
+        placement: ThreadRowPlacement,
         theme: Theme,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
+        let ThreadRowPlacement {
+            indented,
+            pinned,
+            archived,
+        } = placement;
         let thread_id = thread.thread_id.clone();
         let selected = self.selected_thread_id.as_deref() == Some(thread_id.as_str());
         let hovered = self.hovered_thread_id.as_deref() == Some(thread_id.as_str());
@@ -1145,7 +1148,17 @@ impl SidebarView {
                 threads.len().min(MAX_VISIBLE_PROJECT_THREADS)
             };
             for thread in threads.iter().take(visible) {
-                group = group.child(self.thread_row(thread, true, false, false, theme, window, cx));
+                group = group.child(self.thread_row(
+                    thread,
+                    ThreadRowPlacement {
+                        indented: true,
+                        pinned: false,
+                        archived: false,
+                    },
+                    theme,
+                    window,
+                    cx,
+                ));
             }
             if threads.len() > MAX_VISIBLE_PROJECT_THREADS {
                 let show_id = project_id.clone();
@@ -1193,7 +1206,17 @@ impl SidebarView {
             return section.child(self.status_row("pinned-loading", "正在加载…", theme));
         }
         for thread in &self.snapshot.pinned_threads {
-            section = section.child(self.thread_row(thread, false, true, false, theme, window, cx));
+            section = section.child(self.thread_row(
+                thread,
+                ThreadRowPlacement {
+                    indented: false,
+                    pinned: true,
+                    archived: false,
+                },
+                theme,
+                window,
+                cx,
+            ));
         }
         section
     }
@@ -1361,8 +1384,17 @@ impl SidebarView {
             return section.child(self.status_row("recent-empty", "暂无最近聊天", theme));
         }
         for thread in threads {
-            section =
-                section.child(self.thread_row(thread, false, false, false, theme, window, cx));
+            section = section.child(self.thread_row(
+                thread,
+                ThreadRowPlacement {
+                    indented: false,
+                    pinned: false,
+                    archived: false,
+                },
+                theme,
+                window,
+                cx,
+            ));
         }
         section
     }
@@ -1421,8 +1453,17 @@ impl SidebarView {
             return content.child(self.status_row("activity-empty", "暂无进行中的聊天", theme));
         }
         for thread in active {
-            content =
-                content.child(self.thread_row(thread, false, false, false, theme, window, cx));
+            content = content.child(self.thread_row(
+                thread,
+                ThreadRowPlacement {
+                    indented: false,
+                    pinned: false,
+                    archived: false,
+                },
+                theme,
+                window,
+                cx,
+            ));
         }
         content
     }
@@ -1467,7 +1508,17 @@ impl SidebarView {
             return content.child(self.status_row("archived-empty", "暂无已归档聊天", theme));
         }
         for thread in &self.snapshot.archived_threads {
-            content = content.child(self.thread_row(thread, false, false, true, theme, window, cx));
+            content = content.child(self.thread_row(
+                thread,
+                ThreadRowPlacement {
+                    indented: false,
+                    pinned: false,
+                    archived: true,
+                },
+                theme,
+                window,
+                cx,
+            ));
         }
         content
     }
@@ -2492,4 +2543,11 @@ mod tests {
             let _ = std::fs::remove_dir_all(parent);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ThreadRowPlacement {
+    pub(super) indented: bool,
+    pub(super) pinned: bool,
+    pub(super) archived: bool,
 }

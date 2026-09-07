@@ -6,15 +6,10 @@
 //! caller supplies a presentation model and translates [`ApprovalCardEvent`]
 //! back into its own state machine.
 
-use std::rc::Rc;
-
-use gpui::{
-    App, BoxShadow, Div, FontWeight, Role, SharedString, Stateful, Window, div, prelude::*, px,
-    rgba,
-};
+use gpui::{BoxShadow, Div, FontWeight, Role, SharedString, Stateful, div, prelude::*, px, rgba};
 
 use crate::{
-    components::icons::icon,
+    components::{callback::UiCallback, icons::icon},
     theme::{Theme, ThemeMode, UI_MONOSPACE_FONT_FAMILY},
 };
 
@@ -399,20 +394,7 @@ pub enum ApprovalCardEvent {
     KeyboardFocusChanged(Option<ApprovalKeyboardFocus>),
 }
 
-/// Callback kept UI-framework aware so a parent entity can update itself and
-/// notify GPUI without introducing protocol types into this module.
-#[derive(Clone)]
-pub struct ApprovalCardCallback(Rc<dyn Fn(ApprovalCardEvent, &mut Window, &mut App) + 'static>);
-
-impl ApprovalCardCallback {
-    pub fn new(callback: impl Fn(ApprovalCardEvent, &mut Window, &mut App) + 'static) -> Self {
-        Self(Rc::new(callback))
-    }
-
-    fn emit(&self, event: ApprovalCardEvent, window: &mut Window, cx: &mut App) {
-        (self.0)(event, window, cx);
-    }
-}
+pub type ApprovalCardCallback = UiCallback<ApprovalCardEvent>;
 
 #[derive(Clone, Copy)]
 struct ApprovalPalette {

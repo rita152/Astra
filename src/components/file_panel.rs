@@ -1,3 +1,14 @@
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::Duration,
+};
+
+use gpui::{
+    App, Context, Div, Entity, FocusHandle, Focusable, KeyDownEvent, MouseButton, ObjectFit,
+    Render, Role, Window, div, prelude::*, px, uniform_list,
+};
+
 use super::{
     file_editor::{EditorEvent, FileEditor},
     file_io::{self, FileEntry, TextFile},
@@ -5,15 +16,6 @@ use super::{
     prompt_input::{PromptChanged, PromptInput, PromptSubmitted},
 };
 use crate::theme::{Theme, ThemeMode};
-use gpui::{
-    App, Context, Div, Entity, FocusHandle, Focusable, KeyDownEvent, MouseButton, ObjectFit,
-    Render, Role, Window, div, prelude::*, px, uniform_list,
-};
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-    time::Duration,
-};
 
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(no_json)]

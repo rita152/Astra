@@ -349,9 +349,7 @@ fn markdown_image_dimensions(destination: &str) -> Option<(u32, u32)> {
     {
         return *dimensions;
     }
-    let dimensions = crate::agent::generated_image_dimensions(path)
-        .ok()
-        .flatten();
+    let dimensions = crate::media::read_image_dimensions(path).ok().flatten();
     let mut cache = cache.lock().ok()?;
     if cache.len() >= 128 {
         cache.clear();
@@ -387,10 +385,10 @@ fn table_cells(nodes: Vec<RawNode>) -> Vec<MarkdownTableCell> {
 fn take_task_marker(nodes: &mut Vec<RawNode>) -> Option<bool> {
     let mut index = 0;
     while index < nodes.len() {
-        if matches!(nodes[index], RawNode::TaskListMarker(_)) {
-            if let RawNode::TaskListMarker(checked) = nodes.remove(index) {
-                return Some(checked);
-            }
+        if matches!(nodes[index], RawNode::TaskListMarker(_))
+            && let RawNode::TaskListMarker(checked) = nodes.remove(index)
+        {
+            return Some(checked);
         }
         if let RawNode::Element { tag, children } = &mut nodes[index]
             && matches!(
@@ -1945,7 +1943,7 @@ fn highlighted_code_text(
     base_font.weight = CHATGPT_MARKDOWN_BODY_WEIGHT;
     let spans = highlighted_code_spans(code, language).unwrap_or_else(|| {
         (!code.is_empty())
-            .then(|| CodeHighlightSpan {
+            .then_some(CodeHighlightSpan {
                 range: 0..code.len(),
                 style: CodeSyntaxStyle::PLAIN,
             })
@@ -2141,9 +2139,11 @@ impl gpui::RenderOnce for MarkdownTable {
                 table,
                 &header,
                 style,
-                true,
-                false,
-                markdown_hash(&(block_identity, "header")),
+                TableRowPresentation {
+                    is_header: true,
+                    is_last_row: false,
+                    row_identity: markdown_hash(&(block_identity, "header")),
+                },
                 column_count,
                 &widths,
             );
@@ -2153,9 +2153,11 @@ impl gpui::RenderOnce for MarkdownTable {
                 table,
                 row,
                 style,
-                false,
-                index + 1 == rows.len(),
-                markdown_hash(&(block_identity, index)),
+                TableRowPresentation {
+                    is_header: false,
+                    is_last_row: index + 1 == rows.len(),
+                    row_identity: markdown_hash(&(block_identity, index)),
+                },
                 column_count,
                 &widths,
             );
@@ -2183,17 +2185,20 @@ fn append_table_row(
     mut table: Div,
     cells: &[MarkdownTableCell],
     style: MarkdownRenderStyle,
-    is_header: bool,
-    is_last_row: bool,
-    row_identity: u64,
+    presentation: TableRowPresentation,
     column_count: usize,
     widths: &[f32],
 ) -> Div {
-    for index in 0..column_count {
+    let TableRowPresentation {
+        is_header,
+        is_last_row,
+        row_identity,
+    } = presentation;
+    for (index, width) in widths[..column_count].iter().copied().enumerate() {
         let cell = cells.get(index);
         let mut element = div()
             .debug_selector(move || format!("markdown-table-cell-{row_identity}-{index}"))
-            .w(px(widths[index]))
+            .w(px(width))
             .min_w(px(0.0))
             .h_full()
             .pr(px(if index + 1 == column_count {
@@ -3063,7 +3068,7 @@ mod inline_line_break_regressions {
                     };
                     let width = window
                         .text_system()
-                        .shape_line(text.into(), px(12.88), &[run.clone()], None)
+                        .shape_line(text.into(), px(12.88), std::slice::from_ref(&run), None)
                         .width();
                     let lines = window
                         .text_system()
@@ -3119,4 +3124,11 @@ mod inline_line_break_regressions {
             })
             .unwrap();
     }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TableRowPresentation {
+    pub(super) is_header: bool,
+    pub(super) is_last_row: bool,
+    pub(super) row_identity: u64,
 }

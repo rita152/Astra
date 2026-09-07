@@ -1,13 +1,3 @@
-use crate::{
-    components::icons::icon,
-    theme::{Theme, ThemeMode},
-};
-use gpui::{
-    App, Bounds, ClipboardItem, Context, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, Pixels, Point, SharedString,
-    TextRun, UTF16Selection, Window, canvas, div, fill, point, prelude::*, px, rgb, size,
-};
-use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use std::{
     io::{Read, Write},
     ops::Range,
@@ -17,6 +7,18 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
+};
+
+use gpui::{
+    App, Bounds, ClipboardItem, Context, ElementInputHandler, Entity, EntityInputHandler,
+    FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, Pixels, Point, SharedString,
+    TextRun, UTF16Selection, Window, canvas, div, fill, point, prelude::*, px, rgb, size,
+};
+use portable_pty::{CommandBuilder, MasterPty, PtySize};
+
+use crate::{
+    components::icons::icon,
+    theme::{Theme, ThemeMode},
 };
 
 const FONT_SIZE: f32 = 12.0;
@@ -274,10 +276,10 @@ impl TerminalView {
         view
     }
     fn send(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
-        if let Some(input) = self.process.as_ref().and_then(|p| p.input.as_ref()) {
-            if input.try_send(bytes).is_err() {
-                self.status = Some("终端连接已关闭".into());
-            }
+        if let Some(input) = self.process.as_ref().and_then(|p| p.input.as_ref())
+            && input.try_send(bytes).is_err()
+        {
+            self.status = Some("终端连接已关闭".into());
         }
         self.parser.screen_mut().set_scrollback(0);
         self.selection = None;
@@ -289,15 +291,15 @@ impl TerminalView {
         let cols = ((f32::from(bounds.size.width) / CELL_WIDTH).floor() as u16).max(2);
         let rows = ((f32::from(bounds.size.height) / LINE_HEIGHT).floor() as u16).max(1);
         if self.parser.screen().size() != (rows, cols) {
-            if let Some(process) = &self.process {
-                if let Err(error) = process.master.resize(PtySize {
+            if let Some(process) = &self.process
+                && let Err(error) = process.master.resize(PtySize {
                     rows,
                     cols,
                     pixel_width: 0,
                     pixel_height: 0,
-                }) {
-                    self.status = Some(format!("终端尺寸更新失败：{error}"));
-                }
+                })
+            {
+                self.status = Some(format!("终端尺寸更新失败：{error}"));
             }
             self.parser.screen_mut().set_size(rows, cols);
             self.selection = None;
@@ -323,11 +325,11 @@ impl TerminalView {
             let last = if row == end.0 { end.1 } else { screen.size().1 };
             let mut line = String::new();
             for col in first..last {
-                if let Some(cell) = screen.cell(row, col) {
-                    if !cell.is_wide_continuation() {
-                        let s = cell.contents();
-                        line.push_str(if s.is_empty() { " " } else { s });
-                    }
+                if let Some(cell) = screen.cell(row, col)
+                    && !cell.is_wide_continuation()
+                {
+                    let s = cell.contents();
+                    line.push_str(if s.is_empty() { " " } else { s });
                 }
             }
             text.push_str(line.trim_end());
@@ -645,12 +647,12 @@ impl Render for TerminalView {
                                                     &[TextRun {
                                                         len: text.len(),
                                                         font,
-                                                        color: fg.into(),
+                                                        color: fg,
                                                         background_color: None,
                                                         underline: cell.underline().then_some(
                                                             gpui::UnderlineStyle {
                                                                 thickness: px(1.),
-                                                                color: Some(fg.into()),
+                                                                color: Some(fg),
                                                                 wavy: false,
                                                             },
                                                         ),
@@ -694,7 +696,7 @@ impl Render for TerminalView {
                                             &[TextRun {
                                                 len: text.len(),
                                                 font: gpui::font("Menlo"),
-                                                color: foreground.into(),
+                                                color: foreground,
                                                 background_color: Some(theme.surface.into()),
                                                 underline: Some(gpui::UnderlineStyle {
                                                     thickness: px(1.),
@@ -750,12 +752,7 @@ impl EntityInputHandler for TerminalView {
     ) -> Option<String> {
         *adjusted = Some(range.clone());
         Some(String::from_utf16_lossy(
-            &self
-                .marked
-                .encode_utf16()
-                .collect::<Vec<_>>()
-                .get(range)?
-                .to_vec(),
+            self.marked.encode_utf16().collect::<Vec<_>>().get(range)?,
         ))
     }
     fn selected_text_range(

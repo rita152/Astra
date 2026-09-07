@@ -12,15 +12,15 @@
 //! are also represented explicitly so pending protocol state never disappears
 //! without an observable outcome.
 
-use std::{fmt, rc::Rc};
+use std::fmt;
 
 use gpui::{
-    App, BoxShadow, Div, Entity, FontWeight, Role, SharedString, Stateful, Transformation, Window,
-    div, prelude::*, px, radians, rgba,
+    BoxShadow, Div, Entity, FontWeight, Role, SharedString, Stateful, Transformation, div,
+    prelude::*, px, radians, rgba,
 };
 
 use crate::{
-    components::{icons::icon, prompt_input::PromptInput},
+    components::{callback::UiCallback, icons::icon, prompt_input::PromptInput},
     theme::{Theme, ThemeMode},
 };
 
@@ -724,20 +724,7 @@ pub enum UserInputRequestEvent {
     ActiveOptionChanged(Option<usize>),
 }
 
-#[derive(Clone)]
-pub struct UserInputRequestCallback(
-    Rc<dyn Fn(UserInputRequestEvent, &mut Window, &mut App) + 'static>,
-);
-
-impl UserInputRequestCallback {
-    pub fn new(callback: impl Fn(UserInputRequestEvent, &mut Window, &mut App) + 'static) -> Self {
-        Self(Rc::new(callback))
-    }
-
-    fn emit(&self, event: UserInputRequestEvent, window: &mut Window, cx: &mut App) {
-        (self.0)(event, window, cx);
-    }
-}
+pub type UserInputRequestCallback = UiCallback<UserInputRequestEvent>;
 
 #[derive(Clone, Copy)]
 struct UserInputPalette {
@@ -1503,7 +1490,7 @@ fn render_other_row(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::{cell::RefCell, rc::Rc};
 
     use gpui::{
         Bounds, Context, IntoElement, MouseButton, Render, TestApp, Window, WindowBounds,
