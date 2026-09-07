@@ -1830,6 +1830,7 @@ mod tests {
                     items: if full {
                         vec![
                             ThreadHistoryItem::UserMessage {
+                                images: Vec::new(),
                                 item_id: format!("{id}-user"),
                                 text: format!("question {id}"),
                             },

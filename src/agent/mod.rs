@@ -341,10 +341,18 @@ pub enum HistoryTurnStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UserMessageImage {
+    Local(PathBuf),
+    Remote(String),
+    Unavailable(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ThreadHistoryItem {
     UserMessage {
         item_id: String,
         text: String,
+        images: Vec<UserMessageImage>,
     },
     AssistantMessage {
         item_id: String,

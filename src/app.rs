@@ -91,6 +91,9 @@ pub struct ChatApp {
     subagent_panel_menu_open: bool,
     diff_review: Option<DiffReviewPresentation>,
     image_preview: Option<PathBuf>,
+    image_preview_focus: FocusHandle,
+    image_preview_focus_active: bool,
+    image_preview_previous_focus: Option<FocusHandle>,
     image_preview_dimensions: Option<(u32, u32)>,
     image_preview_zoom: f32,
     permission_confirmation_open: bool,
@@ -545,6 +548,9 @@ impl ChatApp {
             subagent_panel_menu_open: false,
             diff_review: None,
             image_preview: None,
+            image_preview_focus: cx.focus_handle(),
+            image_preview_focus_active: false,
+            image_preview_previous_focus: None,
             image_preview_dimensions: None,
             image_preview_zoom: 1.0,
             permission_confirmation_open: false,
@@ -3163,6 +3169,16 @@ impl Render for ChatApp {
         {
             return startup_loading_view(theme).into_any_element();
         }
+        if self.image_preview.is_some() && !self.image_preview_focus_active {
+            self.image_preview_previous_focus = window.focused(cx);
+            self.image_preview_focus.focus(window, cx);
+            self.image_preview_focus_active = true;
+        } else if self.image_preview.is_none() && self.image_preview_focus_active {
+            if let Some(previous) = self.image_preview_previous_focus.take() {
+                previous.focus(window, cx);
+            }
+            self.image_preview_focus_active = false;
+        }
         if self.project_creation_open && self.project_creation_focus_pending {
             self.project_creation_focus.focus(window, cx);
             self.project_creation_focus_pending = false;
@@ -3228,7 +3244,13 @@ impl Render for ChatApp {
             }))
             .on_key_down(cx.listener(Self::handle_project_creation_key))
             .on_action(cx.listener(|this, _: &DismissPermissionUi, _, cx| {
-                if this.bottom_panel_add_menu_open {
+                if this.image_preview.is_some() {
+                    this.image_preview = None;
+                    this.image_preview_dimensions = None;
+                    this.image_preview_zoom = 1.0;
+                    cx.stop_propagation();
+                    cx.notify();
+                } else if this.bottom_panel_add_menu_open {
                     this.close_bottom_panel_menu(cx);
                 } else if this.project_creation_open {
                     this.close_project_creation(cx);
@@ -3539,6 +3561,7 @@ impl Render for ChatApp {
                 shell.child(
                     div()
                         .id("image-preview-dialog")
+                        .track_focus(&self.image_preview_focus)
                         .role(Role::Dialog)
                         .aria_label("图片预览")
                         .absolute()
@@ -3856,6 +3879,11 @@ mod tests {
             |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
         );
         window.update(|chat, _, cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "escape",
+                super::DismissPermissionUi,
+                None,
+            )]);
             chat.startup_model_catalog_resolved = true;
             chat.startup_sidebar_resolved = true;
             chat.startup_minimum_duration_elapsed = true;
@@ -3885,6 +3913,14 @@ mod tests {
             assert_eq!(chat.image_preview_zoom, 1.0);
         });
 
+        window.draw();
+        window.update(|chat, _, cx| {
+            chat.image_preview = Some(source.clone());
+            cx.notify();
+        });
+        window.draw();
+        window.simulate_keystroke("escape");
+        assert!(window.read(|chat, _| chat.image_preview.is_none()));
         std::fs::remove_file(source).unwrap();
         std::fs::remove_file(destination).unwrap();
     }
@@ -4584,6 +4620,7 @@ mod tests {
                 items_view: HistoryItemDetail::Full,
                 items: vec![
                     ThreadHistoryItem::UserMessage {
+                        images: Vec::new(),
                         item_id: format!("user-{thread_id}"),
                         text: message.to_owned(),
                     },

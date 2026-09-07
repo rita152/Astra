@@ -138,6 +138,7 @@ pub enum ConversationPhase {
 pub struct ConversationTranscriptTurn {
     pub phase: ConversationPhase,
     pub user_message: String,
+    pub user_images: Vec<crate::agent::UserMessageImage>,
     pub user_message_time: Option<String>,
     pub assistant_message: String,
     pub assistant_message_time: Option<String>,
@@ -665,6 +666,7 @@ pub struct ComposerView {
     prompt_input: Entity<PromptInput>,
     user_input_other_input: Entity<PromptInput>,
     user_message: Option<String>,
+    user_images: Vec<crate::agent::UserMessageImage>,
     user_message_time: Option<String>,
     assistant_message: String,
     conversation_activity: Vec<ConversationActivity>,
@@ -802,6 +804,7 @@ impl ComposerView {
             prompt_input,
             user_input_other_input,
             user_message: None,
+            user_images: Vec::new(),
             user_message_time: None,
             assistant_message: String::new(),
             conversation_activity: Vec::new(),
@@ -1268,11 +1271,17 @@ impl ComposerView {
             .iter()
             .map(|turn| {
                 let mut user_messages = Vec::new();
+                let mut user_images = Vec::new();
                 let mut assistant_messages = Vec::new();
                 let mut activities = Vec::new();
                 for item in &turn.items {
                     match item {
-                        ThreadHistoryItem::UserMessage { item_id, text } => {
+                        ThreadHistoryItem::UserMessage {
+                            item_id,
+                            text,
+                            images,
+                        } => {
+                            user_images.extend(images.iter().cloned());
                             if let Some(replies) = resumed_question_replies(text) {
                                 activities.extend(replies.into_iter().map(|(question, answer)| {
                                     ConversationActivity::QuestionReply {
@@ -1403,6 +1412,7 @@ impl ComposerView {
                         HistoryTurnStatus::Failed => ConversationPhase::Failed,
                     },
                     user_message: user_messages.join("\n\n"),
+                    user_images,
                     user_message_time: history_time_label(turn.started_at),
                     assistant_message: if final_messages.is_empty() {
                         assistant_messages.join("\n\n")
@@ -1422,6 +1432,7 @@ impl ComposerView {
         if let Some(last) = self.transcript.pop() {
             self.conversation_phase = last.phase;
             self.user_message = Some(last.user_message);
+            self.user_images = last.user_images;
             self.user_message_time = last.user_message_time;
             self.assistant_message = last.assistant_message;
             self.assistant_message_time = last.assistant_message_time;
@@ -1430,6 +1441,7 @@ impl ComposerView {
         } else {
             self.conversation_phase = ConversationPhase::Empty;
             self.user_message = None;
+            self.user_images.clear();
             self.user_message_time = None;
             self.assistant_message.clear();
             self.assistant_message_time = None;
@@ -1447,12 +1459,17 @@ impl ComposerView {
         self.transcript.push(ConversationTranscriptTurn {
             phase: self.conversation_phase,
             user_message,
+            user_images: std::mem::take(&mut self.user_images),
             user_message_time: self.user_message_time.take(),
             assistant_message: std::mem::take(&mut self.assistant_message),
             assistant_message_time: self.assistant_message_time.take(),
             activities: std::mem::take(&mut self.conversation_activity),
             resumed: self.resumed_turn.take(),
         });
+    }
+
+    pub fn user_images(&self) -> Vec<crate::agent::UserMessageImage> {
+        self.user_images.clone()
     }
 
     pub fn resumed_turn(&self) -> Option<ResumedTurnPresentation> {
@@ -6884,6 +6901,7 @@ mod tests {
                     status: HistoryTurnStatus::Completed,
                     items_view: HistoryItemDetail::Full,
                     items: vec![ThreadHistoryItem::UserMessage {
+                        images: vec![crate::agent::UserMessageImage::Local("/tmp/first.png".into())],
                         item_id: "user-1".into(),
                         text: "短行 Short\n".into(),
                     }],
@@ -6897,6 +6915,7 @@ mod tests {
                     status: HistoryTurnStatus::Completed,
                     items_view: HistoryItemDetail::Full,
                     items: vec![ThreadHistoryItem::UserMessage {
+                        images: vec![crate::agent::UserMessageImage::Local("/tmp/second.png".into())],
                         item_id: "user-2".into(),
                         text: concat!(
                             "\n# Files mentioned by the user:\n\n",
@@ -6925,10 +6944,32 @@ mod tests {
             composer.transcript_render_snapshot()
         });
         assert_eq!(prior[0].user_message, "短行 Short");
+        assert_eq!(
+            prior[0].user_images,
+            vec![crate::agent::UserMessageImage::Local(
+                "/tmp/first.png".into()
+            )]
+        );
         let current = app.read_entity(&composer, |composer, _| {
             composer.conversation_render_snapshot().1
         });
         assert_eq!(current.as_deref(), Some("附件 + **Markdown** + 中English"));
+        app.update_entity(&composer, |composer, _| {
+            assert_eq!(
+                composer.user_images(),
+                vec![crate::agent::UserMessageImage::Local(
+                    "/tmp/second.png".into()
+                )]
+            );
+            composer.commit_current_turn();
+            assert!(composer.user_images().is_empty());
+            assert_eq!(
+                composer.transcript.last().unwrap().user_images,
+                vec![crate::agent::UserMessageImage::Local(
+                    "/tmp/second.png".into()
+                )]
+            );
+        });
     }
 
     struct TestInterruptControl {

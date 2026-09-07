@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
     io::{BufRead, BufReader, Error as IoError, ErrorKind, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -33,7 +34,8 @@ use crate::agent::{
     ProjectChange, ProjectId, SortDirection, ThreadActivity, ThreadHistoryItem,
     ThreadHistoryItemEntry, ThreadId, ThreadListRequest, ThreadMetadataUpdate, ThreadSearchResult,
     ThreadSection, ThreadSectionAppearance, ThreadSectionId, ThreadSummary, ThreadTurn,
-    UpdateProject, WorkspaceError, WorkspaceResult, normalize_user_message_for_display,
+    UpdateProject, UserMessageImage, WorkspaceError, WorkspaceResult,
+    normalize_user_message_for_display,
 };
 
 trait ManagedProcess: Send + Sync {
@@ -1126,7 +1128,38 @@ fn parse_history_item(value: &Value) -> Result<ThreadHistoryItem> {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
+            let images = content
+                .iter()
+                .enumerate()
+                .filter_map(
+                    |(index, part)| match part.get("type").and_then(Value::as_str) {
+                        Some("localImage") => Some(
+                            string_field(part, "path", "localImage")
+                                .map(|path| UserMessageImage::Local(path.into())),
+                        ),
+                        Some("image") => Some(string_field(part, "url", "image").map(|url| {
+                            if url.starts_with("data:image/") {
+                                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                                url.hash(&mut hash);
+                                match super::materialize_image_generation_result(
+                                    &format!("user-{index}-{:016x}", hash.finish()),
+                                    &url,
+                                ) {
+                                    Ok(path) => UserMessageImage::Local(path),
+                                    Err(_) => {
+                                        UserMessageImage::Unavailable("无法读取图片附件".into())
+                                    }
+                                }
+                            } else {
+                                UserMessageImage::Remote(url)
+                            }
+                        })),
+                        _ => None,
+                    },
+                )
+                .collect::<Result<Vec<_>>>()?;
             Ok(ThreadHistoryItem::UserMessage {
+                images,
                 item_id,
                 // The answer envelope contains JSON escaping, not Markdown.
                 // Preserve it for the resumed question/answer presentation.
@@ -3106,10 +3139,41 @@ mod tests {
         assert_eq!(
             item,
             ThreadHistoryItem::UserMessage {
+                images: vec![crate::agent::UserMessageImage::Local(
+                    "/tmp/capture.png".into()
+                )],
                 item_id: "user_attachment_1".into(),
                 text: "附件 + **Markdown** + 中English".into(),
             }
         );
+    }
+
+    #[test]
+    fn image_only_history_preserves_order_and_recovers_embedded_images() {
+        use crate::agent::UserMessageImage;
+        let item = parse_history_item(&json!({
+            "type": "userMessage", "id": "image-only-regression",
+            "content": [
+                {"type":"image", "url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="},
+                {"type":"localImage", "path":"/tmp/second.png"},
+                {"type":"image", "url":"data:image/png;base64,invalid!"}
+            ]
+        })).unwrap();
+        let ThreadHistoryItem::UserMessage { text, images, .. } = item else {
+            panic!()
+        };
+        assert!(text.is_empty());
+        assert_eq!(images.len(), 3);
+        let UserMessageImage::Local(path) = &images[0] else {
+            panic!()
+        };
+        assert!(
+            std::fs::read(path)
+                .unwrap()
+                .starts_with(b"\x89PNG\r\n\x1a\n")
+        );
+        assert_eq!(images[1], UserMessageImage::Local("/tmp/second.png".into()));
+        assert!(matches!(&images[2], UserMessageImage::Unavailable(_)));
     }
 
     #[test]

@@ -292,10 +292,12 @@ enum ConversationListRow {
     HistoricalUser {
         turn_index: usize,
         message: String,
+        images: Vec<crate::agent::UserMessageImage>,
         time: Option<String>,
     },
     CurrentUser {
         message: String,
+        images: Vec<crate::agent::UserMessageImage>,
         time: String,
     },
     AssistantMarkdown {
@@ -1000,6 +1002,7 @@ impl HomeView {
             transcript,
             phase,
             user_message.unwrap_or_default(),
+            self.composer.read(cx).user_images(),
             user_message_time.unwrap_or_default(),
             assistant_message,
             assistant_message_time,
@@ -2559,6 +2562,7 @@ fn conversation_list_rows(
     transcript: Vec<ConversationTranscriptTurn>,
     phase: ConversationPhase,
     user_message: String,
+    user_images: Vec<crate::agent::UserMessageImage>,
     user_message_time: String,
     assistant_message: String,
     assistant_message_time: Option<String>,
@@ -2572,10 +2576,11 @@ fn conversation_list_rows(
     let show_thinking_tail = conversation_status(phase).is_some() && !has_active_reasoning;
     let mut rows = Vec::new();
     for (turn_index, turn) in transcript.into_iter().enumerate() {
-        if !turn.user_message.is_empty() {
+        if !turn.user_message.is_empty() || !turn.user_images.is_empty() {
             rows.push(ConversationListRow::HistoricalUser {
                 turn_index,
                 message: turn.user_message,
+                images: turn.user_images,
                 time: turn.user_message_time,
             });
         }
@@ -2616,6 +2621,7 @@ fn conversation_list_rows(
     }
     rows.push(ConversationListRow::CurrentUser {
         message: user_message,
+        images: user_images,
         time: user_message_time,
     });
     if conversation_activity.is_empty() {
@@ -2773,6 +2779,16 @@ fn conversation(
         let Some(row) = rows.get(index).cloned() else {
             return div().into_any_element();
         };
+        let is_markdown = matches!(
+            &row,
+            ConversationListRow::AssistantMarkdown { .. }
+                | ConversationListRow::Activity {
+                    unit: ActivityStreamUnit::Standalone(
+                        ConversationActivity::AssistantMessage { .. }
+                    ),
+                    ..
+                }
+        );
         let (row, top_gap, bottom_gap) = match row {
             ConversationListRow::FileSummary(review) => (
                 resumed_file_summary_card(review, home_entity.clone(), theme, _cx)
@@ -2805,6 +2821,7 @@ fn conversation(
             ConversationListRow::HistoricalUser {
                 turn_index,
                 message,
+                images,
                 time,
             } => (
                 div()
@@ -2812,22 +2829,30 @@ fn conversation(
                     .w_full()
                     .child(current_user_message(
                         message,
+                        images,
                         time.unwrap_or_default(),
                         false,
                         theme,
                         window,
+                        home_entity.clone(),
                     ))
                     .into_any_element(),
                 0.0,
                 16.0,
             ),
-            ConversationListRow::CurrentUser { message, time } => (
+            ConversationListRow::CurrentUser {
+                message,
+                images,
+                time,
+            } => (
                 current_user_message(
                     message,
+                    images,
                     time,
                     user_message_actions_visible_for_capture,
                     theme,
                     window,
+                    home_entity.clone(),
                 )
                 .into_any_element(),
                 0.0,
@@ -2903,7 +2928,10 @@ fn conversation(
             .child(
                 div()
                     .w_full()
-                    .max_w(px(CONVERSATION_CONTENT_MAX_WIDTH))
+                    .min_w(px(0.0))
+                    .when(!is_markdown, |element| {
+                        element.max_w(px(CONVERSATION_CONTENT_MAX_WIDTH))
+                    })
                     .pt(px(top_gap))
                     .pb(px(bottom_gap))
                     .text_size(px(14.0))
@@ -3007,12 +3035,119 @@ fn resumed_work_header(
         )
 }
 
+fn user_message_images(
+    images: Vec<crate::agent::UserMessageImage>,
+    home: Entity<HomeView>,
+    theme: Theme,
+) -> Div {
+    use crate::agent::UserMessageImage;
+    let width = images.len() as f32 * 88.0 - 8.0;
+    div().w(px(width)).max_w_full().mb(px(8.0)).child(
+        div()
+            .id("user-image-scroll")
+            .w_full()
+            .min_w(px(0.0))
+            .overflow_x_scroll()
+            .restrict_scroll_to_axis()
+            .scrollbar_width(px(0.0))
+            .child(div().w(px(width)).flex().gap(px(8.0)).children(
+                images.into_iter().enumerate().map(|(index, image)| {
+                    let unavailable = match &image {
+                        UserMessageImage::Local(path) => !path.is_file(),
+                        UserMessageImage::Unavailable(_) => true,
+                        UserMessageImage::Remote(_) => false,
+                    };
+                    let thumbnail = if unavailable {
+                        div()
+                            .p(px(6.0))
+                            .text_size(px(11.0))
+                            .text_color(theme.text_tertiary)
+                            .child("图片不可用")
+                            .into_any_element()
+                    } else {
+                        let source: gpui::ImageSource = match &image {
+                            UserMessageImage::Local(path) => path.clone().into(),
+                            UserMessageImage::Remote(url) => SharedString::from(url.clone()).into(),
+                            UserMessageImage::Unavailable(_) => unreachable!(),
+                        };
+                        gpui::img(source)
+                            .size_full()
+                            .rounded(px(10.0))
+                            .object_fit(ObjectFit::Cover)
+                            .into_any_element()
+                    };
+                    let click_image = image.clone();
+                    let click_home = home.clone();
+                    let key_home = home.clone();
+                    div()
+                        .id(("user-image", index))
+                        .debug_selector(move || format!("user-image-{index}"))
+                        .size(px(80.0))
+                        .flex_none()
+                        .rounded(px(12.5))
+                        .border_1()
+                        .border_color(theme.text.alpha(0.157))
+                        .overflow_hidden()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(!unavailable, |element| {
+                            element
+                                .role(Role::Button)
+                                .aria_label(format!("打开图片 {}", index + 1))
+                                .focusable()
+                                .tab_stop(true)
+                                .cursor_pointer()
+                                .hover(|style| style.border_color(theme.text.alpha(0.4)))
+                                .focus_visible(|style| style.border_color(theme.text))
+                                .on_click(move |_, _, cx| {
+                                    open_user_image(&click_image, &click_home, cx);
+                                })
+                                .on_key_down(move |event, window, cx| {
+                                    if event.keystroke.key == "tab" {
+                                        if event.keystroke.modifiers.shift {
+                                            window.focus_prev(cx);
+                                        } else {
+                                            window.focus_next(cx);
+                                        }
+                                        cx.stop_propagation();
+                                    } else if matches!(
+                                        event.keystroke.key.as_str(),
+                                        "enter" | "space"
+                                    ) {
+                                        open_user_image(&image, &key_home, cx);
+                                    }
+                                })
+                        })
+                        .child(thumbnail)
+                }),
+            )),
+    )
+}
+
+fn open_user_image(
+    image: &crate::agent::UserMessageImage,
+    home: &Entity<HomeView>,
+    cx: &mut gpui::App,
+) {
+    match image {
+        crate::agent::UserMessageImage::Local(path) => {
+            home.update(cx, |_, cx| cx.emit(OpenImagePreview(path.clone())))
+        }
+        crate::agent::UserMessageImage::Remote(url) => cx.open_url(url),
+        crate::agent::UserMessageImage::Unavailable(_) => {}
+    }
+    cx.stop_propagation();
+}
+
 fn current_user_message(
     user_message: String,
+    user_images: Vec<crate::agent::UserMessageImage>,
     user_message_time: String,
     actions_visible_for_capture: bool,
     theme: Theme,
     window: &mut Window,
+    home: Entity<HomeView>,
 ) -> Div {
     let hover_group: SharedString = "user-message-hover".into();
     let copied_user_message = user_message.clone();
@@ -3031,7 +3166,12 @@ fn current_user_message(
                 .flex()
                 .flex_col()
                 .items_end()
-                .child(user_message_bubble(user_message, theme, window))
+                .when(!user_images.is_empty(), |container| {
+                    container.child(user_message_images(user_images, home, theme))
+                })
+                .when(!user_message.is_empty(), |container| {
+                    container.child(user_message_bubble(user_message, theme, window))
+                })
                 .child(
                     div()
                         .mt(px(USER_MESSAGE_FOOTER_OFFSET))
@@ -7309,6 +7449,7 @@ mod tests {
             items_view: HistoryItemDetail::Full,
             items: vec![
                 ThreadHistoryItem::UserMessage {
+                    images: Vec::new(),
                     item_id: format!("{turn_id}-user"),
                     text: prompt.to_owned(),
                 },
@@ -7396,6 +7537,7 @@ mod tests {
             |_, cx| HomeView::new(ThemeMode::Dark, cx),
         );
         let mut dense_items = vec![ThreadHistoryItem::UserMessage {
+            images: Vec::new(),
             item_id: "dense-user".to_owned(),
             text: "inspect the native material".to_owned(),
         }];
@@ -7441,6 +7583,7 @@ mod tests {
                     status: HistoryTurnStatus::Completed,
                     items_view: HistoryItemDetail::Full,
                     items: vec![ThreadHistoryItem::UserMessage {
+                        images: Vec::new(),
                         item_id: "current-user".to_owned(),
                         text: "continue".to_owned(),
                     }],
@@ -7781,6 +7924,60 @@ mod tests {
         assert_eq!(
             *preview_path.lock().unwrap(),
             Some(PathBuf::from("/tmp/image-view.png"))
+        );
+    }
+
+    #[test]
+    fn uploaded_image_hitboxes_and_keyboard_keep_attachment_order() {
+        use crate::theme::Theme;
+        use gpui::{Entity, IntoElement, Window};
+        struct Images {
+            home: Entity<HomeView>,
+            paths: Vec<PathBuf>,
+        }
+        impl gpui::Render for Images {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                super::user_message_images(
+                    self.paths
+                        .iter()
+                        .cloned()
+                        .map(crate::agent::UserMessageImage::Local)
+                        .collect(),
+                    self.home.clone(),
+                    Theme::for_mode(ThemeMode::Dark),
+                )
+            }
+        }
+        let paths = ["assets/icons/folder.svg", "assets/icons/image-download.svg"]
+            .map(|name| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(name));
+        let mut app = TestApp::new();
+        let home = app.new_entity(|cx| HomeView::new(ThemeMode::Dark, cx));
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let observed = opened.clone();
+        let _observer = app.new_entity(|cx| {
+            cx.subscribe(&home, move |_: &mut (), _, event: &OpenImagePreview, _| {
+                observed.lock().unwrap().push(event.0.clone());
+            })
+            .detach();
+        });
+        let mut window = app.open_window_with_options(WindowOptions::default(), |_, _| Images {
+            home,
+            paths: paths.to_vec(),
+        });
+        window.draw();
+        window.simulate_click(point(px(4.0), px(40.0)), MouseButton::Left);
+        window.simulate_click(point(px(76.0), px(40.0)), MouseButton::Left);
+        window.simulate_keystrokes("tab");
+        window.simulate_keystrokes("space");
+        window.simulate_keystrokes("enter");
+        assert_eq!(
+            *opened.lock().unwrap(),
+            vec![
+                paths[0].clone(),
+                paths[0].clone(),
+                paths[1].clone(),
+                paths[1].clone()
+            ]
         );
     }
 

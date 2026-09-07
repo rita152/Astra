@@ -694,8 +694,16 @@ fn render_block_sequence(
         };
         sequence = sequence.child(
             div()
+                .debug_selector(move || format!("markdown-block-{block_identity}"))
                 .w_full()
                 .min_w(px(0.0))
+                // Prose keeps its readable measure while root tables can use
+                // the surrounding conversation width, as in the desktop app.
+                .when(
+                    matches!(context, SequenceContext::Root)
+                        && !matches!(block, MarkdownBlock::Table { .. }),
+                    |element| element.max_w(px(style.layout.table_min_width)).mx_auto(),
+                )
                 .when(collapsed_gap > 0.0, |element| element.mt(px(collapsed_gap)))
                 .child(render_block(
                     block,
@@ -2062,9 +2070,10 @@ impl gpui::RenderOnce for MarkdownTable {
             }
         }
         let scroll_id = markdown_element_id("markdown-table-scroll", &block_identity);
+        let table_width = widths.iter().sum::<f32>().max(style.layout.table_min_width);
         let mut table = div()
             .debug_selector(move || format!("markdown-table-{block_identity}"))
-            .min_w(px(style.layout.table_min_width))
+            .w(px(table_width))
             .flex_none()
             .grid()
             .grid_cols_auto(column_count as u16)
@@ -2102,8 +2111,10 @@ impl gpui::RenderOnce for MarkdownTable {
             div()
                 .id(scroll_id)
                 .debug_selector(move || format!("markdown-table-viewport-{block_identity}"))
-                .w_full()
+                .w(px(table_width))
+                .max_w_full()
                 .min_w(px(0.0))
+                .flex_none()
                 .overflow_x_scroll()
                 .restrict_scroll_to_axis()
                 .scrollbar_width(px(0.0))
@@ -2248,9 +2259,11 @@ pub fn capture_markdown(args: &[String]) -> bool {
                         .size_full()
                         .overflow_y_scroll()
                         .restrict_scroll_to_axis()
-                        .child(div().w_full().max_w(px(736.0)).mx_auto().child(
-                            render_assistant_markdown(&self.source, theme, "markdown-capture"),
-                        )),
+                        .child(div().w_full().child(render_assistant_markdown(
+                            &self.source,
+                            theme,
+                            "markdown-capture",
+                        ))),
                 )
         }
     }
@@ -2439,7 +2452,7 @@ mod tests {
         assert!((f32::from(a.size.width + b.size.width - table.size.width)).abs() <= 1.0);
         visual.simulate_event(gpui::ScrollWheelEvent {
             position: gpui::point(px(180.0), px(40.0)),
-            delta: gpui::ScrollDelta::Pixels(gpui::point(px(-300.0), px(0.0))),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(-10000.0), px(0.0))),
             touch_phase: gpui::TouchPhase::Moved,
             modifiers: Default::default(),
         });
@@ -2449,6 +2462,62 @@ mod tests {
             scrolled.origin.x < table.origin.x,
             "before={table:?}, after={scrolled:?}"
         );
+        assert!((f32::from(scrolled.right() - viewport.right())).abs() <= 1.0);
+        visual.simulate_event(gpui::ScrollWheelEvent {
+            position: gpui::point(px(180.0), px(40.0)),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(10000.0), px(0.0))),
+            touch_phase: gpui::TouchPhase::Moved,
+            modifiers: Default::default(),
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let restored = visual.debug_bounds("markdown-table-42").unwrap();
+        assert_eq!(restored.origin.x, viewport.origin.x);
+    }
+
+    struct WideMarkdownTable;
+    impl gpui::Render for WideMarkdownTable {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let document = parse_markdown(
+                "正文保持原有宽度。\n\n| 范围 | 当前实现 | 是否属于 GPUI 绘制 |\n| --- | --- | --- |\n| 主界面、侧栏、会话、设置页、菜单和审批卡片等 | Rust 中通过 GPUI 的 `Render`、`div()`、布局和样式 API 组成 | 是 |\n| 图标、图片、部分设置页文字覆盖层 | 用 GPUI 的 `svg()`／`img()` 显示已有资源 | 由 GPUI 渲染，但内容属于静态素材 |\n| ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz | ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz | ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz |\n\n后续正文也保持居中。",
+            );
+            div().w(px(1200.0)).child(render_markdown_document(
+                &document,
+                Theme::for_mode(ThemeMode::Dark),
+                42,
+            ))
+        }
+    }
+
+    #[gpui::test]
+    fn wide_table_exposes_last_header_without_widening_prose(cx: &mut gpui::TestAppContext) {
+        let window = cx.add_window(|_, _| WideMarkdownTable);
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = |visual: &mut gpui::VisualTestContext, selector: String| {
+            visual
+                .debug_bounds(Box::leak(selector.into_boxed_str()))
+                .unwrap()
+        };
+        let table_id = markdown_hash(&(42_u64, 1_usize));
+        let table = bounds(&mut visual, format!("markdown-table-{table_id}"));
+        let viewport = bounds(&mut visual, format!("markdown-table-viewport-{table_id}"));
+        assert!(table.size.width > px(736.0), "{table:?}");
+        assert_eq!(viewport.size.width, table.size.width);
+        assert!((f32::from(table.center().x) - 600.0).abs() <= 1.0);
+        let header_id = markdown_hash(&(table_id, "header"));
+        let last_header = bounds(&mut visual, format!("markdown-table-cell-{header_id}-2"));
+        assert!(last_header.right() <= viewport.right() + px(1.0));
+        assert!(last_header.left() >= viewport.left());
+        for index in [0_usize, 2] {
+            let block_id = markdown_hash(&(42_u64, index));
+            let prose = bounds(&mut visual, format!("markdown-block-{block_id}"));
+            assert_eq!(prose.size.width, px(736.0));
+            assert!((f32::from(prose.center().x) - 600.0).abs() <= 1.0);
+        }
     }
 
     struct StretchedTableGrid;
