@@ -1492,13 +1492,15 @@ fn render_code_block(
     let copy_id = markdown_element_id("markdown-code-copy", &block_identity);
     let wrap_id = markdown_element_id("markdown-code-wrap", &block_identity);
     let language_label = code_language_label(language);
+    let border_width = 1.0;
+    let header_radius = (style.layout.code_radius - border_width).max(0.0);
 
     div()
         .w_full()
         .min_w(px(0.0))
         .overflow_hidden()
         .rounded(px(style.layout.code_radius))
-        .border(px(1.0))
+        .border(px(border_width))
         .border_color(style.palette.code_border)
         .bg(style.palette.code_surface)
         .child(
@@ -1509,6 +1511,9 @@ fn render_code_block(
                 .pl(px(style.layout.code_header_padding_x))
                 .pr(px(style.layout.code_header_padding_right))
                 .py(px(style.layout.code_header_padding_y))
+                // GPUI overflow masks are rectangular. Round both header
+                // backgrounds explicitly to follow the outer border's inset.
+                .rounded_t(px(header_radius))
                 .bg(style.palette.code_header_surface)
                 .flex()
                 .items_center()
@@ -1520,7 +1525,13 @@ fn render_code_block(
                 // translucent gradient used by the code body. Modeling both
                 // layers avoids the misleading computed background-color and
                 // reproduces the final #f4f4f4 / #242424 pixels.
-                .child(div().absolute().inset_0().bg(style.palette.code_surface))
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .rounded_t(px(header_radius))
+                        .bg(style.palette.code_surface),
+                )
                 .child(
                     div()
                         .min_w(px(0.0))
