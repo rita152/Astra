@@ -71,7 +71,8 @@ impl ComposerView {
                     .child(icon("model-fast", theme.text.into()).size(px(14.0)))
             })
             .child(trigger_label);
-        let prompt_is_empty = self.prompt_input.read(cx).text().is_empty();
+        let prompt_is_empty =
+            self.prompt_input.read(cx).text().is_empty() && self.review_comments.is_empty();
         let conversation_started = self.conversation.phase != ConversationPhase::Empty;
         let generation_active = matches!(
             self.conversation.phase,
@@ -91,7 +92,11 @@ impl ComposerView {
             })
             .child(
                 div()
-                    .h(px(98.0))
+                    .h(px(if self.review_comments.is_empty() {
+                        98.0
+                    } else {
+                        130.0
+                    }))
                     .w_full()
                     .rounded(px(COMPOSER_CORNER_RADIUS))
                     .bg(theme.control_soft)
@@ -112,6 +117,43 @@ impl ComposerView {
                     .font_weight(gpui::FontWeight::NORMAL)
                     .px(px(8.0))
                     .py(px(12.0))
+                    .when(!self.review_comments.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .id("composer-review-comments")
+                                .role(gpui::Role::Button)
+                                .aria_label("查看审查评论")
+                                .focusable()
+                                .tab_stop(true)
+                                .h(px(28.))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .px(px(8.))
+                                .mb(px(4.))
+                                .rounded(px(8.))
+                                .bg(theme.text.alpha(0.05))
+                                .cursor_pointer()
+                                .on_click(
+                                    cx.listener(|_, _, _, cx| cx.emit(super::OpenReviewComments)),
+                                )
+                                .on_key_down(cx.listener(|_, e: &gpui::KeyDownEvent, _, cx| {
+                                    if matches!(e.keystroke.key.as_str(), "enter" | "space") {
+                                        cx.emit(super::OpenReviewComments);
+                                        cx.stop_propagation();
+                                    }
+                                }))
+                                .child(
+                                    icon("panel-review", theme.text_secondary.into()).size(px(14.)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(theme.text_secondary)
+                                        .child(format!("{} 个评论", self.review_comments.len())),
+                                ),
+                        )
+                    })
                     .child(self.prompt_input.clone())
                     .when(self.dictation_state == DictationState::Idle, |composer| {
                         composer.child(

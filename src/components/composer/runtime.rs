@@ -36,7 +36,7 @@ impl ComposerView {
         .detach();
     }
     pub(super) fn submit_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
-        if prompt.trim().is_empty()
+        if (prompt.trim().is_empty() && self.review_comments.is_empty())
             || matches!(
                 self.conversation.phase,
                 ConversationPhase::Starting
@@ -64,6 +64,15 @@ impl ComposerView {
             ))
         };
 
+        let prompt = if self.review_comments.is_empty() {
+            prompt
+        } else {
+            format!(
+                "{}\n\n请处理以下审查评论：\n\n{}",
+                prompt.trim(),
+                crate::git_review::comments_prompt(&self.review_comments)
+            )
+        };
         let cycle = self.conversation.begin_prompt(&prompt);
         self.menu_open = false;
         self.permission_menu_open = false;
@@ -85,6 +94,12 @@ impl ComposerView {
                 return;
             }
         };
+        if !self.review_comments.is_empty() {
+            self.review_comments.clear();
+            self.prompt_input
+                .update(cx, |input, _| input.set_submit_empty(false));
+            cx.emit(super::ReviewCommentsSubmitted);
+        }
         self.conversation.actual_model = Some(model.clone());
         self.conversation.model_status = None;
         self.conversation.safety_buffering = false;

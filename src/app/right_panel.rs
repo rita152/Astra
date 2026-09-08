@@ -70,6 +70,11 @@ impl ChatApp {
     }
     pub fn open_right_panel(&mut self, cx: &mut Context<Self>) {
         self.right_panel.open = true;
+        if self.right_panel.mode == Some(RightPanelMode::Review) {
+            self.ensure_review(cx);
+            cx.notify();
+            return;
+        }
         if self.right_panel.mode == Some(RightPanelMode::Files) {
             self.ensure_files(cx);
             cx.notify();
@@ -91,14 +96,16 @@ impl ChatApp {
     }
     pub(super) fn close_right_panel(&mut self, cx: &mut Context<Self>) {
         if self.right_panel.open {
+            self.deactivate_review(cx);
             self.right_panel.open = false;
+            self.right_panel.fullscreen = false;
             self.terminal_return_focus_pending = matches!(
                 self.right_panel.mode,
-                Some(RightPanelMode::Terminal | RightPanelMode::Files)
+                Some(RightPanelMode::Terminal | RightPanelMode::Files | RightPanelMode::Review)
             );
             if !matches!(
                 self.right_panel.mode,
-                Some(RightPanelMode::Terminal | RightPanelMode::Files)
+                Some(RightPanelMode::Terminal | RightPanelMode::Files | RightPanelMode::Review)
             ) {
                 self.right_panel.mode = None;
             }
@@ -124,12 +131,19 @@ impl ChatApp {
             return;
         };
         let mode = *mode;
+        if mode != RightPanelMode::Review {
+            self.deactivate_review(cx);
+            self.right_panel.fullscreen = false;
+        }
         self.right_panel.mode = Some(mode);
         if mode == RightPanelMode::Files {
             self.ensure_files(cx);
         }
         if mode == RightPanelMode::Terminal {
             self.ensure_terminal(cx);
+        }
+        if mode == RightPanelMode::Review {
+            self.ensure_review(cx);
         }
         self.right_panel.subagent = None;
         self.right_panel.subagent_menu_open = false;
@@ -219,6 +233,8 @@ impl ChatApp {
         let focused = self.right_panel.keyboard_focus && self.right_panel.focused_item == index;
         div()
             .id(("right-panel-menu-item", index))
+            .role(Role::Button)
+            .aria_label(label)
             .w_full()
             .h(px(40.0))
             .px(px(10.0))
@@ -696,6 +712,22 @@ impl ChatApp {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
+        if self.right_panel.mode == Some(RightPanelMode::Review)
+            && let Some(panel) = self.review_panels.get(&self.active_conversation)
+        {
+            return div()
+                .id("right-panel")
+                .w(panel_width)
+                .min_w(panel_width)
+                .h_full()
+                .flex_none()
+                .relative()
+                .border_l_1()
+                .border_color(theme.border)
+                .bg(theme.surface)
+                .child(panel.clone())
+                .child(self.right_panel_resize_handle(theme, cx));
+        }
         if let Some(panel) = self.right_panel.subagent.clone() {
             return self.subagent_right_panel(panel, panel_width, theme, cx);
         }

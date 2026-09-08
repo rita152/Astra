@@ -2,6 +2,7 @@ mod agent;
 mod app;
 mod components;
 mod conversation;
+mod git_review;
 mod media;
 mod settings;
 mod theme;
@@ -143,6 +144,42 @@ fn schedule_screenshot(window: &mut gpui::Window, path: String, frames: usize) {
             cx.quit();
         }
     });
+}
+
+#[cfg(feature = "screenshot")]
+fn schedule_review_screenshot(
+    window: &mut gpui::Window,
+    app: gpui::Entity<ChatApp>,
+    path: String,
+    deadline: Instant,
+    stable: usize,
+) {
+    window.on_next_frame(
+        move |window, cx| match app.read(cx).review_capture_ready(cx) {
+            Ok(true) if stable == 0 => {
+                if let Err(error) = save_screenshot(window, &path) {
+                    eprintln!("review screenshot failed: {error}");
+                    std::process::exit(1);
+                }
+                println!("{path}");
+                cx.quit();
+            }
+            Ok(ready) if Instant::now() < deadline => {
+                window.refresh();
+                schedule_review_screenshot(
+                    window,
+                    app,
+                    path,
+                    deadline,
+                    if ready { stable.saturating_sub(1) } else { 3 },
+                );
+            }
+            result => {
+                eprintln!("review screenshot did not become ready: {result:?}");
+                std::process::exit(1);
+            }
+        },
+    );
 }
 
 #[cfg(feature = "screenshot")]
@@ -461,7 +498,10 @@ fn main() {
         })
         .run(move |cx: &mut App| {
             typography::initialize_fonts(cx);
-            cx.bind_keys([gpui::KeyBinding::new("ctrl-`", app::ToggleTerminal, None)]);
+            cx.bind_keys([
+                gpui::KeyBinding::new("ctrl-`", app::ToggleTerminal, None),
+                gpui::KeyBinding::new("ctrl-shift-g", app::ToggleReview, None),
+            ]);
             cx.set_window_appearance(Some(match mode {
                 ThemeMode::Light => WindowAppearance::Light,
                 ThemeMode::Dark => WindowAppearance::Dark,
@@ -688,6 +728,18 @@ fn main() {
                         if let Some(thread_id) = resume_thread.as_deref() {
                             app.resume_thread_for_capture(thread_id.to_owned(), cx);
                         }
+                        #[cfg(feature = "screenshot")]
+                        if let Some(root) =
+                            args.iter().find_map(|a| a.strip_prefix("--review-root="))
+                        {
+                            app.capture_review(PathBuf::from(root), cx);
+                        }
+                        #[cfg(feature = "screenshot")]
+                        if let Some(query) =
+                            args.iter().find_map(|a| a.strip_prefix("--review-filter="))
+                        {
+                            app.capture_review_filter(query, cx);
+                        }
                         app
                     });
                     let closing_app = app.downgrade();
@@ -698,7 +750,15 @@ fn main() {
                     });
                     #[cfg(feature = "screenshot")]
                     if let Some(path) = screenshot_path.clone() {
-                        if let Some(thread_id) = resume_thread.clone() {
+                        if args.iter().any(|a| a.starts_with("--review-root=")) {
+                            schedule_review_screenshot(
+                                window,
+                                app.clone(),
+                                path,
+                                Instant::now() + Duration::from_secs(60),
+                                3,
+                            );
+                        } else if let Some(thread_id) = resume_thread.clone() {
                             schedule_resumed_thread_screenshot(
                                 window,
                                 app.clone(),

@@ -24,6 +24,7 @@ pub struct OpenWorkspaceFile {
     pub path: String,
     pub line: Option<usize>,
 }
+gpui::actions!(workspace_review, [OpenWorkspaceReview]);
 
 struct Document {
     id: u64,
@@ -54,6 +55,7 @@ struct TreeRow {
     depth: usize,
 }
 pub struct FilePanel {
+    review_available: bool,
     cwd: PathBuf,
     mode: ThemeMode,
     documents: Vec<Document>,
@@ -93,6 +95,7 @@ impl FilePanel {
         })
         .detach();
         let mut s = Self {
+            review_available: false,
             cwd: cwd.clone(),
             mode,
             documents: Vec::new(),
@@ -139,6 +142,16 @@ impl FilePanel {
             }
         }
         cx.notify();
+    }
+    pub fn set_review_available(&mut self, available: bool, cx: &mut Context<Self>) {
+        self.review_available = available;
+        cx.notify();
+    }
+    pub fn open_documents(&self) -> Vec<String> {
+        self.documents
+            .iter()
+            .map(|d| d.path.to_string_lossy().into_owned())
+            .collect()
     }
     pub fn focus(&mut self, cx: &mut Context<Self>) {
         if self.active.is_some() {
@@ -712,6 +725,35 @@ impl Render for FilePanel {
             .items_center()
             .gap(px(3.))
             .overflow_x_scroll()
+            .when(self.review_available, |tabs| {
+                tabs.child(
+                    div()
+                        .id("file-panel-review-tab")
+                        .role(Role::Tab)
+                        .aria_label("审查")
+                        .focusable()
+                        .tab_stop(true)
+                        .h(px(28.))
+                        .px(px(8.))
+                        .rounded(px(8.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(theme.sidebar_hover))
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(OpenWorkspaceReview), cx)
+                        })
+                        .on_key_down(|e: &KeyDownEvent, window, cx| {
+                            if matches!(e.keystroke.key.as_str(), "enter" | "space") {
+                                window.dispatch_action(Box::new(OpenWorkspaceReview), cx);
+                                cx.stop_propagation();
+                            }
+                        })
+                        .child(icon("panel-review", theme.text_secondary.into()))
+                        .child("审查"),
+                )
+            })
             .children(self.documents.iter().map(|d| {
                 let id = d.id;
                 let active = self.active == Some(id);

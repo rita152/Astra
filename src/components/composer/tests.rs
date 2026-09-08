@@ -161,6 +161,41 @@ struct RecordingApprovalControl {
     responses: Mutex<Vec<(AgentServerRequestId, AgentCommandApprovalChoice)>>,
 }
 
+#[test]
+fn review_comments_are_sent_once_with_the_owning_conversation() {
+    let mut app = TestApp::new();
+    let backend = RecordingBackend::new();
+    let source: Arc<dyn AgentBackend> = backend.clone();
+    let composer = app.new_entity(|cx| ComposerView::new_with_backend(ThemeMode::Dark, source, cx));
+    app.update_entity(&composer, |c, cx| {
+        c.set_review_comments(
+            vec![crate::git_review::ReviewComment {
+                id: 1,
+                path: "/tmp/project/demo.rs".into(),
+                start: 10,
+                end: 12,
+                old: false,
+                text: "请处理 🙂".into(),
+            }],
+            cx,
+        );
+        c.submit_prompt(String::new(), cx);
+        assert_eq!(
+            c.review_comments.len(),
+            1,
+            "missing model must preserve pending comments"
+        );
+        c.apply_model_catalog(test_model_catalog());
+        c.submit_prompt("修复评论".into(), cx);
+        assert!(c.review_comments.is_empty());
+    });
+    let requests = backend.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].prompt.contains("修复评论"));
+    assert!(requests[0].prompt.contains("demo.rs:R10–R12"));
+    assert!(requests[0].prompt.contains("请处理 🙂"));
+}
+
 impl AgentApprovalControl for RecordingApprovalControl {
     fn respond(
         &self,
@@ -2893,4 +2928,44 @@ fn model_picker_keyboard_navigation_enters_selects_and_escapes_submenus() {
     window.draw();
     window.simulate_keystrokes("down right escape escape");
     assert!(!window.read(|composer, _| composer.menu_open));
+}
+
+#[test]
+fn review_comments_submit_through_the_existing_agent_run_and_clear_once() {
+    let mut app = TestApp::new();
+    let backend = RecordingBackend::new();
+    let backend_for_view: Arc<dyn AgentBackend> = backend.clone();
+    let composer =
+        app.new_entity(|cx| ComposerView::new_with_backend(ThemeMode::Dark, backend_for_view, cx));
+    app.update_entity(&composer, |c, cx| {
+        c.apply_model_catalog(test_model_catalog());
+        c.set_workspace_context(
+            PathBuf::from("/tmp/review-fixture"),
+            None,
+            Some("review-thread".into()),
+            cx,
+        );
+        c.set_review_comments(
+            vec![crate::git_review::ReviewComment {
+                id: 1,
+                path: "src/中文.rs".into(),
+                start: 3,
+                end: 5,
+                old: false,
+                text: "检查边界\n保持原有行为".into(),
+            }],
+            cx,
+        );
+        c.prompt_input.update(cx, |input, cx| input.submit(cx));
+    });
+    app.run_until_parked();
+    let requests = backend.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].thread_id.as_deref(), Some("review-thread"));
+    assert!(
+        requests[0]
+            .prompt
+            .contains("src/中文.rs:R3–R5\n检查边界\n保持原有行为")
+    );
+    assert!(app.read_entity(&composer, |c, _| c.review_comments.is_empty()));
 }

@@ -26,12 +26,16 @@ impl ChatApp {
         composer.update(cx, |composer, cx| {
             composer.set_workspace_context(cwd, project_id, thread_id, cx);
         });
+        self.deactivate_review(cx);
         self.active_conversation = key;
         if self.right_panel.open && self.right_panel.mode == Some(RightPanelMode::Files) {
             self.ensure_files(cx);
         }
         if self.right_panel.open && self.right_panel.mode == Some(RightPanelMode::Terminal) {
             self.ensure_terminal(cx);
+        }
+        if self.right_panel.open && self.right_panel.mode == Some(RightPanelMode::Review) {
+            self.ensure_review(cx);
         }
         self.home
             .update(cx, |home, cx| home.set_composer(composer, cx));
@@ -154,6 +158,11 @@ impl ChatApp {
                         host.project_id = history.thread.project_id.clone();
                     }
                     composer.update(cx, |composer, cx| composer.hydrate_history(history, cx));
+                    if this.active_conversation == key
+                        && this.right_panel.mode == Some(RightPanelMode::Review)
+                    {
+                        this.ensure_review(cx);
+                    }
                 }
                 Err(error) => composer.update(cx, |composer, cx| {
                     composer.set_history_error(error.user_message("读取聊天历史"), cx)
@@ -186,6 +195,9 @@ impl ChatApp {
         }
         if let Some(panel) = self.terminal_panels.remove(&draft_key) {
             self.terminal_panels.insert(real_key.clone(), panel);
+        }
+        if let Some(panel) = self.review_panels.remove(&draft_key) {
+            self.review_panels.insert(real_key.clone(), panel);
         }
         self.conversation_hosts.insert(real_key, host);
         #[cfg(not(test))]

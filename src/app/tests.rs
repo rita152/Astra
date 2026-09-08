@@ -547,6 +547,32 @@ fn right_panel_menu_supports_keyboard_selection() {
 }
 
 #[test]
+fn review_fullscreen_button_does_not_hit_the_global_panel_toggle() {
+    let mut app = TestApp::new();
+    let mut window = app.open_window_with_options(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: point(px(0.), px(0.)),
+                size: size(px(1470.), px(923.)),
+            })),
+            ..Default::default()
+        },
+        |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
+    );
+    window.update(|chat, _, cx| {
+        chat.open_right_panel(cx);
+        chat.select_right_panel_item(4, cx);
+    });
+    window.draw();
+    window.simulate_click(point(px(1378.), px(23.)), MouseButton::Left);
+    window.draw();
+    assert!(window.read(|chat, _| chat.right_panel.open && chat.right_panel.fullscreen));
+    window.simulate_click(point(px(1378.), px(23.)), MouseButton::Left);
+    window.draw();
+    assert!(window.read(|chat, _| chat.right_panel.open && !chat.right_panel.fullscreen));
+}
+
+#[test]
 fn sidebar_resize_handle_supports_full_hit_area_limits_and_collapse() {
     let mut app = TestApp::new();
     let mut window = app.open_window_with_options(

@@ -2096,6 +2096,7 @@ dependencies = [
  "cocoa 0.25.0",
  "gpui",
  "gpui_platform",
+ "libc",
  "objc",
  "portable-pty",
  "pulldown-cmark",

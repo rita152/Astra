@@ -70,6 +70,12 @@ impl ChatApp {
             self.open_files(cx);
             return;
         }
+        if *mode == BottomPanelMode::Review {
+            self.close_bottom_panel_menu(cx);
+            self.right_panel.open = true;
+            self.select_right_panel_item(4, cx);
+            return;
+        }
         self.bottom_panel.tabs.push(*mode);
         self.bottom_panel.active_tab = Some(self.bottom_panel.tabs.len() - 1);
         self.bottom_panel.hovered_tab = None;

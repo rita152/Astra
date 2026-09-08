@@ -34,6 +34,9 @@ two-face = { version = "0.5.1", default-features = false, features = ["syntect-o
 cocoa = "0.25"
 objc = "0.2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2", features = ["test-support"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "a58fff1334b2ea44aaa579b15a5ddd21ccf20bd2", features = ["font-kit", "test-support"] }

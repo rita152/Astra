@@ -20,6 +20,41 @@ use crate::{
 };
 
 impl ChatApp {
+    #[cfg(feature = "screenshot")]
+    pub fn capture_review(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
+        if let Some(host) = self.conversation_hosts.get_mut(&self.active_conversation) {
+            host.cwd = cwd.clone();
+            host.composer.update(cx, |composer, cx| {
+                composer.set_workspace_context(
+                    cwd,
+                    None,
+                    composer.thread_id().map(str::to_owned),
+                    cx,
+                )
+            });
+        }
+        self.review_panels.remove(&self.active_conversation);
+        self.complete_startup_for_capture(cx);
+        self.right_panel.open = true;
+        self.select_right_panel_item(4, cx);
+    }
+    #[cfg(feature = "screenshot")]
+    pub fn review_capture_ready(&self, cx: &gpui::App) -> Result<bool, String> {
+        if let ConversationKey::Thread(thread) = &self.active_conversation
+            && !self.resumed_thread_ready(thread, cx)?
+        {
+            return Ok(false);
+        }
+        self.review_panels
+            .get(&self.active_conversation)
+            .map_or(Ok(false), |p| p.read(cx).capture_ready())
+    }
+    #[cfg(feature = "screenshot")]
+    pub fn capture_review_filter(&mut self, query: &str, cx: &mut Context<Self>) {
+        if let Some(panel) = self.review_panels.get(&self.active_conversation) {
+            panel.update(cx, |panel, cx| panel.capture_filter(query, cx));
+        }
+    }
     /// Opens a persisted thread without requiring the sidebar to finish loading first.
     ///
     /// This is used by the deterministic Markdown capture path. It deliberately

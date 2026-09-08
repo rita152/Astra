@@ -169,6 +169,42 @@ GPUI_MARKDOWN_BENCH_FILE=docs/APP_SERVER_INTEGRATION.md \
 
 独立原生验收沿用 `GPUI Capture.app`，截图构建可附加 `--file-panel-root=/absolute/test/workspace` 和 `--open-file=/absolute/test/workspace/example.rs`，以真实可编辑测试文件验证保存、撤销和冲突。请使用专用测试文件，因为编辑会自动写回磁盘。
 
+## 审查
+
+右侧功能区的“审查”或 `Ctrl+Shift+G` 打开当前会话工作目录的原生 Git 审查面板；会话文件卡的“审核”和底部菜单的“审查”也进入同一个组件。每个会话保留自己的范围、折叠、滚动和评论，从差异打开文件后可通过“审查”标签返回；收起面板后再次打开会保留状态。
+
+- 范围包括上一轮、未提交、未暂存、已暂存、已提交及分支；分支比较使用 merge-base。“上一轮”使用 app-server 的补丁及历史文件变更，保留原始路径、行号和 patch，不用当前工作区内容替代历史。从历史文件卡打开的差异保持固定，重新选择“上一轮”才跟随最新更改。
+- 支持文件树、筛选和跳转、单文件/全部折叠、统一/拆分差异、上下文展开、换行、文字差异、忽略空白、Markdown 预览、复制路径/patch、字符和跨行选择，以及分支范围的“已查看”状态。
+- 点击或拖动行号创建本地评论。原生多行编辑器支持中文 IME、选择、复制和撤销；保存后在主输入框显示可点击的评论汇总，可返回对应评论、修改或删除，也可只发送评论。发送经已有的 `turn/start` 传递文件及左右侧行范围；模型不可用时保留待发送评论，成功开始请求后清除一次。提交信息与评论草稿使用独立编辑器。
+- 提供文件/差异块/全部暂存与取消暂存、确认还原、提交、新分支、推送和 PR 创建。提交信息留空时从暂存文件生成。PR 支持标题、说明、目标分支、是否提交本地更改、草稿/正式创建及打开已有 PR；PR 操作依赖已登录的 `gh`，普通 Git 审查不需要 GitHub 登录。
+
+Git 查询在后台执行，Git/gh 命令有超时、输出上限及进程组回收，面板隐藏后停止轮询。长差异按行虚拟化，切换布局和刷新按文件与源码行恢复位置，Shift+滚轮仅横向滚动；显示选项由现有工作区偏好存储原子保存。改变 Git 状态前检查工作区和 index 的版本，外部修改会要求刷新；操作失败保留错误和输入。还原新增文件时，内容备份到该 worktree Git 目录的 `gpui-discarded/`。
+
+样式和交互来自独立 CDP 端口的 ChatGPT 实例，覆盖 shadow DOM、深浅主题、范围/显示菜单、评论、提交和 PR 对话框。已有 CDP 端口视为正在使用，不能复用；采集脚本要求显式指定新实例的端口：
+
+```bash
+CHATGPT_CDP_HTTP="http://127.0.0.1:$REVIEW_CDP_PORT" node scripts/cdp_capture_review.mjs artifacts/review-reference
+cargo test git_review::tests
+cargo test components::review_panel
+```
+
+screenshot 构建支持 `--review-root=/absolute/test/repository` 和可选的 `--review-filter=src/example.rs`，通过生产数据层打开真实 Git 仓库；与 `--screenshot=...` 组合时先等待 Git 加载完成。使用独立 `GPUI Capture.app` 和临时 Git 仓库验收暂存、还原、提交与推送。PR 回归使用本地 bare remote 和 `gh` 测试替身验证命令链，不发布远程 PR。
+
+两份审查实现已整合：保留完整 Git/hunk 操作、原生提交与 PR 对话框、显示偏好和文件标签往返；接入结构化评论与 Composer 联动、仅评论发送、固定历史差异、源码行滚动定位、命令超时与进程组回收、窄栏自适应。面板宽度小于 560 px 时自动收起文件树，使用“跳转到文件”或 `Cmd+F` 查找；恢复宽度后沿用文件树显示偏好。
+
+整合验收（2026-09-08）：441 项测试通过（426 项单元测试、15 项集成测试），2 项原有忽略项未运行；格式、第一方严格 Clippy、普通目标检查及 screenshot 构建通过。Computer Use 使用独立 bundle ID 的 `GPUI Capture.app`，复核同尺寸深浅主题、菜单键盘、统一/拆分布局、评论的多行中文及 emoji 编辑、评论汇总往返、快捷键、筛选、文件打开、全屏、宽度拖动和窄栏跳转。已在临时仓库实际完成暂存、取消暂存、仅提交已暂存文件并推送至本机 bare remote；本地与远端提交一致，未暂存内容保留。PR 成功命令链使用隔离的 `gh` 替身测试，评论发送使用记录请求的测试后端，不发布真实远程 PR 或发送真实模型提示。双主题截图及结构化记录位于 `artifacts/review-integration/`；本次专用验收实例已关闭。
+
+
+长 diff 性能修复（2026-09-08）：可见行语法高亮使用最多 1,024 行、约 4 MiB 载荷的有界缓存；快照或主题改变时失效。文字差异范围、最大行宽和行号栏宽度按快照建立索引，滚动时直接查找；五位及六位数行号不换行，避免虚拟列表行高意外翻倍。4 万行差异的 100 次滚轮＋布局绘制采样中，统一视图中位耗时从 9.08 ms 降为 1.88 ms，深处拆分＋文字差异从 12.98 ms 降为 3.55 ms。这是 GPUI 测试窗口 CPU 处理耗时，不是屏幕 FPS。独立 Capture 已按相同主题、1470×923 窗口、相同测试仓库和源码位置验证滚动、行号、文字差异、跨行选择复制、评论及水平滚动条。445 项常规测试通过，专项基准已单独运行，两个原有忽略项未运行；格式、严格 Clippy、普通目标检查和 screenshot 构建通过。采样与对比记录位于 `artifacts/long-diff-performance/`。
+
+可用保存的 unified patch 重复测量；该基准默认忽略，需要显式调用：
+
+```bash
+GPUI_DIFF_BENCH_PATCH=/absolute/path/to/long.diff \
+  GPUI_DIFF_BENCH_OUTPUT=/tmp/gpui-diff-timings.json \
+  cargo test long_diff_scroll_timings -- --ignored --nocapture
+```
+
 ## Codex app-server 协议
 
 当前全部 JSON-RPC 方法及实际接入状态统一维护在 [`docs/APP_SERVER_INTEGRATION.md`](docs/APP_SERVER_INTEGRATION.md)。升级 Codex CLI 时直接核对并更新该总表。
@@ -192,6 +228,8 @@ GPUI_MARKDOWN_BENCH_FILE=docs/APP_SERVER_INTEGRATION.md \
 | `src/conversation/` | 会话状态、活动模型、事件归约、流式批处理、历史恢复、模型选择和轮次生命周期；不持有 GPUI Entity 或 Context |
 | `src/components/composer.rs`、`composer/` | 输入框入口；运行时 UI 驱动、选项菜单、权限与审批交互、听写、布局、渲染及截图夹具分别维护 |
 | `src/components/home.rs`、`home/` | 会话视图协调；时间线、消息、工具活动、推理、协作、媒体与请求按功能绘制；具名上下文承载共享渲染数据 |
+| `src/git_review.rs`、`git_review/` | 本机 Git 状态、diff/hunk、版本校验、Git/gh 操作、命令生命周期及结构化评论；不依赖 GPUI 或具体 agent 适配器 |
+| `src/components/review_panel.rs`、`review_panel/` | 审查状态、异步加载、虚拟列表、菜单、差异文本、评论及 Git 对话框；显示选项通过现有工作区偏好保存 |
 | `src/app.rs`、`app/` | 服务装配与应用壳；会话 host、侧栏、底部／右侧面板、图片预览、项目创建、文件和终端面板分别维护；面板状态有独立类型 |
 | `src/settings/view.rs`、`view/` | 设置导航与路由、共享控件及各功能页面；Chronicle 插画坐标作为嵌入资源位于 `assets/illustrations/` |
 | `src/components/callback.rs`、`src/media.rs` | 通用 UI 回调封装和共享图片尺寸读取；通用媒体工具不经 Codex 适配器导出 |
@@ -221,7 +259,7 @@ cargo build --features screenshot
 git diff --check
 ```
 
-当前自动化结果为 409 项测试通过、0 项失败、1 项按原配置忽略。忽略项会调用已登录的本机 Codex CLI 发起真实模型请求；本轮未执行。Clippy 对第一方包的全部 target 与 feature 使用 `-D warnings`；依赖及 vendor 不在此次零告警结论范围内。
+重构收尾时的自动化结果为 409 项测试通过、0 项失败、1 项按原配置忽略。忽略项会调用已登录的本机 Codex CLI 发起真实模型请求；本轮未执行。Clippy 对第一方包的全部 target 与 feature 使用 `-D warnings`；依赖及 vendor 不在此次零告警结论范围内。
 
 界面回归使用保留的旧版可执行文件和最新构建，均通过独立 bundle ID 的 `GPUI Capture.app` 验收。有效截图为 66 组：21 个设置页面 × 两种主题、10 种会话夹具 × 两种主题，以及 Markdown 两种宽度 × 两种主题。对应图片保持相同物理尺寸，未缩放或平移；47 组整图逐像素一致。其余 19 组差异全部落在窗口激活态影响的半透明侧栏、异步工作区列表或模型名称区域，排除这些明确标记的动态区域后，66 组的功能内容区域均逐像素一致。设置正文包含从源码迁出的 Chronicle 插画；三组资源的 3,846 条坐标和颜色记录与迁移前逐项相同。
 

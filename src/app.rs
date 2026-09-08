@@ -21,7 +21,7 @@ use state::{
 
 gpui::actions!(
     permission_ui,
-    [DismissPermissionUi, ToggleTerminal, OpenFiles]
+    [DismissPermissionUi, ToggleTerminal, ToggleReview, OpenFiles]
 );
 
 use crate::{
@@ -35,6 +35,7 @@ use crate::{
         home::{
             HomeView, OpenDiffReview, OpenImagePreview, OpenSubAgentPanel, RetryImageGeneration,
         },
+        review_panel::ReviewPanel,
         sidebar::{NewConversation, OpenProjectCreation, OpenSettings, SelectThread, SidebarView},
         terminal::TerminalPanel,
     },
@@ -63,6 +64,7 @@ pub struct ChatApp {
     bottom_panel: BottomPanelState,
     terminal_panels: HashMap<ConversationKey, Entity<TerminalPanel>>,
     file_panels: HashMap<ConversationKey, Entity<FilePanel>>,
+    review_panels: HashMap<ConversationKey, Entity<ReviewPanel>>,
     file_close_prompt_open: bool,
     terminal_return_focus_pending: bool,
     right_panel: RightPanelState,
@@ -88,6 +90,8 @@ struct ConversationHost {
 
 impl Drop for ChatApp {
     fn drop(&mut self) {
+        #[cfg(not(test))]
+        crate::git_review::shutdown();
         self.codex_app_server.shutdown();
     }
 }
@@ -106,6 +110,7 @@ const RIGHT_PANEL_ITEMS: &[(RightPanelMode, &str, &str, &str)] = &[
     (RightPanelMode::Browser, "浏览器", "⌘T", "panel-browser"),
     (RightPanelMode::Terminal, "终端", "⌃`", "panel-terminal"),
     (RightPanelMode::Files, "文件", "⌘P", "panel-files"),
+    (RightPanelMode::Review, "审查", "⌃⇧G", "panel-review"),
 ];
 const SIDEBAR_MIN_WIDTH: f32 = 240.0;
 const SIDEBAR_MAX_WIDTH: f32 = 480.0;
@@ -179,6 +184,9 @@ impl ChatApp {
         cx.subscribe(&settings, |this, _, event: &ChangeTheme, cx| {
             this.mode = event.0;
             for panel in this.file_panels.values() {
+                panel.update(cx, |panel, cx| panel.set_mode(event.0, cx));
+            }
+            for panel in this.review_panels.values() {
                 panel.update(cx, |panel, cx| panel.set_mode(event.0, cx));
             }
             for panel in this.terminal_panels.values() {
@@ -285,6 +293,7 @@ impl ChatApp {
             bottom_panel: BottomPanelState::new(cx),
             terminal_panels: HashMap::new(),
             file_panels: HashMap::new(),
+            review_panels: HashMap::new(),
             file_close_prompt_open: false,
             terminal_return_focus_pending: false,
             right_panel: RightPanelState::new(cx),

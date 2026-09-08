@@ -9,6 +9,7 @@ use crate::components::{file_panel::FilePanel, terminal::TerminalPanel};
 
 impl ChatApp {
     pub(super) fn ensure_terminal(&mut self, cx: &mut Context<Self>) {
+        self.deactivate_review(cx);
         self.terminal_return_focus_pending = false;
         let key = self.active_conversation.clone();
         if !self.terminal_panels.contains_key(&key) {
@@ -76,6 +77,7 @@ impl ChatApp {
         false
     }
     pub(super) fn ensure_files(&mut self, cx: &mut Context<Self>) {
+        self.deactivate_review(cx);
         let key = self.active_conversation.clone();
         if !self.file_panels.contains_key(&key) {
             let cwd = self
@@ -87,6 +89,9 @@ impl ChatApp {
             self.file_panels.insert(key.clone(), panel);
         }
         self.file_panels[&key].update(cx, |p, cx| p.focus(cx));
+        self.file_panels[&key].update(cx, |p, cx| {
+            p.set_review_available(self.review_panels.contains_key(&key), cx)
+        });
         self.right_panel.focus_pending = false;
     }
     pub(super) fn open_files(&mut self, cx: &mut Context<Self>) {

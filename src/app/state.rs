@@ -24,6 +24,7 @@ pub(super) enum BottomPanelMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RightPanelMode {
+    Review,
     Files,
     SideChat,
     Browser,
@@ -115,6 +116,7 @@ pub(super) struct RightPanelState {
     pub(super) focus: FocusHandle,
     pub(super) focus_pending: bool,
     pub(super) width: Option<f32>,
+    pub(super) fullscreen: bool,
     pub(super) resize_hovered: bool,
     pub(super) resize_dragging: bool,
     pub(super) resize_pointer_offset: f32,
@@ -133,6 +135,7 @@ impl RightPanelState {
             focus: cx.focus_handle().tab_stop(true),
             focus_pending: false,
             width: None,
+            fullscreen: false,
             resize_hovered: false,
             resize_dragging: false,
             resize_pointer_offset: 0.0,

@@ -93,6 +93,11 @@ pub struct ConversationThreadCreated {
     pub thread_id: String,
 }
 impl gpui::EventEmitter<ConversationThreadCreated> for ComposerView {}
+pub struct OpenReviewComments;
+impl gpui::EventEmitter<OpenReviewComments> for ComposerView {}
+
+pub struct ReviewCommentsSubmitted;
+impl gpui::EventEmitter<ReviewCommentsSubmitted> for ComposerView {}
 
 const MODEL_PICKER_WIDTH: f32 = 224.0;
 const MODEL_PICKER_SUBMENU_GAP: f32 = 1.0;
@@ -124,6 +129,7 @@ pub struct ComposerView {
     backend: Arc<dyn AgentBackend>,
     mode: ThemeMode,
     prompt_input: Entity<PromptInput>,
+    review_comments: Vec<crate::git_review::ReviewComment>,
     user_input_other_input: Entity<PromptInput>,
     model_menu_focus: FocusHandle,
     model_menu_focused_item: usize,
@@ -232,6 +238,7 @@ impl ComposerView {
             backend,
             mode,
             prompt_input,
+            review_comments: Vec::new(),
             user_input_other_input,
             model_menu_focus: cx.focus_handle(),
             model_menu_focused_item: 0,
@@ -377,6 +384,68 @@ impl ComposerView {
         self.user_input_other_input
             .update(cx, |input, cx| input.set_mode(mode, cx));
         cx.notify();
+    }
+
+    pub fn set_review_comments(
+        &mut self,
+        comments: Vec<crate::git_review::ReviewComment>,
+        cx: &mut Context<Self>,
+    ) {
+        self.review_comments = comments;
+        self.prompt_input.update(cx, |input, _| {
+            input.set_submit_empty(!self.review_comments.is_empty())
+        });
+        cx.notify();
+    }
+
+    pub fn latest_review(&self) -> Option<crate::components::file_change::DiffReviewPresentation> {
+        let groups = std::iter::once(&self.conversation.activities).chain(
+            self.conversation
+                .transcript
+                .iter()
+                .rev()
+                .map(|t| &t.activities),
+        );
+        for activities in groups {
+            if let Some(review) = activities.iter().rev().find_map(|a| {
+                if let crate::conversation::ConversationActivity::FileChange(c) = a {
+                    c.review
+                        .review_id
+                        .starts_with("turn-diff-")
+                        .then(|| c.review.clone())
+                } else {
+                    None
+                }
+            }) {
+                return Some(review);
+            }
+            let mut raw = String::new();
+            let mut files = Vec::new();
+            for activity in activities {
+                if let crate::conversation::ConversationActivity::FileChange(change) = activity
+                    && change.status == crate::agent::AgentFileChangeStatus::Completed
+                {
+                    files.extend(change.review.files.clone());
+                    if let Some(patch) = &change.review.raw_diff {
+                        raw.push_str(patch);
+                    }
+                }
+            }
+            if !files.is_empty() {
+                let mut review = crate::components::file_change::DiffReviewPresentation::new(
+                    format!(
+                        "latest-{}-{}",
+                        self.conversation.thread_id.as_deref().unwrap_or("draft"),
+                        self.conversation.cycle
+                    ),
+                    "上一轮",
+                    files,
+                );
+                review.raw_diff = (!raw.is_empty()).then_some(raw);
+                return Some(review);
+            }
+        }
+        None
     }
 
     pub fn prompt_focus_handle(&self, cx: &gpui::App) -> FocusHandle {

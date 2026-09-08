@@ -604,7 +604,20 @@ pub(super) fn resumed_file_summary(
         }
     }
     (!files.is_empty()).then(|| {
-        DiffReviewPresentation::new(format!("resumed-summary-{}", turn.id), "本轮更改", files)
+        let mut review =
+            DiffReviewPresentation::new(format!("resumed-summary-{}", turn.id), "本轮更改", files);
+        let raw = activities
+            .iter()
+            .filter_map(|a| {
+                if let ConversationActivity::FileChange(c) = a {
+                    c.review.raw_diff.as_deref()
+                } else {
+                    None
+                }
+            })
+            .collect::<String>();
+        review.raw_diff = (!raw.is_empty()).then_some(raw);
+        review
     })
 }
 

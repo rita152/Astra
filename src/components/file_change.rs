@@ -1524,6 +1524,9 @@ pub struct DiffReviewPresentation {
     pub review_id: String,
     pub turn_label: String,
     pub files: Vec<DiffFilePresentation>,
+    /// Preserve the server's patch for copying and historical review. Never
+    /// reconstruct a historical patch from the current checkout.
+    pub raw_diff: Option<String>,
     pub show_summary: bool,
     pub show_file_tree: bool,
     /// Stable vertical scroll state for the full Review viewport.
@@ -1533,6 +1536,7 @@ pub struct DiffReviewPresentation {
 impl PartialEq for DiffReviewPresentation {
     fn eq(&self, other: &Self) -> bool {
         self.review_id == other.review_id
+            && self.raw_diff == other.raw_diff
             && self.turn_label == other.turn_label
             && self.files == other.files
             && self.show_summary == other.show_summary
@@ -1552,6 +1556,7 @@ impl DiffReviewPresentation {
             review_id: review_id.into(),
             turn_label: turn_label.into(),
             files,
+            raw_diff: None,
             show_summary: false,
             show_file_tree: true,
             review_scroll: ScrollHandle::new(),
@@ -1643,6 +1648,18 @@ impl DiffReviewPresentation {
             let Some(file) = current.as_mut() else {
                 continue;
             };
+            if let Some(path) = raw_line.strip_prefix("+++ ")
+                && path != "/dev/null"
+            {
+                if let Some(parsed) =
+                    crate::git_review::parse_unified(&format!("+++ {path}\n")).first()
+                {
+                    let resolved = resolve_review_path(&parsed.path, cwd);
+                    file.path = review_display_path(&parsed.path, resolved.as_deref(), cwd);
+                    file.resolved_path = resolved;
+                }
+                continue;
+            }
             if raw_line.starts_with("--- ") || raw_line.starts_with("+++ ") {
                 continue;
             }
@@ -1663,7 +1680,9 @@ impl DiffReviewPresentation {
         }
         finish_file(&mut current, &mut files);
 
-        Self::new(review_id, turn_label, files)
+        let mut review = Self::new(review_id, turn_label, files);
+        review.raw_diff = Some(diff.into());
+        review
     }
 
     pub fn from_file_change_entries(
@@ -1738,7 +1757,58 @@ impl DiffReviewPresentation {
                 }
             })
             .collect();
-        Self::new(review_id, turn_label, files)
+        let mut review = Self::new(review_id, turn_label, files);
+        let mut patch = String::new();
+        for (change, file) in changes.iter().zip(&review.files) {
+            if change.diff.starts_with("diff --git ") {
+                patch.push_str(&change.diff);
+                continue;
+            }
+            let old = serde_json::to_string(&format!(
+                "a/{}",
+                review_display_path(
+                    &change.path,
+                    resolve_review_path(&change.path, cwd).as_deref(),
+                    cwd
+                )
+            ))
+            .unwrap();
+            let new = serde_json::to_string(&format!("b/{}", file.path)).unwrap();
+            patch.push_str(&format!("diff --git {old} {new}\n"));
+            match change.kind {
+                AgentFileChangeKind::Add | AgentFileChangeKind::Delete => {
+                    let add = matches!(change.kind, AgentFileChangeKind::Add);
+                    let count = change.diff.lines().count();
+                    patch.push_str(&format!(
+                        "{} file mode 100644\n--- {}\n+++ {}\n@@ -{},{} +{},{} @@\n",
+                        if add { "new" } else { "deleted" },
+                        if add { "/dev/null" } else { &old },
+                        if add { &new } else { "/dev/null" },
+                        if add { 0 } else { 1 },
+                        if add { 0 } else { count },
+                        if add { 1 } else { 0 },
+                        if add { count } else { 0 }
+                    ));
+                    for line in change.diff.lines() {
+                        patch.push(if add { '+' } else { '-' });
+                        patch.push_str(line);
+                        patch.push('\n');
+                    }
+                    if !change.diff.is_empty() && !change.diff.ends_with('\n') {
+                        patch.push_str("\\ No newline at end of file\n");
+                    }
+                }
+                AgentFileChangeKind::Update { .. } => {
+                    patch.push_str(&format!("--- {old}\n+++ {new}\n"));
+                    patch.push_str(&change.diff);
+                    if !patch.ends_with('\n') {
+                        patch.push('\n');
+                    }
+                }
+            }
+        }
+        review.raw_diff = Some(patch);
+        review
     }
 }
 

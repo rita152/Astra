@@ -22,8 +22,8 @@ use loaders::{
     load_all_projects, load_all_search_results, load_all_sections, load_all_threads,
     load_all_turns, receive,
 };
-pub use preferences::UiPreferences;
 use preferences::{PreferenceStore, default_preferences_path};
+pub use preferences::{ReviewPreferences, UiPreferences};
 
 // `Pinned` is the app-server's canonical built-in section name. The sidebar
 // localizes the heading independently; sending the localized label would
@@ -1024,6 +1024,10 @@ impl WorkspaceStore {
         self.save_preferences();
     }
 
+    pub fn set_review_preferences(&self, review: ReviewPreferences) {
+        self.update(|snapshot| snapshot.preferences.review = review);
+        self.save_preferences();
+    }
     fn save_preferences(&self) {
         let _save_guard = match self.preference_save_lock.lock() {
             Ok(guard) => guard,

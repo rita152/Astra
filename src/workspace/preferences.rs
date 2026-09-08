@@ -28,6 +28,33 @@ pub struct UiPreferences {
     pub projects_collapsed: bool,
     #[serde(default)]
     pub recent_collapsed: bool,
+    #[serde(default)]
+    pub review: ReviewPreferences,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReviewPreferences {
+    pub split: bool,
+    pub wrap: bool,
+    pub load_files: bool,
+    pub rich: bool,
+    pub words: bool,
+    pub ignore_whitespace: bool,
+    pub tree_open: bool,
+}
+impl Default for ReviewPreferences {
+    fn default() -> Self {
+        Self {
+            split: false,
+            wrap: false,
+            load_files: true,
+            rich: false,
+            words: false,
+            ignore_whitespace: false,
+            tree_open: true,
+        }
+    }
 }
 
 fn preferences_version() -> u32 {

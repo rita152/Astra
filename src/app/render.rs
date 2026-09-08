@@ -19,7 +19,7 @@ use crate::{
 use super::{
     ChatApp, ConversationKey, DismissPermissionUi, LEADING_TITLEBAR_CONTROLS_TOP,
     MAIN_CONTENT_HORIZONTAL_GUTTER, OpenFiles, RIGHT_PANEL_MIN_WIDTH,
-    STARTUP_LOADING_BLINK_DURATION, STARTUP_LOADING_LOGO_SIZE, ToggleTerminal,
+    STARTUP_LOADING_BLINK_DURATION, STARTUP_LOADING_LOGO_SIZE, ToggleReview, ToggleTerminal,
 };
 
 pub(super) fn panel_resize_handle(
@@ -177,6 +177,14 @@ pub(super) fn permission_risk_row(
 
 impl Render for ChatApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let review_overlay =
+            if self.right_panel.open && self.right_panel.mode == Some(RightPanelMode::Review) {
+                self.review_panels
+                    .get(&self.active_conversation)
+                    .and_then(|p| p.update(cx, |p, cx| p.render_overlay(cx)))
+            } else {
+                None
+            };
         if self.terminal_return_focus_pending {
             if let Some(host) = self.conversation_hosts.get(&self.active_conversation) {
                 host.composer
@@ -244,16 +252,28 @@ impl Render for ChatApp {
         // persisted 1418.21875 px panel, clamped to leave the main thread at
         // its measured 773.09375 px right edge on narrower windows.
         let viewport_width = f32::from(window.viewport_size().width);
-        let default_right_panel_width = (window.viewport_size().width - px(773.09375))
-            .min(px(1_418.218_8))
-            .max(px(RIGHT_PANEL_MIN_WIDTH));
-        let right_panel_width = px(clamp_right_panel_width(
-            self.right_panel
-                .width
-                .unwrap_or(f32::from(default_right_panel_width)),
-            viewport_width,
-            revealed_sidebar_width,
-        ));
+        let default_right_panel_width = (window.viewport_size().width
+            - px(if self.right_panel.mode == Some(RightPanelMode::Review) {
+                759.66406
+            } else {
+                773.09375
+            }))
+        .min(px(1_418.218_8))
+        .max(px(RIGHT_PANEL_MIN_WIDTH));
+        let review_fullscreen = self.right_panel.open
+            && self.right_panel.mode == Some(RightPanelMode::Review)
+            && self.right_panel.fullscreen;
+        let right_panel_width = if review_fullscreen {
+            px(viewport_width - revealed_sidebar_width)
+        } else {
+            px(clamp_right_panel_width(
+                self.right_panel
+                    .width
+                    .unwrap_or(f32::from(default_right_panel_width)),
+                viewport_width,
+                revealed_sidebar_width,
+            ))
+        };
         div()
             .id(if self.showing_settings {
                 "app-shell-settings"
@@ -278,6 +298,7 @@ impl Render for ChatApp {
                 this.open_files(cx);
                 cx.stop_propagation();
             }))
+            .on_action(cx.listener(|this,_:&crate::components::file_panel::OpenWorkspaceReview,_,cx|{this.right_panel.open=true;this.select_right_panel_item(4,cx);cx.stop_propagation();}))
             .on_action(cx.listener(|this, event: &OpenWorkspaceFile, _, cx| {
                 this.open_files(cx);
                 this.file_panels[&this.active_conversation].update(cx, |p,cx| p.open_path(PathBuf::from(&event.path),event.line,cx));
@@ -288,8 +309,18 @@ impl Render for ChatApp {
                 else { this.right_panel.open = true; this.select_right_panel_item(2, cx); }
                 cx.stop_propagation();
             }))
+            .on_action(cx.listener(|this, _: &ToggleReview, _, cx| {
+                if this.right_panel.open && this.right_panel.mode == Some(RightPanelMode::Review) { this.close_right_panel(cx); }
+                else { this.open_review(cx); }
+                cx.stop_propagation();
+            }))
             .on_key_down(cx.listener(Self::handle_project_creation_key))
-            .on_action(cx.listener(|this, _: &DismissPermissionUi, _, cx| {
+            .on_action(cx.listener(|this, _: &DismissPermissionUi, window, cx| {
+                if this.right_panel.open&&this.right_panel.mode==Some(RightPanelMode::Review)
+                    &&let Some(panel)=this.review_panels.get(&this.active_conversation)
+                    &&panel.update(cx,|p,cx|p.dismiss_transient(window,cx)) {
+                    cx.stop_propagation();return;
+                }
                 if this.image_preview.path.is_some() {
                     this.image_preview.path = None;
                     this.image_preview.dimensions = None;
@@ -356,7 +387,7 @@ impl Render for ChatApp {
                                     .min_h(px(0.0))
                                     .flex_1()
                                     .flex()
-                                    .child(
+                                    .when(!review_fullscreen,|row|row.child(
                                         div()
                                             .flex_1()
                                             .min_w(px(0.0))
@@ -372,7 +403,7 @@ impl Render for ChatApp {
                                                     StyleRefinement::default().size_full(),
                                                 ),
                                             ),
-                                    )
+                                    ))
                                     .when(self.right_panel.open, |row| {
                                         row.child(self.right_panel(
                                             right_panel_width,
@@ -386,6 +417,7 @@ impl Render for ChatApp {
                             }),
                     )
             })
+            .when_some(review_overlay,|shell,overlay|shell.child(overlay))
             .when(self.permission_confirmation_open, |shell| {
                 shell.child(
                     div()
@@ -512,7 +544,7 @@ impl Render for ChatApp {
                         ),
                 )
             })
-            .when_some(resumed_title, |shell, (title, in_project)| {
+            .when_some(resumed_title.filter(|_| !review_fullscreen), |shell, (title, in_project)| {
                 // The resumed thread has its own opaque sticky header. Paint
                 // it over the virtual list's overdraw band, just as Electron
                 // masks scrolling Markdown beneath its 46px titlebar.

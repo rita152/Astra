@@ -141,6 +141,8 @@ pub struct FileEditor {
     pub buffer: Buffer,
     pub mode: ThemeMode,
     language: Option<String>,
+    prose_label: Option<String>,
+    placeholder: String,
     focus: FocusHandle,
     marked: Option<Range<usize>>,
     rows: Vec<Row>,
@@ -200,6 +202,8 @@ impl FileEditor {
                 ..Default::default()
             },
             language,
+            prose_label: None,
+            placeholder: String::new(),
             mode,
             focus: cx.focus_handle(),
             marked: None,
@@ -213,6 +217,47 @@ impl FileEditor {
             desired_x: None,
             last_input: None,
             input_error: None,
+        }
+    }
+    /// Reuse the editor's native IME, wrapping, selection and undo for review text.
+    pub fn prose(mode: ThemeMode, label: &str, cx: &mut Context<Self>) -> Self {
+        let mut editor = Self::new(String::new(), None, mode, cx);
+        editor.prose_label = Some(label.into());
+        editor.placeholder = label.into();
+        editor
+    }
+    pub fn text(&self) -> &str {
+        &self.buffer.text
+    }
+    pub fn set_accessible_name(&mut self, label: impl Into<String>) {
+        self.prose_label = Some(label.into());
+    }
+    pub fn set_placeholder(&mut self, placeholder: impl Into<String>, cx: &mut Context<Self>) {
+        self.placeholder = placeholder.into();
+        cx.notify();
+    }
+    pub fn set_text_silently(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.reload(text.into(), cx);
+    }
+    fn line_height(&self) -> f32 {
+        if self.prose_label.is_some() {
+            22.75
+        } else {
+            LINE_HEIGHT
+        }
+    }
+    fn font_size(&self) -> f32 {
+        if self.prose_label.is_some() {
+            13.0
+        } else {
+            FONT_SIZE
+        }
+    }
+    fn gutter(&self) -> f32 {
+        if self.prose_label.is_some() {
+            0.0
+        } else {
+            GUTTER
         }
     }
     pub fn set_mode(&mut self, mode: ThemeMode, cx: &mut Context<Self>) {
@@ -346,6 +391,9 @@ impl FileEditor {
     }
     fn handle_key(&mut self, e: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let k = &e.keystroke;
+        if self.prose_label.is_some() && k.modifiers.platform && k.key == "enter" {
+            return;
+        }
         let text = &self.buffer.text;
         let cursor = self.buffer.cursor;
         let select = k.modifiers.shift;
@@ -416,8 +464,9 @@ impl FileEditor {
                 });
                 self.desired_x = Some(x);
                 let step = if k.key.starts_with("page") {
-                    self.bounds
-                        .map_or(10, |b| (f32::from(b.size.height) / LINE_HEIGHT) as usize)
+                    self.bounds.map_or(10, |b| {
+                        (f32::from(b.size.height) / self.line_height()) as usize
+                    })
                 } else {
                     1
                 };
@@ -443,16 +492,16 @@ impl FileEditor {
         if self.rows.is_empty() {
             return 0;
         }
-        let row = ((f32::from(p.y - b.top()) + self.scroll).max(0.) / LINE_HEIGHT) as usize;
+        let row = ((f32::from(p.y - b.top()) + self.scroll).max(0.) / self.line_height()) as usize;
         let row = &self.rows[row.min(self.rows.len() - 1)];
         row.source(
             row.line
-                .closest_index_for_x((p.x - b.left() - px(GUTTER)).max(px(0.))),
+                .closest_index_for_x((p.x - b.left() - px(self.gutter())).max(px(0.))),
         )
     }
     fn prepare(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.bounds = Some(bounds);
-        let width = (f32::from(bounds.size.width) - GUTTER - 16.).max(24.);
+        let width = (f32::from(bounds.size.width) - self.gutter() - 16.).max(24.);
         if self.layout_dirty || (self.layout_width - width).abs() > 0.5 {
             self.rows.clear();
             self.layout_width = width;
@@ -496,6 +545,10 @@ impl FileEditor {
                             underline: None,
                             strikethrough: None,
                         });
+                    if self.prose_label.is_some() {
+                        run.font = ui_font();
+                        run.color = theme.text.into();
+                    }
                     run.len = expanded.len();
                     if self
                         .marked
@@ -513,7 +566,7 @@ impl FileEditor {
                 map.push((display.len(), source + raw.len()));
                 let full = window.text_system().shape_line(
                     display.clone().into(),
-                    px(FONT_SIZE),
+                    px(self.font_size()),
                     &runs,
                     None,
                 );
@@ -552,7 +605,7 @@ impl FileEditor {
                         .collect::<Vec<_>>();
                     let line = window.text_system().shape_line(
                         display[start..end].to_string().into(),
-                        px(FONT_SIZE),
+                        px(self.font_size()),
                         &row_runs,
                         None,
                     );
@@ -577,28 +630,47 @@ impl FileEditor {
         }
         let height = f32::from(bounds.size.height);
         if self.ensure_cursor {
-            let top = self.row_for(self.buffer.cursor) as f32 * LINE_HEIGHT;
+            let top = self.row_for(self.buffer.cursor) as f32 * self.line_height();
             if top < self.scroll {
                 self.scroll = top;
-            } else if top + LINE_HEIGHT > self.scroll + height {
-                self.scroll = top + LINE_HEIGHT - height;
+            } else if top + self.line_height() > self.scroll + height {
+                self.scroll = top + self.line_height() - height;
             }
             self.ensure_cursor = false;
         }
         self.scroll = self.scroll.clamp(
             0.,
-            (self.rows.len() as f32 * LINE_HEIGHT + 16. - height).max(0.),
+            (self.rows.len() as f32 * self.line_height() + 16. - height).max(0.),
         );
         let _ = cx;
     }
     fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let theme = Theme::for_mode(self.mode);
+        if self.buffer.text.is_empty() && !self.placeholder.is_empty() {
+            let mut run = window.text_style().to_run(self.placeholder.len());
+            run.font = ui_font();
+            run.color = theme.text_tertiary.into();
+            let line = window.text_system().shape_line(
+                self.placeholder.clone().into(),
+                px(self.font_size()),
+                &[run],
+                None,
+            );
+            let _ = line.paint(
+                bounds.origin,
+                px(self.line_height()),
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+        }
         let selection = self.buffer.selection();
-        let start = (self.scroll / LINE_HEIGHT).floor() as usize;
-        let count = (f32::from(bounds.size.height) / LINE_HEIGHT).ceil() as usize + 1;
+        let start = (self.scroll / self.line_height()).floor() as usize;
+        let count = (f32::from(bounds.size.height) / self.line_height()).ceil() as usize + 1;
         for (index, row) in self.rows.iter().enumerate().skip(start).take(count) {
-            let y = bounds.top() + px(index as f32 * LINE_HEIGHT - self.scroll);
-            let origin = point(bounds.left() + px(GUTTER), y);
+            let y = bounds.top() + px(index as f32 * self.line_height() - self.scroll);
+            let origin = point(bounds.left() + px(self.gutter()), y);
             if !selection.is_empty() && selection.end > row.start() && selection.start <= row.end()
             {
                 let left = row
@@ -613,18 +685,18 @@ impl FileEditor {
                 window.paint_quad(fill(
                     Bounds::new(
                         origin + point(left, px(0.)),
-                        size((right - left).max(px(2.)), px(LINE_HEIGHT)),
+                        size((right - left).max(px(2.)), px(self.line_height())),
                     ),
                     theme.accent.alpha(0.18),
                 ));
             }
-            if let Some(number) = row.number {
+            if let Some(number) = row.number.filter(|_| self.prose_label.is_none()) {
                 let mut font = ui_font();
                 font.family = UI_MONOSPACE_FONT_FAMILY.into();
                 let text = number.to_string();
                 let line = window.text_system().shape_line(
                     text.clone().into(),
-                    px(FONT_SIZE),
+                    px(self.font_size()),
                     &[TextRun {
                         len: text.len(),
                         font,
@@ -636,8 +708,8 @@ impl FileEditor {
                     None,
                 );
                 let _ = line.paint(
-                    point(bounds.left() + px(GUTTER - 12.) - line.width(), y),
-                    px(LINE_HEIGHT),
+                    point(bounds.left() + px(self.gutter() - 12.) - line.width(), y),
+                    px(self.line_height()),
                     gpui::TextAlign::Left,
                     None,
                     window,
@@ -646,7 +718,7 @@ impl FileEditor {
             }
             let _ = row.line.paint(
                 origin,
-                px(LINE_HEIGHT),
+                px(self.line_height()),
                 gpui::TextAlign::Left,
                 None,
                 window,
@@ -663,9 +735,9 @@ impl FileEditor {
                 ));
             }
         }
-        if self.rows.len() as f32 * LINE_HEIGHT > f32::from(bounds.size.height) {
+        if self.rows.len() as f32 * self.line_height() > f32::from(bounds.size.height) {
             let height = f32::from(bounds.size.height);
-            let total = self.rows.len() as f32 * LINE_HEIGHT + 16.;
+            let total = self.rows.len() as f32 * self.line_height() + 16.;
             let thumb = (height * height / total).max(24.);
             let top = self.scroll / (total - height) * (height - thumb);
             window.paint_quad(fill(
@@ -684,7 +756,9 @@ impl Render for FileEditor {
         let paint_entity = entity.clone();
         div()
             .id("file-editor")
-            .bg(Theme::for_mode(self.mode).file_editor_surface)
+            .when(self.prose_label.is_none(), |d| {
+                d.bg(Theme::for_mode(self.mode).file_editor_surface)
+            })
             .relative()
             .size_full()
             .overflow_hidden()
@@ -692,7 +766,12 @@ impl Render for FileEditor {
             .key_context("FileEditor")
             .track_focus(&self.focus)
             .role(gpui::Role::TextInput)
-            .aria_label("文件内容，可直接编辑并自动保存")
+            .aria_label(
+                self.prose_label
+                    .clone()
+                    .unwrap_or_else(|| "文件内容，可直接编辑并自动保存".into()),
+            )
+            .aria_placeholder(self.placeholder.clone())
             .aria_value(self.buffer.text.clone())
             .on_key_down(cx.listener(Self::handle_key))
             .on_action(cx.listener(|s, _: &EditorCopy, _, cx| {
@@ -803,9 +882,9 @@ impl Render for FileEditor {
                 if s.selecting {
                     if let Some(b) = s.bounds {
                         if e.position.y < b.top() {
-                            s.scroll = (s.scroll - LINE_HEIGHT).max(0.);
+                            s.scroll = (s.scroll - s.line_height()).max(0.);
                         } else if e.position.y > b.bottom() {
-                            s.scroll += LINE_HEIGHT;
+                            s.scroll += s.line_height();
                         }
                     }
                     s.buffer.cursor = s.offset_at(e.position);
@@ -821,7 +900,7 @@ impl Render for FileEditor {
                 cx.listener(|s, _, _, _| s.selecting = false),
             )
             .on_scroll_wheel(cx.listener(|s, e: &gpui::ScrollWheelEvent, _, cx| {
-                s.scroll -= f32::from(e.delta.pixel_delta(px(LINE_HEIGHT)).y);
+                s.scroll -= f32::from(e.delta.pixel_delta(px(s.line_height())).y);
                 s.ensure_cursor = false;
                 cx.notify();
                 cx.stop_propagation();
@@ -964,10 +1043,10 @@ impl EntityInputHandler for FileEditor {
         let row = self.rows.get(index)?;
         Some(Bounds::new(
             point(
-                b.left() + px(GUTTER) + row.line.x_for_index(row.display(p)),
-                b.top() + px(index as f32 * LINE_HEIGHT - self.scroll),
+                b.left() + px(self.gutter()) + row.line.x_for_index(row.display(p)),
+                b.top() + px(index as f32 * self.line_height() - self.scroll),
             ),
-            size(px(1.), px(LINE_HEIGHT)),
+            size(px(1.), px(self.line_height())),
         ))
     }
     fn character_index_for_point(

@@ -61,6 +61,7 @@ pub struct PromptInput {
     last_bounds: Option<Bounds<Pixels>>,
     horizontal_scroll: f32,
     is_selecting: bool,
+    submit_empty: bool,
 }
 
 impl gpui::EventEmitter<PromptSubmitted> for PromptInput {}
@@ -83,6 +84,7 @@ impl PromptInput {
             last_bounds: None,
             horizontal_scroll: 0.0,
             is_selecting: false,
+            submit_empty: false,
         }
     }
 
@@ -210,9 +212,13 @@ impl PromptInput {
         cx.notify();
     }
 
+    pub fn set_submit_empty(&mut self, allow: bool) {
+        self.submit_empty = allow;
+    }
+
     pub fn submit(&mut self, cx: &mut Context<Self>) {
         let prompt = self.content.trim().to_owned();
-        if !prompt.is_empty() {
+        if !prompt.is_empty() || self.submit_empty {
             cx.emit(PromptSubmitted(prompt));
         }
     }
