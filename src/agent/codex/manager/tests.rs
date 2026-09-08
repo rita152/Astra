@@ -29,6 +29,8 @@ use crate::agent::{
 
 const WAIT: Duration = Duration::from_secs(3);
 
+mod side_conversation;
+
 #[test]
 fn history_retains_message_phase_and_semantic_command_actions() {
     let message = parse_history_item(
@@ -502,6 +504,7 @@ fn request(prompt: &str, thread_id: Option<&str>) -> AgentRequest {
         effort: "medium".to_owned(),
         service_tier: None,
         permission_mode: AgentPermissionMode::Request,
+        context: Default::default(),
     }
 }
 

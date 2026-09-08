@@ -13,13 +13,13 @@ use super::{right_panel::clamp_right_panel_width, state::RightPanelMode};
 use crate::workspace::WorkspaceSnapshot;
 use crate::{
     components::{file_panel::OpenWorkspaceFile, icons::icon},
-    theme::{Theme, ui_font},
+    theme::{CHAT_CONTENT_HORIZONTAL_GUTTER, Theme, ui_font},
 };
 
 use super::{
-    ChatApp, ConversationKey, DismissPermissionUi, LEADING_TITLEBAR_CONTROLS_TOP,
-    MAIN_CONTENT_HORIZONTAL_GUTTER, OpenFiles, RIGHT_PANEL_MIN_WIDTH,
-    STARTUP_LOADING_BLINK_DURATION, STARTUP_LOADING_LOGO_SIZE, ToggleReview, ToggleTerminal,
+    ChatApp, ConversationKey, DismissPermissionUi, LEADING_TITLEBAR_CONTROLS_TOP, OpenFiles,
+    OpenSideChat, RIGHT_PANEL_MIN_WIDTH, STARTUP_LOADING_BLINK_DURATION, STARTUP_LOADING_LOGO_SIZE,
+    ToggleReview, ToggleTerminal,
 };
 
 pub(super) fn panel_resize_handle(
@@ -185,6 +185,15 @@ impl Render for ChatApp {
             } else {
                 None
             };
+        let side_chat_overlay = if self.right_panel.open
+            && self.right_panel.mode == Some(RightPanelMode::SideChat)
+        {
+            self.side_chat_panels
+                .get(&self.active_conversation)
+                .and_then(|panel| panel.update(cx, |panel, cx| panel.render_overlay(window, cx)))
+        } else {
+            None
+        };
         if self.terminal_return_focus_pending {
             if let Some(host) = self.conversation_hosts.get(&self.active_conversation) {
                 host.composer
@@ -195,6 +204,9 @@ impl Render for ChatApp {
             self.terminal_return_focus_pending = false;
         }
         let viewport = window.viewport_size();
+        if window.focused(cx).is_none() {
+            self.root_focus.focus(window, cx);
+        }
         let theme = Theme::for_window(
             self.mode,
             window.is_window_active(),
@@ -261,7 +273,10 @@ impl Render for ChatApp {
         .min(px(1_418.218_8))
         .max(px(RIGHT_PANEL_MIN_WIDTH));
         let review_fullscreen = self.right_panel.open
-            && self.right_panel.mode == Some(RightPanelMode::Review)
+            && matches!(
+                self.right_panel.mode,
+                Some(RightPanelMode::Review | RightPanelMode::SideChat)
+            )
             && self.right_panel.fullscreen;
         let right_panel_width = if review_fullscreen {
             px(viewport_width - revealed_sidebar_width)
@@ -281,6 +296,7 @@ impl Render for ChatApp {
                 "app-shell"
             })
             .size_full()
+            .track_focus(&self.root_focus)
             .relative()
             .flex()
             .font(ui_font())
@@ -314,8 +330,27 @@ impl Render for ChatApp {
                 else { this.open_review(cx); }
                 cx.stop_propagation();
             }))
+            .on_action(cx.listener(|this, _: &OpenSideChat, _, cx| {
+                this.right_panel.open = true;
+                this.select_right_panel_item(0, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &crate::components::side_chat::RestoreSideChat, _, cx| {
+                this.deactivate_review(cx);
+                this.right_panel.open = true;
+                this.right_panel.mode = Some(RightPanelMode::SideChat);
+                this.right_panel.fullscreen = false;
+                this.right_panel.diff_review = None;
+                this.ensure_side_chat(false, cx);
+                cx.stop_propagation();
+            }))
             .on_key_down(cx.listener(Self::handle_project_creation_key))
             .on_action(cx.listener(|this, _: &DismissPermissionUi, window, cx| {
+                if this.right_panel.open && this.right_panel.mode == Some(RightPanelMode::SideChat)
+                    && let Some(panel) = this.side_chat_panels.get(&this.active_conversation)
+                    && panel.update(cx, |panel, cx| panel.dismiss_transient(cx)) {
+                    cx.stop_propagation(); return;
+                }
                 if this.right_panel.open&&this.right_panel.mode==Some(RightPanelMode::Review)
                     &&let Some(panel)=this.review_panels.get(&this.active_conversation)
                     &&panel.update(cx,|p,cx|p.dismiss_transient(window,cx)) {
@@ -396,7 +431,7 @@ impl Render for ChatApp {
                                             // workspace edges when a side panel narrows the main
                                             // column. Max-width content remains unchanged on wide
                                             // windows because HomeView still centers it internally.
-                                            .px(px(MAIN_CONTENT_HORIZONTAL_GUTTER))
+                                            .px(px(CHAT_CONTENT_HORIZONTAL_GUTTER))
                                             .bg(theme.surface)
                                             .child(
                                                 self.home.clone().cached(
@@ -418,6 +453,7 @@ impl Render for ChatApp {
                     )
             })
             .when_some(review_overlay,|shell,overlay|shell.child(overlay))
+            .when_some(side_chat_overlay,|shell,overlay|shell.child(overlay))
             .when(self.permission_confirmation_open, |shell| {
                 shell.child(
                     div()
@@ -534,7 +570,9 @@ impl Render for ChatApp {
                                                 .hover(|style| style.bg(rgba(0xff676433)))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.permission_confirmation_open = false;
-                                                    this.home.update(cx, |home, cx| home.confirm_full_access(cx));
+                                                    if let Some(composer) = this.permission_confirmation_target.take() {
+                                                        composer.update(cx, |composer, cx| composer.confirm_full_access(cx));
+                                                    } else { this.home.update(cx, |home, cx| home.confirm_full_access(cx)); }
                                                     cx.notify();
                                                 }))
                                                 .child(icon("permission-warning", rgba(0xff6764ff).into()).size(px(16.0)))

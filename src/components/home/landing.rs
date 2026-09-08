@@ -3,7 +3,7 @@
 use gpui::{Div, Entity, div, prelude::*, px};
 
 use super::{
-    COMPOSER_BOTTOM_INSET,
+    COMPOSER_BOTTOM_INSET, CONVERSATION_BOTTOM_INSET,
     context::{ConversationRenderContext, MainConversationSnapshot},
     conversation::conversation,
     requests::{
@@ -31,6 +31,8 @@ pub(super) fn home(
     let home_entity = render.home_entity.clone();
     let theme = render.theme;
     let MainConversationSnapshot {
+        side_chat,
+        composer_height,
         rows: conversation_rows,
         phase,
         activities: conversation_activity,
@@ -77,8 +79,12 @@ pub(super) fn home(
                     .absolute()
                     // These are component boundaries, not a viewport-specific
                     // heading coordinate. GPUI centers the group in between them.
-                    .top(px(46.0))
-                    .bottom(px(153.0))
+                    .top(px(if side_chat { 78.0 } else { 46.0 }))
+                    .bottom(px(if side_chat {
+                        composer_height + 60.0
+                    } else {
+                        CONVERSATION_BOTTOM_INSET
+                    }))
                     .w_full()
                     .flex()
                     .items_center()
@@ -93,19 +99,42 @@ pub(super) fn home(
                             .items_center()
                             .gap(px(12.0))
                             .child(
-                                icon("home-mark", theme.home_mark.into())
-                                    .size(px(56.0))
-                                    .relative()
-                                    .top(px(-2.0)),
+                                icon(
+                                    if side_chat { "side-chat" } else { "home-mark" },
+                                    if side_chat {
+                                        theme.text_secondary
+                                    } else {
+                                        theme.home_mark
+                                    }
+                                    .into(),
+                                )
+                                .size(px(if side_chat { 32.0 } else { 56.0 }))
+                                .relative()
+                                .top(px(-2.0)),
                             )
                             .child(
                                 div()
-                                    .text_size(px(28.0))
-                                    .line_height(px(33.6))
+                                    .text_size(px(if side_chat { 16.0 } else { 28.0 }))
+                                    .line_height(px(if side_chat { 24.0 } else { 33.6 }))
                                     .font_weight(gpui::FontWeight::NORMAL)
                                     .text_color(theme.text)
-                                    .child("你想让我们在 coda 中构建什么？"),
-                            ),
+                                    .child(if side_chat {
+                                        "侧边聊天"
+                                    } else {
+                                        "你想让我们在 coda 中构建什么？"
+                                    }),
+                            )
+                            .when(side_chat, |group| {
+                                group.child(
+                                    div()
+                                        .mt(px(-4.0))
+                                        .text_size(px(13.0))
+                                        .line_height(px(18.5714))
+                                        .text_color(theme.text_secondary)
+                                        .text_center()
+                                        .child("侧边聊天是临时聊天，关闭应用后会消失。"),
+                                )
+                            }),
                     ),
             )
         })
@@ -114,6 +143,11 @@ pub(super) fn home(
                 render.clone(),
                 conversation_rows,
                 conversation_list,
+                if side_chat {
+                    composer_height + 55.0
+                } else {
+                    CONVERSATION_BOTTOM_INSET
+                },
             ))
         })
         .when(phase != ConversationPhase::Empty, |root| {
@@ -209,18 +243,21 @@ pub(super) fn home(
                 .flex_col()
                 .justify_end()
                 .gap(px(8.0))
-                .when(phase == ConversationPhase::Empty, |container| {
-                    container.child(
-                        div()
-                            .min_h(px(80.0))
-                            .px(px(19.0))
-                            .flex()
-                            .flex_col()
-                            .justify_end()
-                            .child(first_suggestion)
-                            .child(second_suggestion),
-                    )
-                })
+                .when(
+                    phase == ConversationPhase::Empty && !side_chat,
+                    |container| {
+                        container.child(
+                            div()
+                                .min_h(px(80.0))
+                                .px(px(19.0))
+                                .flex()
+                                .flex_col()
+                                .justify_end()
+                                .child(first_suggestion)
+                                .child(second_suggestion),
+                        )
+                    },
+                )
                 .when(!blocking_request_pending, |container| {
                     container.child(composer)
                 }),

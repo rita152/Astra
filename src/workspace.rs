@@ -1028,6 +1028,10 @@ impl WorkspaceStore {
         self.update(|snapshot| snapshot.preferences.review = review);
         self.save_preferences();
     }
+    pub fn set_skip_side_chat_close_confirmation(&self, skip: bool) {
+        self.update(|snapshot| snapshot.preferences.skip_side_chat_close_confirmation = skip);
+        self.save_preferences();
+    }
     fn save_preferences(&self) {
         let _save_guard = match self.preference_save_lock.lock() {
             Ok(guard) => guard,

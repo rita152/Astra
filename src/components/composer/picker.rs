@@ -386,11 +386,9 @@ impl ComposerView {
             .hover(move |style| style.bg(theme.sidebar_hover))
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                this.submenu = if this.submenu == Some(submenu) {
-                    None
-                } else {
-                    Some(submenu)
-                };
+                // Hover may already have opened the submenu immediately before
+                // the click. Clicking its trigger must keep that menu open.
+                this.submenu = Some(submenu);
                 cx.notify();
             }))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -515,7 +513,10 @@ impl ComposerView {
         }
         .min(MODEL_PICKER_SUBMENU_MAX_HEIGHT);
         let top = MODEL_PICKER_SUBMENU_BOTTOM_OFFSET - estimated_height;
-        let layout = submenu_layout(viewport_width, width);
+        let layout = self.trailing_margin.map_or_else(
+            || submenu_layout(viewport_width, width),
+            |margin| super::layout::submenu_layout_at_right(margin, width),
+        );
         let mut menu = div()
             .id("model-picker-submenu")
             .absolute()

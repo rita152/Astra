@@ -37,6 +37,7 @@ pub enum AgentCapability {
     ThreadSectionList,
     ThreadSectionCreate,
     ThreadSectionMove,
+    SideConversation,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -113,6 +114,31 @@ pub struct AgentRequest {
     pub effort: String,
     pub service_tier: Option<String>,
     pub permission_mode: AgentPermissionMode,
+    pub context: AgentPromptContext,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentPromptContext {
+    pub files: Vec<AgentInputFile>,
+    /// None preserves the current conversation mode; false explicitly exits planning.
+    pub plan_mode: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentInputFile {
+    pub path: PathBuf,
+    pub image: bool,
+}
+
+/// An independent, temporary conversation using a parent's history as context.
+/// Opening one must not submit a turn or change the parent conversation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SideConversationRequest {
+    pub parent_thread_id: ThreadId,
+    pub cwd: PathBuf,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub service_tier: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,6 +198,15 @@ pub trait AgentBackend: Send + Sync {
     }
 
     fn subscribe_connection_events(&self) -> Receiver<AgentConnectionEvent>;
+    fn open_side_conversation(
+        &self,
+        _request: SideConversationRequest,
+    ) -> Receiver<WorkspaceResult<ThreadId>> {
+        unsupported_receiver(AgentCapability::SideConversation)
+    }
+    fn close_side_conversation(&self, _thread_id: ThreadId) -> Receiver<WorkspaceResult<()>> {
+        unsupported_receiver(AgentCapability::SideConversation)
+    }
     #[cfg_attr(test, allow(dead_code))]
     fn load_model_catalog(&self) -> Receiver<Result<AgentModelCatalog, String>>;
     #[allow(dead_code)]

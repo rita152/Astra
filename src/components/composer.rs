@@ -2,6 +2,7 @@
 use crate::agent::CodexAppServerBackend;
 
 mod capture;
+mod context;
 mod dictation;
 mod layout;
 mod permissions;
@@ -9,6 +10,7 @@ mod picker;
 mod render;
 mod requests;
 mod runtime;
+mod side_chat;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -129,6 +131,14 @@ pub struct ComposerView {
     backend: Arc<dyn AgentBackend>,
     mode: ThemeMode,
     prompt_input: Entity<PromptInput>,
+    side_editor: Option<Entity<crate::components::file_editor::FileEditor>>,
+    side_ready: bool,
+    available_width: Option<f32>,
+    trailing_margin: Option<f32>,
+    prompt_context: crate::agent::AgentPromptContext,
+    context_menu_open: bool,
+    context_focus: FocusHandle,
+    focus_prompt_pending: bool,
     review_comments: Vec<crate::git_review::ReviewComment>,
     user_input_other_input: Entity<PromptInput>,
     model_menu_focus: FocusHandle,
@@ -238,6 +248,14 @@ impl ComposerView {
             backend,
             mode,
             prompt_input,
+            side_editor: None,
+            side_ready: true,
+            available_width: None,
+            trailing_margin: None,
+            prompt_context: Default::default(),
+            context_menu_open: false,
+            context_focus: cx.focus_handle(),
+            focus_prompt_pending: false,
             review_comments: Vec::new(),
             user_input_other_input,
             model_menu_focus: cx.focus_handle(),
@@ -381,6 +399,9 @@ impl ComposerView {
         self.mode = mode;
         self.prompt_input
             .update(cx, |input, cx| input.set_mode(mode, cx));
+        if let Some(editor) = &self.side_editor {
+            editor.update(cx, |editor, cx| editor.set_mode(mode, cx));
+        }
         self.user_input_other_input
             .update(cx, |input, cx| input.set_mode(mode, cx));
         cx.notify();
@@ -449,7 +470,10 @@ impl ComposerView {
     }
 
     pub fn prompt_focus_handle(&self, cx: &gpui::App) -> FocusHandle {
-        self.prompt_input.read(cx).focus_handle(cx)
+        self.side_editor.as_ref().map_or_else(
+            || self.prompt_input.read(cx).focus_handle(cx),
+            |editor| editor.read(cx).focus_handle(cx),
+        )
     }
 
     pub fn user_input_other_entity(&self) -> Entity<PromptInput> {

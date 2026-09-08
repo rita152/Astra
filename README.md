@@ -209,6 +209,21 @@ GPUI_DIFF_BENCH_PATCH=/absolute/path/to/long.diff \
 
 当前全部 JSON-RPC 方法及实际接入状态统一维护在 [`docs/APP_SERVER_INTEGRATION.md`](docs/APP_SERVER_INTEGRATION.md)。升级 Codex CLI 时直接核对并更新该总表。
 
+## 侧边聊天
+
+右侧功能区的“侧边聊天”、底部添加菜单或 `⌥⌘S` 在当前主聊天的上下文上新建临时侧边对话。主聊天需要先有真实线程。侧边聊天支持多个标签、拖动排序、`Ctrl+Tab`／`Ctrl+Shift+Tab` 切换、`Cmd+W` 关闭当前标签、全屏和面板缩放；标题跟随首条问题，后台回复显示未读状态。收起面板和切换主聊天会保留对应的消息、草稿与滚动位置，文件、审查和终端提供返回侧边聊天的标签。
+
+正文与主对话共用两侧 `24px` 留白，输入框在此基础上再向内 `6px`。长气泡按当前会话列的 70% 限宽，改变面板宽度时重新测量列表项并保留滚动锚点，避免窄栏中文字贴边、越界或覆盖后续回复。原生输入框支持多行、中文 IME、选择、复制粘贴、撤销／重做，`Enter` 发送，`Shift+Enter` 换行；窄栏仍保留模型、权限及发送入口。
+
+侧边对话复用现有流式消息、工具、审批、Markdown、图片与回复复制／评价组件。添加菜单可通过系统选择器附加文件和文件夹，也支持拖入文件；图片作为 `localImage` 输入，其他文件作为路径上下文。计划模式使用真实 `turn/start.collaborationMode`。所有轮次都有独立的中断对象，停止或关闭侧边聊天不会中断主聊天。无消息的标签直接关闭，有消息时显示带“不再询问”的确认；关闭应用后临时聊天消失，连接失效时当前消息仍可查看和复制。
+
+协议优先使用 `thread/fork(ephemeral=true, excludeTurns=true)`、`thread/inject_items` 和 `thread/unsubscribe`，不建立本地聊天数据库。参考样式通过独立 ChatGPT 调试实例的 CDP 采集；必须新建未被其他任务使用的端口，再将端点设置为 `CHATGPT_CDP_HTTP`：
+
+```bash
+node scripts/cdp_capture_side_chat.mjs artifacts/side-chat reference
+cargo test side_ -- --test-threads=1
+```
+
 ## 架构与渐进重构
 
 应用以 `AgentBackend` 作为 coding agent 的应用边界，按领域契约、协议适配、工作区数据、会话状态和 GPUI 展示分层。`ChatApp` 在入口装配共享服务并注入各视图；会话事件归约与历史恢复集中在 `conversation`，输入框和活动视图按功能组织。各批迁移同步移动原有测试，保留既有协议与界面行为。

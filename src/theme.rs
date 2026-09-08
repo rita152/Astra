@@ -11,6 +11,9 @@ pub const UI_CJK_FALLBACK_FAMILY: &str = "PingFang SC";
 pub const UI_MONOSPACE_FONT_FAMILY: &str = "Menlo";
 /// Live ChatGPT body/`font-normal` token; explicit 400-weight controls stay 400.
 pub const UI_BODY_FONT_WEIGHT: FontWeight = FontWeight(430.0);
+/// Shared outer inset for main and side conversation content. Toolbar chrome
+/// remains full width; messages and the floating composer use this gutter.
+pub const CHAT_CONTENT_HORIZONTAL_GUTTER: f32 = 24.0;
 
 pub fn ui_font() -> Font {
     let mut font = font(UI_FONT_FAMILY);

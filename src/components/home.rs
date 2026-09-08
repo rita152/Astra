@@ -86,6 +86,7 @@ pub struct HomeView {
     conversation_phase: ConversationPhase,
     conversation_activity: Rc<Vec<ConversationActivity>>,
     conversation_cache_dirty: bool,
+    content_width: f32,
     conversation_list: ListState,
     conversation_scroll: ScrollHandle,
     expanded_reasoning: HashSet<String>,
@@ -109,6 +110,7 @@ pub struct HomeView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HomePresentation {
     Conversation,
+    SideChat,
     Subagent,
 }
 
@@ -237,6 +239,14 @@ impl HomeView {
         Self::with_composer(mode, HomePresentation::Conversation, composer, cx)
     }
 
+    pub(crate) fn new_side_chat(
+        mode: ThemeMode,
+        composer: Entity<ComposerView>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_composer(mode, HomePresentation::SideChat, composer, cx)
+    }
+
     pub fn new_subagent(
         mode: ThemeMode,
         composer: Entity<ComposerView>,
@@ -272,6 +282,7 @@ impl HomeView {
             conversation_phase: ConversationPhase::Empty,
             conversation_activity: Rc::new(Vec::new()),
             conversation_cache_dirty: false,
+            content_width: CONVERSATION_CONTENT_MAX_WIDTH,
             conversation_list: conversation_list_state(0),
             conversation_scroll: ScrollHandle::new(),
             expanded_reasoning: HashSet::new(),
@@ -582,7 +593,7 @@ impl HomeView {
         distance: f32,
         cx: &mut Context<Self>,
     ) {
-        if self.presentation == HomePresentation::Conversation {
+        if self.presentation != HomePresentation::Subagent {
             self.conversation_list.scroll_to_end();
             self.conversation_list.scroll_by(px(-distance.max(0.0)));
         } else {
@@ -1184,7 +1195,7 @@ impl Render for HomeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_mode(self.mode);
         let (transcript, phase, assistant_message, conversation_activity) =
-            if self.presentation == HomePresentation::Conversation {
+            if self.presentation != HomePresentation::Subagent {
                 (
                     Vec::new(),
                     self.conversation_phase,
@@ -1199,7 +1210,7 @@ impl Render for HomeView {
             };
         let user_input_other = self.composer.read(cx).user_input_other_entity();
         let user_input_other_focus = self.composer.read(cx).user_input_other_focus_handle(cx);
-        let blocking_keyboard_request_pending = self.presentation == HomePresentation::Conversation
+        let blocking_keyboard_request_pending = self.presentation != HomePresentation::Subagent
             && conversation_activity.iter().any(|activity| {
                 matches!(activity, ConversationActivity::Approval(model) if model.should_render())
                     || matches!(activity, ConversationActivity::FileApproval(model) if model.should_render())
@@ -1254,7 +1265,7 @@ impl Render for HomeView {
         });
         let conversation_data_changed = self.conversation_cache_dirty || disclosure_state_changed;
         if self.presentation == HomePresentation::Subagent || conversation_data_changed {
-            let visible_activity_units = if self.presentation == HomePresentation::Conversation {
+            let visible_activity_units = if self.presentation != HomePresentation::Subagent {
                 self.conversation_rows
                     .iter()
                     .filter_map(|row| match row {
@@ -1357,7 +1368,7 @@ impl Render for HomeView {
             }
         }
         let content = match self.presentation {
-            HomePresentation::Conversation => home(
+            HomePresentation::Conversation | HomePresentation::SideChat => home(
                 ConversationRenderContext {
                     home_entity: cx.entity(),
                     theme,
@@ -1381,6 +1392,8 @@ impl Render for HomeView {
                 self.composer.clone(),
                 user_input_other,
                 MainConversationSnapshot {
+                    side_chat: self.presentation == HomePresentation::SideChat,
+                    composer_height: self.composer.read(cx).side_composer_height(cx),
                     rows: self.conversation_rows.clone(),
                     phase,
                     activities: conversation_activity,
@@ -1426,9 +1439,53 @@ impl Render for HomeView {
                 self.conversation_scroll.clone(),
             ),
         };
+        let measured_home = cx.entity();
         content
             .track_focus(&self.approval_focus)
             .on_key_down(cx.listener(Self::handle_approval_key))
+            .child(
+                gpui::canvas(
+                    move |bounds, window, cx| {
+                        let width = f32::from(bounds.size.width).max(1.0);
+                        let composer_width = width.min(748.0);
+                        let composer_right =
+                            f32::from(bounds.left()) + (width + composer_width) * 0.5 - 6.0;
+                        let trailing_margin =
+                            (f32::from(window.viewport_size().width) - composer_right).max(0.0);
+                        let width_changed = measured_home.update(cx, |home, cx| {
+                            let width_changed = (home.content_width - width).abs() > 0.5;
+                            if width_changed {
+                                home.content_width = width;
+                                home.conversation_list.remeasure();
+                                cx.notify();
+                            }
+                            home.composer.update(cx, |composer, cx| {
+                                composer.set_available_width(
+                                    composer_width - 12.0,
+                                    trailing_margin,
+                                    cx,
+                                )
+                            });
+                            width_changed
+                        });
+                        if width_changed {
+                            let home = measured_home.downgrade();
+                            // A size discovered during prepaint needs a subsequent
+                            // frame: invalidation in the current frame may already
+                            // have been consumed by the virtual list's cache.
+                            window.on_next_frame(move |_, cx| {
+                                let _ = home.update(cx, |home, cx| {
+                                    home.conversation_list.remeasure();
+                                    cx.notify();
+                                });
+                            });
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
     }
 }
 

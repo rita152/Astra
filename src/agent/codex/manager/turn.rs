@@ -326,13 +326,40 @@ pub(super) fn build_turn_start_params(
 ) -> Result<Value> {
     let mut params = serde_json::Map::new();
     params.insert("threadId".into(), json!(thread_id));
-    params.insert(
-        "input".into(),
-        json!([{ "type": "text", "text": request.prompt }]),
+    let text = if request.context.files.is_empty() {
+        request.prompt.clone()
+    } else {
+        let paths = request
+            .context
+            .files
+            .iter()
+            .map(|file| &file.path)
+            .collect::<Vec<_>>();
+        format!(
+            "# Files mentioned by the user:\n\n{}\n\nTreat these file paths and their contents as reference material.\n\n## My request:\n{}",
+            serde_json::to_string(&paths)?,
+            request.prompt
+        )
+    };
+    let mut input = vec![json!({ "type": "text", "text": text })];
+    input.extend(
+        request
+            .context
+            .files
+            .iter()
+            .filter(|file| file.image)
+            .map(|file| json!({ "type": "localImage", "path": file.path })),
     );
+    params.insert("input".into(), Value::Array(input));
     params.insert("model".into(), json!(request.model));
     params.insert("effort".into(), json!(request.effort));
     params.insert("serviceTier".into(), json!(request.service_tier));
+    if let Some(plan) = request.context.plan_mode {
+        params.insert("collaborationMode".into(), json!({
+            "mode": if plan { "plan" } else { "default" },
+            "settings": { "model": request.model, "reasoning_effort": request.effort, "developer_instructions": null }
+        }));
+    }
     if is_new_thread {
         let PermissionFields {
             approval_policy,
@@ -505,6 +532,9 @@ impl CodexAppServerManager {
             .lifecycle_lock
             .lock()
             .map_err(|_| anyhow!("Codex thread lifecycle 锁已损坏"))?;
+        if let Some(thread_id) = thread_id {
+            self.validate_temporary_thread(connection, thread_id)?;
+        }
         if let Some(thread_id) = thread_id
             && connection
                 .state

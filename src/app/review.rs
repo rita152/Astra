@@ -133,6 +133,14 @@ impl ChatApp {
             .map(|p| p.read(cx).open_documents())
             .unwrap_or_default();
         self.review_panels[&key].update(cx, |p, cx| p.set_file_tabs(tabs, cx));
+        self.review_panels[&key].update(cx, |p, cx| {
+            p.set_side_chat_available(
+                self.side_chat_panels
+                    .get(&key)
+                    .is_some_and(|p| !p.read(cx).is_empty()),
+                cx,
+            )
+        });
         self.right_panel.focus_pending = false;
     }
     pub(super) fn open_diff_review(

@@ -70,6 +70,11 @@ impl ChatApp {
     }
     pub fn open_right_panel(&mut self, cx: &mut Context<Self>) {
         self.right_panel.open = true;
+        if self.right_panel.mode == Some(RightPanelMode::SideChat) {
+            self.ensure_side_chat(false, cx);
+            cx.notify();
+            return;
+        }
         if self.right_panel.mode == Some(RightPanelMode::Review) {
             self.ensure_review(cx);
             cx.notify();
@@ -96,16 +101,27 @@ impl ChatApp {
     }
     pub(super) fn close_right_panel(&mut self, cx: &mut Context<Self>) {
         if self.right_panel.open {
+            self.deactivate_side_chat(cx);
             self.deactivate_review(cx);
             self.right_panel.open = false;
             self.right_panel.fullscreen = false;
             self.terminal_return_focus_pending = matches!(
                 self.right_panel.mode,
-                Some(RightPanelMode::Terminal | RightPanelMode::Files | RightPanelMode::Review)
+                Some(
+                    RightPanelMode::Terminal
+                        | RightPanelMode::Files
+                        | RightPanelMode::Review
+                        | RightPanelMode::SideChat
+                )
             );
             if !matches!(
                 self.right_panel.mode,
-                Some(RightPanelMode::Terminal | RightPanelMode::Files | RightPanelMode::Review)
+                Some(
+                    RightPanelMode::Terminal
+                        | RightPanelMode::Files
+                        | RightPanelMode::Review
+                        | RightPanelMode::SideChat
+                )
             ) {
                 self.right_panel.mode = None;
             }
@@ -131,11 +147,17 @@ impl ChatApp {
             return;
         };
         let mode = *mode;
+        if mode != RightPanelMode::SideChat {
+            self.deactivate_side_chat(cx);
+        }
         if mode != RightPanelMode::Review {
             self.deactivate_review(cx);
             self.right_panel.fullscreen = false;
         }
         self.right_panel.mode = Some(mode);
+        if mode == RightPanelMode::SideChat {
+            self.ensure_side_chat(true, cx);
+        }
         if mode == RightPanelMode::Files {
             self.ensure_files(cx);
         }
@@ -712,6 +734,22 @@ impl ChatApp {
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
+        if self.right_panel.mode == Some(RightPanelMode::SideChat)
+            && let Some(panel) = self.side_chat_panels.get(&self.active_conversation)
+        {
+            return div()
+                .id("right-panel")
+                .w(panel_width)
+                .min_w(panel_width)
+                .h_full()
+                .flex_none()
+                .relative()
+                .border_l_1()
+                .border_color(theme.border)
+                .bg(theme.surface)
+                .child(panel.clone())
+                .child(self.right_panel_resize_handle(theme, cx));
+        }
         if self.right_panel.mode == Some(RightPanelMode::Review)
             && let Some(panel) = self.review_panels.get(&self.active_conversation)
         {

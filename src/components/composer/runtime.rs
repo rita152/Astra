@@ -36,7 +36,10 @@ impl ComposerView {
         .detach();
     }
     pub(super) fn submit_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
-        if (prompt.trim().is_empty() && self.review_comments.is_empty())
+        if !self.side_ready
+            || (prompt.trim().is_empty()
+                && self.review_comments.is_empty()
+                && self.prompt_context.files.is_empty())
             || matches!(
                 self.conversation.phase,
                 ConversationPhase::Starting
@@ -64,6 +67,17 @@ impl ComposerView {
             ))
         };
 
+        // Failed validation must preserve a side-chat draft and its attachments.
+        if self.side_editor.is_some() && selection.is_err() {
+            self.conversation.permission_error = Some("没有可用模型，请选择模型后重试。".into());
+            cx.notify();
+            return;
+        }
+        let prompt = if prompt.trim().is_empty() && !self.prompt_context.files.is_empty() {
+            "请查看附加文件。".to_owned()
+        } else {
+            prompt
+        };
         let prompt = if self.review_comments.is_empty() {
             prompt
         } else {
@@ -74,11 +88,20 @@ impl ComposerView {
             )
         };
         let cycle = self.conversation.begin_prompt(&prompt);
+        let prompt_context = self.prompt_context.clone();
+        self.conversation.user_images = prompt_context
+            .files
+            .iter()
+            .filter(|file| file.image)
+            .map(|file| crate::agent::UserMessageImage::Local(file.path.clone()))
+            .collect();
         self.menu_open = false;
         self.permission_menu_open = false;
         self.permission_menu_keyboard_focus = false;
         self.submenu = None;
-        self.prompt_input.update(cx, |input, cx| input.clear(cx));
+        self.clear_prompt(cx);
+        self.prompt_context.files.clear();
+        self.context_menu_open = false;
 
         let (model, effort, service_tier) = match selection {
             Ok(selection) => selection,
@@ -115,6 +138,7 @@ impl ComposerView {
             effort,
             service_tier,
             permission_mode: self.permission_mode.agent_mode(),
+            context: prompt_context,
         });
         let (receiver, interrupt) = run.into_parts();
         self.conversation.active_turn = interrupt;

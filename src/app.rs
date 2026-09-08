@@ -6,6 +6,7 @@ mod project_creation;
 mod render;
 mod review;
 mod right_panel;
+mod side_chat;
 mod sidebar;
 mod state;
 mod workspace_panels;
@@ -21,7 +22,13 @@ use state::{
 
 gpui::actions!(
     permission_ui,
-    [DismissPermissionUi, ToggleTerminal, ToggleReview, OpenFiles]
+    [
+        DismissPermissionUi,
+        ToggleTerminal,
+        ToggleReview,
+        OpenFiles,
+        OpenSideChat
+    ]
 );
 
 use crate::{
@@ -36,6 +43,7 @@ use crate::{
             HomeView, OpenDiffReview, OpenImagePreview, OpenSubAgentPanel, RetryImageGeneration,
         },
         review_panel::ReviewPanel,
+        side_chat::SideChatPanel,
         sidebar::{NewConversation, OpenProjectCreation, OpenSettings, SelectThread, SidebarView},
         terminal::TerminalPanel,
     },
@@ -53,6 +61,7 @@ pub struct ChatApp {
     active_conversation: ConversationKey,
     next_draft_id: u64,
     mode: ThemeMode,
+    root_focus: gpui::FocusHandle,
     startup_model_catalog_resolved: bool,
     startup_sidebar_resolved: bool,
     startup_minimum_duration_elapsed: bool,
@@ -65,11 +74,13 @@ pub struct ChatApp {
     terminal_panels: HashMap<ConversationKey, Entity<TerminalPanel>>,
     file_panels: HashMap<ConversationKey, Entity<FilePanel>>,
     review_panels: HashMap<ConversationKey, Entity<ReviewPanel>>,
+    side_chat_panels: HashMap<ConversationKey, Entity<SideChatPanel>>,
     file_close_prompt_open: bool,
     terminal_return_focus_pending: bool,
     right_panel: RightPanelState,
     image_preview: ImagePreviewState,
     permission_confirmation_open: bool,
+    permission_confirmation_target: Option<Entity<ComposerView>>,
     project_creation: ProjectCreationState,
 }
 
@@ -118,7 +129,6 @@ const RIGHT_PANEL_MIN_WIDTH: f32 = 320.0;
 const RIGHT_PANEL_MAIN_MIN_WIDTH: f32 = 384.0;
 const SUBAGENT_PANEL_DEFAULT_WIDTH: f32 = 603.0;
 const SUBAGENT_PANEL_HEADER_HEIGHT: f32 = 48.0;
-const MAIN_CONTENT_HORIZONTAL_GUTTER: f32 = 24.0;
 // The native 14px traffic lights start at y=18px, so their center is y=25px.
 // Center the 28px leading titlebar controls on that same horizontal axis.
 const LEADING_TITLEBAR_CONTROLS_TOP: f32 = 11.0;
@@ -192,6 +202,9 @@ impl ChatApp {
             for panel in this.terminal_panels.values() {
                 panel.update(cx, |panel, cx| panel.set_mode(event.0, cx));
             }
+            for panel in this.side_chat_panels.values() {
+                panel.update(cx, |panel, cx| panel.set_mode(event.0, cx));
+            }
             cx.set_window_appearance(Some(match event.0 {
                 ThemeMode::Light => WindowAppearance::Light,
                 ThemeMode::Dark => WindowAppearance::Dark,
@@ -215,6 +228,7 @@ impl ChatApp {
         .detach();
         cx.subscribe(&home, |this, _, _: &RequestFullAccessConfirmation, cx| {
             this.permission_confirmation_open = true;
+            this.permission_confirmation_target = Some(this.home.read(cx).composer_entity());
             cx.notify();
         })
         .detach();
@@ -280,6 +294,7 @@ impl ChatApp {
             active_conversation,
             next_draft_id: 2,
             mode,
+            root_focus: cx.focus_handle(),
             // Unit tests intentionally exercise the full shell without spawning
             // the external Codex model-catalog process.
             startup_model_catalog_resolved: cfg!(test),
@@ -294,11 +309,13 @@ impl ChatApp {
             terminal_panels: HashMap::new(),
             file_panels: HashMap::new(),
             review_panels: HashMap::new(),
+            side_chat_panels: HashMap::new(),
             file_close_prompt_open: false,
             terminal_return_focus_pending: false,
             right_panel: RightPanelState::new(cx),
             image_preview: ImagePreviewState::new(cx),
             permission_confirmation_open: false,
+            permission_confirmation_target: None,
             project_creation: ProjectCreationState::new(cx),
         }
     }

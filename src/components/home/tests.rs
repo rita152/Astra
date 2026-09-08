@@ -1686,6 +1686,75 @@ fn user_bubble_paragraph_layout_preserves_hard_breaks_and_collapses_blank_runs()
 }
 
 #[test]
+fn side_chat_wrapped_user_rows_remeasure_when_the_panel_narrows() {
+    let mut app = TestApp::new();
+    let mut window = app.open_window_with_options(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.0), px(0.0)),
+                size(px(700.0), px(850.0)),
+            ))),
+            ..Default::default()
+        },
+        |_, cx| {
+            let mut home = HomeView::new(ThemeMode::Dark, cx);
+            home.presentation = super::HomePresentation::SideChat;
+            home
+        },
+    );
+    window.update(|home, _, cx| home.submit_prompt_for_capture(
+        "这次仅验证侧边聊天排版。请用两段中文说明侧边聊天用于独立提问，主对话保持原状。缩窄面板后每一行都应完整显示，回复应位于用户气泡下方。", cx));
+    for _ in 0..3 {
+        window.draw();
+        app.run_until_parked();
+    }
+    let height = |window: &TestAppWindow<HomeView>| {
+        window.read(|home, _| {
+            let index = home
+                .conversation_rows
+                .iter()
+                .position(|row| {
+                    matches!(
+                        row,
+                        super::timeline::ConversationListRow::CurrentUser { .. }
+                    )
+                })
+                .unwrap();
+            home.conversation_list
+                .bounds_for_item(index)
+                .unwrap()
+                .size
+                .height
+        })
+    };
+    let wide_height = height(&window);
+    window.update(|_, window, cx| {
+        window.resize(size(px(272.0), px(850.0)));
+        window.bounds_changed(cx);
+    });
+    for _ in 0..3 {
+        window.draw();
+        app.run_until_parked();
+    }
+    let narrow_height = height(&window);
+    assert!(
+        narrow_height > wide_height + px(40.0),
+        "wrapped text must increase its virtual row height: {wide_height:?} -> {narrow_height:?}; content width {}, list {:?}",
+        window.read(|home, _| home.content_width),
+        window.read(|home, _| home.conversation_list.viewport_bounds())
+    );
+    window.update(|_, window, cx| {
+        window.resize(size(px(700.0), px(850.0)));
+        window.bounds_changed(cx);
+    });
+    for _ in 0..3 {
+        window.draw();
+        app.run_until_parked();
+    }
+    assert!((f32::from(height(&window) - wide_height)).abs() < 1.0);
+}
+
+#[test]
 fn response_action_icons_use_the_css_resolved_size() {
     assert_eq!(RESPONSE_ACTION_ICON_SIZE, 16.0);
 }

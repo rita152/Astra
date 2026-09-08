@@ -9,6 +9,10 @@ pub(super) fn submenu_layout(viewport_width: f32, natural_width: f32) -> Submenu
     let main_width = (viewport_width - APP_SIDEBAR_WIDTH).max(0.0);
     let composer_width = main_width.min(HOME_COMPOSER_MAX_WIDTH);
     let trailing_margin = ((main_width - composer_width) * 0.5).max(0.0);
+    submenu_layout_at_right(trailing_margin, natural_width)
+}
+
+pub(super) fn submenu_layout_at_right(trailing_margin: f32, natural_width: f32) -> SubmenuLayout {
     let available_right = trailing_margin + MODEL_PICKER_RIGHT_INSET - MODEL_PICKER_SUBMENU_GAP;
 
     if available_right >= MODEL_PICKER_MIN_SUBMENU_WIDTH {

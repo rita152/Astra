@@ -501,6 +501,7 @@ fn main() {
             cx.bind_keys([
                 gpui::KeyBinding::new("ctrl-`", app::ToggleTerminal, None),
                 gpui::KeyBinding::new("ctrl-shift-g", app::ToggleReview, None),
+                gpui::KeyBinding::new("cmd-alt-s", app::OpenSideChat, None),
             ]);
             cx.set_window_appearance(Some(match mode {
                 ThemeMode::Light => WindowAppearance::Light,
@@ -529,6 +530,7 @@ fn main() {
             // Register terminal bindings after the application-wide Escape fallback.
             components::terminal::init(cx);
             components::file_editor::init(cx);
+            components::side_chat::init(cx);
             cx.bind_keys([gpui::KeyBinding::new("cmd-p", app::OpenFiles, None)]);
             let bounds = Bounds::centered(None, size(px(window_width), px(window_height)), cx);
             let initial_bounds = if start_maximized {

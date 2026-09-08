@@ -56,6 +56,7 @@ struct TreeRow {
 }
 pub struct FilePanel {
     review_available: bool,
+    side_chat_available: bool,
     cwd: PathBuf,
     mode: ThemeMode,
     documents: Vec<Document>,
@@ -96,6 +97,7 @@ impl FilePanel {
         .detach();
         let mut s = Self {
             review_available: false,
+            side_chat_available: false,
             cwd: cwd.clone(),
             mode,
             documents: Vec::new(),
@@ -145,6 +147,10 @@ impl FilePanel {
     }
     pub fn set_review_available(&mut self, available: bool, cx: &mut Context<Self>) {
         self.review_available = available;
+        cx.notify();
+    }
+    pub fn set_side_chat_available(&mut self, available: bool, cx: &mut Context<Self>) {
+        self.side_chat_available = available;
         cx.notify();
     }
     pub fn open_documents(&self) -> Vec<String> {
@@ -370,6 +376,7 @@ impl FilePanel {
                             match e {
                                 EditorEvent::Changed => s.schedule_save(id, cx),
                                 EditorEvent::Save => s.save(id, cx),
+                                EditorEvent::Submit => {}
                             }
                             cx.notify();
                         })
@@ -725,6 +732,12 @@ impl Render for FilePanel {
             .items_center()
             .gap(px(3.))
             .overflow_x_scroll()
+            .when(self.side_chat_available, |tabs| {
+                tabs.child(super::side_chat::restore_tab(
+                    "file-panel-side-chat-tab",
+                    theme,
+                ))
+            })
             .when(self.review_available, |tabs| {
                 tabs.child(
                     div()

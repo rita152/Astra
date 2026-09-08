@@ -30,6 +30,8 @@ pub struct UiPreferences {
     pub recent_collapsed: bool,
     #[serde(default)]
     pub review: ReviewPreferences,
+    #[serde(default)]
+    pub skip_side_chat_close_confirmation: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -819,6 +819,7 @@ impl EntityInputHandler for TerminalView {
 }
 
 pub struct TerminalPanel {
+    side_chat_available: bool,
     tabs: Vec<(usize, Entity<TerminalView>)>,
     active: usize,
     next_id: usize,
@@ -828,6 +829,7 @@ pub struct TerminalPanel {
 impl TerminalPanel {
     pub fn new(cwd: PathBuf, mode: ThemeMode, cx: &mut Context<Self>) -> Self {
         let mut panel = Self {
+            side_chat_available: false,
             tabs: Vec::new(),
             active: 0,
             next_id: 0,
@@ -862,6 +864,10 @@ impl TerminalPanel {
             });
         }
     }
+    pub fn set_side_chat_available(&mut self, available: bool, cx: &mut Context<Self>) {
+        self.side_chat_available = available;
+        cx.notify();
+    }
 }
 impl Render for TerminalPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -893,6 +899,12 @@ impl Render for TerminalPanel {
                             .min_w(px(0.))
                             .overflow_x_scroll()
                             .gap(px(4.))
+                            .when(self.side_chat_available, |tabs| {
+                                tabs.child(super::side_chat::restore_tab(
+                                    "terminal-side-chat-tab",
+                                    theme,
+                                ))
+                            })
                             .children(self.tabs.iter().enumerate().map(|(index, (id, _))| {
                                 div()
                                     .id(("terminal-tab", *id))

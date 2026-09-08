@@ -310,6 +310,12 @@ impl Render for ReviewPanel {
                                 .size(px(20.)),
                             ),
                     )
+                    .when(self.side_chat_available, |tabs| {
+                        tabs.child(crate::components::side_chat::restore_tab(
+                            "review-side-chat-tab",
+                            t,
+                        ))
+                    })
                     .child(self.button(
                         "review-new-tab",
                         "打开侧边面板标签页",

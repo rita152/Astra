@@ -5,6 +5,7 @@ mod connection;
 mod dispatch;
 mod events;
 mod protocol;
+mod side_conversation;
 mod transport;
 mod turn;
 mod workspace;
@@ -42,6 +43,9 @@ struct ManagerInner {
     connection_ready: Condvar,
     connection_events: Mutex<ConnectionEventHub>,
     shutdown_once: AtomicBool,
+    // Retain retired identities until app exit so an expired in-memory thread
+    // can never accidentally fall through to disk-based thread/resume.
+    temporary_threads: Mutex<HashMap<String, side_conversation::TemporaryThread>>,
 }
 
 impl ManagerInner {
@@ -207,6 +211,26 @@ impl ManagerInner {
             None => message,
         };
         connection.fail_all(&message);
+        let closed_temporary = self
+            .temporary_threads
+            .lock()
+            .map(|mut threads| {
+                threads
+                    .iter_mut()
+                    .filter_map(|(id, thread)| {
+                        if thread.generation == generation && !thread.closed {
+                            thread.closed = true;
+                            Some(id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for thread_id in closed_temporary {
+            self.publish_connection_event(AgentConnectionEvent::ThreadClosed { thread_id });
+        }
         if let Ok(mut state) = self.state.lock() {
             if state
                 .current
@@ -290,6 +314,7 @@ impl CodexAppServerManager {
                 connection_ready: Condvar::new(),
                 connection_events: Mutex::new(ConnectionEventHub::default()),
                 shutdown_once: AtomicBool::new(false),
+                temporary_threads: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -326,6 +351,7 @@ impl CodexAppServerManager {
             AgentCapability::ThreadSectionList,
             AgentCapability::ThreadSectionCreate,
             AgentCapability::ThreadSectionMove,
+            AgentCapability::SideConversation,
         ])
     }
 }

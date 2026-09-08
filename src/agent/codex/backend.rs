@@ -9,10 +9,10 @@ use super::manager::CodexAppServerManager;
 use crate::agent::{
     AgentBackend, AgentConnectionEvent, AgentModelCatalog, AgentPermissionMode,
     AgentPermissionProfile, AgentRequest, AgentRun, AgentThreadSettings, CreateProject,
-    HistoryItemDetail, Page, PageRequest, Project, ProjectId, ThreadHistoryItemEntry, ThreadId,
-    ThreadListRequest, ThreadMetadataUpdate, ThreadSearchResult, ThreadSection,
-    ThreadSectionAppearance, ThreadSectionId, ThreadSummary, ThreadTurn, UpdateProject,
-    WorkspaceResult,
+    HistoryItemDetail, Page, PageRequest, Project, ProjectId, SideConversationRequest,
+    ThreadHistoryItemEntry, ThreadId, ThreadListRequest, ThreadMetadataUpdate, ThreadSearchResult,
+    ThreadSection, ThreadSectionAppearance, ThreadSectionId, ThreadSummary, ThreadTurn,
+    UpdateProject, WorkspaceResult,
 };
 
 /// Codex CLI adapter. JSON-RPC details intentionally stay inside this module.
@@ -46,6 +46,17 @@ impl AgentBackend for CodexAppServerBackend {
 
     fn subscribe_connection_events(&self) -> Receiver<AgentConnectionEvent> {
         self.manager.subscribe_connection_events()
+    }
+
+    fn open_side_conversation(
+        &self,
+        request: SideConversationRequest,
+    ) -> Receiver<WorkspaceResult<ThreadId>> {
+        self.manager.open_side_conversation(request)
+    }
+
+    fn close_side_conversation(&self, thread_id: ThreadId) -> Receiver<WorkspaceResult<()>> {
+        self.manager.close_side_conversation(thread_id)
     }
 
     fn load_model_catalog(&self) -> Receiver<Result<AgentModelCatalog, String>> {

@@ -98,6 +98,7 @@ pub struct ReviewPanel {
     scope: Scope,
     snapshot: Arc<Snapshot>,
     file_tabs: Vec<String>,
+    side_chat_available: bool,
     last_turn: Vec<FileDiff>,
     latest_turn: Vec<FileDiff>,
     history_pinned: bool,
@@ -239,6 +240,7 @@ impl ReviewPanel {
             scope: Scope::Uncommitted,
             snapshot: Arc::new(Snapshot::default()),
             file_tabs: Vec::new(),
+            side_chat_available: false,
             last_turn: vec![],
             latest_turn: vec![],
             history_pinned: false,
@@ -357,6 +359,10 @@ impl ReviewPanel {
     }
     pub fn set_file_tabs(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
         self.file_tabs = paths;
+        cx.notify();
+    }
+    pub fn set_side_chat_available(&mut self, available: bool, cx: &mut Context<Self>) {
+        self.side_chat_available = available;
         cx.notify();
     }
     pub fn apply_preferences(

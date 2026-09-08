@@ -288,6 +288,7 @@ fn turn_start_for_mode(mode: AgentPermissionMode, cwd: PathBuf) -> Value {
             effort: "medium".into(),
             service_tier: None,
             permission_mode: mode,
+            context: Default::default(),
         },
         &tx,
     )
@@ -572,6 +573,7 @@ fn drives_one_complete_prompt_and_normalizes_stream_events() {
             effort: "high".into(),
             service_tier: Some("priority".into()),
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     )
@@ -809,6 +811,7 @@ fn existing_thread_resumes_before_turn_start() {
             effort: "high".into(),
             service_tier: Some("priority".into()),
             permission_mode: AgentPermissionMode::Request,
+            context: Default::default(),
         },
         &tx,
     )
@@ -910,6 +913,7 @@ fn resume_goal_cleared_requires_a_matching_string_thread_id() {
                 effort: "medium".into(),
                 service_tier: None,
                 permission_mode: AgentPermissionMode::Full,
+                context: Default::default(),
             },
             &tx,
         )
@@ -961,6 +965,7 @@ fn goal_cleared_after_resumed_turn_start_fails_fast() {
             effort: "medium".into(),
             service_tier: None,
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     )
@@ -1011,6 +1016,7 @@ fn thread_started_must_match_the_canonical_thread_id_in_either_order() {
                 effort: "medium".into(),
                 service_tier: None,
                 permission_mode: AgentPermissionMode::Full,
+                context: Default::default(),
             },
             &tx,
         )
@@ -1046,6 +1052,7 @@ fn deferred_turn_is_not_forwarded_when_turn_start_fails() {
             effort: "medium".into(),
             service_tier: None,
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     );
@@ -1085,6 +1092,7 @@ fn deferred_batch_is_atomic_when_a_later_notification_mismatches() {
             effort: "medium".into(),
             service_tier: None,
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     );
@@ -1125,6 +1133,7 @@ fn active_goal_approval_is_discarded_when_turn_start_fails() {
             effort: "medium".into(),
             service_tier: None,
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     );
@@ -1176,6 +1185,7 @@ fn deferred_started_approval_and_resolution_keep_wire_order() {
             effort: "medium".into(),
             service_tier: None,
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     )
@@ -1229,6 +1239,7 @@ fn live_item_event_must_match_the_active_turn() {
             effort: "medium".into(),
             service_tier: None,
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     );
@@ -1269,6 +1280,7 @@ fn completed_turn_can_finish_before_turn_start_response() {
             effort: "medium".into(),
             service_tier: None,
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     )
@@ -1311,6 +1323,7 @@ fn resume_rpc_error_fails_closed_without_starting_or_turning() {
             effort: "medium".into(),
             service_tier: None,
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     );
@@ -1367,6 +1380,7 @@ fn resume_response_requires_the_requested_thread_id() {
                 effort: "medium".into(),
                 service_tier: None,
                 permission_mode: AgentPermissionMode::Full,
+                context: Default::default(),
             },
             &tx,
         );
@@ -1424,6 +1438,7 @@ fn resume_failure_cleanup_reaps_the_app_server_process() {
             effort: "medium".into(),
             service_tier: None,
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     );
@@ -1470,6 +1485,7 @@ fn pending_interrupt_uses_the_active_thread_and_turn_and_waits_for_terminal_stat
             effort: "medium".into(),
             service_tier: None,
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     )
@@ -2177,6 +2193,7 @@ fn user_facing_notifications_are_normalized_without_ending_the_turn() {
             effort: "medium".into(),
             service_tier: None,
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     )
@@ -2246,6 +2263,7 @@ fn failed_turn_completion_is_the_terminal_event_and_keeps_error_details() {
             effort: "medium".into(),
             service_tier: None,
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     )
@@ -3001,6 +3019,7 @@ fn real_cli_safe_network_command_accept_once_round_trip() {
         effort: model.default_reasoning_effort.clone(),
         service_tier: model.default_service_tier.clone(),
         permission_mode: AgentPermissionMode::Request,
+        context: Default::default(),
     });
     let (events, _interrupt) = run.into_parts();
     let deadline = Instant::now() + Duration::from_secs(180);
@@ -4638,6 +4657,7 @@ fn thread_created_delivery_failure_stops_the_session() {
             effort: "medium".into(),
             service_tier: None,
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     )
@@ -4672,6 +4692,7 @@ fn active_turn_stops_at_the_first_unknown_method() {
             effort: "medium".into(),
             service_tier: None,
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     )
@@ -4719,6 +4740,7 @@ fn model_notifications_are_normalized_into_agent_events() {
             effort: "high".into(),
             service_tier: None,
             permission_mode: AgentPermissionMode::Full,
+            context: Default::default(),
         },
         &tx,
     )

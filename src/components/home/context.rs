@@ -38,6 +38,8 @@ pub(super) struct ConversationRenderContext {
 }
 
 pub(super) struct MainConversationSnapshot {
+    pub(super) side_chat: bool,
+    pub(super) composer_height: f32,
     pub(super) rows: Rc<Vec<ConversationListRow>>,
     pub(super) phase: ConversationPhase,
     pub(super) activities: Rc<Vec<ConversationActivity>>,

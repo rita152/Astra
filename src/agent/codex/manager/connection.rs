@@ -34,6 +34,7 @@ pub(super) struct TurnKey {
 pub(super) enum ThreadLifecycleKind {
     Start,
     Resume(String),
+    Fork,
 }
 
 pub(super) struct PendingThreadLifecycle {

@@ -28,6 +28,7 @@ gpui::actions!(
         EditorBackspace,
         EditorDelete,
         EditorEnter,
+        EditorLineBreak,
         EditorTab
     ]
 );
@@ -43,6 +44,7 @@ pub fn init(cx: &mut App) {
         gpui::KeyBinding::new("backspace", EditorBackspace, Some("FileEditor")),
         gpui::KeyBinding::new("delete", EditorDelete, Some("FileEditor")),
         gpui::KeyBinding::new("enter", EditorEnter, Some("FileEditor")),
+        gpui::KeyBinding::new("shift-enter", EditorLineBreak, Some("FileEditor")),
         gpui::KeyBinding::new("tab", EditorTab, Some("FileEditor")),
     ]);
 }
@@ -136,6 +138,7 @@ fn next(text: &str, offset: usize) -> usize {
 pub enum EditorEvent {
     Changed,
     Save,
+    Submit,
 }
 pub struct FileEditor {
     pub buffer: Buffer,
@@ -143,6 +146,7 @@ pub struct FileEditor {
     language: Option<String>,
     prose_label: Option<String>,
     placeholder: String,
+    composer: bool,
     focus: FocusHandle,
     marked: Option<Range<usize>>,
     rows: Vec<Row>,
@@ -204,6 +208,7 @@ impl FileEditor {
             language,
             prose_label: None,
             placeholder: String::new(),
+            composer: false,
             mode,
             focus: cx.focus_handle(),
             marked: None,
@@ -226,6 +231,15 @@ impl FileEditor {
         editor.placeholder = label.into();
         editor
     }
+    pub fn composer(mode: ThemeMode, cx: &mut Context<Self>) -> Self {
+        let mut editor = Self::prose(mode, "侧边聊天输入框", cx);
+        editor.placeholder = "随心输入".into();
+        editor.composer = true;
+        editor
+    }
+    pub fn composer_height(&self) -> f32 {
+        (self.rows.len().max(2) as f32 * self.line_height()).clamp(44.0, 220.0)
+    }
     pub fn text(&self) -> &str {
         &self.buffer.text
     }
@@ -240,14 +254,18 @@ impl FileEditor {
         self.reload(text.into(), cx);
     }
     fn line_height(&self) -> f32 {
-        if self.prose_label.is_some() {
+        if self.composer {
+            22.0
+        } else if self.prose_label.is_some() {
             22.75
         } else {
             LINE_HEIGHT
         }
     }
     fn font_size(&self) -> f32 {
-        if self.prose_label.is_some() {
+        if self.composer {
+            14.0
+        } else if self.prose_label.is_some() {
             13.0
         } else {
             FONT_SIZE
@@ -389,8 +407,23 @@ impl FileEditor {
             .sum();
         self.move_to(offset, false, cx);
     }
-    fn handle_key(&mut self, e: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn handle_key(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &e.keystroke;
+        if self.composer
+            && k.key == "tab"
+            && !k.modifiers.control
+            && !k.modifiers.platform
+            && !k.modifiers.alt
+            && !self.composing()
+        {
+            if k.modifiers.shift {
+                window.focus_prev(cx);
+            } else {
+                window.focus_next(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.prose_label.is_some() && k.modifiers.platform && k.key == "enter" {
             return;
         }
@@ -503,6 +536,7 @@ impl FileEditor {
         self.bounds = Some(bounds);
         let width = (f32::from(bounds.size.width) - self.gutter() - 16.).max(24.);
         if self.layout_dirty || (self.layout_width - width).abs() > 0.5 {
+            let old_height = self.composer_height();
             self.rows.clear();
             self.layout_width = width;
             self.layout_dirty = false;
@@ -627,6 +661,9 @@ impl FileEditor {
                 }
                 source += raw.len() + 1;
             }
+            if self.composer && self.composer_height() != old_height {
+                cx.notify();
+            }
         }
         let height = f32::from(bounds.size.height);
         if self.ensure_cursor {
@@ -640,7 +677,9 @@ impl FileEditor {
         }
         self.scroll = self.scroll.clamp(
             0.,
-            (self.rows.len() as f32 * self.line_height() + 16. - height).max(0.),
+            (self.rows.len() as f32 * self.line_height() + if self.composer { 0.0 } else { 16.0 }
+                - height)
+                .max(0.),
         );
         let _ = cx;
     }
@@ -818,6 +857,13 @@ impl Render for FileEditor {
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|s, _: &EditorEnter, _, cx| {
+                if s.composer {
+                    if !s.composing() {
+                        cx.emit(EditorEvent::Submit);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 let start = s.buffer.text[..s.buffer.cursor]
                     .rfind('\n')
                     .map_or(0, |i| i + 1);
@@ -828,8 +874,18 @@ impl Render for FileEditor {
                 s.replace(&format!("\n{indent}"), cx);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|s, _: &EditorTab, _, cx| {
-                s.replace("    ", cx);
+            .on_action(cx.listener(|s, _: &EditorLineBreak, _, cx| {
+                if !s.composing() {
+                    s.replace("\n", cx);
+                }
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|s, _: &EditorTab, window, cx| {
+                if s.composer {
+                    window.focus_next(cx);
+                } else {
+                    s.replace("    ", cx);
+                }
                 cx.stop_propagation();
             }))
             .on_mouse_down(
@@ -1061,6 +1117,78 @@ impl EntityInputHandler for FileEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn side_composer_commits_ime_before_enter_and_preserves_multiline_undo() {
+        let mut app = gpui::TestApp::new();
+        app.update(init);
+        let submissions = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = submissions.clone();
+        let mut window = app.open_window_with_options(
+            gpui::WindowOptions {
+                window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::new(
+                    point(px(0.0), px(0.0)),
+                    size(px(260.0), px(140.0)),
+                ))),
+                ..Default::default()
+            },
+            |_, cx| {
+                let entity = cx.entity();
+                cx.subscribe(&entity, move |_, _, event: &EditorEvent, _| {
+                    if matches!(event, EditorEvent::Submit) {
+                        observed.set(observed.get() + 1);
+                    }
+                })
+                .detach();
+                FileEditor::composer(ThemeMode::Dark, cx)
+            },
+        );
+        window.draw();
+        window.simulate_click(point(px(20.0), px(10.0)), MouseButton::Left);
+        window.update(|editor, window, cx| {
+            editor.replace_and_mark_text_in_range(None, "ni", Some(0..2), window, cx)
+        });
+        window.simulate_keystrokes("enter");
+        assert_eq!(
+            submissions.get(),
+            0,
+            "IME candidate confirmation must not submit a side prompt"
+        );
+        window.update(|editor, window, cx| editor.replace_text_in_range(None, "你好", window, cx));
+        window.simulate_keystrokes("shift-enter");
+        window.simulate_input("第二行 👋");
+        assert_eq!(
+            window.read(|editor, _| editor.text().to_owned()),
+            "你好\n第二行 👋"
+        );
+        window.simulate_keystrokes("enter");
+        assert_eq!(submissions.get(), 1);
+        window.simulate_keystrokes("cmd-z");
+        assert_eq!(window.read(|editor, _| editor.text().to_owned()), "你好\n");
+        window.simulate_keystrokes("cmd-shift-z");
+        assert_eq!(
+            window.read(|editor, _| editor.text().to_owned()),
+            "你好\n第二行 👋"
+        );
+        window.update(|_, window, cx| {
+            window.resize(size(px(260.0), px(44.0)));
+            window.bounds_changed(cx);
+        });
+        window.simulate_keystrokes("cmd-a");
+        window.simulate_input("第一行\n第二行\n第三行\n第四行");
+        window.draw();
+        let expanded_height = window.read(|editor, _| editor.composer_height());
+        window.update(|_, window, cx| {
+            window.resize(size(px(260.0), px(expanded_height)));
+            window.bounds_changed(cx);
+        });
+        window.draw();
+        assert_eq!(
+            window.read(|editor, _| editor.scroll),
+            0.0,
+            "growing to fit all lines must reveal the first line"
+        );
+    }
     #[test]
     fn native_editor_handles_wrapping_selection_clipboard_and_ime() {
         let mut app = gpui::TestApp::new();

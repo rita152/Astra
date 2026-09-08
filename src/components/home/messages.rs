@@ -102,12 +102,12 @@ pub(super) fn user_message_paragraphs(source: &str) -> Vec<String> {
     paragraphs
 }
 
-pub(super) fn render_user_message_text(source: String, minimum_width: Pixels) -> Div {
+pub(super) fn render_user_message_text(source: String) -> Div {
     user_message_paragraphs(&source)
         .into_iter()
         .enumerate()
         .fold(
-            div().relative().min_w(minimum_width).flex().flex_col(),
+            div().relative().w_full().min_w(px(0.0)).flex().flex_col(),
             |content, (index, paragraph)| {
                 content.child(
                     div()
@@ -152,21 +152,19 @@ pub(super) fn user_message_text_width(message: &str, window: &mut Window) -> f32
         .fold(0.0_f32, f32::max)
 }
 
-pub(super) fn user_message_bubble(message: String, theme: Theme, window: &mut Window) -> Div {
+pub(super) fn user_message_bubble(
+    message: String,
+    theme: Theme,
+    width: f32,
+    window: &mut Window,
+) -> Div {
     let text_width = user_message_text_width(&message, window);
-    let measured_width = px(text_width + USER_MESSAGE_HORIZONTAL_PADDING * 2.0);
-    let maximum_text_width = CONVERSATION_CONTENT_MAX_WIDTH * USER_MESSAGE_MAX_WIDTH_RATIO
-        - USER_MESSAGE_HORIZONTAL_PADDING * 2.0;
-    let minimum_text_width = if text_width < maximum_text_width {
-        text_width + USER_MESSAGE_TEXT_LAYOUT_EPSILON
-    } else {
-        maximum_text_width
-    };
+    let measured_width =
+        px(text_width + USER_MESSAGE_HORIZONTAL_PADDING * 2.0 + USER_MESSAGE_TEXT_LAYOUT_EPSILON);
     div()
-        .w(measured_width)
-        .max_w(px(
-            CONVERSATION_CONTENT_MAX_WIDTH * USER_MESSAGE_MAX_WIDTH_RATIO
-        ))
+        .w(measured_width.min(px(width)))
+        .max_w_full()
+        .min_w(px(0.0))
         .px(px(USER_MESSAGE_HORIZONTAL_PADDING))
         .py(px(USER_MESSAGE_VERTICAL_PADDING))
         .relative()
@@ -185,7 +183,7 @@ pub(super) fn user_message_bubble(message: String, theme: Theme, window: &mut Wi
             .absolute()
             .inset_0(),
         )
-        .child(render_user_message_text(message, px(minimum_text_width)))
+        .child(render_user_message_text(message))
 }
 
 pub(super) fn user_message_images(
@@ -293,17 +291,28 @@ pub(super) fn open_user_image(
     cx.stop_propagation();
 }
 
+pub(super) struct UserMessageContent {
+    pub(super) text: String,
+    pub(super) images: Vec<crate::agent::UserMessageImage>,
+    pub(super) time: String,
+}
+
 pub(super) fn current_user_message(
-    user_message: String,
-    user_images: Vec<crate::agent::UserMessageImage>,
-    user_message_time: String,
+    message: UserMessageContent,
     actions_visible_for_capture: bool,
     theme: Theme,
     window: &mut Window,
     home: Entity<HomeView>,
+    content_width: f32,
 ) -> Div {
+    let UserMessageContent {
+        text: user_message,
+        images: user_images,
+        time: user_message_time,
+    } = message;
     let hover_group: SharedString = "user-message-hover".into();
     let copied_user_message = user_message.clone();
+    let keyboard_user_message = user_message.clone();
     div()
         .min_h(px(USER_MESSAGE_VERTICAL_PADDING * 2.0
             + USER_MESSAGE_LINE_HEIGHT
@@ -316,6 +325,10 @@ pub(super) fn current_user_message(
         .child(
             div()
                 .group(hover_group.clone())
+                .w(px(content_width.min(CONVERSATION_CONTENT_MAX_WIDTH)
+                    * USER_MESSAGE_MAX_WIDTH_RATIO))
+                .max_w_full()
+                .min_w(px(0.0))
                 .flex()
                 .flex_col()
                 .items_end()
@@ -323,7 +336,13 @@ pub(super) fn current_user_message(
                     container.child(user_message_images(user_images, home, theme))
                 })
                 .when(!user_message.is_empty(), |container| {
-                    container.child(user_message_bubble(user_message, theme, window))
+                    container.child(user_message_bubble(
+                        user_message,
+                        theme,
+                        content_width.min(CONVERSATION_CONTENT_MAX_WIDTH)
+                            * USER_MESSAGE_MAX_WIDTH_RATIO,
+                        window,
+                    ))
                 })
                 .child(
                     div()
@@ -349,6 +368,19 @@ pub(super) fn current_user_message(
                         .child(
                             div()
                                 .id("user-message-copy")
+                                .role(Role::Button)
+                                .aria_label("复制消息")
+                                .focusable()
+                                .tab_stop(true)
+                                .focus_visible(|s| s.opacity(1.0))
+                                .on_key_down(move |e: &gpui::KeyDownEvent, _, cx| {
+                                    if matches!(e.keystroke.key.as_str(), "enter" | "space") {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            keyboard_user_message.clone(),
+                                        ));
+                                        cx.stop_propagation();
+                                    }
+                                })
                                 .debug_selector(|| "USER_MESSAGE_COPY".to_owned())
                                 .size(px(26.0))
                                 .rounded(px(10.0))
@@ -464,15 +496,20 @@ pub(super) fn current_response_footer(
                             theme,
                         ))
                 })
-                .child(message_action(
-                    "message-branch",
-                    "response-branch",
-                    3,
-                    false,
-                    assistant_message,
-                    home_entity,
-                    theme,
-                )),
+                .when(
+                    home_entity.read(cx).presentation != super::HomePresentation::SideChat,
+                    |actions| {
+                        actions.child(message_action(
+                            "message-branch",
+                            "response-branch",
+                            3,
+                            false,
+                            assistant_message,
+                            home_entity,
+                            theme,
+                        ))
+                    },
+                ),
         )
         .when_some(completed_at, |footer, completed_at| {
             footer.child(
@@ -504,8 +541,40 @@ pub(super) fn message_action(
     home_entity: Entity<HomeView>,
     theme: Theme,
 ) -> impl IntoElement {
+    let keyboard_message = assistant_message.clone();
+    let keyboard_home = home_entity.clone();
     div()
         .id(id)
+        .role(Role::Button)
+        .aria_label(match action {
+            0 => "复制",
+            1 => "赞",
+            2 => "踩",
+            _ => "从此处分叉",
+        })
+        .focusable()
+        .tab_stop(true)
+        .focus_visible(move |s| s.bg(theme.sidebar_hover))
+        .on_key_down(move |e: &gpui::KeyDownEvent, _, cx| {
+            if matches!(e.keystroke.key.as_str(), "enter" | "space") {
+                match action {
+                    0 => cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                        keyboard_message.clone(),
+                    )),
+                    1 | 2 => keyboard_home.update(cx, |home, cx| {
+                        let value = if action == 1 { 1 } else { -1 };
+                        home.response_feedback = if home.response_feedback == value {
+                            0
+                        } else {
+                            value
+                        };
+                        cx.notify();
+                    }),
+                    _ => {}
+                }
+                cx.stop_propagation();
+            }
+        })
         .size(px(26.0))
         .rounded(px(10.0))
         .flex()

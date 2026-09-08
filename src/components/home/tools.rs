@@ -503,10 +503,29 @@ pub(super) fn static_command_action_activity(
                                             .inset(),
                                     ])
                                 })
-                                .on_click(move |_, _, cx| cx.open_with_system(&click_path))
-                                .on_key_down(move |event, _, cx| {
+                                .on_click(move |_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(
+                                            crate::components::file_panel::OpenWorkspaceFile {
+                                                path: click_path.to_string_lossy().into_owned(),
+                                                line: None,
+                                            },
+                                        ),
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                })
+                                .on_key_down(move |event, window, cx| {
                                     if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                        cx.open_with_system(&key_path);
+                                        window.dispatch_action(
+                                            Box::new(
+                                                crate::components::file_panel::OpenWorkspaceFile {
+                                                    path: key_path.to_string_lossy().into_owned(),
+                                                    line: None,
+                                                },
+                                            ),
+                                            cx,
+                                        );
                                         cx.stop_propagation();
                                     }
                                 })

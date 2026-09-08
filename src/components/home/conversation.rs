@@ -9,8 +9,8 @@ use gpui::{
 };
 
 use super::{
-    CONVERSATION_BOTTOM_EPSILON, CONVERSATION_BOTTOM_INSET, CONVERSATION_CONTENT_MAX_WIDTH,
-    CONVERSATION_LIST_OVERDRAW, CONVERSATION_TOP_INSET, HomeView, OpenDiffReview,
+    CONVERSATION_BOTTOM_EPSILON, CONVERSATION_CONTENT_MAX_WIDTH, CONVERSATION_LIST_OVERDRAW,
+    CONVERSATION_TOP_INSET, HomeView, OpenDiffReview,
     activity::{activity_stream, render_activity_stream_unit},
     animation::thinking_shimmer,
     context::ConversationRenderContext,
@@ -210,6 +210,7 @@ pub(super) fn conversation(
     render: ConversationRenderContext,
     rows: Rc<Vec<ConversationListRow>>,
     conversation_list: ListState,
+    bottom_inset: f32,
 ) -> impl IntoElement {
     let home_entity = render.home_entity.clone();
     let theme = render.theme;
@@ -270,13 +271,16 @@ pub(super) fn conversation(
                     .id(("transcript-turn-user", turn_index))
                     .w_full()
                     .child(current_user_message(
-                        message,
-                        images,
-                        time.unwrap_or_default(),
+                        super::messages::UserMessageContent {
+                            text: message,
+                            images,
+                            time: time.unwrap_or_default(),
+                        },
                         false,
                         theme,
                         window,
                         home_entity.clone(),
+                        home_entity.read(_cx).content_width,
                     ))
                     .into_any_element(),
                 0.0,
@@ -288,13 +292,16 @@ pub(super) fn conversation(
                 time,
             } => (
                 current_user_message(
-                    message,
-                    images,
-                    time,
+                    super::messages::UserMessageContent {
+                        text: message,
+                        images,
+                        time,
+                    },
                     user_message_actions_visible_for_capture,
                     theme,
                     window,
                     home_entity.clone(),
+                    home_entity.read(_cx).content_width,
                 )
                 .into_any_element(),
                 0.0,
@@ -368,7 +375,7 @@ pub(super) fn conversation(
     })
     .size_full()
     .pt(px(CONVERSATION_TOP_INSET))
-    .pb(px(CONVERSATION_BOTTOM_INSET));
+    .pb(px(bottom_inset));
 
     div()
         .id("conversation-scroll")

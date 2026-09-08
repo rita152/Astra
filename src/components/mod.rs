@@ -11,6 +11,7 @@ pub mod markdown;
 pub mod permissions_approval;
 pub mod prompt_input;
 pub mod review_panel;
+pub mod side_chat;
 pub mod sidebar;
 pub mod terminal;
 pub mod user_input_request;

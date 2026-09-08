@@ -27,7 +27,22 @@ impl ChatApp {
             composer.set_workspace_context(cwd, project_id, thread_id, cx);
         });
         self.deactivate_review(cx);
+        self.deactivate_side_chat(cx);
         self.active_conversation = key;
+        if self.right_panel.open
+            && matches!(self.right_panel.mode, Some(RightPanelMode::SideChat) | None)
+        {
+            if self
+                .side_chat_panels
+                .get(&self.active_conversation)
+                .is_some_and(|panel| !panel.read(cx).is_empty())
+            {
+                self.right_panel.mode = Some(RightPanelMode::SideChat);
+                self.ensure_side_chat(false, cx);
+            } else if self.right_panel.mode == Some(RightPanelMode::SideChat) {
+                self.right_panel.mode = None;
+            }
+        }
         if self.right_panel.open && self.right_panel.mode == Some(RightPanelMode::Files) {
             self.ensure_files(cx);
         }

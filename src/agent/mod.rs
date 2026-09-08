@@ -21,8 +21,9 @@ pub use activity::{
 };
 pub(crate) use backend::AgentInterruptControl;
 pub use backend::{
-    AgentBackend, AgentCapabilities, AgentCapability, AgentInterruptHandle, AgentInterruptOutcome,
-    AgentRequest, AgentRun, WorkspaceError, WorkspaceResult,
+    AgentBackend, AgentCapabilities, AgentCapability, AgentInputFile, AgentInterruptHandle,
+    AgentInterruptOutcome, AgentPromptContext, AgentRequest, AgentRun, SideConversationRequest,
+    WorkspaceError, WorkspaceResult,
 };
 pub use catalog::{
     AgentActivePermissionProfile, AgentEffectivePermissions, AgentModel, AgentModelCatalog,

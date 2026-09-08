@@ -22,6 +22,14 @@ impl ChatApp {
             self.terminal_panels.insert(key.clone(), panel);
         }
         self.terminal_panels[&key].update(cx, |panel, cx| panel.focus(cx));
+        self.terminal_panels[&key].update(cx, |panel, cx| {
+            panel.set_side_chat_available(
+                self.side_chat_panels
+                    .get(&key)
+                    .is_some_and(|p| !p.read(cx).is_empty()),
+                cx,
+            )
+        });
         self.right_panel.focus_pending = false;
     }
     pub fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -91,6 +99,14 @@ impl ChatApp {
         self.file_panels[&key].update(cx, |p, cx| p.focus(cx));
         self.file_panels[&key].update(cx, |p, cx| {
             p.set_review_available(self.review_panels.contains_key(&key), cx)
+        });
+        self.file_panels[&key].update(cx, |p, cx| {
+            p.set_side_chat_available(
+                self.side_chat_panels
+                    .get(&key)
+                    .is_some_and(|p| !p.read(cx).is_empty()),
+                cx,
+            )
         });
         self.right_panel.focus_pending = false;
     }
