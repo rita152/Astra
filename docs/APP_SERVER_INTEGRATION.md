@@ -1,293 +1,339 @@
-# Codex app-server 协议接入总表
+# Codex app-server 接入
 
-> 当前运行时 Codex CLI 版本：`codex-cli 0.153.0`；`imageGeneration` 另以桌面 ChatGPT 内嵌 `0.153.0-alpha.5` 的真实会话交叉验证；协议事实来源：本机执行 `codex app-server generate-json-schema --experimental` 生成的 schema；运行时事实来源：`src/agent/codex/`、`src/agent/` 的领域模块、`src/workspace.rs` 与 `src/workspace/`、`src/conversation/`、`src/components/`、`src/app.rs` 与 `src/app/`。
+## 基线与口径
 
-客户端初始化时启用 experimental API。下表是当前协议的唯一维护来源，完整列出 248 个 JSON-RPC 方法：155 个客户端请求、11 个服务端请求、1 个客户端通知、81 个服务端通知。
+核对基线：`codex-cli 0.153.0`（2026-09-08）。方法与字段来自该 CLI 生成的 schema，接入状态来自仓库实现。schema 随 CLI 版本生成，见[官方协议说明](https://learn.chatgpt.com/docs/app-server#message-schema)；升级时重新导出并核对：
 
-当前接入统计：已接入 63、后端已接入 2、部分接入 4、未接入 179。未接入的客户端方法不会发送；未接入的服务端请求按原 id 回复 `-32601` 后 fail-fast；未接入的服务端通知收到即 fail-fast。升级 Codex CLI 时重新生成 experimental schema 并直接核对、更新本表。0.153.0 不存在 `isPinned`，置顶通过服务端返回的 `Pinned` thread section ID 实现。
+```bash
+codex --version
+codex app-server generate-json-schema --out artifacts/app-server-schema/default
+codex app-server generate-json-schema --experimental --out artifacts/app-server-schema/experimental
+```
 
-状态口径：“已接入”表示本表声明的产品语义已形成真实协议收发、领域映射和必要 UI／副作用的完整闭环，不等于消费 schema 的每个可选字段；已知有效变体或安全相关字段尚未承接时标记为“部分接入”。
+共 **248** 个方法：155 个客户端请求、11 个服务端请求、1 个客户端通知、81 个服务端通知。表中“默认”表示方法出现在默认 schema，“实验”表示仅出现在 experimental schema；字段以 experimental schema 为准。运行时启用 `experimentalApi=true`。
 
-## 运行时生命周期
+| 状态 | 数量 | 判定 |
+|---|---|---|
+| 已接入 | 63 | 表中声明的产品行为已连通协议、领域数据和 UI／副作用；不表示消费全部可选字段 |
+| 后端已接入 | 2 | 已实现读取或校验，尚无对应可见 UI 调用方或展示 |
+| 部分接入 | 4 | 只支持部分类型、有效变体或限定生命周期窗口 |
+| 未接入 | 179 | 客户端不发送；服务端请求按原 id 回复 `-32601` 并终止当前连接，服务端通知直接报错并终止连接 |
 
-侧边聊天使用 PATH 中的 0.153.0 真实 app-server 验证，并交叉核对 ChatGPT 内嵌 0.153.4 的 experimental schema；两者方法集合均为 248 项。`SideChatPanel` 按主会话缓存多个临时标签，输入、模型选择、滚动及运行状态相互独立。打开通过 `thread/fork → thread/inject_items` 初始化，发送与停止复用 `turn/start`、`turn/interrupt`，关闭通过 `thread/unsubscribe` 释放。历史边界说明父会话仅供参考，禁止延续父任务或调用子 agent；仅侧边新消息中明确要求的修改才属于该侧边请求。连接失效后保留消息供查看和复制，不能把临时 id 当成持久化线程恢复。本地偏好仅增加关闭确认选项，不保存临时聊天内容。
+未接入行的“—”沿用上述规则。`tool/requestUserInput` 是兼容别名，不计入本版本 schema 的 248 项。
 
-代码定位：中立类型由 `src/agent/mod.rs` 统一导出，定义按职责位于同目录的 `backend`、`catalog`、`thread`、`activity`、`status`、`events`、`requests` 和 `message` 模块。Codex wire 编解码位于 `src/agent/codex/` 的 `catalog`、`items`、`notifications`、`permissions`、`requests` 与 `workspace_protocol`；`methods` 维护方法覆盖和校验。`session` 管理轮次会话，`registry` 管理服务端请求及响应决策，`dispatch` 派发轮次事件，`transport` 负责进程 JSONL 通信。应用级连接 generation、启动与退出回收由 `manager.rs` 管理，共享连接、传输、事件订阅、turn 路由、目录和工作区请求各在 `manager/` 对应子模块中维护。工作区分页读取与偏好持久化分别位于 `src/workspace/loaders.rs` 和 `preferences.rs`；通用图片尺寸读取位于 `src/media.rs`。UI 会话事件归约、活动更新、历史恢复和流式批处理位于 `src/conversation/`，由 `ComposerView` 的运行时驱动衔接 GPUI。新增能力继续遵守以上边界，具体接入范围、wire 参数和兼容行为以下表为准。
+## 连接与状态
 
-`ChatApp` 创建并持有一个应用级 `Arc<CodexAppServerManager>` 和 `Arc<WorkspaceStore>`，通过 agent-neutral `AgentBackend` 注入 UI。`Project`、`ThreadSummary`、`ThreadHistory`、分页、能力集和 `Unsupported` 均位于中立领域层，Codex JSON-RPC method 与原始错误不会进入 UI。`WorkspaceStore` 是 sidebar 唯一的项目／会话数据来源，所有选择和变更使用稳定 `project_id`／`thread_id`；本地只持久化版本化 UI 偏好（包括 pinned section id 与折叠状态），以同目录临时文件、flush/sync、原子 rename 写入，不保存项目或会话影子真相。
+- **连接**：`ChatApp` 持有一个共享 manager。每个 generation 启动一个 `codex app-server --stdio`，只握手一次；单 reader 读取 stdout，stdin 串行写入完整 JSONL。所有 RPC 共用递增 request id，响应可乱序。
+- **线程与轮次**：首次提示词执行 `thread/start → turn/start`；既有线程在当前 generation 未加载时先 resume，之后直接 start turn。同一线程最多一个活动 turn，不同线程可并行；start/resume/fork 共用串行生命周期注册表。
+- **归属与提前事件**：轮次事件按 `threadId + turnId` 路由；server request 按原始字符串／数字 id 记录所属轮次。`turn/start` 响应前的事件按 wire 顺序缓存，取得响应后验证并回放；错配 id、字段或枚举报错。
+- **审批与输入**：响应最多一次，提交后禁用交互，等待 `serverRequest/resolved` 释放 responder。结束轮次只清理自身请求；过期 responder 不得作用于后续轮次。
+- **终止与恢复**：turn 完成、中断或业务失败不关闭共享进程。EOF、崩溃、写失败或致命协议错误使旧 generation 的 pending RPC 和活动轮次各失败一次；回收旧进程后，下一次显式操作可重建连接，不自动重放提示词。应用退出时幂等终止并 wait 子进程。
+- **状态通知**：应用／线程状态通过 `AgentConnectionEvent` 快照订阅，轮次事件进入各自 `AgentRun`。工作区通知可先于 RPC 响应；内存覆盖层防止迟到列表撤销重命名、移动、归档或删除。
+- **工作区与历史**：以服务端稳定 id 管理项目和线程；置顶使用服务端 `Pinned` 分区，当前 schema 无 `isPinned`。历史先 `thread/read(includeTurns=false)`，再分页读取 `thread/turns/list(itemsView=full)`；实际非 full 的轮次由 `thread/items/list` 补全。不维护本地会话数据库。
+- **临时侧边聊天**：`thread/fork → thread/inject_items` 完成后才允许发送。父历史仅供参考，侧边说明禁止延续父任务或调用子 agent；新消息明确要求的修改才属于侧边请求。关闭使用 `thread/unsubscribe`；临时 id 只在所属 generation 使用，失效后保留可读消息，禁止 resume。
 
-恢复呈现保留 `agentMessage.phase`，优先用最后一条 `final_answer` 区分最终答复与过程消息（同一持久化轮次中的中途澄清也可能使用这个 phase）；旧历史缺少 phase 时回退到最后一条未标注助手消息。仅已完成且可识别最终答复的轮次折叠过程前缀，使用 turn 的 `durationMs` 显示耗时，`startedAt`／`completedAt` 显示本地时间。`commandExecution` 历史复用实时命令解析，保留 `commandActions`、cwd、exitCode；旧记录缺少 actions/cwd 时分别回退为空列表和线程 cwd。读取、搜索、列目录与 shell 的标题及失败状态因此与实时活动一致。已完成的历史 `fileChange` 按路径合并为回合文件汇总，增删数和审查内容均来自保留的补丁，不读取当前工作区 diff 冒充历史变更。上述字段来自已有 `thread/turns/list`／`thread/items/list` 响应，不新增 RPC。
+代码入口：协议位于 [src/agent/codex/](../src/agent/codex/)，领域类型位于 [src/agent/](../src/agent/)，工作区合并位于 [src/workspace.rs](../src/workspace.rs)，会话归约位于 [src/conversation/](../src/conversation/)。方法表的“入口”相对于 `src/agent/codex/`，省略 `.rs`。
 
-右侧“审查”面板复用上述 `turn/diff/updated` 及历史 `fileChange` 数据，并保留原始 unified patch 供复制；本地评论由面板与 Composer 共享结构化数据，可单独发送或随提示词发送，经现有 `turn/start` 传递文件、左右侧及行范围，不新增 RPC；从历史文件卡打开的差异固定在所选内容，实时事件只更新最新范围的缓存。当前 0.153.0 schema 没有 Git 状态、diff 浏览、暂存、还原、提交、推送或 PR 创建专用方法；这些操作由不依赖具体 agent 的 `src/git_review.rs` 使用本机 Git/gh 实现。`review/start` 启动模型代码评审，不提供该 Git 面板的数据或文件操作，因此保持未接入；协议接入数量不变。显示选项仍由 `workspace/preferences.rs` 保存。
+## Item 与历史兼容
 
+实时 `item/started`／`item/completed` 支持下表除 `webSearch` 外的类型。未知实时类型报错；历史额外支持 `webSearch`，其他未知类型保留为 `ThreadHistoryItem::Unsupported`。因此两个实时 item 方法仍标为“部分接入”。
 
-`ChatApp` 按 `DraftId`／`ThreadId` 缓存 `ConversationHost`。选中既有会话时以 `thread/read(includeTurns=false)` 恢复上下文，再以 `thread/turns/list(itemsView=full)` 逐页读取完整历史并恢复多轮 transcript；服务端仍返回非 full item 视图时才按 turn 继续分页调用 `thread/items/list`。切换后后台会话及进行中的 turn 继续存活；新草稿第一次发送才执行 `thread/start`，携带对应 `cwd`、`projectId` 与 `historyMode=paginated`，收到 canonical `ThreadCreated` 后原 host 从 Draft key 原地重键为真实 thread key。sidebar 全程使用稳定 `ProjectId`／`ThreadId`／`SectionId`：线程先按显式 `projectId` 分组；缺省时规范化 `cwd`，按路径组件匹配最深 project root；仍未匹配才进入最近。启动时项目、最近、归档和置顶集合各自在独立 worker 中并发加载，利用共享连接的乱序响应能力消除 RPC 瀑布；全局启动加载与模型目录一起等待首屏项目、最近和置顶集合完成，归档继续在后台加载，因此主界面不会暴露 sidebar 的中间“正在加载…”状态，也不会被非首屏归档数据额外阻塞。真实搜索、最近、归档、活动、重命名、置顶、删除、移动与 Finder 操作都经由 store/backend，提供 loading、error、retry、empty 和 pending 状态；不扫描 `~/.codex`，也不建立本地线程数据库。PR、站点、已安排及插件入口保留已校准的视觉入口，但不伪造业务数据或协议行为。其布局与交互数值通过 CDP `127.0.0.1:9222` 读取桌面 ChatGPT App 的实际计算样式，不另行设计自定义 UI/UX。
+| 类型 | 数据与兼容处理 | 展示行为 |
+|---|---|---|
+| `userMessage` | 校验 text/image/localImage/audio/localAudio/skill/mention；文本统一换行、解码显示转义并移除附件包络，历史保留图片顺序 | 实时不重复添加用户消息；恢复文本与附件 |
+| `agentMessage` | 历史保留 phase；最终答复优先取最后一条 final_answer，旧历史回退到最后一条未标注消息 | 仅已完成且可识别最终答复的轮次折叠过程前缀 |
+| `reasoning` | 按 item.id 与 summaryIndex/contentIndex 保存稀疏增量，保留开始／完成时间；不跨 item/index 合并 | 展示 summary，缺省时展示 content；完成后显示耗时 |
+| `commandExecution` | 保留 command、cwd、exitCode、commandActions；旧历史缺少 actions/cwd 时用空列表／线程目录 | 读取、搜索、列目录与 shell 分别显示，输出归属对应命令 |
+| `fileChange` | 保留 path、kind、diff；实时接受 patchUpdated 和 turn 聚合 diff；历史按路径汇总 | 文件卡及固定历史差异使用原始 patch；本机 Git 面板另由 Git/gh 提供工作区数据 |
+| `imageView` | id/path；同 id 原位更新 | 缩略图与全局原图预览 |
+| `imageGeneration` | 当前 status 为 in_progress/completed/failed，result 必需；读取 nullable revisedPrompt/savedPath/transparentBackground/failure。唯一 typed failure 为 usageLimitExceeded{limitId,resetsAt}；旧命名仅在历史路径兼容 | 优先 savedPath，文件不可用时物化 base64；中断移除未完成 loader，不伪造 failed item |
+| `contextCompaction` | 按 item.id 更新；历史恢复为已完成活动 | 独立压缩上下文活动 |
+| `collabAgentToolCall`、`collabToolCall`、`subAgentActivity` | 当前、相邻版本与旧历史映射为 AgentCollaboration。按载荷中的工具／接收者状态更新；稳定 item.id 原位更新，旧离散事件按 agentThreadId 合并 | 每个接收者独立状态；子任务失败不结束父轮次，支持只读嵌套子会话面板 |
+| `mcpToolCall` | 保留 server/tool/status/arguments/appContext/pluginId/result/error；兼容旧 metadata、mcpAppResourceUri 与字符串 error，连接器自定义 JSON 不丢字段 | 按稳定 item.id 更新；完成快照保留已收到的 progress，错误可见 |
+| `webSearch`（仅历史） | 恢复查询与结果；实时类型尚未接入 | 恢复搜索活动 |
 
-每个 connection generation 只 spawn 一个 `codex app-server --stdio`，只发送一次 `initialize` 和一次 `initialized`。一个长期 reader loop 独占 stdout，连接级单调 request id 与 pending registry 关联所有 response；共享 stdin 锁把每条完整 JSONL 与 flush 作为一次串行写事务。串行化的 thread lifecycle registry 关联 `thread/start`／`thread/resume` 与可能先到的 `thread/started`，每个 thread 在同一 generation 只 start 或 resume 一次。新 thread 的 RPC 顺序为 `thread/start` → `turn/start`；已加载 thread 的后续 prompt 直接 `turn/start`；仅在新 generation 或尚未加载时先 `thread/resume`，resume 失败不回退为 start。
+当前 schema 中的 hookPrompt、functionCallOutput、plan、dynamicToolCall、webSearch、sleep、enteredReviewMode、exitedReviewMode 尚未接入实时 item 路径。协作枚举、字段校验与历史别名见 `items.rs`；历史解码见 `workspace_protocol.rs`。样式、尺寸和交互入口见 README 与组件实现。
 
-每个 thread 同时最多一个 active turn。manager 按 `threadId + turnId` 路由 turn notification，按原始 JSON-RPC id 路由 server request/resolved，并在 `turn/start` response 前缓存该 turn 的 started/item/request/completed 消息，确定 canonical turn id 后按 wire order 原子校验和回放。app-scoped 与 thread-scoped 状态通过 `AgentConnectionEvent` 快照订阅进入 UI，不会投递给碰巧活跃的 turn；turn-scoped 事件只进入对应 `AgentRun`。workspace 通知是连接级非致命事件，可早于对应 RPC response；store 以 server-derived 内存覆盖层压过随后到达的过期列表响应，避免归档、删除、重命名、项目移动等状态回滚，同时不把该覆盖层持久化为本地真相。
+## 方法总表
 
-reasoning item 以 `item.id` 独立建模，严格保存 `startedAtMs`／`completedAtMs`，并按 `summaryIndex`／`contentIndex` 承接稀疏数组及增量文本；同一 turn 内的多个 reasoning item 不会合并或串线。`commandExecution.commandActions` 不再只做 schema 校验后丢弃，而是以 `read`／`listFiles`／`search`／`unknown` 的 agent-neutral 结构保留；一个 commandExecution 的每个 action 分别渲染一行，读取行提供文件链接，只有 shell/unknown 行拥有二级详情折叠。`imageView` 的 `id/path` 在实时 started/completed 与历史分页中统一映射为 agent-neutral 图像活动，started/completed 以稳定 id 原位更新，不重复插入；当前 turn 默认展开、历史默认折叠，点击 21 px 标题行展开 80 px 缩略图，再点击缩略图进入全局预览，键盘 disclosure 与全屏预览（背景／关闭／Escape 退出、下载及缩放）均按桌面 ChatGPT CDP 实测行为实现。`contextCompaction` 同样按稳定 `item.id` 在 `item/started` 与 `item/completed` 间原位更新，历史分页恢复为已完成状态，不再落入 Unsupported 警告；它作为独立活动行打断工具组，运行态显示“正在压缩上下文”文字 shimmer，完成态显示“上下文已压缩”。该行经 `127.0.0.1:9222` 在桌面 ChatGPT App 中真实执行 `/compact` 后测得：高 21 px、20 px 原始图标、图文间距 6 px、系统字体 14/21 px、前景 `text/60%`，透明背景且无 border、radius 或 padding；原始图标与 bundle 语义可由 `scripts/extract_chatgpt_context_compaction.cjs` 复核。`mcpToolCall` 也以稳定 `item.id` 在 started/progress/completed 间原位更新，并在历史分页与 resume 后恢复同一 agent-neutral 项；严格保留 `server/tool/status/arguments/appContext/pluginId/result/error`，同时兼容旧历史缺少新增 metadata、deprecated `mcpAppResourceUri` 及旧字符串 error。连接器自定义的 arguments/result/appContext 保持原始 JSON，避免客户端丢失 server-specific 字段。完成态按桌面 ChatGPT 实测渲染为透明的 21 px 原生行：16 px MCP 图标、6 px 间距、系统字体 14/21 px；实时 DOM 内层声明 `text/40%`，但外层 important 规则的 `text/60%` 是最终计算值，因此图标与标签都按 `text/60%` 绘制；label 优先使用受信 `appContext.actionName`，否则把 tool 名规范化为标题。失败态同时显示“失败”和 error message，不只依赖颜色。UI 将相邻 reasoning 与 command item 折叠为一个桌面 ChatGPT 语义的工具调用组：运行态默认展开并以最新 reasoning 短标题作为 21 px 标题行，完成态默认折叠并汇总为“已读取文件”“运行了命令”等动作文案；组内行间距 4 px、滚动区最高 224 px、边缘渐隐 24 px，鼠标及 Enter／Space 共用折叠路径，300 ms `cubic-bezier(.19, 1, .22, 1)` 高度／透明度过渡遵循 reduced-motion；标题箭头另使用桌面端 300 ms `cubic-bezier(.4, 0, .2, 1)` 旋转。没有相邻命令的 reasoning 仍独立渲染，活动时自动展开并跟随最新内容，完成后显示“思考了 {elapsed}”或“完成思考”，正文最高 140 px。
+### 客户端请求（155）
 
-用户消息的实时提交与历史恢复共用同一显示归一化：把 CRLF 统一为 LF，移除 app-server/桌面桥接保留的全部末尾换行，保留内部硬换行与空白段落，解码 CommonMark 标点转义，并在带附件时只从桌面端注入的 `Files mentioned by the user` 包络提取 `My request` 正文。`userMessage.content` 按生成 schema 校验 `text`、`image`、`localImage`、`audio`、`localAudio`、`skill` 和 `mention`；非文本项不会被误拼进气泡。气泡按真实 CDP 计算样式使用 70% 会话列最大宽度、水平 16 px／垂直 10 px 内边距、14/22.75 px 文字、22 px `superellipse(1.5)` 圆角、20 px 段落间距以及气泡与 26 px 操作区之间 4 px 间距。
+| 方法 | API | 状态 | 已实现行为与限制 | 入口 |
+|---|---|---|---|---|
+| `account/bedrock/discover` | 实验 | 未接入 | — | — |
+| `account/bedrock/setup` | 实验 | 未接入 | — | — |
+| `account/login/cancel` | 默认 | 未接入 | — | — |
+| `account/login/start` | 默认 | 未接入 | — | — |
+| `account/logout` | 默认 | 未接入 | — | — |
+| `account/rateLimitResetCredit/consume` | 默认 | 未接入 | — | — |
+| `account/rateLimits/read` | 默认 | 未接入 | — | — |
+| `account/read` | 默认 | 未接入 | — | — |
+| `account/sendAddCreditsNudgeEmail` | 默认 | 未接入 | — | — |
+| `account/usage/read` | 默认 | 未接入 | — | — |
+| `account/workspaceMessages/read` | 默认 | 未接入 | — | — |
+| `app/installed` | 默认 | 未接入 | — | — |
+| `app/list` | 默认 | 未接入 | — | — |
+| `app/read` | 默认 | 未接入 | — | — |
+| `collaborationMode/list` | 实验 | 未接入 | — | — |
+| `command/exec` | 默认 | 未接入 | — | — |
+| `command/exec/resize` | 默认 | 未接入 | — | — |
+| `command/exec/terminate` | 默认 | 未接入 | — | — |
+| `command/exec/write` | 默认 | 未接入 | — | — |
+| `config/batchWrite` | 默认 | 未接入 | — | — |
+| `config/mcpServer/reload` | 默认 | 未接入 | — | — |
+| `config/read` | 默认 | 未接入 | — | — |
+| `config/value/write` | 默认 | 未接入 | — | — |
+| `configRequirements/read` | 默认 | 未接入 | — | — |
+| `environment/add` | 实验 | 未接入 | — | — |
+| `environment/info` | 实验 | 未接入 | — | — |
+| `environment/status` | 实验 | 未接入 | — | — |
+| `experimentalFeature/enablement/set` | 默认 | 未接入 | — | — |
+| `experimentalFeature/list` | 默认 | 未接入 | — | — |
+| `externalAgentConfig/detect` | 默认 | 未接入 | — | — |
+| `externalAgentConfig/import` | 默认 | 未接入 | — | — |
+| `externalAgentConfig/import/readHistories` | 默认 | 未接入 | — | — |
+| `externalAgentConfig/import/recordHistory` | 默认 | 未接入 | — | — |
+| `feedback/upload` | 默认 | 未接入 | — | — |
+| `fs/copy` | 默认 | 未接入 | — | — |
+| `fs/createDirectory` | 默认 | 未接入 | — | — |
+| `fs/getMetadata` | 默认 | 未接入 | — | — |
+| `fs/readDirectory` | 默认 | 未接入 | — | — |
+| `fs/readFile` | 默认 | 未接入 | — | — |
+| `fs/remove` | 默认 | 未接入 | — | — |
+| `fs/unwatch` | 默认 | 未接入 | — | — |
+| `fs/watch` | 默认 | 未接入 | — | — |
+| `fs/writeFile` | 默认 | 未接入 | — | — |
+| `fuzzyFileSearch` | 默认 | 未接入 | — | — |
+| `fuzzyFileSearch/sessionStart` | 实验 | 未接入 | — | — |
+| `fuzzyFileSearch/sessionStop` | 实验 | 未接入 | — | — |
+| `fuzzyFileSearch/sessionUpdate` | 实验 | 未接入 | — | — |
+| `hooks/list` | 默认 | 未接入 | — | — |
+| `initialize` | 默认 | 已接入 | 每个连接 generation 一次；发送 clientInfo、experimentalApi=true、requestAttestation=false。 | `manager` |
+| `marketplace/add` | 默认 | 未接入 | — | — |
+| `marketplace/remove` | 默认 | 未接入 | — | — |
+| `marketplace/upgrade` | 默认 | 未接入 | — | — |
+| `mcpServer/event/stream/start` | 实验 | 未接入 | — | — |
+| `mcpServer/event/stream/stop` | 实验 | 未接入 | — | — |
+| `mcpServer/oauth/login` | 默认 | 未接入 | — | — |
+| `mcpServer/resource/read` | 默认 | 未接入 | — | — |
+| `mcpServer/tool/call` | 默认 | 未接入 | — | — |
+| `mcpServerStatus/list` | 默认 | 未接入 | — | — |
+| `memory/reset` | 实验 | 未接入 | — | — |
+| `mock/experimentalMethod` | 实验 | 未接入 | — | — |
+| `model/list` | 默认 | 已接入 | limit=50、includeHidden=false；遍历 nextCursor，拒绝循环游标；返回模型、默认值、推理强度及服务档位。 | `manager/catalog` |
+| `modelProvider/capabilities/read` | 默认 | 未接入 | — | — |
+| `permissionProfile/list` | 默认 | 后端已接入 | cursor=null、limit=100、cwd；返回 id/allowed/extends；存在下一页时报错。后端可调用，当前无可见 UI 调用方。 | `manager/catalog` |
+| `plugin/install` | 默认 | 未接入 | — | — |
+| `plugin/installed` | 默认 | 未接入 | — | — |
+| `plugin/list` | 默认 | 未接入 | — | — |
+| `plugin/reconcile` | 默认 | 未接入 | — | — |
+| `plugin/read` | 默认 | 未接入 | — | — |
+| `plugin/search` | 实验 | 未接入 | — | — |
+| `plugin/share/checkout` | 默认 | 未接入 | — | — |
+| `plugin/share/delete` | 默认 | 未接入 | — | — |
+| `plugin/share/list` | 默认 | 未接入 | — | — |
+| `plugin/share/save` | 默认 | 未接入 | — | — |
+| `plugin/share/updateTargets` | 默认 | 未接入 | — | — |
+| `plugin/skill/read` | 默认 | 未接入 | — | — |
+| `plugin/uninstall` | 默认 | 未接入 | — | — |
+| `process/kill` | 实验 | 未接入 | — | — |
+| `process/resizePty` | 实验 | 未接入 | — | — |
+| `process/spawn` | 实验 | 未接入 | — | — |
+| `process/writeStdin` | 实验 | 未接入 | — | — |
+| `project/create` | 实验 | 已接入 | 发送 idempotencyKey、name、roots[{path}]；以 result.project 更新工作区。 | `manager/workspace` |
+| `project/delete` | 实验 | 已接入 | 按 projectId 删除；同步移除项目及关联列表状态。 | `manager/workspace` |
+| `project/import` | 实验 | 未接入 | — | — |
+| `project/list` | 实验 | 已接入 | 按 position 升序分页；提供侧栏项目数据。 | `manager/workspace` |
+| `project/move` | 实验 | 已接入 | projectId、nullable beforeProjectId；使用服务端顺序。 | `manager/workspace` |
+| `project/read` | 实验 | 未接入 | — | — |
+| `project/update` | 实验 | 已接入 | 按需发送 name、roots；以 result.project 更新工作区。 | `manager/workspace` |
+| `remoteControl/client/list` | 实验 | 未接入 | — | — |
+| `remoteControl/client/revoke` | 实验 | 未接入 | — | — |
+| `remoteControl/disable` | 实验 | 未接入 | — | — |
+| `remoteControl/enable` | 实验 | 未接入 | — | — |
+| `remoteControl/pairing/start` | 实验 | 未接入 | — | — |
+| `remoteControl/pairing/status` | 实验 | 未接入 | — | — |
+| `remoteControl/status/read` | 实验 | 未接入 | — | — |
+| `review/start` | 默认 | 未接入 | 启动模型代码评审；本机 Git 审查面板使用 Git/gh 与已有 turn diff，不调用此方法。 | — |
+| `server/diagnostics` | 实验 | 未接入 | — | — |
+| `skills/config/write` | 默认 | 未接入 | — | — |
+| `skills/extraRoots/set` | 默认 | 未接入 | — | — |
+| `skills/list` | 默认 | 未接入 | — | — |
+| `thread/approveGuardianDeniedAction` | 默认 | 未接入 | — | — |
+| `thread/archive` | 默认 | 已接入 | 按 threadId 归档；通知与列表合并规则见“连接与状态”。 | `manager/workspace` |
+| `thread/backgroundTerminals/clean` | 实验 | 未接入 | — | — |
+| `thread/backgroundTerminals/list` | 实验 | 未接入 | — | — |
+| `thread/backgroundTerminals/terminate` | 实验 | 未接入 | — | — |
+| `thread/compact/start` | 默认 | 未接入 | — | — |
+| `thread/decrement_elicitation` | 实验 | 未接入 | — | — |
+| `thread/delete` | 默认 | 已接入 | 按 threadId 删除；从所有侧栏集合移除。 | `manager/workspace` |
+| `thread/fork` | 默认 | 已接入 | 仅用于临时侧边聊天：ephemeral=true、excludeTurns=true、threadSource=user，携带 cwd、说明及可选 model/effort/serviceTier。验证新 id、ephemeral 和先到的 thread/started；无持久化分叉 UI。 | `manager/side_conversation` |
+| `thread/goal/clear` | 默认 | 未接入 | — | — |
+| `thread/goal/get` | 默认 | 未接入 | — | — |
+| `thread/goal/set` | 默认 | 未接入 | — | — |
+| `thread/increment_elicitation` | 实验 | 未接入 | — | — |
+| `thread/inject_items` | 默认 | 已接入 | 向新侧边线程注入 user message，标记父历史仅供参考；不开始 turn。失败时释放临时 fork，不交付可发送的线程。 | `manager/side_conversation` |
+| `thread/items/list` | 默认 | 已接入 | 按 threadId、nullable turnId 升序分页；补全非 full 的历史轮次。 | `manager/workspace` |
+| `thread/list` | 默认 | 已接入 | 分页读取最近、归档、项目与分区列表；保留前后游标及 projectId/sectionId 的省略、null、值三态。 | `manager/workspace` |
+| `thread/loaded/list` | 默认 | 未接入 | — | — |
+| `thread/memoryMode/set` | 实验 | 未接入 | — | — |
+| `thread/metadata/update` | 默认 | 已接入 | projectId 省略表示不变，空字符串表示移出项目，非空 id 表示分配；读取 result.thread。 | `manager/workspace` |
+| `thread/name/set` | 默认 | 已接入 | threadId、name；重命名会话。 | `manager/workspace` |
+| `thread/queue/add` | 实验 | 未接入 | — | — |
+| `thread/queue/delete` | 实验 | 未接入 | — | — |
+| `thread/queue/list` | 实验 | 未接入 | — | — |
+| `thread/queue/reorder` | 实验 | 未接入 | — | — |
+| `thread/queue/start` | 实验 | 未接入 | — | — |
+| `thread/queue/update` | 实验 | 未接入 | — | — |
+| `thread/read` | 默认 | 已接入 | includeTurns=false；读取线程上下文，历史另行分页。 | `manager/workspace` |
+| `thread/realtime/appendAudio` | 实验 | 未接入 | — | — |
+| `thread/realtime/appendSpeech` | 实验 | 未接入 | — | — |
+| `thread/realtime/appendText` | 实验 | 未接入 | — | — |
+| `thread/realtime/listVoices` | 实验 | 未接入 | — | — |
+| `thread/realtime/start` | 实验 | 未接入 | — | — |
+| `thread/realtime/stop` | 实验 | 未接入 | — | — |
+| `thread/resume` | 默认 | 已接入 | threadId、excludeTurns=true；当前 generation 未加载时执行一次，返回 id 必须匹配；失败不回退为新建。 | `manager/turn` |
+| `thread/revert` | 默认 | 未接入 | — | — |
+| `thread/rollback` | 默认 | 未接入 | — | — |
+| `thread/search` | 实验 | 已接入 | 非空 searchTerm、archived、分页和排序；返回 thread 与 snippet。 | `manager/workspace` |
+| `thread/searchOccurrences` | 实验 | 未接入 | — | — |
+| `thread/section/move` | 默认 | 已接入 | threadId、nullable sectionId/beforeThreadId；用于置顶和取消置顶。 | `manager/workspace` |
+| `thread/settings/update` | 实验 | 已接入 | 更新已有线程权限：approvalPolicy、approvalsReviewer、profile 或 sandboxPolicy。先注册 waiter，等待对应 thread/settings/updated；临时线程沿用所属 generation。 | `manager/catalog`、`permissions` |
+| `thread/shellCommand` | 默认 | 未接入 | — | — |
+| `thread/start` | 默认 | 已接入 | 首条提示词才新建；发送 cwd、projectId、historyMode=paginated、ephemeral=false、serviceName、model、serviceTier；采用 result.thread.id。 | `manager/turn` |
+| `thread/timeline/list` | 实验 | 未接入 | — | — |
+| `thread/turns/list` | 默认 | 已接入 | 按 threadId 升序分页，itemsView=full；保留实际 itemsView 和双向游标，按需补取 item。 | `manager/workspace` |
+| `thread/unarchive` | 默认 | 已接入 | 按 threadId 取消归档；读取 result.thread 并刷新列表。 | `manager/workspace` |
+| `thread/unsubscribe` | 默认 | 已接入 | 只关闭本应用创建的临时线程；先请求中断自身轮次，接受 unsubscribed/notSubscribed/notLoaded；不影响父线程。 | `manager/side_conversation` |
+| `threadSection/create` | 默认 | 已接入 | name、可选 appearance{icon,color}；返回 section，当前用于建立 Pinned 分区。 | `manager/workspace` |
+| `threadSection/delete` | 默认 | 未接入 | — | — |
+| `threadSection/list` | 默认 | 已接入 | 遍历分区分页；以服务端 Pinned 的稳定 id 实现置顶。 | `manager/workspace` |
+| `threadSection/update` | 默认 | 未接入 | — | — |
+| `turn/interrupt` | 默认 | 已接入 | 定向 threadId/turnId，每轮最多发送一次；等待真实 interrupted 终态，保持共享连接。 | `manager/turn` |
+| `turn/settings/update` | 实验 | 未接入 | — | — |
+| `turn/start` | 默认 | 已接入 | 文本及 localImage 输入、路径上下文、model/effort/serviceTier、可选 plan/default collaborationMode；新线程首轮附权限字段。以 result.turn.id 建立轮次归属。 | `manager/turn` |
+| `turn/steer` | 默认 | 未接入 | — | — |
+| `windowsSandbox/readiness` | 默认 | 未接入 | — | — |
+| `windowsSandbox/setupStart` | 默认 | 未接入 | — | — |
 
-协作活动是一等 `ThreadItem`，不再落入占位或 Unsupported。本机 0.153.0 schema 与桌面端实际流量的主 discriminator 是 `collabAgentToolCall`：必需字段为 `id`、`tool`、`status`、`senderThreadId`、`receiverThreadIds` 和 `agentsStates`。公开／相邻版本还会发送单目标 `collabToolCall`，以 nullable `receiverThreadId`／`newThreadId`、`agentStatus`、`agentName`／`newAgentNickname`／`agentPath` 携带目标状态和展示名；两者映射到同一个 `AgentCollaboration`，不会形成两套 UI。`tool` 严格接受 `spawnAgent`、`sendInput`、`resumeAgent`、`wait`、`closeAgent`、`sendMessage`、`followupTask`、`interruptAgent`、`listAgents`，顶层 `status` 严格接受 `inProgress`、`completed`、`failed`、`interrupted`。agent 状态域为 `pendingInit`、`running`、`interrupted`、`completed`、`errored`、`shutdown`、`notFound`，并可带 nullable `message`；`collabAgentToolCall` 顶层另可带 nullable `prompt`、`model` 和非空 nullable `reasoningEffort`。schema 同时保留历史兼容项 `subAgentActivity`，其 `id`、`kind=started|interacted|interrupted|completed`、`agentThreadId`、`agentPath` 均为必需字段。
+### 客户端通知（1）
 
-0.153.0 没有协作专用 delta notification。实时链路由通用 `item/started`／`item/completed` 携带完整 item 快照；主类型的 `status` 与每个 `agentsStates[*].status` 是状态真相，不能用外层通知名称推断成功或失败。旧类型用离散 `interacted` item 表达中间更新。主类型按稳定 `item.id` 原位 upsert；真实旧链路会为同一子任务的 started／interacted／completed 生成不同 item id，因此旧类型必须按 `agentThreadId` 折叠。子任务失败只更新该协作行，不结束父 turn；父 turn 仍只由自身 `turn/completed` 决定终态。
+| 方法 | API | 状态 | 已实现行为与限制 | 入口 |
+|---|---|---|---|---|
+| `initialized` | 默认 | 已接入 | initialize 成功后发送一次 params={}，无 id。 | `manager` |
 
-历史恢复与实时事件共用同一个严格 parser 和 agent-neutral `AgentCollaboration`：`thread/turns/list(itemsView=full)` 及必要时的 `thread/items/list` 都恢复协作活动，随后到达的实时快照继续按上述 identity 规则更新而不会重复。每个 receiver 独立显示 running／成功／失败／中断等状态；点击名称或按 Enter／Space 使用同一激活路径，按真实 receiver thread id 在已有可调宽 right-panel 中打开只读“子智能体”会话，不切换父任务或侧边栏选中项。面板复用 child `ComposerView` 的实时状态与历史加载，隐藏子任务 prompt 和输入框，只渲染子智能体输出；46 px 顶部 tab 工具栏、48 px 返回栏、信息下拉框、返回／关闭按钮与 Escape 都为原生 GPUI 交互。嵌套协作行可继续在同一右侧面板打开下一层 child，因此并行和任意层级嵌套无需 UI 特判。实现全程为原生 GPUI 元素，不使用 WebView。
+### 服务端请求（11）
 
-`imageGeneration` 是与 `imageView` 分离的 canonical item：严格读取 `id/status/result`，以及 nullable `revisedPrompt/savedPath/transparentBackground/failure`；当前唯一 typed failure 为 `usageLimitExceeded{limitId,resetsAt}`。实时 `in_progress` 与 `completed/failed` 以同 id 原位更新；优先显示 `savedPath`，文件缺失时把历史 base64 `result` 解码到稳定临时缓存，保留 PNG/JPEG/GIF 像素尺寸与显式 load error。UI 按桌面实测使用 178×178、16 px 圆角的原生加载卡和最长 480 px、16 px 圆角的完成图像；点击或 Enter／Space 打开全局预览，预览显示原始尺寸并提供下载、缩放、背景／关闭与 Escape 关闭；真实失败／加载失败显示带键盘操作的重试。真实点击停止的 trace 只产生 `turn/completed: interrupted`，没有伪造的 image item completed，因此 Composer 会移除未完成 loader。
+| 方法 | API | 状态 | 已实现行为与限制 | 入口 |
+|---|---|---|---|---|
+| `account/chatgptAuthTokens/refresh` | 默认 | 未接入 | — | — |
+| `applyPatchApproval` | 默认 | 未接入 | 旧版文件审批；不由现有展示组件接管。 | — |
+| `attestation/generate` | 默认 | 未接入 | — | — |
+| `currentTime/read` | 实验 | 未接入 | — | — |
+| `execCommandApproval` | 默认 | 未接入 | 旧版命令审批；不与 v2 item 请求混用。 | — |
+| `item/commandExecution/requestApproval` | 默认 | 部分接入 | 仅支持普通命令、reason、网络 host 和 accept/decline/execpolicy 决策；尚未承接 writeStdin、approvalId、网络 protocol、additionalPermissions、proposedNetworkPolicyAmendments、acceptForSession/applyNetworkPolicyAmendment 等变体。 | `requests`、`registry` |
+| `item/fileChange/requestApproval` | 默认 | 未接入 | 文件审批卡有展示与测试实现，尚未接入该 RPC。 | — |
+| `item/permissions/requestApproval` | 默认 | 已接入 | 校验 thread/turn/item、cwd、startedAtMs、nullable environmentId/reason；保留 read/write、entries、glob 深度、path/glob/special path 与 nullable network。允许只返回请求子集及 turn/session scope，拒绝返回空权限。 | `requests`、`permissions`、`registry` |
+| `item/tool/call` | 默认 | 未接入 | — | — |
+| `item/tool/requestUserInput` | 默认 | 已接入 | 保留 question id/header/question/options/isOther/isSecret、isBlocking、nullable autoResolutionMs；返回 question id → 字符串数组的 answers，Debug 隐去答案；兼容 tool/requestUserInput 别名。 | `requests`、`registry` |
+| `mcpServer/elicitation/request` | 默认 | 未接入 | — | — |
 
-`turn/completed` 只结束对应 `AgentRun` 并清理该 turn 的 responder/registry，不关闭共享进程。`turn/interrupt` 使用连接级唯一 request id，作用于一个 thread/turn 并等待真实 interrupted 终态；abandon 会中断或安全分离该 turn，不会关闭连接。EOF、崩溃、写失败或致命协议错误会使旧 generation 的全部 pending RPC 和 active turn 各失败一次、清理旧 server request，且不会自动重放 prompt；reaping 门禁会阻止旧进程完成 terminate/wait 前启动替代 generation，下一次显式操作才可重建，既有 thread 会先 resume。应用 shutdown 或最后一个 manager owner drop 会幂等地 terminate 并 wait 子进程；shutdown 与首次 spawn 并发时也会等待新产生的 child 被回收。
+### 服务端通知（81）
 
-| 方法 | 方向与类型 | 协议范围 | 协议要点 | 运行时入口 | 领域映射 | UI／副作用 | 接入状态 | 兼容与测试 |
-|---|---|---|---|---|---|---|---|---|
-| `account/bedrock/discover` | 客户端请求 | 实验 | `params: BedrockDiscoverParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `account/bedrock/setup` | 客户端请求 | 实验 | `params: BedrockSetupParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `account/login/cancel` | 客户端请求 | 默认 | `params: CancelLoginAccountParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `account/login/start` | 客户端请求 | 默认 | `params: LoginAccountParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `account/logout` | 客户端请求 | 默认 | `params: undefined`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `account/rateLimitResetCredit/consume` | 客户端请求 | 默认 | `params: ConsumeAccountRateLimitResetCreditParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `account/rateLimits/read` | 客户端请求 | 默认 | `params: undefined`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `account/read` | 客户端请求 | 默认 | `params: GetAccountParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `account/sendAddCreditsNudgeEmail` | 客户端请求 | 默认 | `params: SendAddCreditsNudgeEmailParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `account/usage/read` | 客户端请求 | 默认 | `params?: GetAccountTokenUsageParams \| undefined`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `account/workspaceMessages/read` | 客户端请求 | 默认 | `params: undefined`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `app/installed` | 客户端请求 | 默认 | `params: AppsInstalledParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `app/list` | 客户端请求 | 默认 | `params: AppsListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `app/read` | 客户端请求 | 默认 | `params: AppsReadParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `collaborationMode/list` | 客户端请求 | 实验 | `params: CollaborationModeListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `command/exec` | 客户端请求 | 默认 | `params: CommandExecParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `command/exec/resize` | 客户端请求 | 默认 | `params: CommandExecResizeParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `command/exec/terminate` | 客户端请求 | 默认 | `params: CommandExecTerminateParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `command/exec/write` | 客户端请求 | 默认 | `params: CommandExecWriteParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `config/batchWrite` | 客户端请求 | 默认 | `params: ConfigBatchWriteParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `config/mcpServer/reload` | 客户端请求 | 默认 | `params: undefined`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `config/read` | 客户端请求 | 默认 | `params: ConfigReadParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `config/value/write` | 客户端请求 | 默认 | `params: ConfigValueWriteParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `configRequirements/read` | 客户端请求 | 默认 | `params: undefined`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `environment/add` | 客户端请求 | 实验 | `params: EnvironmentAddParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `environment/info` | 客户端请求 | 实验 | `params: EnvironmentInfoParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `environment/status` | 客户端请求 | 实验 | `params: EnvironmentStatusParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `experimentalFeature/enablement/set` | 客户端请求 | 默认 | `params: ExperimentalFeatureEnablementSetParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `experimentalFeature/list` | 客户端请求 | 默认 | `params: ExperimentalFeatureListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `externalAgentConfig/detect` | 客户端请求 | 默认 | `params: ExternalAgentConfigDetectParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `externalAgentConfig/import` | 客户端请求 | 默认 | `params: ExternalAgentConfigImportParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `externalAgentConfig/import/readHistories` | 客户端请求 | 默认 | `params: undefined`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `externalAgentConfig/import/recordHistory` | 客户端请求 | 默认 | `params: ExternalAgentConfigImportHistoryRecordParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `feedback/upload` | 客户端请求 | 默认 | `params: FeedbackUploadParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `fs/copy` | 客户端请求 | 默认 | `params: FsCopyParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `fs/createDirectory` | 客户端请求 | 默认 | `params: FsCreateDirectoryParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `fs/getMetadata` | 客户端请求 | 默认 | `params: FsGetMetadataParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `fs/readDirectory` | 客户端请求 | 默认 | `params: FsReadDirectoryParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `fs/readFile` | 客户端请求 | 默认 | `params: FsReadFileParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `fs/remove` | 客户端请求 | 默认 | `params: FsRemoveParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `fs/unwatch` | 客户端请求 | 默认 | `params: FsUnwatchParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `fs/watch` | 客户端请求 | 默认 | `params: FsWatchParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `fs/writeFile` | 客户端请求 | 默认 | `params: FsWriteFileParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `fuzzyFileSearch` | 客户端请求 | 默认 | `params: FuzzyFileSearchParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `fuzzyFileSearch/sessionStart` | 客户端请求 | 实验 | `params: FuzzyFileSearchSessionStartParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `fuzzyFileSearch/sessionStop` | 客户端请求 | 实验 | `params: FuzzyFileSearchSessionStopParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `fuzzyFileSearch/sessionUpdate` | 客户端请求 | 实验 | `params: FuzzyFileSearchSessionUpdateParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `hooks/list` | 客户端请求 | 默认 | `params: HooksListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `initialize` | 客户端请求 | 默认 | `clientInfo`；`capabilities.experimentalApi=true`；使用连接级唯一 id 等待响应；每个长期 connection generation 只发送一次 | `CodexAppServerManager::start_generation`、共享 pending RPC registry | 无 | 建立应用级共享连接；不属于任何 turn | 已接入 | 并发首次调用 single-flight；未知／malformed 握手消息使 generation fail-fast；启动中 shutdown 会等待 child 回收；`concurrent_first_calls_single_flight_initialize_and_shutdown_waits_once`、`shutdown_waits_for_an_in_flight_spawn_and_reaps_the_process`、`handshake_wait_rejects_unknown_methods_instead_of_skipping_them` |
-| `marketplace/add` | 客户端请求 | 默认 | `params: MarketplaceAddParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `marketplace/remove` | 客户端请求 | 默认 | `params: MarketplaceRemoveParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `marketplace/upgrade` | 客户端请求 | 默认 | `params: MarketplaceUpgradeParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `mcpServer/event/stream/start` | 客户端请求 | 实验 | `params: McpServerEventStreamStartParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `mcpServer/event/stream/stop` | 客户端请求 | 实验 | `params: McpServerEventStreamStopParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `mcpServer/oauth/login` | 客户端请求 | 默认 | `params: McpServerOauthLoginParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `mcpServer/resource/read` | 客户端请求 | 默认 | `params: McpResourceReadParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `mcpServer/tool/call` | 客户端请求 | 默认 | `params: McpServerToolCallParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `mcpServerStatus/list` | 客户端请求 | 默认 | `params: ListMcpServerStatusParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `memory/reset` | 客户端请求 | 实验 | `params: undefined`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `mock/experimentalMethod` | 客户端请求 | 实验 | `params: MockExperimentalMethodParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `model/list` | 客户端请求 | 默认 | `cursor`、`limit=50`、`includeHidden=false`；读取 `data`、`nextCursor`；每页使用连接级唯一 id | `CodexAppServerManager::load_model_catalog_blocking`、共享 manager | `AgentModelCatalog` | 填充模型、推理强度和 service tier 选项 | 已接入 | 与权限、settings、turn RPC 共用连接且允许 response 乱序；空目录、重复 cursor、错误响应均失败；`all_rpc_families_share_unique_connection_ids_and_out_of_order_responses`、`model_catalog_accumulates_pages_and_maps_defaults_and_options` |
-| `modelProvider/capabilities/read` | 客户端请求 | 默认 | `params: ModelProviderCapabilitiesReadParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `permissionProfile/list` | 客户端请求 | 默认 | `cursor=null`、`limit=100`、`cwd`；读取 profile `id/allowed/extends`；复用共享连接 | `CodexAppServerManager::load_permission_profiles_blocking` | `Vec<AgentPermissionProfile>` | 当前无可见调用方 | 后端已接入 | 与模型、settings、turn RPC 的 response id 严格隔离；超过 100 项不静默截断；`all_rpc_families_share_unique_connection_ids_and_out_of_order_responses`、`permission_profile_list_maps_available_profiles` |
-| `plugin/install` | 客户端请求 | 默认 | `params: PluginInstallParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `plugin/installed` | 客户端请求 | 默认 | `params: PluginInstalledParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `plugin/list` | 客户端请求 | 默认 | `params: PluginListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `plugin/reconcile` | 客户端请求 | 默认 | `params: PluginReconcileParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 0.153.0 新增；客户端不发送 |
-| `plugin/read` | 客户端请求 | 默认 | `params: PluginReadParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `plugin/search` | 客户端请求 | 实验 | `params: PluginSearchParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `plugin/share/checkout` | 客户端请求 | 默认 | `params: PluginShareCheckoutParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `plugin/share/delete` | 客户端请求 | 默认 | `params: PluginShareDeleteParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `plugin/share/list` | 客户端请求 | 默认 | `params: PluginShareListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `plugin/share/save` | 客户端请求 | 默认 | `params: PluginShareSaveParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `plugin/share/updateTargets` | 客户端请求 | 默认 | `params: PluginShareUpdateTargetsParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `plugin/skill/read` | 客户端请求 | 默认 | `params: PluginSkillReadParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `plugin/uninstall` | 客户端请求 | 默认 | `params: PluginUninstallParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `process/kill` | 客户端请求 | 实验 | `params: ProcessKillParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `process/resizePty` | 客户端请求 | 实验 | `params: ProcessResizePtyParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `process/spawn` | 客户端请求 | 实验 | `params: ProcessSpawnParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `process/writeStdin` | 客户端请求 | 实验 | `params: ProcessWriteStdinParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `project/create` | 客户端请求 | 实验 | `idempotencyKey`、`name`、`roots[{path}]`；读取 `result.project` | `CodexAppServerManager::create_project_blocking` → `WorkspaceStore::create_project` | `CreateProject` → `Project` | Finder 选目录后创建；显示 pending／error 并刷新 sidebar | 已接入 | scripted server 精确断言 0.153.0 参数与结果；fake store 覆盖稳定 id 和 pending |
-| `project/delete` | 客户端请求 | 实验 | `projectId`；成功结果为空对象 | `CodexAppServerManager::delete_project` → `WorkspaceStore::delete_project` | 稳定 `ProjectId` | 项目菜单二次确认删除；pending／error 可见 | 已接入 | scripted server 验证参数；store 不以数组下标定位 |
-| `project/import` | 客户端请求 | 实验 | `params: ProjectImportParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `project/list` | 客户端请求 | 实验 | `cursor`、`limit`、`sortKey=position`、`sortDirection=asc`；读取 `nextCursor` | `CodexAppServerManager::list_projects_blocking` → `WorkspaceStore::refresh_projects` | `Page<Project>` | sidebar 项目 loading／error／retry／empty，逐页合并；首次加载纳入全局启动状态 | 已接入 | 重复 cursor 拒绝；scripted schema 测试、fake backend 多页测试 |
-| `project/move` | 客户端请求 | 实验 | `projectId`、nullable `beforeProjectId`；成功结果为空对象 | `CodexAppServerManager::move_project` → `WorkspaceStore::move_project` | 两个稳定 `ProjectId` | 项目菜单上移／下移，显示 pending／error | 已接入 | scripted server 断言 before id；UI 不发送数组下标 |
-| `project/read` | 客户端请求 | 实验 | `params: ProjectReadParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `project/update` | 客户端请求 | 实验 | `projectId`，按需发送 `name`／`roots[{path}]`；读取 `result.project` | `CodexAppServerManager::update_project_blocking` → `WorkspaceStore::update_project` | `UpdateProject` → `Project` | sidebar 项目重命名；同一领域入口支持 roots 更新；pending／error 可见 | 已接入 | scripted server 覆盖 name/roots；响应按稳定 id upsert |
-| `remoteControl/client/list` | 客户端请求 | 实验 | `params: RemoteControlClientsListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `remoteControl/client/revoke` | 客户端请求 | 实验 | `params: RemoteControlClientsRevokeParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `remoteControl/disable` | 客户端请求 | 实验 | `params: RemoteControlDisableParams \| null`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `remoteControl/enable` | 客户端请求 | 实验 | `params: RemoteControlEnableParams \| null`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `remoteControl/pairing/start` | 客户端请求 | 实验 | `params: RemoteControlPairingStartParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `remoteControl/pairing/status` | 客户端请求 | 实验 | `params: RemoteControlPairingStatusParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `remoteControl/status/read` | 客户端请求 | 实验 | `params: undefined`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `review/start` | 客户端请求 | 默认 | `params: ReviewStartParams`；启动模型代码评审，非 Git 差异浏览接口 | — | 无 | 无 | 未接入 | 本地 Git 审查面板使用现有 turn diff/历史及本机 Git/gh |
-| `server/diagnostics` | 客户端请求 | 实验 | `params: ServerDiagnosticsParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `skills/config/write` | 客户端请求 | 默认 | `params: SkillsConfigWriteParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `skills/extraRoots/set` | 客户端请求 | 默认 | `params: SkillsExtraRootsSetParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `skills/list` | 客户端请求 | 默认 | `params: SkillsListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/approveGuardianDeniedAction` | 客户端请求 | 默认 | `params: ThreadApproveGuardianDeniedActionParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/archive` | 客户端请求 | 默认 | `threadId`；成功结果为空对象 | `CodexAppServerManager::archive_thread` → `WorkspaceStore::archive_thread` | 稳定 `ThreadId` | 行内 hover 与菜单归档；从活动列表移入归档，显示 pending／error | 已接入 | scripted 参数测试；fake store 验证 response 与通知幂等 |
-| `thread/backgroundTerminals/clean` | 客户端请求 | 实验 | `params: ThreadBackgroundTerminalsCleanParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/backgroundTerminals/list` | 客户端请求 | 实验 | `params: ThreadBackgroundTerminalsListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/backgroundTerminals/terminate` | 客户端请求 | 实验 | `params: ThreadBackgroundTerminalsTerminateParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/compact/start` | 客户端请求 | 默认 | `params: ThreadCompactStartParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/decrement_elicitation` | 客户端请求 | 实验 | `params: ThreadDecrementElicitationParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/delete` | 客户端请求 | 默认 | `threadId`；成功结果为空对象 | `CodexAppServerManager::delete_thread` → `WorkspaceStore::delete_thread` | 稳定 `ThreadId` | 会话菜单二次确认删除；所有列表同步移除并显示 pending／error | 已接入 | scripted 参数测试；server-derived deleted overlay 防止迟到列表复活 |
-| `thread/fork` | 客户端请求 | 默认 | `threadId`、`cwd`、`ephemeral=true`、`excludeTurns=true`、`threadSource=user`、侧边聊天 developer instructions；继承并可覆盖 model/effort/serviceTier | `manager/side_conversation.rs::open_side_conversation_blocking`，串行 lifecycle registry | `SideConversationRequest` → 独立临时 `ThreadId` | 右侧侧边聊天及 ⌥⌘S；多个临时标签，不写入普通会话列表；不提交主聊天轮次 | 已接入 | 校验 canonical id 不等于 parent、ephemeral=true、与提前到达的 thread/started 一致；fork 后只在当前 generation 使用；本接入范围为临时侧边聊天，不提供持久化分叉 UI；GPUI 的 0.153.0 真实运行、ChatGPT 内嵌 0.153.4 schema 与并行主/侧轮次测试 |
-| `thread/goal/clear` | 客户端请求 | 默认 | `params: ThreadGoalClearParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/goal/get` | 客户端请求 | 默认 | `params: ThreadGoalGetParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/goal/set` | 客户端请求 | 默认 | `params: ThreadGoalSetParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/increment_elicitation` | 客户端请求 | 实验 | `params: ThreadIncrementElicitationParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/inject_items` | 客户端请求 | 默认 | 在新侧边 thread 中追加一条 raw Responses user message，明确此前记录是父会话参考资料；不开始 turn | `manager/side_conversation.rs::open_side_conversation_blocking` | 初始化成功后才向侧边 Composer 交付可发送的 ThreadId | 防止侧边聊天自动延续主任务；继承历史不在侧边消息列表重复显示 | 已接入 | 注入失败时 unsubscribe 临时 fork，保留 UI 重试；不得继续 turn/start；scripted 失败清理及真实侧边会话验证 |
-| `thread/items/list` | 客户端请求 | 默认 | `threadId`、nullable `turnId`、cursor/limit、`sortDirection=asc`；读取 item 分页 | `CodexAppServerManager::list_thread_items_blocking` → `WorkspaceStore::load_history` 的按需回退 | `Page<ThreadHistoryItemEntry>`；用户消息保留 `localImage/image` 附件顺序，data URL 物化为本地图片；`imageView`、`imageGeneration`、`contextCompaction`、`collabToolCall`、`collabAgentToolCall`、兼容 `subAgentActivity` 与 `mcpToolCall` 均转为中立历史事件 | `thread/turns/list(itemsView=full)` 仍返回 summary／notLoaded 时按 turn 逐页补齐 transcript；恢复图像查看／生成、上下文压缩、协作与 MCP 活动 | 已接入 | 真实 fresh-window trace 经 `thread/read → thread/resume → thread/items/list` 恢复 completed imageGeneration；scripted server 覆盖 item/cursor；图像生成、三种协作 wire 与 MCP 的严格历史 parser 均有回归；fake backend 覆盖非 full turn 回退且不重复加载 full turn |
-| `thread/list` | 客户端请求 | 默认 | cursor/limit、`archived`、nullable/省略的 `projectId` 与 `sectionId`、sort key/direction；读取双向 cursor | `CodexAppServerManager::list_threads_blocking` → `WorkspaceStore` 各 collection loader | `Page<ThreadSummary>`、`ThreadActivity` | 最近、项目、置顶、活动、归档列表均来自真实数据；启动时各 collection 并发请求，首屏最近与置顶纳入全局加载、归档后台完成；显式 `projectId` 优先，缺省时按规范化 cwd 与最深 project root 组件匹配；loading／error／retry／empty | 已接入 | scripted 参数／映射测试；fake 多页、并发 collection、重复 cursor、稳定 id、迟到响应、cwd 嵌套 root 与相邻字符串前缀覆盖测试 |
-| `thread/loaded/list` | 客户端请求 | 默认 | `params: ThreadLoadedListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/memoryMode/set` | 客户端请求 | 实验 | `params: ThreadMemoryModeSetParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/metadata/update` | 客户端请求 | 默认 | `threadId`；省略 `projectId` 表示不变，空字符串表示取消项目，非空稳定 id 表示分配；读取 `result.thread` | `CodexAppServerManager::update_thread_metadata` → `WorkspaceStore::update_thread_metadata` | `AgentOptionalField<ProjectId>` → `ThreadSummary` | 会话菜单移至项目／移出项目，显示 pending／error | 已接入 | 严格遵循 0.153.0 schema 的空字符串清除语义；scripted 与通知覆盖测试 |
-| `thread/name/set` | 客户端请求 | 默认 | `threadId`、`name`；成功结果为空对象 | `CodexAppServerManager::set_thread_name` → `WorkspaceStore::rename_thread` | 稳定 `ThreadId` 与名称 | 会话菜单重命名，pending／error 可见 | 已接入 | scripted 参数测试；name notification 可先于 response 且不回滚 |
-| `thread/queue/add` | 客户端请求 | 实验 | `params: ThreadQueueAddParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/queue/delete` | 客户端请求 | 实验 | `params: ThreadQueueDeleteParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/queue/list` | 客户端请求 | 实验 | `params: ThreadQueueListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/queue/reorder` | 客户端请求 | 实验 | `params: ThreadQueueReorderParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/queue/start` | 客户端请求 | 实验 | `params: ThreadQueueStartParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/queue/update` | 客户端请求 | 实验 | `params: ThreadQueueUpdateParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/read` | 客户端请求 | 默认 | `threadId`、`includeTurns=false`；读取 `result.thread` | `CodexAppServerManager::read_thread_blocking` → `WorkspaceStore::load_history` | `ThreadSummary`，与后续 turn 页组成 `ThreadHistory` | 打开既有会话时恢复 cwd/project/title，并显示历史 loading／error／retry | 已接入 | scripted 映射测试；fake history 测试覆盖分页和上下文恢复 |
-| `thread/realtime/appendAudio` | 客户端请求 | 实验 | `params: ThreadRealtimeAppendAudioParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/realtime/appendSpeech` | 客户端请求 | 实验 | `params: ThreadRealtimeAppendSpeechParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/realtime/appendText` | 客户端请求 | 实验 | `params: ThreadRealtimeAppendTextParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/realtime/listVoices` | 客户端请求 | 实验 | `params: ThreadRealtimeListVoicesParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/realtime/start` | 客户端请求 | 实验 | `params: ThreadRealtimeStartParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/realtime/stop` | 客户端请求 | 实验 | `params: ThreadRealtimeStopParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/resume` | 客户端请求 | 默认 | 发送 `threadId`、`excludeTurns=true`；要求 `result.thread.id` 与请求完全一致；只在 thread 尚未加载到当前 generation 时发送一次 | `CodexAppServerManager::ensure_thread_loaded`、串行 thread lifecycle registry | 将既有 thread 标记为当前 generation 已加载 | 在原会话继续 turn；后续 prompt 或 settings RPC 直接复用 loaded thread | 已接入 | 新 generation 首轮 resume、第二轮不重复；settings 更新也会先确保 thread 已加载；失败时 fail-closed，不回退 `thread/start`；保留 prompt resume bootstrap 的 `thread/goal/cleared` 窗口；`existing_thread_resumes_once_per_generation_then_starts_turns_directly`、`eof_fails_pending_work_once_and_next_operation_restarts_then_resumes`、`resume_rpc_error_fails_closed_without_starting_or_turning` |
-| `thread/revert` | 客户端请求 | 默认 | `params: ThreadRevertParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/rollback` | 客户端请求 | 默认 | `params: ThreadRollbackParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/search` | 客户端请求 | 实验 | 非空 `searchTerm`、`archived`、cursor/limit、sort key/direction；读取 thread 与 snippet | `CodexAppServerManager::search_threads_blocking` → `WorkspaceStore::search` | `Page<ThreadSearchResult>` | ChatGPT command-palette 样式真实搜索；loading／error／retry／empty／pending query | 已接入 | scripted server 验证搜索参数/snippet；旧请求结果以 generation 丢弃 |
-| `thread/searchOccurrences` | 客户端请求 | 实验 | `params: ThreadSearchOccurrencesParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/section/move` | 客户端请求 | 默认 | `threadId`、nullable `sectionId`／`beforeThreadId`；成功结果为空对象 | `CodexAppServerManager::move_thread_to_section` → `WorkspaceStore::set_thread_pinned` | 稳定 thread/section id | 置顶把会话移入服务端 `Pinned` section；取消置顶移至 null section；pending／error 可见 | 已接入 | 不使用 0.153.0 不存在的 `isPinned`；scripted 参数与 fake pin section 测试 |
-| `thread/settings/update` | 客户端请求 | 实验 | `threadId`、`approvalPolicy`、`approvalsReviewer`，以及 profile 或 `sandboxPolicy`；使用共享连接 request id | `CodexAppServerManager::update_thread_permissions_blocking`、loaded-thread set、thread settings waiter | `AgentThreadSettings`、`AgentConnectionEvent::ThreadSettingsUpdated` | 更新权限模式、有效 sandbox/profile 与错误提示 | 已接入 | 新 generation 会先 resume 目标 thread；waiter 在发送前注册，允许通知先于 response；必须同时等到成功 response 和匹配 thread 的有效权限通知；与其他 RPC 乱序不串线；`all_rpc_families_share_unique_connection_ids_and_out_of_order_responses` |
-| `thread/shellCommand` | 客户端请求 | 默认 | `params: ThreadShellCommandParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/start` | 客户端请求 | 默认 | 首次发送时发送对应 `cwd`、nullable `projectId`、`historyMode=paginated`、`ephemeral=false`、`serviceName`、`model`、`serviceTier`；读取 canonical `result.thread.id`；不发送 schema 中不存在的 `isPinned` | `CodexAppServerManager::ensure_thread_loaded`、串行 thread lifecycle registry | `AgentEvent::ThreadCreated`；标记 generation 已加载 | Composer 首次发送才创建；`ChatApp` 将同一 `ConversationHost` 从 DraftId 原地重键为 ThreadId | 已接入 | `thread/started` 可先于 response 且必须匹配；同一 conversation 两轮只 start 一次、从不 resume；scripted test 断言 historyMode/cwd/projectId/无 `isPinned`；rekey UI 回归保护 host 不被替换 |
-| `thread/timeline/list` | 客户端请求 | 实验 | `params: ThreadTimelineListParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `thread/turns/list` | 客户端请求 | 默认 | `threadId`、cursor/limit、`sortDirection=asc`、`itemsView=full`；读取 turn/item、实际 `itemsView` 与双向 cursor | `CodexAppServerManager::list_thread_turns_blocking` → `WorkspaceStore::load_history` | `Page<ThreadTurn>` → 多轮 `ThreadHistory`；图像查看／生成、上下文压缩、协作与 MCP item 保留协议身份、状态和结构化数据 | 逐页恢复用户、助手、reasoning、命令、图像查看、生成图像、上下文压缩、并行／嵌套协作及 MCP transcript；若响应仍非 full，再按 turn 调用 `thread/items/list`；历史 loading／error／retry；用户图片随当前／历史消息显示为 80px 靠右缩略图，本地／内嵌图片支持点击和 Enter／Space 打开预览，失效附件保留占位；历史 `webSearch` 保留 query/action/results，按网页搜索行并入工具组；澄清回答 envelope 保留 JSON 转义，恢复独立问答卡片；CUA MCP 依据 result._meta 的 toolSurface 与 arguments.title 呈现并保持组内顺序 | 已接入 | scripted item/视图映射、生成图像 current/legacy parser 与 base64 fallback、压缩／协作／MCP 历史 parser、Composer 历史＋实时折叠回归；fake backend 覆盖多页和 items 回退 |
-| `thread/unarchive` | 客户端请求 | 默认 | `threadId`；读取 `result.thread` | `CodexAppServerManager::unarchive_thread` → `WorkspaceStore::unarchive_thread` | `ThreadSummary` | 归档页恢复会话；pending／error 可见并刷新活动列表 | 已接入 | scripted 参数/结果测试；通知先于 response 幂等且不会 fail-fast |
-| `thread/unsubscribe` | 客户端请求 | 默认 | `threadId`；接受 unsubscribed/notSubscribed/notLoaded 三种 status | `manager/side_conversation.rs::close_side_conversation_blocking` | 仅允许释放本应用创建的临时聊天；活动轮次先请求中断 | 关闭标签或释放面板时清理；仅收起面板保留会话；迟到的 fork 成功响应也会释放 | 已接入 | 关闭只影响对应 thread/turn；临时身份在 app 生命周期内保留失效标记，禁止磁盘 resume；覆盖创建中关闭、初始化失败、连接代际变化、拒绝关闭主线程 |
-| `threadSection/create` | 客户端请求 | 默认 | `name`、可选 `appearance{icon,color}`；读取 `result.section` | `CodexAppServerManager::create_thread_section` → `WorkspaceStore::ensure_pinned_section` | `ThreadSection` | `threadSection/list` 未返回专用 section 时按需创建服务端 canonical `Pinned` section，并只持久化其 id；sidebar 文案仍本地化显示“置顶” | 已接入 | scripted 参数/结果测试；已有 `Pinned` 时绝不重复 create；并发 ensure 由 store 串行化，偏好原子写入 |
-| `threadSection/delete` | 客户端请求 | 默认 | `params: ThreadSectionDeleteParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `threadSection/list` | 客户端请求 | 默认 | cursor/limit；读取 section 与 `nextCursor` | `CodexAppServerManager::list_thread_sections` → `WorkspaceStore::refresh_all`／`ensure_pinned_section` | `Page<ThreadSection>` | 解析已保存 pinned id 或按 canonical 名称 `Pinned` 寻找专用 section，再加载置顶会话 | 已接入 | scripted 分页/appearance 映射；fake backend 验证本地不保存 pinned thread 列表且使用服务端返回 id |
-| `threadSection/update` | 客户端请求 | 默认 | `params: ThreadSectionUpdateParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `turn/interrupt` | 客户端请求 | 默认 | 当前 `threadId`、`turnId`；使用连接级唯一 request id；同一 turn 只发送一次并继续等待 `turn/completed: interrupted` | `ManagedTurn::request_interrupt`、`ManagedTurn::send_interrupt`、`AgentInterruptHandle` | `AgentInterruptOutcome`；终态由对应 turn 决定 | Composer 进入 stopping，最终显示 stopped/failed | 已接入 | 只影响目标 turn；重复、已终止、response 失败和 abandon 均不关闭共享进程或影响其他 thread；`interrupt_and_abandon_are_turn_scoped_and_keep_shared_process_alive`、`pending_interrupt_uses_the_active_thread_and_turn_and_waits_for_terminal_status` |
-| `turn/settings/update` | 客户端请求 | 实验 | `params: TurnSettingsUpdateParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `turn/start` | 客户端请求 | 默认 | `threadId`、文本及可选 `localImage` 的 `input`、文件/文件夹路径上下文、可选 `collaborationMode`（计划/默认）、`model`、`effort`、`serviceTier`；新 thread 首轮另带权限字段；每个 logical turn 使用连接级唯一 request id 并读取独立 `result.turn.id` | `CodexAppServerManager::run_prompt_blocking`、`ManagedTurn` registry | `threadId + turnId` 对应一个 `AgentRun` | 主与侧边 Composer 各自进入 starting/streaming；附件和计划模式保持所属会话隔离 | 已接入 | 同一 thread 同时最多一个 active turn；response 前的 started/item/server-request/completed 按 wire order 缓存并原子校验；同一 thread 完成后可直接开始下一 turn，失败不泄漏缓存；`one_new_conversation_runs_two_turns_on_one_initialized_process`、`interleaved_threads_route_events_and_one_failed_turn_does_not_stop_the_other` |
-| `turn/steer` | 客户端请求 | 默认 | `params: TurnSteerParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `windowsSandbox/readiness` | 客户端请求 | 默认 | `params: undefined`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `windowsSandbox/setupStart` | 客户端请求 | 默认 | `params: WindowsSandboxSetupStartParams`；当前客户端不发送 | — | 无 | 无 | 未接入 | 客户端不发送 |
-| `account/chatgptAuthTokens/refresh` | 服务端请求 | 默认 | payload 当前不解析 | `respond_to_server_request(_on_session)` | 无 | 无 | 未接入 | 按原 id 回复 `-32601`，随后本地 fail-fast；通用未知反向请求测试保护 |
-| `applyPatchApproval` | 服务端请求 | 默认 | legacy patch 审批，payload 当前不解析 | 同上 | 无 | 现有文件审批组件不代表协议已接入 | 未接入 | `-32601` 后 fail-fast |
-| `attestation/generate` | 服务端请求 | 默认 | attestation payload 当前不解析 | 同上 | 无 | 无 | 未接入 | `-32601` 后 fail-fast |
-| `currentTime/read` | 服务端请求 | 实验 | 时间读取 payload 当前不解析 | 同上 | 无 | 无 | 未接入 | `-32601` 后 fail-fast |
-| `execCommandApproval` | 服务端请求 | 默认 | legacy command 审批，不能与 v2 item 请求混用 | 同上 | 无 | 不进入当前命令审批卡 | 未接入 | `-32601` 后 fail-fast |
-| `item/commandExecution/requestApproval` | 服务端请求 | 默认 | 保留原始 id 类型并严格校验 `threadId/turnId/itemId`；当前只映射命令、原因、`networkApprovalContext.host` 与 accept/decline/execpolicy 相关 decision；未承接 `kind=writeStdin`、`approvalId`、网络 `protocol`、`additionalPermissions`、`proposedNetworkPolicyAmendments` 以及 `acceptForSession`/`applyNetworkPolicyAmendment` 等有效变体 | 单 reader → `threadId + turnId` turn registry → `respond_to_server_request_on_session`；连接级 request owner registry | 窄化的 `AgentCommandApprovalRequest` + turn 专属 `AgentApprovalHandle` | 普通命令或仅展示 host 的网络审批卡；附加文件／网络权限与网络协议尚不可见 | 部分接入 | 多 thread 与另外两类 server request 可交错；原始 id 单次回复、response→resolved、过期 responder 与 turn 终止定向清理均覆盖；`interleaved_server_requests_route_by_original_id_and_resolve_once` |
-| `item/fileChange/requestApproval` | 服务端请求 | 默认 | 文件变更审批 payload 当前不解析 | 同上 | 无 | 文件审批组件仅有展示/测试能力，未接真实 RPC | 未接入 | `unsupported_file_change_server_request_is_rejected` 验证 `-32601` |
-| `item/permissions/requestApproval` | 服务端请求 | 默认 | 严格读取 `threadId/turnId/itemId/cwd/startedAtMs`、nullable `environmentId/reason` 与 `RequestPermissionProfile`；保留 read/write、entries、glob 深度、path/glob/special path 和 nullable network；允许时原样返回请求权限子集，scope 映射 `turn/session`，拒绝返回空权限 | 单 reader → turn registry → `respond_to_server_request_on_session`、turn 专属 pending registry | `AgentPermissionsApprovalRequest` + `AgentPermissionsApprovalHandle` | 权限卡展示 cwd、reason、文件和网络权限；响应后禁用并等待 resolved | 已接入 | 多 thread 交错不串线；文件、网络、混合权限及三种决定、越权防护、重复操作、错误参数、定向清理与 resolved 回归覆盖；`interleaved_server_requests_route_by_original_id_and_resolve_once` |
-| `item/tool/call` | 服务端请求 | 默认 | 动态工具调用 payload 当前不解析 | 同上 | 无 | 无 | 未接入 | `-32601` 后 fail-fast |
-| `item/tool/requestUserInput` | 服务端请求 | 默认 | 严格读取 `threadId/turnId/itemId/questions/isBlocking` 与 nullable `autoResolutionMs`；保留每题 `id/header/question/options/isOther/isSecret`；按 schema 返回 question id 到字符串数组的 `answers` map；兼容新版 host 使用的 `tool/requestUserInput` 方法别名 | 单 reader → turn registry → `respond_to_server_request_on_session`、turn 专属 pending registry | `AgentUserInputRequest` + `AgentUserInputHandle`；答案 Debug 全量脱敏 | 复用多问题/Other/secret UI；Accept／Decline／Cancel 等连接器审批选项由同一 options UI 原样提交，提交后显示 submitting、禁用重复提交并等待 resolved | 已接入 | 当前桌面配置中的 `create_thread` 实测无需审批而直接完成，因此拒绝链路按本机 experimental schema fixture 验证；多 thread 交错、方法别名、原始字符串/数字 id、精确单次 response、错误参数、过期 responder 和 turn 定向清理均覆盖；`interleaved_server_requests_route_by_original_id_and_resolve_once` |
-| `mcpServer/elicitation/request` | 服务端请求 | 默认 | MCP elicitation payload 当前不解析 | 同上 | 无 | 无 | 未接入 | `-32601` 后 fail-fast |
-| `initialized` | 客户端通知 | 默认 | `params={}`，无 id；仅在当前 generation 的 `initialize` 成功后发送一次 | `CodexAppServerManager::start_generation` | 无 | 解锁该长期连接上的全部业务请求 | 已接入 | 同一应用两轮与并发首次调用都只有一次；`one_new_conversation_runs_two_turns_on_one_initialized_process`、`concurrent_first_calls_single_flight_initialize_and_shutdown_waits_once` |
-| `account/login/completed` | 服务端通知 | 默认 | `params: AccountLoginCompletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `account/rateLimits/updated` | 服务端通知 | 默认 | 严格读取必填 `rateLimits` 稀疏快照；覆盖 limit id/name、primary/secondary 窗口、credits、individual limit、spend-control、plan type 与 reached type；枚举仅接受 0.153.0 schema 值 | 单 reader 的 app-scoped 分支、`parse_account_rate_limits_updated`、connection event hub | `AgentConnectionEvent::AccountRateLimitsUpdated` | 即使没有 active turn 也保存并广播快照；Composer 合并可用字段且不结束 turn | 已接入 | 不会投递给任意 active turn；新订阅者可回放最新快照；严格 schema 回归与 `app_scoped_events_are_published_without_an_active_turn_and_replayed_as_snapshots` 覆盖 |
-| `account/updated` | 服务端通知 | 默认 | `params: AccountUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `app/list/updated` | 服务端通知 | 默认 | `params: AppListUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `autoApprovalReview/strictReviewRequired` | 服务端通知 | 默认 | `params: StrictReviewRequiredNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `command/exec/outputDelta` | 服务端通知 | 默认 | `params: CommandExecOutputDeltaNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `configWarning` | 服务端通知 | 默认 | `summary`；可选 `details/path/range` | 单 reader 的 app-scoped 分支、`parse_agent_notification`、connection event hub | `AgentConnectionEvent::ConfigWarning` | 无 active turn 时仍进入连接快照与配置警告 Notice | 已接入 | 不借用 turn receiver；range 类型与行列字段严格校验；`app_scoped_events_are_published_without_an_active_turn_and_replayed_as_snapshots` |
-| `deprecationNotice` | 服务端通知 | 默认 | `params: DeprecationNoticeNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `error` | 服务端通知 | 默认 | `threadId`、`turnId`、`error.message`、可选 details、`willRetry` | 单 reader 的 turn-scoped 分支、复合 id registry、`parse_agent_notification` | 只向 owner turn 发送 `AgentEvent::Error` | 可重试错误显示低强调活动；通知本身不伪造终态 | 已接入 | 多 thread 严格隔离；未知或错配 turn fail-fast；最终终态仍由 `turn/completed` 决定 |
-| `externalAgentConfig/import/completed` | 服务端通知 | 默认 | `params: ExternalAgentConfigImportCompletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `externalAgentConfig/import/progress` | 服务端通知 | 默认 | `params: ExternalAgentConfigImportProgressNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `fs/changed` | 服务端通知 | 默认 | `params: FsChangedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `fuzzyFileSearch/sessionCompleted` | 服务端通知 | 默认 | `params: FuzzyFileSearchSessionCompletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `fuzzyFileSearch/sessionUpdated` | 服务端通知 | 默认 | `params: FuzzyFileSearchSessionUpdatedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `guardianWarning` | 服务端通知 | 默认 | `params: GuardianWarningNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `hook/completed` | 服务端通知 | 默认 | `params: HookCompletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `hook/started` | 服务端通知 | 默认 | `params: HookStartedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `item/agentMessage/delta` | 服务端通知 | 默认 | 严格读取 `threadId`、`turnId`、`itemId`、`delta` | 单 reader → `ManagedTurn`（response 前可缓存）→ `process_turn_message` | 只向 owner turn 发送 `AgentEvent::TextDelta` | 合并对应 Composer 的流式助手文本 | 已接入 | 多 thread delta 可交错且不串线；字段错误或未知复合 id fail-fast；`interleaved_threads_route_events_and_one_failed_turn_does_not_stop_the_other` |
-| `item/autoApprovalReview/completed` | 服务端通知 | 默认 | `params: ItemGuardianApprovalReviewCompletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `item/autoApprovalReview/started` | 服务端通知 | 默认 | `params: ItemGuardianApprovalReviewStartedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `item/commandExecution/outputDelta` | 服务端通知 | 默认 | 严格读取 `threadId`、`turnId`、`itemId`、`delta` | 单 reader → `ManagedTurn` → `process_turn_message` | 只向 owner turn 发送 `AgentEvent::CommandOutputDelta` | 追加目标 Composer 的命令输出 | 已接入 | response 前可缓存；跨 thread/turn 错配和字段错误 fail-fast |
-| `item/commandExecution/terminalInteraction` | 服务端通知 | 默认 | 严格读取 `threadId`、`turnId`、`itemId`、`processId`、`stdin`；空 `stdin` 表示后台进程轮询，非空值仅映射为“已写入输入”的布尔语义，不保留输入正文 | 单 reader → `threadId + turnId` turn registry → `process_turn_message` | 只向 owner turn 发送 `AgentEvent::CommandTerminalInteraction`，并以 `itemId` 关联命令、保留 `processId` | 不新增独立 UI；按 ChatGPT App 的 CDP 实测继续复用现有运行中命令行（“正在运行 {command}”、终端图标、弱化文字与 shimmer），终端输入正文不进入 UI 状态 | 已接入 | response 前可缓存；跨 thread/turn 错配、缺失或非字符串字段 fail-fast；不发送 JSON-RPC response；`terminal_interaction_routes_to_its_owner_and_keeps_the_generation_alive`、`terminal_interaction_maps_poll_and_redacts_stdin_content`、`terminal_interaction_reuses_the_running_command_activity` |
-| `item/completed` | 服务端通知 | 默认 | 要求对象 `item` 及字符串 `type/id`；严格承接 `userMessage`、`agentMessage`、`commandExecution`、`reasoning`、`fileChange`、`imageView`、`imageGeneration`、`contextCompaction`、`collabToolCall`、`collabAgentToolCall`、`subAgentActivity` 与 `mcpToolCall`；userMessage.content 接受生成 schema 的七种 UserInput；imageGeneration 要求字符串 `status/result`，读取 nullable `revisedPrompt/savedPath/transparentBackground/failure`；协作项以 payload status 为准；MCP 严格读取结构化 metadata 并兼容 deprecated URI；其他 item 延续严格校验 | 单 reader → `ManagedTurn`（response 前按 wire order 缓存）→ `process_turn_message`、各 item parser | 只向 owner turn 映射完成事件，包括稳定 id 的 `ImageGenerationUpdated`、`CollaborationUpdated` 与 `McpToolCallUpdated`；base64 仅在本地路径不可用时物化，transport bytes 不进入 UI model | imageGeneration 原位把 178 px loader 替换为最长 480 px 输出卡，失败显示限制／重置与重试；三种协作 wire 与 MCP 原位进入终态并由历史恢复；点击生成图进入带尺寸、下载、缩放与关闭的全局预览 | 部分接入 | 真实 imageGeneration completed payload、1024×1024 PNG 路径和 fresh history；真实 MCP lifecycle；协作并行／失败／turn 隔离；typed quota failure、错型 fail-fast、materialization、尺寸、同 id upsert 和旧 metadata 均有回归 |
-| `item/fileChange/outputDelta` | 服务端通知 | 默认 | 严格读取 `threadId/turnId/itemId/delta`；协议已标记 deprecated 且服务端不再发送 | 单 reader → owner `ManagedTurn` → `process_turn_message` | 无内容事件（只验证兼容 wire） | 不重复展示已由结构化 changes 承接的旧文本输出 | 已接入 | 错配与缺字段 fail-fast |
-| `item/fileChange/patchUpdated` | 服务端通知 | 默认 | 严格读取 `threadId/turnId/itemId/changes[]` 及每项 `path/diff/kind` | 单 reader → owner `ManagedTurn` → `process_turn_message` | `AgentEvent::FileChangePatchUpdated` | 按 item id 原位刷新工具 block 内的 fileChange disclosure、逐文件 diff 卡片和增删统计 | 已接入 | response 前可缓存；跨 thread/turn、未知 kind 与缺字段 fail-fast |
-| `item/mcpToolCall/progress` | 服务端通知 | 默认 | 严格读取 `threadId`、`turnId`、`itemId` 与字符串 `message` | 单 reader → `threadId + turnId` owner registry → `process_turn_message` | `AgentEvent::McpToolCallProgress` | 按稳定 item id 追加到现有 MCP 活动，completed 快照替换时保留已收 progress；孤立 progress 不创建伪造工具项 | 已接入 | response 前可缓存并按 wire order 回放；错配 thread/turn 或错误字段 fail-fast；生命周期 fixture 覆盖 started→progress→completed |
-| `item/plan/delta` | 服务端通知 | 默认 | `params: PlanDeltaNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `item/reasoning/summaryPartAdded` | 服务端通知 | 默认 | 严格读取 `threadId`、`turnId`、`itemId` 与非负 `summaryIndex` | 单 reader → `ManagedTurn`（response 前可缓存）→ `process_turn_message` | 只向 owner turn 发送 `AgentEvent::ReasoningSummaryPartAdded` | 为目标 reasoning item 建立对应 summary 槽位，活动正文自动展开并跟随末尾 | 已接入 | 未见 start 的孤立增量不创建幽灵 item；索引／字段错误 fail-fast；reasoning 生命周期与 Composer 稀疏索引回归覆盖 |
-| `item/reasoning/summaryTextDelta` | 服务端通知 | 默认 | 严格读取 `threadId`、`turnId`、`itemId`、非负 `summaryIndex` 与字符串 `delta` | 单 reader → `ManagedTurn`（response 前可缓存）→ `process_turn_message` | 只向 owner turn 发送 `AgentEvent::ReasoningSummaryTextDelta` | 按 item/index 追加 summary；仅相邻且同 item/index 的事件合并，标题按桌面 ChatGPT 规则规范化 | 已接入 | 跨 item/index 不合并；字段错误 fail-fast；协议映射、coalescing 与 UI 状态回归覆盖 |
-| `item/reasoning/textDelta` | 服务端通知 | 默认 | 严格读取 `threadId`、`turnId`、`itemId`、非负 `contentIndex` 与字符串 `delta` | 单 reader → `ManagedTurn`（response 前可缓存）→ `process_turn_message` | 只向 owner turn 发送 `AgentEvent::ReasoningTextDelta` | 按 item/index 追加 content；summary 为空时作为可见正文，活动项自动滚动到底部 | 已接入 | 跨 item/index 不合并；字段错误 fail-fast；协议映射、coalescing 与 UI 状态回归覆盖 |
-| `item/started` | 服务端通知 | 默认 | 校验 `threadId/turnId`；要求对象 `item` 及字符串 `type/id`；严格承接 `userMessage`、`agentMessage`、`commandExecution`、`reasoning`、`fileChange`、`imageView`、`imageGeneration`、`contextCompaction`、`collabToolCall`、`collabAgentToolCall`、`subAgentActivity` 与 `mcpToolCall`；userMessage.content 接受生成 schema 的七种 UserInput；imageGeneration 的 canonical 状态为 `in_progress`、`result=""`；协作、MCP 和其余结构化 item 按各自完整枚举、required/nullable 与 metadata 规则严格解析 | 单 reader → `ManagedTurn`（response 前可缓存）→ `process_turn_message`、各 item parser | 只向 owner turn 映射对应 started/update 事件，包括 `ImageGenerationUpdated(inProgress)`、`CollaborationUpdated` 与 `McpToolCallUpdated`；userMessage 只校验而不重复发送 UI 事件 | imageGeneration 建立 178×178 原生加载卡并启动 reduced-motion 兼容 shimmer；协作行显示 receiver 状态；MCP 显示同构标题并等待 progress/completed；同 id 原位更新，停止 turn 清除图像 loader 而不伪造 failed | 部分接入 | CDP 实测 imageGeneration started→completed 约 23.8 秒且无独立 progress，真实 Stop 只产生 interrupted turn；MCP started trace、三种协作 wire、附件、严格枚举、early item、去重和跨 thread 路由均有回归 |
-| `mcpServer/event/stream/notification` | 服务端通知 | 默认 | `params: McpServerEventStreamNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `mcpServer/oauthLogin/completed` | 服务端通知 | 默认 | `params: McpServerOauthLoginCompletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `mcpServer/startupStatus/updated` | 服务端通知 | 默认 | 严格读取 `name` 与 `starting/ready/failed/cancelled` 状态；`threadId/error/failureReason` 可缺省或为 null，仅接受 `reauthenticationRequired` | 单 reader 的 app/thread-scoped 分支、`parse_mcp_server_startup_status_updated`、connection event hub | `AgentConnectionEvent::McpServerStartupStatusUpdated` | 按 app 或 thread/server 保存快照；目标 thread 的 Composer 显示启动失败警告，不结束 turn | 已接入 | `threadId=null` 在无 active turn 时仍广播；thread-scoped 状态按 id 隔离且可在 Composer 获得 canonical id 前缓存；未知状态/原因 fail-fast |
-| `model/rerouted` | 服务端通知 | 默认 | `fromModel`、`toModel`、`reason` 与 thread/turn | 单 reader → `threadId + turnId` registry → `parse_agent_notification` | 只向 owner turn 发送 `AgentEvent::ModelRerouted` | 更新目标 Composer 的实际模型和状态提示 | 已接入 | response 前可缓存；多 thread 严格隔离，未知／错配 turn fail-fast；`model_notifications_are_normalized_into_agent_events` |
-| `model/safetyBuffering/updated` | 服务端通知 | 默认 | model、useCases、reasons、showBufferingUi、nullable fasterModel 与 thread/turn | 单 reader → `threadId + turnId` registry → `parse_agent_notification` | 只向 owner turn 发送 `AgentEvent::ModelSafetyBufferingUpdated` | 目标 Composer 显示／清除安全检查状态并提示可选更快模型 | 已接入 | response 前可缓存；多 thread 严格隔离；字段类型严格校验与模型通知回归覆盖 |
-| `model/verification` | 服务端通知 | 默认 | `verifications[]` 与 thread/turn | 单 reader → `threadId + turnId` registry → `parse_agent_notification` | 只向 owner turn 发送 `AgentEvent::ModelVerificationRequired` | 目标 Composer 显示需要账户验证并进入失败终态 | 已接入 | response 前可缓存；其他 thread 不受影响；模型通知解析和 UI 状态均有回归 |
-| `modelProvider/authRecoveryCompleted` | 服务端通知 | 默认 | `threadId`、`turnId`、`provider`、`message`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `modelProvider/authRecoveryStarted` | 服务端通知 | 默认 | `threadId`、`turnId`、`provider`、`message`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `process/exited` | 服务端通知 | 默认 | `params: ProcessExitedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `process/outputDelta` | 服务端通知 | 默认 | `params: ProcessOutputDeltaNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `project/changed` | 服务端通知 | 默认 | 严格读取 `projectId` 与 `changeType=created/updated/deleted` | 单 reader 的 workspace 分支、connection event hub → `WorkspaceStore` | `AgentConnectionEvent::ProjectChanged`／`ProjectChange` | 按稳定 id 刷新或移除项目及关联会话 | 已接入 | 可早于任意 RPC response，不触发 generation fail-fast；scripted 乱序与 store 迟到快照测试 |
-| `remoteControl/status/changed` | 服务端通知 | 默认 | 严格校验 `status`、`serverName`、`installationId` 与 nullable `environmentId` | 单 reader 的 connection-scoped 分支、`validate_remote_control_status_changed` | manager 内连接状态快照 | 无；不会阻断共享连接初始化或后续业务 RPC | 后端已接入 | 仅兼容 app-server 主动连接状态，不建立 Composer UI；未知状态或错误字段使 generation fail-fast |
-| `serverRequest/resolved` | 服务端通知 | 默认 | `threadId` 与保持原类型的 `requestId`；连接级 owner registry 先定位 logical turn，再由该 turn 的 pending/completed registry 还原并核对 thread/turn/item/kind | 单 reader → `server_request_owners` → `handle_server_request_resolved` | 只向 owner turn 发送 `AgentEvent::ServerRequestResolved` | 最终释放对应 command approval、user input 或 permissions approval responder | 已接入 | 多 thread 三类请求可交错且每个最多回复一次；一个 turn 结束只清理自身 request；错误 thread、未知 id 和过期 responder 确定性失败；`interleaved_server_requests_route_by_original_id_and_resolve_once` |
-| `skills/changed` | 服务端通知 | 默认 | `params: SkillsChangedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/archived` | 服务端通知 | 默认 | 严格读取 `threadId` | 单 reader 的 workspace 分支、connection event hub → `WorkspaceStore` | `AgentConnectionEvent::ThreadArchived` | 从最近／项目／置顶移除并刷新归档 | 已接入 | 可先于 archive response；server-derived overlay 防止迟到列表回滚；连接保持存活 |
-| `thread/closed` | 服务端通知 | 默认 | 严格读取 `threadId`；同时从当前 generation loaded set 移除 | 单 reader 的 workspace 分支、connection event hub → `WorkspaceStore` | `AgentConnectionEvent::ThreadClosed`、`ThreadActivity::Closed` | 清除该会话活动标识；侧边聊天保留可读消息并禁用继续发送；后台 host 不误收其他会话事件 | 已接入 | 可先于 response 且不 fail-fast；scripted 七类 workspace 通知测试；临时 thread 所属 generation 失败也映射关闭状态 |
-| `thread/compacted` | 服务端通知 | 默认 | `params: ContextCompactedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/deleted` | 服务端通知 | 默认 | 严格读取 `threadId`；从当前 generation loaded set 移除 | 单 reader 的 workspace 分支、connection event hub → `WorkspaceStore` | `AgentConnectionEvent::ThreadDeleted` | 从所有 sidebar collection 移除 | 已接入 | deleted overlay 确保随后到达的旧 list response 不复活会话；scripted/fake backend 覆盖 |
-| `thread/environment/connected` | 服务端通知 | 默认 | `params: EnvironmentConnectionNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/environment/disconnected` | 服务端通知 | 默认 | `params: EnvironmentConnectionNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/goal/cleared` | 服务端通知 | 默认 | 仅在既有 thread 的 resume bootstrap 窗口接收：`thread/resume` 请求开始至紧随其后的 `turn/start` response 完成；严格要求匹配 `threadId` | 单 reader、`pending_thread_lifecycle`／`resume_bootstrap_threads`、`validate_resume_goal_cleared` | resume 生命周期兼容信号 | 无；不新增 goal 状态或 UI | 部分接入 | bootstrap 之外仍 fail-fast；多个 thread 的 resume 窗口与下一条 lifecycle 请求显式隔离；既有字段/错配测试、`existing_thread_resumes_once_per_generation_then_starts_turns_directly`、`late_resume_bootstrap_notification_is_not_bound_to_another_resume` 覆盖 |
-| `thread/goal/updated` | 服务端通知 | 默认 | payload 当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
-| `thread/name/updated` | 服务端通知 | 默认 | 严格读取 `threadId`，`threadName` 可省略／null／字符串 | 单 reader 的 workspace 分支、connection event hub → `WorkspaceStore` | `AgentConnectionEvent::ThreadNameUpdated` | 即时更新所有列表中的会话名称 | 已接入 | 通知可先于 rename response；名称 overlay 覆盖随后旧 snapshot；严格字段测试 |
-| `thread/project/updated` | 服务端通知 | 默认 | 严格读取 `threadId` 与必需但 nullable 的 `projectId` | 单 reader 的 workspace 分支、connection event hub → `WorkspaceStore` | `AgentConnectionEvent::ThreadProjectUpdated` | 即时把会话移入／移出项目分组 | 已接入 | 通知可先于 metadata response；project overlay 防止迟到列表回滚；null 解析测试 |
-| `thread/queue/changed` | 服务端通知 | 默认 | `params: ThreadQueueChangedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/realtime/closed` | 服务端通知 | 默认 | `params: ThreadRealtimeClosedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/realtime/error` | 服务端通知 | 默认 | `params: ThreadRealtimeErrorNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/realtime/item/completed` | 服务端通知 | 默认 | `params: ThreadRealtimeItemCompletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/realtime/item/started` | 服务端通知 | 默认 | `params: ThreadRealtimeItemStartedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/realtime/item/transcript/delta` | 服务端通知 | 默认 | `params: ThreadRealtimeItemTranscriptDeltaNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/realtime/itemAdded` | 服务端通知 | 默认 | `params: ThreadRealtimeItemAddedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/realtime/outputAudio/delta` | 服务端通知 | 默认 | `params: ThreadRealtimeOutputAudioDeltaNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/realtime/sdp` | 服务端通知 | 默认 | `params: ThreadRealtimeSdpNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/realtime/started` | 服务端通知 | 默认 | `params: ThreadRealtimeStartedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/realtime/transcript/delta` | 服务端通知 | 默认 | `params: ThreadRealtimeTranscriptDeltaNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/realtime/transcript/done` | 服务端通知 | 默认 | `params: ThreadRealtimeTranscriptDoneNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/reverted` | 服务端通知 | 默认 | `params: ThreadRevertedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `thread/settings/updated` | 服务端通知 | 默认 | thread id；model、effort、serviceTier、cwd；可选有效权限字段 | 单 reader 的 thread-scoped 分支、settings waiter、connection event hub | `AgentConnectionEvent::ThreadSettingsUpdated`；匹配 RPC waiter 返回 `AgentThreadSettings` | 只同步目标 thread 的模型、目录和有效权限状态 | 已接入 | waiter 先注册，通知可早于 RPC response；其他 thread 不会满足 waiter 或污染 Composer；`all_rpc_families_share_unique_connection_ids_and_out_of_order_responses` |
-| `thread/started` | 服务端通知 | 默认 | 严格读取 `params.thread.id`；thread id 仍以请求 response 为 canonical 来源 | 单 reader、串行 `pending_thread_lifecycle`、当前 generation 的 loaded-thread set | 与唯一进行中的 `thread/start`／`thread/resume` 关联；新 thread 映射 `AgentEvent::ThreadCreated` | Composer 的 `thread_id` 只由 canonical response 更新一次 | 已接入 | 通知先于 response 时缓存关联；已加载 thread 的迟到通知不会绑定到下一条 lifecycle 请求；未知、冲突或 canonical 不一致使 generation fail-fast；`one_new_conversation_runs_two_turns_on_one_initialized_process`、`late_loaded_thread_notification_does_not_bind_the_next_lifecycle`、既有严格解析测试 |
-| `thread/status/changed` | 服务端通知 | 默认 | 严格读取 `threadId` 与 `notLoaded/idle/systemError/active`；`active` 仅接受已知 flags | 单 reader 的 thread-scoped 分支、connection event hub | `AgentConnectionEvent::ThreadStatusChanged` | 只按目标 thread id 保存最新 GPUI 状态；不结束 turn | 已接入 | 不替代 turn 终态；可在没有 active turn 时保存，其他 thread 的 Composer 不消费；未知状态/flag fail-fast |
-| `thread/tokenUsage/updated` | 服务端通知 | 默认 | 严格读取 `threadId`、`turnId`、`tokenUsage.total/last` 与可选 context window | 单 reader 的 turn-scoped 分支、`threadId + turnId` registry、`parse_thread_token_usage_updated` | 只向 owner `AgentRun` 发送 `AgentEvent::ThreadTokenUsageUpdated` | 目标 Composer 保存用量；不生成活动、不结束 turn | 已接入 | 多 thread 交错按复合 id 隔离；未知或已完成 turn、错配 id、字段错误使 generation fail-fast |
-| `thread/unarchived` | 服务端通知 | 默认 | 严格读取 `threadId` | 单 reader 的 workspace 分支、connection event hub → `WorkspaceStore` | `AgentConnectionEvent::ThreadUnarchived` | 从归档移除并刷新最近／项目列表 | 已接入 | 可先于 unarchive response；与 archived 通知按最新 connection snapshot/overlay 生效，不触发 fail-fast |
-| `turn/completed` | 服务端通知 | 默认 | `params.turn.status` 为 `completed`、`interrupted` 或 `failed`；失败读取 error message/details | 单 reader → `threadId + turnId` registry → `process_turn_message`、`Connection::finish_turn` | 只向对应 `AgentRun` 发送一个 `Completed`、`Interrupted` 或 `Failed` | 结束该 turn、定向清理 responder；共享 app-server 与其他 thread 保持存活 | 已接入 | 未知终态 fail-fast；一个 thread 失败不影响另一个；完成后同一 thread 可直接新 `turn/start`；`interleaved_threads_route_events_and_one_failed_turn_does_not_stop_the_other`、`one_new_conversation_runs_two_turns_on_one_initialized_process` |
-| `turn/diff/updated` | 服务端通知 | 默认 | 严格读取 `threadId/turnId/diff`，内容为当前 turn 最新聚合 unified diff | 单 reader → owner `ManagedTurn` → `process_turn_message` | `AgentEvent::TurnDiffUpdated` | 更新最近工具 block 内 fileChange 卡片的文件、行号与增删统计；展开二级 disclosure 或右侧“上一轮”查看真实 diff；保留原始 patch 供复制 | 已接入 | 空 diff 安全保留已有 item changes；错配与缺字段 fail-fast |
-| `turn/moderationMetadata` | 服务端通知 | 默认 | `params: TurnModerationMetadataNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `turn/plan/updated` | 服务端通知 | 默认 | payload 当前不读取；没有计划 UI 映射 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到时明确报错；等待对应 AgentEvent 与 GPUI 状态后才可接入 |
-| `turn/started` | 服务端通知 | 默认 | 要求 `params.turn.status=inProgress`，并校验 thread/turn | 单 reader、`ManagedTurn` response 前缓存、`parse_agent_notification` | 只向复合 id 匹配的 `AgentRun` 发送 `AgentEvent::Started` | 对应 Composer 进入流式状态 | 已接入 | 可早于 `turn/start` response；与 item/completed 一起按 wire order 原子验证；跨 thread/turn 错配使 generation fail-fast |
-| `warning` | 服务端通知 | 默认 | `message`；可选 `threadId` | 单 reader 的 app/thread-scoped 分支、connection event hub、`parse_agent_notification` | `AgentConnectionEvent::Warning { thread_id, message }` | app warning 无 active turn 仍可见；thread warning 只进入目标 Composer | 已接入 | 不再依赖模型目录或任意 turn receiver；连接快照订阅避免静默丢弃；`app_scoped_events_are_published_without_an_active_turn_and_replayed_as_snapshots` |
-| `windows/worldWritableWarning` | 服务端通知 | 默认 | `params: WindowsWorldWritableWarningNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
-| `windowsSandbox/setupCompleted` | 服务端通知 | 默认 | `params: WindowsSandboxSetupCompletedNotification`；当前不读取 | `ensure_server_method_is_defined` | 无 | 无 | 未接入 | 收到即 fail-fast |
+| 方法 | API | 状态 | 已实现行为与限制 | 入口 |
+|---|---|---|---|---|
+| `account/login/completed` | 默认 | 未接入 | — | — |
+| `account/rateLimits/updated` | 默认 | 已接入 | 应用级稀疏快照：合并窗口、credits、spend control 等可用字段；nullable 字段不清除已知值，不依附活动轮次。 | `manager/dispatch`、`notifications` |
+| `account/updated` | 默认 | 未接入 | — | — |
+| `app/list/updated` | 默认 | 未接入 | — | — |
+| `autoApprovalReview/strictReviewRequired` | 默认 | 未接入 | — | — |
+| `command/exec/outputDelta` | 默认 | 未接入 | — | — |
+| `configWarning` | 默认 | 已接入 | 应用级 summary 及可选 details/path/range；无活动轮次仍显示配置警告。 | `manager/dispatch`、`notifications` |
+| `deprecationNotice` | 默认 | 未接入 | — | — |
+| `error` | 默认 | 已接入 | 定向轮次的 error.message、details、willRetry；显示错误信息，终态仍等待 turn/completed。 | `notifications` |
+| `externalAgentConfig/import/completed` | 默认 | 未接入 | — | — |
+| `externalAgentConfig/import/progress` | 默认 | 未接入 | — | — |
+| `fs/changed` | 默认 | 未接入 | — | — |
+| `fuzzyFileSearch/sessionCompleted` | 默认 | 未接入 | — | — |
+| `fuzzyFileSearch/sessionUpdated` | 默认 | 未接入 | — | — |
+| `guardianWarning` | 默认 | 未接入 | — | — |
+| `hook/completed` | 默认 | 未接入 | — | — |
+| `hook/started` | 默认 | 未接入 | — | — |
+| `item/agentMessage/delta` | 默认 | 已接入 | 按 thread/turn/item 追加 delta，进入所属会话的文本流。 | `notifications` |
+| `item/autoApprovalReview/completed` | 默认 | 未接入 | — | — |
+| `item/autoApprovalReview/started` | 默认 | 未接入 | — | — |
+| `item/commandExecution/outputDelta` | 默认 | 已接入 | 按 itemId 追加命令输出 delta。 | `dispatch` |
+| `item/commandExecution/terminalInteraction` | 默认 | 已接入 | 保留 itemId、processId；stdin 仅转为“是否写入”的布尔值，正文不进入领域或 UI 状态；复用命令活动。 | `dispatch` |
+| `item/completed` | 默认 | 部分接入 | 接入类型见“Item 与历史兼容”；以 item 载荷状态更新，不以通知名称推定成功。未知实时类型使连接失败。 | `dispatch`、`items` |
+| `item/fileChange/outputDelta` | 默认 | 已接入 | deprecated；校验 thread/turn/item/delta，不再产生内容事件。 | `dispatch` |
+| `item/fileChange/patchUpdated` | 默认 | 已接入 | 按 itemId 替换 changes[path/diff/kind]，刷新文件卡与差异统计。 | `dispatch`、`items` |
+| `item/mcpToolCall/progress` | 默认 | 已接入 | 按 itemId 追加 message，完成快照保留进度；孤立 progress 不创建工具项。 | `dispatch` |
+| `item/plan/delta` | 默认 | 未接入 | — | — |
+| `item/reasoning/summaryPartAdded` | 默认 | 已接入 | 按 itemId 和非负 summaryIndex 建立槽位；孤立增量不创建 reasoning 项。 | `dispatch` |
+| `item/reasoning/summaryTextDelta` | 默认 | 已接入 | 按 itemId/summaryIndex 追加 delta；仅合并相邻且同 item/index 的事件。 | `dispatch` |
+| `item/reasoning/textDelta` | 默认 | 已接入 | 按 itemId/contentIndex 追加 delta；summary 为空时以 content 展示正文。 | `dispatch` |
+| `item/started` | 默认 | 部分接入 | 接入类型见“Item 与历史兼容”；创建或原位更新活动。userMessage 只校验，不重复显示用户提交；未知实时类型使连接失败。 | `dispatch`、`items` |
+| `mcpServer/event/stream/notification` | 默认 | 未接入 | — | — |
+| `mcpServer/oauthLogin/completed` | 默认 | 未接入 | — | — |
+| `mcpServer/startupStatus/updated` | 默认 | 已接入 | 按 app 或 thread/server 保存 starting/ready/failed/cancelled；threadId/error/failureReason 可省略或 null，仅接受 reauthenticationRequired 原因；不结束 turn。 | `manager/dispatch`、`notifications` |
+| `model/rerouted` | 默认 | 已接入 | 定向轮次的 fromModel/toModel/reason，更新实际模型与提示。 | `notifications` |
+| `model/safetyBuffering/updated` | 默认 | 已接入 | 保留 model/useCases/reasons/showBufferingUi、nullable fasterModel；更新所属会话的安全检查状态。 | `notifications` |
+| `model/verification` | 默认 | 已接入 | 读取 verifications[]；目标 Composer 显示账户验证要求并进入失败状态。 | `notifications` |
+| `modelProvider/authRecoveryCompleted` | 默认 | 未接入 | — | — |
+| `modelProvider/authRecoveryStarted` | 默认 | 未接入 | — | — |
+| `process/exited` | 默认 | 未接入 | — | — |
+| `process/outputDelta` | 默认 | 未接入 | — | — |
+| `project/changed` | 默认 | 已接入 | projectId、created/updated/deleted；刷新或移除项目，可先于 RPC 响应。 | `manager/dispatch` |
+| `remoteControl/status/changed` | 默认 | 后端已接入 | 校验 status/serverName/installationId、nullable environmentId，保存连接快照；无 Composer UI。 | `manager/dispatch`、`notifications` |
+| `serverRequest/resolved` | 默认 | 已接入 | 按原类型 requestId 找到所属轮次，再核对 thread/item/kind 并释放审批或输入 responder；未知、错配、过期请求报错。 | `manager/dispatch`、`requests`、`registry` |
+| `skills/changed` | 默认 | 未接入 | — | — |
+| `thread/archived` | 默认 | 已接入 | 按 threadId 移除最近、项目及置顶条目，刷新归档；覆盖迟到快照。 | `manager/dispatch` |
+| `thread/closed` | 默认 | 已接入 | 从当前 generation 的已加载集合移除并发布关闭状态；侧边聊天保留消息，禁用发送。 | `manager/dispatch` |
+| `thread/compacted` | 默认 | 未接入 | — | — |
+| `thread/deleted` | 默认 | 已接入 | 按 threadId 从所有集合移除；迟到列表不得恢复已删除线程。 | `manager/dispatch` |
+| `thread/environment/connected` | 默认 | 未接入 | — | — |
+| `thread/environment/disconnected` | 默认 | 未接入 | — | — |
+| `thread/goal/cleared` | 默认 | 部分接入 | 仅兼容既有线程 resume bootstrap：从 thread/resume 开始至随后 turn/start 响应处理完毕，要求 threadId 匹配；窗口外报错，不建立 goal 状态。 | `manager/dispatch`、`notifications` |
+| `thread/goal/updated` | 默认 | 未接入 | 未建立 goal 领域状态或 UI。 | — |
+| `thread/name/updated` | 默认 | 已接入 | threadId、可省略或 null 的 threadName；即时更新名称并覆盖迟到快照。 | `manager/dispatch` |
+| `thread/project/updated` | 默认 | 已接入 | threadId、必需但 nullable 的 projectId；移动或移出项目并覆盖迟到快照。 | `manager/dispatch` |
+| `thread/queue/changed` | 默认 | 未接入 | — | — |
+| `thread/realtime/closed` | 默认 | 未接入 | — | — |
+| `thread/realtime/error` | 默认 | 未接入 | — | — |
+| `thread/realtime/item/completed` | 默认 | 未接入 | — | — |
+| `thread/realtime/item/started` | 默认 | 未接入 | — | — |
+| `thread/realtime/item/transcript/delta` | 默认 | 未接入 | — | — |
+| `thread/realtime/itemAdded` | 默认 | 未接入 | — | — |
+| `thread/realtime/outputAudio/delta` | 默认 | 未接入 | — | — |
+| `thread/realtime/sdp` | 默认 | 未接入 | — | — |
+| `thread/realtime/started` | 默认 | 未接入 | — | — |
+| `thread/realtime/transcript/delta` | 默认 | 未接入 | — | — |
+| `thread/realtime/transcript/done` | 默认 | 未接入 | — | — |
+| `thread/reverted` | 默认 | 未接入 | — | — |
+| `thread/settings/updated` | 默认 | 已接入 | 只同步目标线程的 model/effort/serviceTier/cwd 和有效权限；包含 permissions 时才满足权限更新 waiter。 | `manager/dispatch`、`notifications` |
+| `thread/started` | 默认 | 已接入 | 校验 params.thread.id，关联当前 start/resume/fork；RPC 响应是最终 id 来源。已加载线程的迟到通知不得绑定到下一次生命周期请求。 | `manager/dispatch` |
+| `thread/status/changed` | 默认 | 已接入 | 按 threadId 保存 notLoaded/idle/systemError/active；active 仅接受 waitingOnApproval/waitingOnUserInput，不替代 turn 终态。 | `manager/dispatch`、`notifications` |
+| `thread/tokenUsage/updated` | 默认 | 已接入 | 按 threadId/turnId 保存 tokenUsage.total/last 与可选 context window；不创建活动或结束轮次。 | `notifications` |
+| `thread/unarchived` | 默认 | 已接入 | 从归档移除，刷新最近及项目列表；覆盖迟到快照。 | `manager/dispatch` |
+| `turn/completed` | 默认 | 已接入 | 接受 completed/interrupted/failed；失败读取 message/details。每轮只发送一个终态并清理自身请求，其他轮次及共享连接继续存活。 | `dispatch`、`manager/connection` |
+| `turn/diff/updated` | 默认 | 已接入 | 所属轮次最新聚合 unified diff；保留原始 patch，刷新文件卡与“上一轮”范围；空 diff 不清除已有 item changes。 | `dispatch` |
+| `turn/moderationMetadata` | 默认 | 未接入 | — | — |
+| `turn/plan/updated` | 默认 | 未接入 | 未建立计划进度 UI；发送 plan collaborationMode 不代表接入此通知。 | — |
+| `turn/started` | 默认 | 已接入 | 要求 turn.status=inProgress；可早于 turn/start 响应，验证后使所属会话进入流式状态。 | `notifications`、`manager/turn` |
+| `warning` | 默认 | 已接入 | message、可选 threadId；应用级警告无活动轮次仍可见，线程级只进入目标 Composer。 | `manager/dispatch`、`notifications` |
+| `windows/worldWritableWarning` | 默认 | 未接入 | — | — |
+| `windowsSandbox/setupCompleted` | 默认 | 未接入 | — | — |
+
+## 维护与验证
+
+修改方法、有效变体、兼容别名或失败处理时，同步更新本表与对应测试；升级 CLI 时核对四个 schema union（ClientRequest、ServerRequest、ClientNotification、ServerNotification），保持方法唯一、方向／API 分类和状态统计一致。只有形成表中声明的产品路径后才标记“已接入”。
+
+```bash
+cargo test agent::codex
+cargo test workspace::
+cargo test conversation::
+cargo test components::composer
+cargo test side_ -- --test-threads=1
+```
+
+协议解析与反向请求回归在 `src/agent/codex/tests.rs`；共享进程、乱序响应、线程隔离、清理与退出回收在 `manager/tests.rs`，临时侧边线程在 `manager/tests/side_conversation.rs`。实际模型请求测试默认忽略；常规回归使用 scripted transport 或 fake backend。构建与界面验收入口见 [README.md](../README.md)。
