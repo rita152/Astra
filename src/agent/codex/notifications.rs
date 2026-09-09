@@ -428,6 +428,17 @@ pub(super) fn optional_string_at(
 
 pub(super) fn parse_agent_notification(message: &Value) -> Result<Option<AgentEvent>> {
     let event = match message.get("method").and_then(Value::as_str) {
+        Some("item/autoApprovalReview/started" | "item/autoApprovalReview/completed") => {
+            AgentEvent::AutoApprovalReviewUpdated(Box::new(super::auto_approval::parse_review(
+                message,
+            )?))
+        }
+        Some("autoApprovalReview/strictReviewRequired") => {
+            AgentEvent::StrictReviewRequired(super::auto_approval::parse_strict_review(message)?)
+        }
+        Some("guardianWarning") => {
+            AgentEvent::GuardianWarning(super::auto_approval::parse_guardian_warning(message)?)
+        }
         Some("turn/started") => {
             let _ = required_notification_string(message, "threadId")?;
             let _ = required_string_at(message, "/params/turn/id", "params.turn.id")?;

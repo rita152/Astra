@@ -14,10 +14,10 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 
 | 状态 | 数量 | 判定 |
 |---|---|---|
-| 已接入 | 63 | 表中声明的产品行为已连通协议、领域数据和 UI／副作用；不表示消费全部可选字段 |
+| 已接入 | 67 | 表中声明的产品行为已连通协议、领域数据和 UI／副作用；不表示消费全部可选字段 |
 | 后端已接入 | 2 | 已实现读取或校验，尚无对应可见 UI 调用方或展示 |
 | 部分接入 | 4 | 只支持部分类型、有效变体或限定生命周期窗口 |
-| 未接入 | 179 | 客户端不发送；服务端请求按原 id 回复 `-32601` 并终止当前连接，服务端通知直接报错并终止连接 |
+| 未接入 | 175 | 客户端不发送；服务端请求按原 id 回复 `-32601` 并终止当前连接，服务端通知直接报错并终止连接 |
 
 未接入行的“—”沿用上述规则。`tool/requestUserInput` 是兼容别名，不计入本版本 schema 的 248 项。
 
@@ -27,6 +27,7 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 - **线程与轮次**：首次提示词执行 `thread/start → turn/start`；既有线程在当前 generation 未加载时先 resume，之后直接 start turn。同一线程最多一个活动 turn，不同线程可并行；start/resume/fork 共用串行生命周期注册表。
 - **归属与提前事件**：轮次事件按 `threadId + turnId` 路由；server request 按原始字符串／数字 id 记录所属轮次。`turn/start` 响应前的事件按 wire 顺序缓存，取得响应后验证并回放；错配 id、字段或枚举报错。
 - **审批与输入**：响应最多一次，提交后禁用交互，等待 `serverRequest/resolved` 释放 responder。结束轮次只清理自身请求；过期 responder 不得作用于后续轮次。
+- **自动复核**：复核记录与人工审批请求分开，所有复核通知统一通过线程订阅与单调快照分发，避免轮次通道关闭时的竞争。未绑定 turn 的提前通知按完整标识等待真实 turn/start 响应，复核通知不会抢占启动中的轮次；已结束轮次的迟到通知经线程订阅更新原活动或历史快照。中断／失败／完成后本地结束等待展示，保留服务端原始状态与时间，不伪造完成通知；后续真实结果仍可补全。重复开始、重复完成和较旧完成消息不会回退已有结果。视图复用完整复核键，有目标项时随对应工具展示（MCP 拒绝独立展示），无目标项时独立展示；通过态隐藏但保留数据。当前 schema 未提供复核历史 item，应用重启后仅恢复服务端实际返回的历史，不从 rollout 或本地数据库补造复核。
 - **终止与恢复**：turn 完成、中断或业务失败不关闭共享进程。EOF、崩溃、写失败或致命协议错误使旧 generation 的 pending RPC 和活动轮次各失败一次；回收旧进程后，下一次显式操作可重建连接，不自动重放提示词。应用退出时幂等终止并 wait 子进程。
 - **状态通知**：应用／线程状态通过 `AgentConnectionEvent` 快照订阅，轮次事件进入各自 `AgentRun`。工作区通知可先于 RPC 响应；内存覆盖层防止迟到列表撤销重命名、移动、归档或删除。
 - **工作区与历史**：以服务端稳定 id 管理项目和线程；置顶使用服务端 `Pinned` 分区，当前 schema 无 `isPinned`。历史先 `thread/read(includeTurns=false)`，再分页读取 `thread/turns/list(itemsView=full)`；实际非 full 的轮次由 `thread/items/list` 补全。不维护本地会话数据库。
@@ -246,7 +247,7 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 | `account/rateLimits/updated` | 默认 | 已接入 | 应用级稀疏快照：合并窗口、credits、spend control 等可用字段；nullable 字段不清除已知值，不依附活动轮次。 | `manager/dispatch`、`notifications` |
 | `account/updated` | 默认 | 未接入 | — | — |
 | `app/list/updated` | 默认 | 未接入 | — | — |
-| `autoApprovalReview/strictReviewRequired` | 默认 | 未接入 | — | — |
+| `autoApprovalReview/strictReviewRequired` | 默认 | 已接入 | 按 thread/turn/startedAtMs 保存独立复核提示，同一时间去重；只展示额外安全检查状态，无 request id 或人工审批 responder，不改变 turn 终态。 | `auto_approval`、`manager/dispatch` |
 | `command/exec/outputDelta` | 默认 | 未接入 | — | — |
 | `configWarning` | 默认 | 已接入 | 应用级 summary 及可选 details/path/range；无活动轮次仍显示配置警告。 | `manager/dispatch`、`notifications` |
 | `deprecationNotice` | 默认 | 未接入 | — | — |
@@ -256,12 +257,12 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 | `fs/changed` | 默认 | 未接入 | — | — |
 | `fuzzyFileSearch/sessionCompleted` | 默认 | 未接入 | — | — |
 | `fuzzyFileSearch/sessionUpdated` | 默认 | 未接入 | — | — |
-| `guardianWarning` | 默认 | 未接入 | — | — |
+| `guardianWarning` | 默认 | 已接入 | 线程级 message，允许无活动轮次；同一当前轮次去重，通用消息保留原文，反复拒绝提示显示状态分隔行。schema 无 turnId/reviewId，不推定归属或终态。 | `auto_approval`、`manager/dispatch` |
 | `hook/completed` | 默认 | 未接入 | — | — |
 | `hook/started` | 默认 | 未接入 | — | — |
 | `item/agentMessage/delta` | 默认 | 已接入 | 按 thread/turn/item 追加 delta，进入所属会话的文本流。 | `notifications` |
-| `item/autoApprovalReview/completed` | 默认 | 未接入 | — | — |
-| `item/autoApprovalReview/started` | 默认 | 未接入 | — | — |
+| `item/autoApprovalReview/completed` | 默认 | 已接入 | 以 threadId/turnId/reviewId 原位更新；保留完整 action、nullable targetItemId/rationale/riskLevel/userAuthorization、startedAtMs/completedAtMs 与 decisionSource=agent。处理 approved/denied/timedOut/aborted，不替代 turn/completed。 | `auto_approval`、`notifications`、`manager/dispatch` |
+| `item/autoApprovalReview/started` | 默认 | 已接入 | 支持 command/execve/writeStdin/applyPatch/networkAccess/mcpToolCall/requestPermissions 七类动作及共享的五种状态；targetItemId 可缺失或为 null。开始通知不得覆盖已完成结果。 | `auto_approval`、`notifications`、`manager/dispatch` |
 | `item/commandExecution/outputDelta` | 默认 | 已接入 | 按 itemId 追加命令输出 delta。 | `dispatch` |
 | `item/commandExecution/terminalInteraction` | 默认 | 已接入 | 保留 itemId、processId；stdin 仅转为“是否写入”的布尔值，正文不进入领域或 UI 状态；复用命令活动。 | `dispatch` |
 | `item/completed` | 默认 | 部分接入 | 接入类型见“Item 与历史兼容”；以 item 载荷状态更新，不以通知名称推定成功。未知实时类型使连接失败。 | `dispatch`、`items` |

@@ -86,7 +86,8 @@ impl ComposerView {
         let prompt_is_empty = self.prompt_text(cx).trim().is_empty()
             && self.review_comments.is_empty()
             && self.prompt_context.files.is_empty();
-        let conversation_started = self.conversation.phase != ConversationPhase::Empty;
+        let conversation_started = self.conversation.phase != ConversationPhase::Empty
+            || !self.conversation.activities.is_empty();
         let generation_active = matches!(
             self.conversation.phase,
             ConversationPhase::Starting

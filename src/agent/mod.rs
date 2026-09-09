@@ -2,6 +2,7 @@
 //! Domain modules depend on each other explicitly; concrete protocols stay in adapters.
 
 mod activity;
+mod auto_approval;
 mod backend;
 mod catalog;
 mod codex;
@@ -18,6 +19,10 @@ pub use activity::{
     AgentImageGenerationStatus, AgentImageView, AgentMcpToolCall, AgentMcpToolCallStatus,
     AgentReasoning, CommandExecution, CommandExecutionAction, CommandExecutionStatus,
     LegacySubAgentActivityKind,
+};
+pub use auto_approval::{
+    AgentAutoApprovalReview, AgentAutoApprovalReviewAction, AgentAutoApprovalReviewKey,
+    AgentAutoApprovalReviewStatus, AgentGuardianWarning, AgentStrictReviewRequirement,
 };
 pub(crate) use backend::AgentInterruptControl;
 pub use backend::{

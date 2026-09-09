@@ -484,6 +484,10 @@ fn main() {
     });
 
     #[cfg(feature = "screenshot")]
+    if components::auto_approval::capture_auto_approval(&args) {
+        return;
+    }
+    #[cfg(feature = "screenshot")]
     if components::markdown::capture_markdown(&args) {
         return;
     }
@@ -530,6 +534,7 @@ fn main() {
             // Register terminal bindings after the application-wide Escape fallback.
             components::terminal::init(cx);
             components::file_editor::init(cx);
+            components::auto_approval::init(cx);
             components::side_chat::init(cx);
             cx.bind_keys([gpui::KeyBinding::new("cmd-p", app::OpenFiles, None)]);
             let bounds = Bounds::centered(None, size(px(window_width), px(window_height)), cx);

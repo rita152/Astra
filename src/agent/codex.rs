@@ -1,5 +1,6 @@
 //! Codex app-server adapter. Protocol details remain inside this module.
 
+mod auto_approval;
 mod backend;
 mod catalog;
 mod dispatch;

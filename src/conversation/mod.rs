@@ -1,6 +1,7 @@
 //! Conversation state and event processing, independent of GPUI entities.
 
 mod activity;
+mod auto_approval;
 mod events;
 mod lifecycle;
 mod model;
@@ -9,6 +10,7 @@ mod stream;
 mod transcript;
 
 pub(crate) use activity::{ConversationActivity, ReasoningActivityPresentation};
+pub(crate) use auto_approval::{AutoApprovalReviewPresentation, StrictReviewPresentation};
 pub(crate) use state::ConversationState;
 pub(crate) use stream::{
     STREAM_DISCONNECTED_MESSAGE, STREAM_UPDATE_INTERVAL, collect_ready_agent_events,

@@ -571,10 +571,31 @@ pub(super) fn parse_permissions_approval_request(
         .context("item/permissions/requestApproval params.startedAtMs 必须是 int64")?;
     let environment_id = optional_request_string(params, METHOD, "environmentId")?;
     let reason = optional_request_string(params, METHOD, "reason")?;
-    let permissions = params
-        .get("permissions")
-        .and_then(Value::as_object)
-        .context("item/permissions/requestApproval params.permissions 必须是对象")?;
+    let permissions = parse_permission_request_profile(
+        params
+            .get("permissions")
+            .context("params.permissions 缺失")?,
+    )?;
+    Ok((
+        request_id.clone(),
+        AgentPermissionsApprovalRequest {
+            request_id,
+            thread_id,
+            turn_id,
+            item_id,
+            environment_id,
+            started_at_ms,
+            cwd,
+            reason,
+            permissions,
+        },
+    ))
+}
+
+pub(super) fn parse_permission_request_profile(
+    value: &Value,
+) -> Result<AgentPermissionRequestProfile> {
+    let permissions = value.as_object().context("params.permissions 必须是对象")?;
     if let Some(field) = permissions
         .keys()
         .find(|field| !matches!(field.as_str(), "fileSystem" | "network"))
@@ -589,23 +610,10 @@ pub(super) fn parse_permissions_approval_request(
     let network = parse_optional_field(permissions, "network", |value| {
         parse_additional_network_permissions(value)
     })?;
-    Ok((
-        request_id.clone(),
-        AgentPermissionsApprovalRequest {
-            request_id,
-            thread_id,
-            turn_id,
-            item_id,
-            environment_id,
-            started_at_ms,
-            cwd,
-            reason,
-            permissions: AgentPermissionRequestProfile {
-                file_system,
-                network,
-            },
-        },
-    ))
+    Ok(AgentPermissionRequestProfile {
+        file_system,
+        network,
+    })
 }
 
 pub(super) fn parse_additional_network_permissions(

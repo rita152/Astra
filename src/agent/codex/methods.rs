@@ -12,6 +12,9 @@ use super::notifications::{
 pub(super) const UNDEFINED_METHOD_PARAMS_LIMIT: usize = 2_000;
 
 pub(super) const TURN_SCOPED_SERVER_METHODS: &[&str] = &[
+    "item/autoApprovalReview/started",
+    "item/autoApprovalReview/completed",
+    "autoApprovalReview/strictReviewRequired",
     "item/commandExecution/requestApproval",
     "item/permissions/requestApproval",
     "item/tool/requestUserInput",
@@ -40,7 +43,11 @@ pub(super) const TURN_SCOPED_SERVER_METHODS: &[&str] = &[
 pub(super) fn is_defined_server_method(method: &str) -> bool {
     matches!(
         method,
-        "item/commandExecution/requestApproval"
+        "item/autoApprovalReview/started"
+            | "item/autoApprovalReview/completed"
+            | "autoApprovalReview/strictReviewRequired"
+            | "guardianWarning"
+            | "item/commandExecution/requestApproval"
             | "item/permissions/requestApproval"
             | "item/tool/requestUserInput"
             | "tool/requestUserInput"
@@ -88,6 +95,13 @@ pub(super) fn ensure_server_method_is_defined(message: &Value) -> Result<()> {
         );
     };
     match method {
+        "item/autoApprovalReview/started" | "item/autoApprovalReview/completed" => {
+            super::auto_approval::parse_review(message).map(|_| ())
+        }
+        "autoApprovalReview/strictReviewRequired" => {
+            super::auto_approval::parse_strict_review(message).map(|_| ())
+        }
+        "guardianWarning" => super::auto_approval::parse_guardian_warning(message).map(|_| ()),
         // The request response remains the canonical source of the thread id.
         // This lifecycle notification is still schema-checked and correlated
         // with that response by the active prompt session.

@@ -253,14 +253,27 @@ impl ManagedTurn {
         for message in &dispatch.buffered {
             ensure_session_message_matches(message, &self.thread_id, turn_id)?;
         }
+        if !dispatch.accepted {
+            let _ = self.events.send_blocking(AgentEvent::TurnIdentified {
+                thread_id: self.thread_id.clone(),
+                turn_id: turn_id.to_owned(),
+            });
+        }
         dispatch.accepted = true;
         let buffered = std::mem::take(&mut dispatch.buffered);
         let mut outcome = None;
         for message in buffered {
-            if outcome.is_some() {
+            if outcome.is_some()
+                && !super::super::auto_approval::REVIEW_METHODS.contains(
+                    &message
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )
+            {
                 bail!("turn/completed 之后仍收到同一 turn 的缓存消息");
             }
-            outcome = process_turn_message(
+            let next_outcome = process_turn_message(
                 &self.session,
                 &message,
                 &self.thread_id,
@@ -268,6 +281,7 @@ impl ManagedTurn {
                 &self.events,
                 &mut dispatch.streamed_text,
             )?;
+            outcome = outcome.or(next_outcome);
         }
         Ok(outcome)
     }

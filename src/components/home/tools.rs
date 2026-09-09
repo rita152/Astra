@@ -102,6 +102,7 @@ pub(super) fn tool_activity_group(
     theme: Theme,
 ) -> Div {
     let ToolGroupDisclosure {
+        review_views,
         expanded,
         disclosure_progress,
         chevron_progress,
@@ -193,6 +194,9 @@ pub(super) fn tool_activity_group(
             .flex_col()
             .gap(px(TOOL_GROUP_ITEM_GAP)),
         |rows, activity| match activity {
+            ConversationActivity::AutoApprovalReview(review) => {
+                rows.children(review_views.get(&review.review.key).cloned())
+            }
             ConversationActivity::Command(command) => rows.child(command_execution_activity(
                 home_entity.clone(),
                 command,

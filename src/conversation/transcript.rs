@@ -33,6 +33,7 @@ pub(crate) enum ConversationPhase {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConversationTranscriptTurn {
+    pub turn_id: Option<String>,
     pub phase: ConversationPhase,
     pub user_message: String,
     pub user_images: Vec<crate::agent::UserMessageImage>,
@@ -361,6 +362,7 @@ impl ConversationState {
                     })
                     .collect();
                 ConversationTranscriptTurn {
+                    turn_id: Some(turn.turn_id.clone()),
                     phase: match turn.status {
                         HistoryTurnStatus::InProgress => ConversationPhase::Streaming,
                         HistoryTurnStatus::Completed => ConversationPhase::Complete,
@@ -386,6 +388,7 @@ impl ConversationState {
             })
             .collect();
         if let Some(last) = self.transcript.pop() {
+            self.turn_id = last.turn_id;
             self.phase = last.phase;
             self.user_message = Some(last.user_message);
             self.user_images = last.user_images;
@@ -395,6 +398,7 @@ impl ConversationState {
             self.activities = last.activities;
             self.resumed_turn = last.resumed;
         } else {
+            self.turn_id = None;
             self.phase = ConversationPhase::Empty;
             self.user_message = None;
             self.user_images.clear();
@@ -404,12 +408,14 @@ impl ConversationState {
             self.activities.clear();
             self.resumed_turn = None;
         }
+        self.replay_pending_reviews();
     }
     pub(crate) fn commit_current_turn(&mut self) {
         let Some(user_message) = self.user_message.take() else {
             return;
         };
         self.transcript.push(ConversationTranscriptTurn {
+            turn_id: self.turn_id.clone(),
             phase: self.phase,
             user_message,
             user_images: std::mem::take(&mut self.user_images),

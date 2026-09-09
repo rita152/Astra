@@ -49,6 +49,9 @@ impl ReasoningActivityPresentation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConversationActivity {
+    AutoApprovalReview(Box<super::auto_approval::AutoApprovalReviewPresentation>),
+    StrictReview(super::auto_approval::StrictReviewPresentation),
+    GuardianWarning(crate::agent::AgentGuardianWarning),
     AssistantMessage {
         item_id: String,
         text: String,
