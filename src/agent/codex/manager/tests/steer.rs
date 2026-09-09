@@ -327,3 +327,139 @@ fn steer_attachment_history_keeps_files_and_persisted_images_in_order() {
         matches!(&images[1],crate::agent::UserMessageAttachment::Local(path) if path.is_file())
     );
 }
+
+#[test]
+fn steer_with_progress_and_both_approval_paths_preserves_cleanup_and_isolation() {
+    use crate::conversation::{ConversationActivity as A, ConversationPhase, ConversationState};
+    let (manager, spawner) = manager_with_fake();
+    let observations = manager.subscribe_connection_events();
+    let (events, _handle) = manager
+        .run_prompt(request("initial", Some("a")))
+        .into_parts();
+    let mut endpoint = spawner.next_endpoint();
+    handshake(&mut endpoint);
+    start_known_turn(&mut endpoint, "a", "ra");
+    let target = ready(&events);
+    let mut state = ConversationState {
+        thread_id: Some("a".into()),
+        ..Default::default()
+    };
+    state.begin_prompt("initial");
+    state.apply_agent_event_batch(vec![AgentEvent::TurnReady(target.clone())]);
+    let (other, _other_handle) = manager.run_prompt(request("other", Some("b"))).into_parts();
+    start_known_turn(&mut endpoint, "b", "rb");
+    ready(&other);
+
+    endpoint.send(json!({"method":"item/autoApprovalReview/started","params":{
+        "threadId":"a","turnId":"ra","reviewId":"review","targetItemId":null,"startedAtMs":100,
+        "action":{"type":"networkAccess","host":"example.com","port":443,"protocol":"https","target":"example.com:443"},
+        "review":{"status":"inProgress"}
+    }}));
+    endpoint.send(
+        json!({"method":"item/started","params":{"threadId":"a","turnId":"ra","startedAtMs":100,
+        "item":{"type":"sleep","id":"sleep","durationMs":15000}}}),
+    );
+    endpoint.send(json!({"method":"item/completed","params":{"threadId":"a","turnId":"ra","completedAtMs":200,
+        "item":{"type":"webSearch","id":"search","query":"Rust","action":{"type":"search"},"results":[]}}}));
+    endpoint.send(json!({"method":"item/plan/delta","params":{"threadId":"a","turnId":"ra","itemId":"plan","delta":"keep this plan"}}));
+    endpoint.send(json!({"id":"file","method":"item/fileChange/requestApproval","params":{
+        "threadId":"a","turnId":"ra","itemId":"patch","startedAtMs":123,"reason":null,"grantRoot":null
+    }}));
+    let file = loop {
+        let event = wait_value(&events);
+        let handle = if let AgentEvent::FileApprovalRequested { responder, .. } = &event {
+            Some(responder.clone())
+        } else {
+            None
+        };
+        state.apply_agent_event_batch(vec![event]);
+        if let Some(handle) = handle {
+            break handle;
+        }
+    };
+    let submission = state.record_submission(
+        crate::conversation::SubmissionDraft {
+            text: "input appended".into(),
+            context: Default::default(),
+            comments: vec![],
+        },
+        "input appended".into(),
+        false,
+    );
+    let ack = manager.steer_turn(steer(&target, &submission));
+    let rpc = endpoint.recv();
+    assert_eq!(rpc["method"], "turn/steer");
+    user(&endpoint, &target, &submission);
+    file.respond(crate::agent::AgentFileApprovalChoice::Accept)
+        .unwrap();
+    let response = endpoint.recv();
+    assert_eq!(response["id"], "file");
+    assert_eq!(response["result"]["decision"], "accept");
+    endpoint.send(
+        json!({"method":"serverRequest/resolved","params":{"threadId":"a","requestId":"file"}}),
+    );
+    endpoint.send(command_approval(json!(1001), "a", "ra"));
+    let command = loop {
+        let event = wait_value(&events);
+        let handle = if let AgentEvent::CommandApprovalRequested { responder, .. } = &event {
+            Some(responder.clone())
+        } else {
+            None
+        };
+        state.apply_agent_event_batch(vec![event]);
+        if let Some(handle) = handle {
+            break handle;
+        }
+    };
+    for event in std::iter::from_fn(|| observations.try_recv().ok()) {
+        state.apply_connection_event(event);
+    }
+    assert_eq!(state.turn_id.as_deref(), Some("ra"));
+    assert!(
+        state
+            .activities
+            .iter()
+            .any(|a| matches!(a, A::AutoApprovalReview(_)))
+    );
+    assert!(
+        state
+            .activities
+            .iter()
+            .any(|a| matches!(a, A::Plan(p) if p.text == "keep this plan"))
+    );
+    assert!(
+        state
+            .activities
+            .iter()
+            .any(|a| matches!(a, A::UserMessage { .. }))
+    );
+    assert_eq!(state.file_approval_responders.len(), 0);
+    assert_eq!(state.approval_responders.len(), 1);
+    complete(&endpoint, "a", "ra", "interrupted");
+    state.apply_agent_event_batch(collect_terminal(&events));
+    assert_eq!(state.phase, ConversationPhase::Stopped);
+    assert!(state.approval_responders.is_empty());
+    assert!(command.respond(AgentCommandApprovalChoice::Accept).is_err());
+    assert!(state.activities.iter().any(
+        |a| matches!(a, A::Sleep(s) if s.status == crate::agent::AgentActivityStatus::Interrupted)
+    ));
+    assert!(state.activities.iter().any(
+        |a| matches!(a, A::WebSearch(s) if s.status == crate::agent::AgentActivityStatus::Completed)
+    ));
+    assert!(
+        state
+            .activities
+            .iter()
+            .any(|a| matches!(a, A::AutoApprovalReview(r) if r.closed_locally))
+    );
+    endpoint.respond(&rpc, json!({"turnId":"ra"}));
+    state.resolve_submission(&submission, wait_value(&ack));
+    assert_eq!(state.phase, ConversationPhase::Stopped);
+    endpoint.send(json!({"method":"item/agentMessage/delta","params":{"threadId":"b","turnId":"rb","itemId":"answer","delta":"other keeps running"}}));
+    complete(&endpoint, "b", "rb", "completed");
+    let remaining = collect_terminal(&other);
+    assert!(remaining.contains(&AgentEvent::TextDelta("other keeps running".into())));
+    assert_eq!(remaining.last(), Some(&AgentEvent::Completed));
+    assert_eq!(spawner.spawn_count.load(Ordering::Acquire), 1);
+    manager.shutdown();
+}

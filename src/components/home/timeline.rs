@@ -203,6 +203,17 @@ pub(super) fn activity_stream_units(
                 pending.id = Some(reasoning.item_id.clone());
                 active_reasoning.push(reasoning.clone());
             }
+            ConversationActivity::UserMessage { .. } => {
+                // A steer starts a new response segment inside the same turn.
+                // Keep the previous segment's plan before its user message.
+                flush_pending_tool_activity_group(&mut pending, &mut units);
+                if let Some(plan) = proposed_plan.take() {
+                    units.push(ActivityStreamUnit::Standalone(ConversationActivity::Plan(
+                        plan,
+                    )));
+                }
+                units.push(ActivityStreamUnit::Standalone(activity.clone()));
+            }
             ConversationActivity::TurnPlan(_) => {}
             ConversationActivity::Plan(plan) => {
                 proposed_plan = Some(plan.clone());

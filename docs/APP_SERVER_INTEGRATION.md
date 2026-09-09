@@ -14,10 +14,10 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 
 | 状态 | 数量 | 判定 |
 |---|---|---|
-| 已接入 | 71 | 表中声明的产品行为已连通协议、领域数据和 UI／副作用；不表示消费全部可选字段 |
+| 已接入 | 72 | 表中声明的产品行为已连通协议、领域数据和 UI／副作用；不表示消费全部可选字段 |
 | 后端已接入 | 2 | 已实现读取或校验，尚无对应可见 UI 调用方或展示 |
 | 部分接入 | 3 | 只支持部分类型、有效变体或限定生命周期窗口 |
-| 未接入 | 172 | 客户端不发送；服务端请求按原 id 回复 `-32601` 并终止当前连接，服务端通知直接报错并终止连接 |
+| 未接入 | 171 | 客户端不发送；服务端请求按原 id 回复 `-32601` 并终止当前连接，服务端通知直接报错并终止连接 |
 
 未接入行的“—”沿用上述规则。`tool/requestUserInput` 是兼容别名，不计入本版本 schema 的 248 项。
 
@@ -48,7 +48,7 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 | 已接受后收到轮次终态或迟到 RPC | 结果只归属原提交；不恢复已经结束的轮次 |
 | 恢复到仍运行但非本 manager 持有的历史轮次 | 没有可用活动身份，保留输入并反馈尚未就绪 |
 
-每次发送有独立快照以及 Sending／Accepted／Failed 状态。服务端 `userMessage` 可先于响应到达；消息事件已证明接受后，即使确认响应丢失或校验失败，也保留 Accepted 并显示该提交的确认异常，不恢复或自动重发输入。`clientId` 优先关联本次 `clientUserMessageId`，缺省时按当前轮次尚未关联的内容与附件快照匹配，不将相同文本的多次合法提交合并。相同 item 内容的 started/completed 重复通知在协议层去重；会话层另按 item.id 和已关联的 clientId 防止重复气泡。消息更新保留原位置。历史保留 clientId，并据此关联已接受但尚未收到实时消息的回执；按服务端 item 顺序恢复后续用户消息，完成折叠不会隐藏追加消息。
+每次发送有独立快照以及 Sending／Accepted／Failed 状态。服务端 `userMessage` 可先于响应到达；消息事件已证明接受后，即使确认响应丢失或校验失败，也保留 Accepted 并显示该提交的确认异常，不恢复或自动重发输入。`clientId` 优先关联本次 `clientUserMessageId`，缺省时按当前轮次尚未关联的内容与附件快照匹配，不将相同文本的多次合法提交合并。相同 item 内容的 started/completed 重复通知在协议层去重；会话层另按 item.id 和已关联的 clientId 防止重复气泡。消息更新保留原位置；计划卡按追加消息划分展示段，追加前的计划保留在该消息之前，不被后续计划覆盖。历史保留 clientId，并据此关联已接受但尚未收到实时消息的回执；按服务端 item 顺序恢复后续用户消息，完成折叠不会隐藏追加消息。
 
 Composer 在运行中有草稿时显示“追加输入”，无草稿时显示停止；Enter 发送、Shift+Enter 换行。失败快照可显式恢复，自动恢复仅限草稿自发送后未修改且仍为空；已有新草稿时不覆盖。主会话与侧边聊天分别持有草稿、提交和事件流。提交快照只保留在当前应用会话中，不写入后端历史。RPC 已接受但尚未收到 userMessage 时显示接受回执；若轮次此时结束，仍保留回执和快照，并允许显式恢复副本，不把未收到的消息事件伪造到服务端历史，也不自动重发。
 
@@ -300,7 +300,7 @@ Composer 在运行中有草稿时显示“追加输入”，无草稿时显示�
 | `item/reasoning/summaryPartAdded` | 默认 | 已接入 | 按 itemId 和非负 summaryIndex 建立槽位；孤立增量不创建 reasoning 项。 | `dispatch` |
 | `item/reasoning/summaryTextDelta` | 默认 | 已接入 | 按 itemId/summaryIndex 追加 delta；仅合并相邻且同 item/index 的事件。 | `dispatch` |
 | `item/reasoning/textDelta` | 默认 | 已接入 | 按 itemId/contentIndex 追加 delta；summary 为空时以 content 展示正文。 | `dispatch` |
-| `item/started` | 默认 | 部分接入 | 接入类型见“Item 与历史兼容”；创建或原位更新活动。userMessage 只校验，不重复显示用户提交；未知实时类型使连接失败。 | `dispatch`、`items` |
+| `item/started` | 默认 | 部分接入 | 接入类型见“Item 与历史兼容”；创建或原位更新活动。userMessage 按 item.id/clientId 关联提交并原位去重；未知实时类型使连接失败。 | `dispatch`、`items` |
 | `mcpServer/event/stream/notification` | 默认 | 未接入 | — | — |
 | `mcpServer/oauthLogin/completed` | 默认 | 未接入 | — | — |
 | `mcpServer/startupStatus/updated` | 默认 | 已接入 | 按 app 或 thread/server 保存 starting/ready/failed/cancelled；threadId/error/failureReason 可省略或 null，仅接受 reauthenticationRequired 原因；不结束 turn。 | `manager/dispatch`、`notifications` |

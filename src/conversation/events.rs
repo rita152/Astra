@@ -205,12 +205,6 @@ impl ConversationState {
                 self.phase = ConversationPhase::Streaming;
             }
             match event {
-                AgentEvent::TurnIdentified { thread_id, turn_id } => {
-                    if self.thread_id.as_deref() == Some(thread_id.as_str()) {
-                        self.turn_id = Some(turn_id);
-                        self.replay_pending_reviews();
-                    }
-                }
                 AgentEvent::AutoApprovalReviewUpdated(review) => {
                     self.apply_auto_approval_review(*review)
                 }
@@ -228,7 +222,9 @@ impl ConversationState {
                 }
                 AgentEvent::TurnReady(identity) => {
                     if self.thread_id.as_deref() == Some(identity.thread_id.as_str()) {
+                        self.turn_id = Some(identity.turn_id.clone());
                         self.turn_identity = Some(identity.clone());
+                        self.replay_pending_reviews();
                         if self.phase == ConversationPhase::Starting {
                             self.phase = ConversationPhase::Thinking;
                         }

@@ -264,10 +264,6 @@ impl ManagedTurn {
             ensure_session_message_matches(message, &self.thread_id, turn_id)?;
         }
         if !dispatch.accepted {
-            let _ = self.events.send_blocking(AgentEvent::TurnIdentified {
-                thread_id: self.thread_id.clone(),
-                turn_id: turn_id.to_owned(),
-            });
             let connection = self.connection.upgrade().context("轮次连接已释放")?;
             let _ =
                 self.events

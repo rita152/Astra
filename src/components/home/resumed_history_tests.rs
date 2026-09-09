@@ -183,6 +183,7 @@ fn identical_resumed_answers_have_distinct_footer_scopes() {
     let turns = ["turn-a", "turn-b"]
         .into_iter()
         .map(|id| ConversationTranscriptTurn {
+            turn_id: Some(id.into()),
             phase: ConversationPhase::Complete,
             user_message: "prompt".into(),
             user_images: vec![],

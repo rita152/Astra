@@ -52,10 +52,11 @@ impl Capture {
             AgentEvent::ThreadCreated {
                 thread_id: "auto-approval-capture".into(),
             },
-            AgentEvent::TurnIdentified {
+            AgentEvent::TurnReady(crate::agent::AgentTurnIdentity {
+                generation: 0,
                 thread_id: "auto-approval-capture".into(),
                 turn_id: "turn-a".into(),
-            },
+            }),
             AgentEvent::Started,
         ]);
         let status = match selected {

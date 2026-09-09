@@ -10,10 +10,11 @@ fn state(thread: &str, turn: &str) -> ConversationState {
         AgentEvent::ThreadCreated {
             thread_id: thread.into(),
         },
-        AgentEvent::TurnIdentified {
+        AgentEvent::TurnReady(crate::agent::AgentTurnIdentity {
+            generation: 1,
             thread_id: thread.into(),
             turn_id: turn.into(),
-        },
+        }),
         AgentEvent::Started,
     ]);
     state
@@ -111,10 +112,11 @@ fn same_target_and_review_ids_in_other_turns_and_sessions_remain_independent() {
     a.apply_agent_event_batch(vec![AgentEvent::Completed]);
     a.begin_prompt("Next");
     a.apply_agent_event_batch(vec![
-        AgentEvent::TurnIdentified {
+        AgentEvent::TurnReady(crate::agent::AgentTurnIdentity {
+            generation: 1,
             thread_id: "a".into(),
             turn_id: "turn-2".into(),
-        },
+        }),
         AgentEvent::Started,
     ]);
     a.apply_auto_approval_review(review(
@@ -183,10 +185,13 @@ fn early_connection_events_replay_after_both_thread_and_turn_are_known() {
         thread_id: "a".into(),
     }]);
     assert!(s.activities.is_empty());
-    s.apply_agent_event_batch(vec![AgentEvent::TurnIdentified {
-        thread_id: "a".into(),
-        turn_id: "turn".into(),
-    }]);
+    s.apply_agent_event_batch(vec![AgentEvent::TurnReady(
+        crate::agent::AgentTurnIdentity {
+            generation: 1,
+            thread_id: "a".into(),
+            turn_id: "turn".into(),
+        },
+    )]);
     assert_eq!(rows(&s).len(), 1);
     assert!(s.pending_review_events.is_empty());
 }

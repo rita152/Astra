@@ -621,3 +621,42 @@ mod tests {
         assert!(!app.read_entity(&home, |h, _| h.expanded_commands.contains("turn-plan-test")));
     }
 }
+
+#[cfg(test)]
+mod steer_integration_tests {
+    use super::super::timeline::{ActivityStreamUnit, activity_stream_units};
+    use crate::{
+        agent::{AgentActivityStatus, AgentPlan},
+        conversation::ConversationActivity,
+    };
+
+    #[test]
+    fn steering_keeps_each_plan_on_its_side_of_the_user_message() {
+        let plan = |id: &str| {
+            ConversationActivity::Plan(AgentPlan {
+                id: id.into(),
+                text: id.into(),
+                status: AgentActivityStatus::Completed,
+            })
+        };
+        let units = activity_stream_units(&[
+            plan("before"),
+            ConversationActivity::UserMessage {
+                item_id: "steer".into(),
+                text: "revise".into(),
+                images: vec![],
+            },
+            plan("after"),
+        ]);
+        assert_eq!(units.len(), 3, "steering must not replace the earlier plan");
+        assert!(
+            matches!(&units[0], ActivityStreamUnit::Standalone(ConversationActivity::Plan(p)) if p.id == "before")
+        );
+        assert!(
+            matches!(&units[1], ActivityStreamUnit::Standalone(ConversationActivity::UserMessage { item_id, .. }) if item_id == "steer")
+        );
+        assert!(
+            matches!(&units[2], ActivityStreamUnit::Standalone(ConversationActivity::Plan(p)) if p.id == "after")
+        );
+    }
+}

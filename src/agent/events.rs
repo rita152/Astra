@@ -72,10 +72,6 @@ pub enum AgentEvent {
         thread_id: String,
     },
     Started,
-    TurnIdentified {
-        thread_id: String,
-        turn_id: String,
-    },
     AutoApprovalReviewUpdated(Box<AgentAutoApprovalReview>),
     StrictReviewRequired(AgentStrictReviewRequirement),
     GuardianWarning(AgentGuardianWarning),

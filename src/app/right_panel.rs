@@ -730,7 +730,14 @@ impl ChatApp {
                     .min_h(px(0.0))
                     .flex_1()
                     .bg(theme.surface)
-                    .child(panel.home.cached(StyleRefinement::default().size_full())),
+                    .child(if panel.home.read(cx).needs_live_interaction_render(cx) {
+                        panel.home.into_any_element()
+                    } else {
+                        panel
+                            .home
+                            .cached(StyleRefinement::default().size_full())
+                            .into_any_element()
+                    }),
             )
             .when(menu_open, |panel| panel.child(dropdown))
     }

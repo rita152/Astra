@@ -437,8 +437,8 @@ impl Render for ChatApp {
                                             .px(px(CHAT_CONTENT_HORIZONTAL_GUTTER))
                                             .bg(theme.surface)
                                             .child(
-                                                if self.home.read(cx).has_visible_request(cx) {
-                                                    // Approval focus, AX nodes and text selection
+                                                if self.home.read(cx).needs_live_interaction_render(cx) {
+                                                    // Interactive activity focus, AX nodes and text selection
                                                     // must remain registered on every frame.
                                                     self.home.clone().into_any_element()
                                                 } else {

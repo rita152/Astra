@@ -237,6 +237,33 @@ impl HomeView {
     pub(crate) fn has_visible_request(&self, cx: &gpui::App) -> bool {
         self.composer.read(cx).has_visible_request()
     }
+
+    pub(crate) fn needs_live_interaction_render(&self, cx: &gpui::App) -> bool {
+        let interactive = |activity: &ConversationActivity| {
+            matches!(
+                activity,
+                ConversationActivity::Plan(_)
+                    | ConversationActivity::TurnPlan(_)
+                    | ConversationActivity::AutoApprovalReview(_)
+                    | ConversationActivity::StrictReview(_)
+                    | ConversationActivity::GuardianWarning(_)
+                    | ConversationActivity::UserMessage { .. }
+            )
+        };
+        self.has_visible_request(cx)
+            || self.conversation_activity.iter().any(interactive)
+            || self.conversation_rows.iter().any(|row| match row {
+                ConversationListRow::Activity {
+                    unit: ActivityStreamUnit::Standalone(activity),
+                    ..
+                } => interactive(activity),
+                ConversationListRow::Activity {
+                    unit: ActivityStreamUnit::ToolGroup(group),
+                    ..
+                } => group.activities.iter().any(interactive),
+                _ => false,
+            })
+    }
     #[cfg(feature = "screenshot")]
     pub fn replay_approvals(
         &mut self,
