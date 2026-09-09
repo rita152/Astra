@@ -50,6 +50,8 @@ pub(super) struct ConnectionState {
     pub(super) reserved_threads: HashSet<String>,
     pub(super) starting_turns: HashMap<String, Arc<ManagedTurn>>,
     pub(super) turns: HashMap<TurnKey, Arc<ManagedTurn>>,
+    // A late informational event must never bind to a newer starting turn.
+    pub(super) finished_turns: HashSet<TurnKey>,
     pub(super) server_request_owners: HashMap<AgentServerRequestId, TurnKey>,
     resolved_server_requests: HashMap<AgentServerRequestId, String>,
     resolved_server_request_order: VecDeque<AgentServerRequestId>,
@@ -335,6 +337,12 @@ impl Connection {
     pub(super) fn finish_turn(&self, turn: &Arc<ManagedTurn>, result: Result<TurnOutcome>) {
         turn.finish(result);
         if let Ok(mut state) = self.state.lock() {
+            if let Some(turn_id) = turn.turn_id() {
+                state.finished_turns.insert(TurnKey {
+                    thread_id: turn.thread_id.clone(),
+                    turn_id,
+                });
+            }
             state.reserved_threads.remove(&turn.thread_id);
             if state
                 .starting_turns

@@ -162,6 +162,13 @@ pub(super) fn process_turn_message<W: Write + Send + 'static>(
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
+                "plan" | "webSearch" | "sleep" => {
+                    required_notification_i64(message, "startedAtMs")
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    let event = super::progress::parse_progress_event(item, false)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(events, event, "progress item")?;
+                }
                 "mcpToolCall" => {
                     let tool_call = parse_mcp_tool_call(item)
                         .map_err(|error| turn_item_protocol_error(message, error))?;
@@ -179,6 +186,23 @@ pub(super) fn process_turn_message<W: Write + Send + 'static>(
                     ));
                 }
             }
+        }
+        Some("item/plan/delta") => {
+            send_turn_event(
+                events,
+                AgentEvent::PlanDelta {
+                    item_id: required_notification_string(message, "itemId")?,
+                    delta: required_notification_string(message, "delta")?,
+                },
+                "item/plan/delta",
+            )?;
+        }
+        Some("turn/plan/updated") => {
+            send_turn_event(
+                events,
+                AgentEvent::TurnPlanUpdated(super::progress::parse_turn_plan(message)?),
+                "turn/plan/updated",
+            )?;
         }
         Some("item/agentMessage/delta") => {
             let _item_id = required_notification_string(message, "itemId")?;
@@ -385,6 +409,13 @@ pub(super) fn process_turn_message<W: Write + Send + 'static>(
                         "item/completed collaboration",
                     )
                     .map_err(|error| turn_item_protocol_error(message, error))?;
+                }
+                "plan" | "webSearch" | "sleep" => {
+                    required_notification_i64(message, "completedAtMs")
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    let event = super::progress::parse_progress_event(item, true)
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(events, event, "progress item")?;
                 }
                 "mcpToolCall" => {
                     let tool_call = parse_mcp_tool_call(item)

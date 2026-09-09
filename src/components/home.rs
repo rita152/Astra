@@ -13,6 +13,7 @@ mod mcp;
 mod media;
 mod messages;
 mod notices;
+mod progress;
 mod reasoning;
 mod requests;
 mod timeline;
@@ -445,7 +446,8 @@ impl HomeView {
                 }
                 let needs_shimmer = composer.conversation_phase() == ConversationPhase::Thinking
                     || composer.has_active_context_compaction()
-                    || composer.has_active_image_generation();
+                    || composer.has_active_image_generation()
+                    || composer.has_active_plan();
                 this.sync_thinking_shimmer(needs_shimmer, cx);
                 cx.notify();
             }
@@ -479,7 +481,8 @@ impl HomeView {
         self.expanded_collaborations.clear();
         let needs_shimmer = composer.conversation_phase() == ConversationPhase::Thinking
             || composer.has_active_context_compaction()
-            || composer.has_active_image_generation();
+            || composer.has_active_image_generation()
+            || composer.has_active_plan();
         self.sync_thinking_shimmer(needs_shimmer, cx);
         cx.notify();
     }
@@ -1711,3 +1714,52 @@ mod tests;
 
 #[cfg(feature = "screenshot")]
 pub(crate) use timeline::resumed_activity_audit;
+
+#[cfg(feature = "screenshot")]
+impl HomeView {
+    pub fn set_progress_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |view, cx| view.set_progress_for_capture(state, cx));
+        cx.notify();
+    }
+}
+
+#[derive(Clone)]
+pub struct OpenPlan(pub crate::agent::AgentPlan);
+impl gpui::EventEmitter<OpenPlan> for HomeView {}
+#[derive(Clone)]
+pub struct DownloadPlan(pub crate::agent::AgentPlan);
+impl gpui::EventEmitter<DownloadPlan> for HomeView {}
+
+impl HomeView {
+    pub fn set_plan_panel_for_view(&mut self, item_id: Option<String>, cx: &mut Context<Self>) {
+        let incoming = item_id.map(|id| format!("plan-in-panel:{id}"));
+        let previous = self
+            .expanded_commands
+            .iter()
+            .find(|key| key.starts_with("plan-in-panel:"))
+            .cloned();
+        if previous == incoming {
+            return;
+        }
+        self.expanded_commands
+            .retain(|key| !key.starts_with("plan-in-panel:"));
+        if let Some(key) = incoming {
+            self.expanded_commands.insert(key);
+        }
+        self.conversation_list.remeasure();
+        self.conversation_cache_dirty = true;
+        cx.notify();
+    }
+}
+
+impl HomeView {
+    pub fn dismiss_plan_popovers(&mut self, cx: &mut Context<Self>) {
+        let count = self.expanded_commands.len();
+        self.expanded_commands
+            .retain(|key| !key.starts_with("turn-plan-") && !key.starts_with("plan-feedback-"));
+        if self.expanded_commands.len() != count {
+            cx.notify();
+        }
+    }
+}

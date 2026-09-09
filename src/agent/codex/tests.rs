@@ -2132,7 +2132,6 @@ fn unintegrated_notifications_remain_fail_fast() {
         "deprecationNotice",
         "thread/goal/updated",
         "thread/goal/cleared",
-        "turn/plan/updated",
         "protocol/arbitraryFutureNotification",
     ] {
         let error = ensure_server_method_is_defined(&json!({
@@ -4291,10 +4290,7 @@ fn every_unsupported_thread_item_type_fails_for_started_and_completed() {
     for item_type in [
         "hookPrompt",
         "functionCallOutput",
-        "plan",
         "dynamicToolCall",
-        "webSearch",
-        "sleep",
         "enteredReviewMode",
         "exitedReviewMode",
     ] {

@@ -271,6 +271,11 @@ impl ManagedTurn {
                         .unwrap_or_default(),
                 )
             {
+                if super::super::progress::is_progress_notification(&message)
+                    || message.get("method").and_then(Value::as_str) == Some("turn/completed")
+                {
+                    continue;
+                }
                 bail!("turn/completed 之后仍收到同一 turn 的缓存消息");
             }
             let next_outcome = process_turn_message(

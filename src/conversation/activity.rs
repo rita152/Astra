@@ -68,11 +68,10 @@ pub(crate) enum ConversationActivity {
     ContextCompaction(AgentContextCompaction),
     Collaboration(AgentCollaboration),
     McpToolCall(Box<AgentMcpToolCall>),
-    WebSearch {
-        item_id: String,
-        query: String,
-        results: serde_json::Value,
-    },
+    TurnPlan(crate::agent::AgentTurnPlan),
+    Plan(crate::agent::AgentPlan),
+    Sleep(crate::agent::AgentSleep),
+    WebSearch(crate::agent::AgentWebSearch),
     QuestionReply {
         item_id: String,
         question: String,
@@ -373,3 +372,88 @@ pub(crate) fn upsert_file_change_activity(
         activities.push(ConversationActivity::FileChange(presentation));
     }
 }
+
+/// Ignore a late start after a terminal item and preserve early plan deltas.
+pub(crate) fn upsert_progress_activity(
+    activities: &mut Vec<ConversationActivity>,
+    incoming: ConversationActivity,
+) {
+    use ConversationActivity::*;
+    let existing = activities
+        .iter_mut()
+        .find(|current| match (&**current, &incoming) {
+            (Plan(a), Plan(b)) => a.id == b.id,
+            (WebSearch(a), WebSearch(b)) => a.id == b.id,
+            (Sleep(a), Sleep(b)) => a.id == b.id,
+            (TurnPlan(a), TurnPlan(b)) => a.turn_id == b.turn_id,
+            _ => false,
+        });
+    if let Some(existing) = existing {
+        use crate::agent::AgentActivityStatus::InProgress;
+        match (&*existing, &incoming) {
+            (Plan(a), Plan(b))
+                if b.status == InProgress && (a.status != InProgress || !a.text.is_empty()) =>
+            {
+                return;
+            }
+            (WebSearch(a), WebSearch(b)) if b.status == InProgress && a.status != InProgress => {
+                return;
+            }
+            (Sleep(a), Sleep(b)) if b.status == InProgress && a.status != InProgress => return,
+            _ => {}
+        }
+        *existing = incoming;
+    } else {
+        activities.push(incoming);
+    }
+}
+
+pub(crate) fn append_plan_delta(
+    activities: &mut Vec<ConversationActivity>,
+    item_id: String,
+    delta: String,
+) {
+    use crate::agent::{AgentActivityStatus, AgentPlan};
+    if let Some(plan) = activities.iter_mut().find_map(|a| match a {
+        ConversationActivity::Plan(p) if p.id == item_id => Some(p),
+        _ => None,
+    }) {
+        if plan.status == AgentActivityStatus::InProgress {
+            plan.text.push_str(&delta);
+        }
+    } else {
+        activities.push(ConversationActivity::Plan(AgentPlan {
+            id: item_id,
+            text: delta,
+            status: AgentActivityStatus::InProgress,
+        }));
+    }
+}
+
+pub(crate) fn finish_progress_activities(
+    activities: &mut [ConversationActivity],
+    outcome: crate::agent::AgentActivityStatus,
+) {
+    for activity in activities {
+        let status = match activity {
+            ConversationActivity::TurnPlan(v) => {
+                for step in &mut v.steps {
+                    if step.status == crate::agent::AgentPlanStepStatus::InProgress {
+                        step.status = crate::agent::AgentPlanStepStatus::Pending;
+                    }
+                }
+                continue;
+            }
+            ConversationActivity::Plan(v) => &mut v.status,
+            ConversationActivity::WebSearch(v) => &mut v.status,
+            ConversationActivity::Sleep(v) => &mut v.status,
+            _ => continue,
+        };
+        if *status == crate::agent::AgentActivityStatus::InProgress {
+            *status = outcome;
+        }
+    }
+}
+
+#[cfg(test)]
+mod progress_tests;

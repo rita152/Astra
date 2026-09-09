@@ -310,6 +310,9 @@ impl ComposerView {
         self.conversation.has_active_context_compaction()
     }
 
+    pub fn has_active_plan(&self) -> bool {
+        self.conversation.has_active_plan()
+    }
     pub fn has_active_image_generation(&self) -> bool {
         self.conversation.has_active_image_generation()
     }

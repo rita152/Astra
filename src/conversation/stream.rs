@@ -16,6 +16,18 @@ pub(crate) const STREAM_DISCONNECTED_MESSAGE: &str = "Codex 事件流意外断�
 
 pub(crate) fn push_coalesced_agent_event(batch: &mut Vec<AgentEvent>, event: AgentEvent) {
     match event {
+        AgentEvent::PlanDelta { item_id, delta } => {
+            if let Some(AgentEvent::PlanDelta {
+                item_id: buffered_id,
+                delta: buffered,
+            }) = batch.last_mut()
+                && buffered_id == &item_id
+            {
+                buffered.push_str(&delta);
+            } else {
+                batch.push(AgentEvent::PlanDelta { item_id, delta });
+            }
+        }
         AgentEvent::TextDelta(delta) => {
             if let Some(AgentEvent::TextDelta(buffered)) = batch.last_mut() {
                 buffered.push_str(&delta);

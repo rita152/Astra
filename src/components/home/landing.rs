@@ -64,6 +64,13 @@ pub(super) fn home(
         } else {
             None
         };
+    let turn_plan = conversation_activity
+        .iter()
+        .rev()
+        .find_map(|activity| match activity {
+            ConversationActivity::TurnPlan(plan) if !plan.steps.is_empty() => Some(plan.clone()),
+            _ => None,
+        });
     let blocking_request_pending = pending_command_approval.is_some()
         || pending_user_input.is_some()
         || pending_file_approval.is_some()
@@ -283,6 +290,32 @@ pub(super) fn home(
                                 .child(first_suggestion)
                                 .child(second_suggestion),
                         )
+                    },
+                )
+                .when_some(
+                    turn_plan.filter(|_| {
+                        !blocking_request_pending
+                            && matches!(
+                                phase,
+                                ConversationPhase::Starting
+                                    | ConversationPhase::Thinking
+                                    | ConversationPhase::Streaming
+                                    | ConversationPhase::Stopping
+                            )
+                    }),
+                    |container, plan| {
+                        let expanded = render
+                            .disclosures
+                            .expanded_commands
+                            .contains(&format!("turn-plan-{}", plan.turn_id));
+                        container.child(div().w_full().flex().justify_center().child(
+                            super::progress::turn_plan_control(
+                                home_entity.clone(),
+                                plan,
+                                expanded,
+                                theme,
+                            ),
+                        ))
                     },
                 )
                 .when(!blocking_request_pending, |container| {

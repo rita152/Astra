@@ -360,12 +360,7 @@ pub(super) fn parse_history_item(value: &Value) -> Result<ThreadHistoryItem> {
         "mcpToolCall" => Ok(ThreadHistoryItem::McpToolCall(Box::from(
             parse_mcp_tool_call(value.as_object().context("mcpToolCall item 必须是对象")?)?,
         ))),
-        "webSearch" => Ok(ThreadHistoryItem::WebSearch {
-            item_id,
-            query: string_field(value, "query", "webSearch item")?,
-            action: value.get("action").cloned().unwrap_or(Value::Null),
-            results: value.get("results").cloned().unwrap_or(Value::Null),
-        }),
+        "plan" | "webSearch" | "sleep" => super::progress::parse_progress_history(value),
         _ => Ok(ThreadHistoryItem::Unsupported { item_id, kind }),
     }
 }
@@ -505,12 +500,12 @@ mod resumed_rendering_metadata_tests {
     #[test]
     fn resumed_web_search_preserves_query_actions_and_results() {
         let value = json!({"type":"webSearch","id":"search","query":"字体","action":{"type":"search","queries":["字体"]},"results":[{"url":"https://example.test/","title":"字体"}]});
-        let ThreadHistoryItem::WebSearch {
+        let ThreadHistoryItem::WebSearch(crate::agent::AgentWebSearch {
             query,
             action,
             results,
             ..
-        } = parse_history_item(&value).unwrap()
+        }) = parse_history_item(&value).unwrap()
         else {
             panic!("search must not become an unsupported warning")
         };

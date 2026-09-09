@@ -326,18 +326,22 @@ pub(super) fn conversation(
                 16.0,
             ),
             ConversationListRow::CurrentResponseFooter {
+                id,
                 message,
                 completed_at,
             } => (
-                current_response_footer(
-                    message,
-                    completed_at,
-                    response_feedback,
-                    home_entity.clone(),
-                    theme,
-                    _cx,
-                )
-                .into_any_element(),
+                div()
+                    .id(SharedString::from(format!("response-footer-{id}")))
+                    .child(current_response_footer(
+                        &id,
+                        message,
+                        completed_at,
+                        response_feedback,
+                        home_entity.clone(),
+                        theme,
+                        _cx,
+                    ))
+                    .into_any_element(),
                 0.0,
                 3.0,
             ),
@@ -446,10 +450,14 @@ pub(super) fn resumed_work_header(
                     cx.stop_propagation();
                     click_home.update(cx, |home, cx| home.toggle_resumed_turn(&click_id, cx));
                 })
-                .on_key_down(move |event: &KeyDownEvent, _, cx| {
-                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                .on_key_down(|event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "tab" {
+                        if event.keystroke.modifiers.shift {
+                            window.focus_prev(cx);
+                        } else {
+                            window.focus_next(cx);
+                        }
                         cx.stop_propagation();
-                        home.update(cx, |home, cx| home.toggle_resumed_turn(&id, cx));
                     }
                 })
                 .child(label)

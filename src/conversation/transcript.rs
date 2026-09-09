@@ -164,6 +164,9 @@ impl ConversationState {
             )
         })
     }
+    pub(crate) fn has_active_plan(&self) -> bool {
+        self.activities.iter().any(|activity| matches!(activity,ConversationActivity::Plan(plan) if plan.status==crate::agent::AgentActivityStatus::InProgress))
+    }
     pub(crate) fn has_active_image_generation(&self) -> bool {
         self.activities.iter().any(|activity| {
             matches!(
@@ -231,7 +234,7 @@ impl ConversationState {
                 let mut user_images = Vec::new();
                 let mut assistant_messages = Vec::new();
                 let mut activities = Vec::new();
-                for item in &turn.items {
+                for (item_index, item) in turn.items.iter().enumerate() {
                     match item {
                         ThreadHistoryItem::UserMessage {
                             item_id,
@@ -324,17 +327,38 @@ impl ConversationState {
                         ThreadHistoryItem::McpToolCall(tool_call) => {
                             activities.push(ConversationActivity::McpToolCall(tool_call.clone()));
                         }
-                        ThreadHistoryItem::WebSearch {
-                            item_id,
-                            query,
-                            results,
-                            ..
-                        } => {
-                            activities.push(ConversationActivity::WebSearch {
-                                item_id: item_id.clone(),
-                                query: query.clone(),
-                                results: results.clone(),
-                            });
+                        ThreadHistoryItem::WebSearch(v) => {
+                            let mut v = v.clone();
+                            v.status = restored_progress_status(
+                                turn.status,
+                                item_index + 1 == turn.items.len(),
+                            );
+                            super::activity::upsert_progress_activity(
+                                &mut activities,
+                                ConversationActivity::WebSearch(v),
+                            );
+                        }
+                        ThreadHistoryItem::Plan(v) => {
+                            let mut v = v.clone();
+                            v.status = restored_progress_status(
+                                turn.status,
+                                item_index + 1 == turn.items.len(),
+                            );
+                            super::activity::upsert_progress_activity(
+                                &mut activities,
+                                ConversationActivity::Plan(v),
+                            );
+                        }
+                        ThreadHistoryItem::Sleep(v) => {
+                            let mut v = v.clone();
+                            v.status = restored_progress_status(
+                                turn.status,
+                                item_index + 1 == turn.items.len(),
+                            );
+                            super::activity::upsert_progress_activity(
+                                &mut activities,
+                                ConversationActivity::Sleep(v),
+                            );
                         }
                         ThreadHistoryItem::Unsupported { kind, .. } => {
                             activities.push(ConversationActivity::Warning {
@@ -471,3 +495,22 @@ impl ConversationState {
 
 #[cfg(test)]
 mod tests;
+
+/// Like the desktop renderer, only the tail snapshot can still be active.
+/// ThreadItem carries no completion marker; an interrupted tail is displayed
+/// as interrupted without inventing actual elapsed time.
+fn restored_progress_status(
+    status: HistoryTurnStatus,
+    is_tail: bool,
+) -> crate::agent::AgentActivityStatus {
+    use crate::agent::AgentActivityStatus;
+    if !is_tail {
+        return AgentActivityStatus::Completed;
+    }
+    match status {
+        HistoryTurnStatus::InProgress => AgentActivityStatus::InProgress,
+        HistoryTurnStatus::Completed => AgentActivityStatus::Completed,
+        HistoryTurnStatus::Interrupted => AgentActivityStatus::Interrupted,
+        HistoryTurnStatus::Failed => AgentActivityStatus::Failed,
+    }
+}

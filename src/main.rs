@@ -401,6 +401,11 @@ fn main() {
         arg.strip_prefix("--mcp-tool-call-ui-state=")
             .map(ToOwned::to_owned)
     });
+    #[cfg(feature = "screenshot")]
+    let progress_ui_state = args.iter().find_map(|arg| {
+        arg.strip_prefix("--progress-ui-state=")
+            .map(ToOwned::to_owned)
+    });
     let image_generation_ui_state = args.iter().find_map(|arg| {
         arg.strip_prefix("--image-generation-ui-state=")
             .map(ToOwned::to_owned)
@@ -717,6 +722,11 @@ fn main() {
                         }
                         if let Some(state) = mcp_tool_call_ui_state.as_deref() {
                             app.set_mcp_tool_call_for_capture(state, cx);
+                        }
+                        #[cfg(feature = "screenshot")]
+                        if let Some(state) = progress_ui_state.as_deref() {
+                            app.complete_startup_for_capture(cx);
+                            app.set_progress_for_capture(state, cx);
                         }
                         if let Some(state) = image_generation_ui_state.as_deref() {
                             app.set_image_generation_for_capture(

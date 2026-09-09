@@ -2,7 +2,7 @@
 
 ## 基线与口径
 
-核对基线：`codex-cli 0.153.0`（2026-09-08）。方法与字段来自该 CLI 生成的 schema，接入状态来自仓库实现。schema 随 CLI 版本生成，见[官方协议说明](https://learn.chatgpt.com/docs/app-server#message-schema)；升级时重新导出并核对：
+核对基线：`codex-cli 0.153.0`（2026-09-09）。方法与字段来自该 CLI 生成的 schema，接入状态来自仓库实现。schema 随 CLI 版本生成，见[官方协议说明](https://learn.chatgpt.com/docs/app-server#message-schema)；升级时重新导出并核对：
 
 ```bash
 codex --version
@@ -14,10 +14,10 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 
 | 状态 | 数量 | 判定 |
 |---|---|---|
-| 已接入 | 69 | 表中声明的产品行为已连通协议、领域数据和 UI／副作用；不表示消费全部可选字段 |
+| 已接入 | 71 | 表中声明的产品行为已连通协议、领域数据和 UI／副作用；不表示消费全部可选字段 |
 | 后端已接入 | 2 | 已实现读取或校验，尚无对应可见 UI 调用方或展示 |
 | 部分接入 | 3 | 只支持部分类型、有效变体或限定生命周期窗口 |
-| 未接入 | 174 | 客户端不发送；服务端请求按原 id 回复 `-32601` 并终止当前连接，服务端通知直接报错并终止连接 |
+| 未接入 | 172 | 客户端不发送；服务端请求按原 id 回复 `-32601` 并终止当前连接，服务端通知直接报错并终止连接 |
 
 未接入行的“—”沿用上述规则。`tool/requestUserInput` 是兼容别名，不计入本版本 schema 的 248 项。
 
@@ -37,7 +37,7 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 
 ## Item 与历史兼容
 
-实时 `item/started`／`item/completed` 支持下表除 `webSearch` 外的类型。未知实时类型报错；历史额外支持 `webSearch`，其他未知类型保留为 `ThreadHistoryItem::Unsupported`。因此两个实时 item 方法仍标为“部分接入”。
+实时 `item/started`／`item/completed` 与历史恢复支持下表类型。未知实时类型报错，未知历史类型保留为 `ThreadHistoryItem::Unsupported`。两个实时 item 方法仍因其余未接入类型标为“部分接入”。
 
 | 类型 | 数据与兼容处理 | 展示行为 |
 |---|---|---|
@@ -51,9 +51,15 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 | `contextCompaction` | 按 item.id 更新；历史恢复为已完成活动 | 独立压缩上下文活动 |
 | `collabAgentToolCall`、`collabToolCall`、`subAgentActivity` | 当前、相邻版本与旧历史映射为 AgentCollaboration。按载荷中的工具／接收者状态更新；稳定 item.id 原位更新，旧离散事件按 agentThreadId 合并 | 每个接收者独立状态；子任务失败不结束父轮次，支持只读嵌套子会话面板 |
 | `mcpToolCall` | 保留 server/tool/status/arguments/appContext/pluginId/result/error；兼容旧 metadata、mcpAppResourceUri 与字符串 error，连接器自定义 JSON 不丢字段 | 按稳定 item.id 更新；完成快照保留已收到的 progress，错误可见 |
-| `webSearch`（仅历史） | 恢复查询与结果；实时类型尚未接入 | 恢复搜索活动 |
+| `plan` | `item/plan/delta` 按所属 turn 内的 item.id 累加；completed item.text 权威覆盖增量，迟到 started/delta 不撤销终态 | Markdown 计划卡；整卡及键盘打开只读文件标签，支持复制和显式导出，沿用本地评价 UI |
+| `webSearch` | 共享实时／历史解析，保留 query、action、results 和额外 JSON 字段；校验 search/openPage/findInPage/other 及 nullable 字段，results 为数组或 null | 单条显示查询／页面／查找目标及状态，多项沿用活动分组 |
+| `sleep` | durationMs 为 uint64；实时按 started/completed 更新，中断／失败只结束仍在运行的活动 | 等待时长及状态；中断明确标记“原定”时长，不把请求时长称为实际耗时 |
 
-当前 schema 中的 hookPrompt、functionCallOutput、plan、dynamicToolCall、webSearch、sleep、enteredReviewMode、exitedReviewMode 尚未接入实时 item 路径。协作枚举、字段校验与历史别名见 `items.rs`；历史解码见 `workspace_protocol.rs`。样式、尺寸和交互入口见 README 与组件实现。
+当前 schema 中的 hookPrompt、functionCallOutput、dynamicToolCall、enteredReviewMode、exitedReviewMode 尚未接入实时 item 路径。协作枚举、字段校验与历史别名见 `items.rs`；历史解码见 `workspace_protocol.rs`。计划、搜索和等待共享 `progress.rs` 解码；样式、尺寸和交互入口见 README 与组件实现。
+
+`turn/plan/updated` 的 explanation／步骤状态单独建模为 turn 进度，替换当前 turn 的上一份步骤快照，不覆盖 plan 文本，也不自动推断所有步骤完成。活动结束不替代 `turn/completed`；turn 终止时仅收束仍活动的 item，并把仍进行中的计划步骤恢复为 pending。相同生命周期事件只更新已有活动；跨 thread/turn 由 manager 路由隔离，已结束 turn 的迟到计划／搜索／等待通知及重复 turn 完成通知不会重新绑定新 turn。增量没有序号或偏移，合法重复字符必须保留，不能按字符串去重；最终 plan item 负责文本收敛。
+
+历史 `ThreadItem` 没有逐项开始／完成标记，也不携带 `turn/plan/updated` 步骤快照。恢复保留最终 plan 文本和搜索 JSON；尾项状态参考 turn 状态，前序记录按完成展示，不能还原并行活动的逐项终止时刻或实际等待耗时。本机 CLI 的中断样例在 full 历史中仅返回用户消息，未持久化未完成的 sleep；这类完全缺失的 item 无法跨应用重启恢复。步骤快照不从计划文本伪造，也不另建本地会话数据库。当前参考 ChatGPT 隐藏 sleep；GPUI 按产品要求保留等待行。计划文本的原生选择目前限于普通正文段落（含粗体／斜体样式），跨 Markdown 块及链接／代码混排片段的连续选择尚未实现；整份计划可用复制按钮取得。
 
 ## 方法总表
 
@@ -269,7 +275,7 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 | `item/fileChange/outputDelta` | 默认 | 已接入 | deprecated；校验 thread/turn/item/delta，不再产生内容事件。 | `dispatch` |
 | `item/fileChange/patchUpdated` | 默认 | 已接入 | 按 itemId 替换 changes[path/diff/kind]，刷新文件卡与差异统计。 | `dispatch`、`items` |
 | `item/mcpToolCall/progress` | 默认 | 已接入 | 按 itemId 追加 message，完成快照保留进度；孤立 progress 不创建工具项。 | `dispatch` |
-| `item/plan/delta` | 默认 | 未接入 | — | — |
+| `item/plan/delta` | 默认 | 已接入 | 按 thread/turn/item 归属累加计划文本；支持早到增量，最终 item 权威覆盖；终态后忽略迟到增量。 | `progress`、`dispatch` |
 | `item/reasoning/summaryPartAdded` | 默认 | 已接入 | 按 itemId 和非负 summaryIndex 建立槽位；孤立增量不创建 reasoning 项。 | `dispatch` |
 | `item/reasoning/summaryTextDelta` | 默认 | 已接入 | 按 itemId/summaryIndex 追加 delta；仅合并相邻且同 item/index 的事件。 | `dispatch` |
 | `item/reasoning/textDelta` | 默认 | 已接入 | 按 itemId/contentIndex 追加 delta；summary 为空时以 content 展示正文。 | `dispatch` |
@@ -319,7 +325,7 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 | `turn/completed` | 默认 | 已接入 | 接受 completed/interrupted/failed；失败读取 message/details。每轮只发送一个终态并清理自身请求，其他轮次及共享连接继续存活。 | `dispatch`、`manager/connection` |
 | `turn/diff/updated` | 默认 | 已接入 | 所属轮次最新聚合 unified diff；保留原始 patch，刷新文件卡与“上一轮”范围；空 diff 不清除已有 item changes。 | `dispatch` |
 | `turn/moderationMetadata` | 默认 | 未接入 | — | — |
-| `turn/plan/updated` | 默认 | 未接入 | 未建立计划进度 UI；发送 plan collaborationMode 不代表接入此通知。 | — |
+| `turn/plan/updated` | 默认 | 已接入 | 独立 turn 步骤快照与 explanation；输入框上方显示步骤进度，悬停／点击／键盘查看步骤。 | `progress`、`dispatch` |
 | `turn/started` | 默认 | 已接入 | 要求 turn.status=inProgress；可早于 turn/start 响应，验证后使所属会话进入流式状态。 | `notifications`、`manager/turn` |
 | `warning` | 默认 | 已接入 | message、可选 threadId；应用级警告无活动轮次仍可见，线程级只进入目标 Composer。 | `manager/dispatch`、`notifications` |
 | `windows/worldWritableWarning` | 默认 | 未接入 | — | — |

@@ -377,3 +377,12 @@ impl ChatApp {
         self.select_right_panel_item(3, cx);
     }
 }
+
+#[cfg(feature = "screenshot")]
+impl ChatApp {
+    pub fn set_progress_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.home
+            .update(cx, |view, cx| view.set_progress_for_capture(state, cx));
+        cx.notify();
+    }
+}

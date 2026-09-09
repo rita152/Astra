@@ -411,6 +411,7 @@ pub(super) fn current_user_message(
 }
 
 pub(super) fn current_response_footer(
+    turn_scope: &str,
     assistant_message: String,
     completed_at: Option<String>,
     response_feedback: i8,
@@ -420,6 +421,7 @@ pub(super) fn current_response_footer(
 ) -> Div {
     use std::hash::{Hash, Hasher};
     let mut hash = std::hash::DefaultHasher::new();
+    turn_scope.hash(&mut hash);
     assistant_message.hash(&mut hash);
     let feedback_id = hash.finish();
     let feedback_open = home_entity.read(cx).response_feedback_menu == Some(feedback_id);

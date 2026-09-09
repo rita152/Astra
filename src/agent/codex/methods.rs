@@ -22,6 +22,8 @@ pub(super) const TURN_SCOPED_SERVER_METHODS: &[&str] = &[
     "tool/requestUserInput",
     "item/started",
     "item/agentMessage/delta",
+    "item/plan/delta",
+    "turn/plan/updated",
     "item/commandExecution/outputDelta",
     "item/commandExecution/terminalInteraction",
     "item/fileChange/outputDelta",
@@ -56,6 +58,8 @@ pub(super) fn is_defined_server_method(method: &str) -> bool {
             | "serverRequest/resolved"
             | "item/started"
             | "item/agentMessage/delta"
+            | "item/plan/delta"
+            | "turn/plan/updated"
             | "item/commandExecution/outputDelta"
             | "item/commandExecution/terminalInteraction"
             | "item/fileChange/outputDelta"

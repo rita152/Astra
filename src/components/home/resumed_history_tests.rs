@@ -46,9 +46,15 @@ fn resumed_header_keyboard_toggles_with_a_persistent_focus_handle() {
     window.update(|header, window, cx| window.focus(&header.focus, cx));
     window.draw();
     window.simulate_keystroke("enter");
+    window.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("enter").unwrap(),
+    });
     assert!(window.read(|header, cx| header.home.read(cx).expanded_resumed_turns.contains("turn")));
     window.draw();
     window.simulate_keystroke("space");
+    window.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("space").unwrap(),
+    });
     assert!(
         !window.read(|header, cx| header.home.read(cx).expanded_resumed_turns.contains("turn"))
     );
@@ -169,4 +175,48 @@ fn incomplete_failed_and_unidentified_history_stays_visible() {
     assert_eq!(rows.len(), 2);
     assert_eq!(resumed_work_label(None), "工作过程");
     assert_eq!(resumed_work_label(Some(3_849_000)), "用时 1小时 4分钟 9秒");
+}
+
+#[test]
+fn identical_resumed_answers_have_distinct_footer_scopes() {
+    use crate::conversation::ConversationTranscriptTurn;
+    let turns = ["turn-a", "turn-b"]
+        .into_iter()
+        .map(|id| ConversationTranscriptTurn {
+            phase: ConversationPhase::Complete,
+            user_message: "prompt".into(),
+            user_images: vec![],
+            user_message_time: None,
+            assistant_message: "完成".into(),
+            assistant_message_time: None,
+            activities: vec![],
+            resumed: Some(ResumedTurnPresentation {
+                id: id.into(),
+                duration_ms: None,
+                final_message_ids: vec![],
+            }),
+        })
+        .collect();
+    let rows = super::timeline::conversation_list_rows(
+        turns,
+        super::context::CurrentTurnRows {
+            phase: ConversationPhase::Empty,
+            user_message: String::new(),
+            user_images: vec![],
+            user_message_time: String::new(),
+            assistant_message: String::new(),
+            assistant_message_time: None,
+            conversation_activity: &[],
+            resumed_turn: None,
+        },
+        &HashSet::new(),
+    );
+    let ids = rows
+        .into_iter()
+        .filter_map(|row| match row {
+            ConversationListRow::CurrentResponseFooter { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["turn-a", "turn-b"]);
 }

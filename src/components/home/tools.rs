@@ -220,11 +220,9 @@ pub(super) fn tool_activity_group(
                     ),
                 ))
             }
-            ConversationActivity::WebSearch {
-                item_id,
-                query,
-                results,
-            } => rows.child(web_search_activity(item_id, query, results, theme)),
+            ConversationActivity::WebSearch(search) => {
+                rows.child(web_search_activity(search, theme))
+            }
             ConversationActivity::McpToolCall(call) => {
                 let expanded = expanded_commands.contains(&call.id);
                 rows.child(computer_use_activity(

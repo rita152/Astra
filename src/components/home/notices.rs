@@ -165,21 +165,20 @@ pub(super) fn notice_activity(
 }
 
 pub(super) fn web_search_activity(
-    item_id: String,
-    query: String,
-    _results: serde_json::Value,
+    search: crate::agent::AgentWebSearch,
     theme: Theme,
 ) -> impl IntoElement {
+    let label = web_search_label(&search);
     div()
-        .id(SharedString::from(format!("web-search-{item_id}")))
+        .id(SharedString::from(format!("web-search-{}", search.id)))
         .h(px(21.0))
         .min_w(px(0.0))
         .flex()
         .items_center()
         .gap(px(6.0))
-        .text_color(theme.text.alpha(0.60))
+        .text_color(theme.markdown_text.alpha(0.60))
         .child(
-            icon("search", theme.text.alpha(0.60).into())
+            icon("panel-browser", theme.markdown_text.alpha(0.60).into())
                 .size(px(16.0))
                 .flex_none(),
         )
@@ -189,7 +188,7 @@ pub(super) fn web_search_activity(
                 .truncate()
                 .text_size(px(14.0))
                 .line_height(px(21.0))
-                .child(format!("已搜索网页 ：{query}")),
+                .child(label),
         )
 }
 
@@ -235,4 +234,55 @@ pub(super) fn context_compaction_activity(
                 shimmer_progress,
             ))
         })
+}
+
+pub(super) fn web_search_label(search: &crate::agent::AgentWebSearch) -> String {
+    use crate::agent::AgentActivityStatus;
+    let active = search.status == AgentActivityStatus::InProgress;
+    let (verb, target) = match search
+        .action
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("openPage") => (
+            if active {
+                "正在打开网页"
+            } else {
+                "已打开网页"
+            },
+            search
+                .action
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&search.query)
+                .to_owned(),
+        ),
+        Some("findInPage") => (
+            if active {
+                "正在查找网页"
+            } else {
+                "已查找网页"
+            },
+            search
+                .action
+                .get("pattern")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&search.query)
+                .to_owned(),
+        ),
+        _ => (
+            if active {
+                "正在搜索网页"
+            } else {
+                "已搜索网页"
+            },
+            search.query.clone(),
+        ),
+    };
+    let verb = match search.status {
+        AgentActivityStatus::Interrupted => "网页搜索已中断",
+        AgentActivityStatus::Failed => "网页搜索失败",
+        _ => verb,
+    };
+    format!("{verb} ：{target}")
 }
