@@ -100,6 +100,8 @@ impl ChatApp {
         cx.notify();
     }
     pub(super) fn close_right_panel(&mut self, cx: &mut Context<Self>) {
+        self.home
+            .update(cx, |home, cx| home.set_plan_panel_for_view(None, cx));
         if self.right_panel.open {
             self.deactivate_side_chat(cx);
             self.deactivate_review(cx);
@@ -147,6 +149,10 @@ impl ChatApp {
             return;
         };
         let mode = *mode;
+        if mode != RightPanelMode::Files {
+            self.home
+                .update(cx, |home, cx| home.set_plan_panel_for_view(None, cx));
+        }
         if mode != RightPanelMode::SideChat {
             self.deactivate_side_chat(cx);
         }

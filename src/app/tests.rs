@@ -1264,3 +1264,31 @@ fn appearance_cards_change_the_application_theme() {
     window.simulate_click(point(px(772.0), px(250.0)), MouseButton::Left);
     assert_eq!(window.read(|app, _| app.mode), ThemeMode::Dark);
 }
+
+#[test]
+fn proposed_plan_export_writes_exact_markdown_and_reports_io_failure() {
+    let mut app = TestApp::new();
+    let mut window = app.open_window_with_options(WindowOptions::default(), |_, cx| {
+        ChatApp::new(ThemeMode::Dark, false, cx)
+    });
+    let plan = crate::agent::AgentPlan {
+        id: "plan".into(),
+        text: "# 计划\n\n保留 **Markdown** 与换行。\n".into(),
+        status: crate::agent::AgentActivityStatus::Completed,
+    };
+    let path = std::env::temp_dir().join(format!("gpui-plan-export-{}.md", std::process::id()));
+    window.update(|chat, _, cx| chat.download_plan(plan.clone(), cx));
+    assert!(app.did_prompt_for_new_path());
+    app.simulate_new_path_selection(|_| Some(path.clone()));
+    app.run_until_parked();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), plan.text);
+    std::fs::remove_file(path).unwrap();
+    window.update(|chat, _, cx| chat.download_plan(plan, cx));
+    app.simulate_new_path_selection(|_| Some(std::env::temp_dir()));
+    app.run_until_parked();
+    assert!(window.read(|chat, _| {
+        chat.plan_export_error
+            .as_ref()
+            .is_some_and(|s| s.starts_with("无法保存计划"))
+    }));
+}

@@ -2145,3 +2145,5 @@ fn dropping_last_manager_owner_terminates_and_waits_for_process() {
     assert_eq!(process.terminate_calls.load(Ordering::Acquire), 1);
     assert!(process.waited.load(Ordering::Acquire));
 }
+
+mod progress;

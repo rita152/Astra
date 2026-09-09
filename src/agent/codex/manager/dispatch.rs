@@ -266,6 +266,20 @@ impl ManagerInner {
                     .and_then(Value::as_str)
                     .with_context(|| format!("{method} 消息缺少字符串 params.threadId"))?;
                 let turn_id = turn_id_from_turn_message(message)?;
+                if (super::super::progress::is_progress_notification(message)
+                    || method == "turn/completed")
+                    && connection
+                        .state
+                        .lock()
+                        .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?
+                        .finished_turns
+                        .contains(&TurnKey {
+                            thread_id: thread_id.to_owned(),
+                            turn_id: turn_id.clone(),
+                        })
+                {
+                    return Ok(());
+                }
                 let turn = connection.bind_starting_turn(thread_id, &turn_id)?;
                 if let Some(outcome) = turn.ingest(message)? {
                     connection.finish_turn(&turn, Ok(outcome));

@@ -29,6 +29,7 @@ gpui::actions!(workspace_review, [OpenWorkspaceReview]);
 struct Document {
     id: u64,
     path: PathBuf,
+    plan: Option<crate::agent::AgentPlan>,
     editor: Option<Entity<FileEditor>>,
     saved: Option<TextFile>,
     error: Option<String>,
@@ -42,6 +43,17 @@ struct Document {
     markdown_pending_revision: Option<u64>,
 }
 impl Document {
+    fn label(&self) -> String {
+        if self.plan.is_some() {
+            "套餐".to_owned()
+        } else {
+            self.path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
     fn dirty(&self, cx: &App) -> bool {
         self.editor
             .as_ref()
@@ -153,9 +165,13 @@ impl FilePanel {
         self.side_chat_available = available;
         cx.notify();
     }
+    pub fn active_plan_id(&self) -> Option<String> {
+        self.current()?.plan.as_ref().map(|p| p.id.clone())
+    }
     pub fn open_documents(&self) -> Vec<String> {
         self.documents
             .iter()
+            .filter(|d| d.plan.is_none())
             .map(|d| d.path.to_string_lossy().into_owned())
             .collect()
     }
@@ -299,6 +315,48 @@ impl FilePanel {
         }
         cx.notify();
     }
+    /// Proposed plans are virtual, read-only tabs. They never enter file IO or save paths.
+    pub fn open_plan(&mut self, plan: crate::agent::AgentPlan, cx: &mut Context<Self>) {
+        let markdown = parse_markdown(&plan.text);
+        if let Some(doc) = self
+            .documents
+            .iter_mut()
+            .find(|d| d.plan.as_ref().is_some_and(|p| p.id == plan.id))
+        {
+            if let Some(preview) = &doc.markdown {
+                preview.update(cx, |p, cx| p.set_document(markdown, cx));
+            }
+            doc.plan = Some(plan);
+            self.active = Some(doc.id);
+        } else {
+            let id = self.next_id;
+            self.next_id += 1;
+            let preview = cx.new(|cx| {
+                let mut preview = MarkdownPreview::new(markdown, self.mode, cx);
+                preview.enable_text_selection();
+                preview
+            });
+            self.documents.push(Document {
+                id,
+                path: PathBuf::from("套餐"),
+                plan: Some(plan),
+                editor: None,
+                saved: None,
+                error: None,
+                loading: false,
+                saving: false,
+                revision: 0,
+                image: false,
+                preview: true,
+                markdown: Some(preview),
+                markdown_revision: Some(0),
+                markdown_pending_revision: None,
+            });
+            self.active = Some(id);
+        }
+        self.focus_editor = true;
+        cx.notify();
+    }
     pub fn open_path(&mut self, path: PathBuf, line: Option<usize>, cx: &mut Context<Self>) {
         let path = if path.is_absolute() {
             path
@@ -327,6 +385,7 @@ impl FilePanel {
             Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
         );
         self.documents.push(Document {
+            plan: None,
             id,
             path: path.clone(),
             editor: None,
@@ -565,7 +624,7 @@ impl FilePanel {
         let Some(d) = self.documents.iter().find(|d| d.id == id) else {
             return;
         };
-        if d.saving {
+        if d.saving || d.plan.is_some() {
             return;
         }
         let path = d.path.clone();
@@ -784,10 +843,7 @@ impl Render for FilePanel {
                     .hover(move |s| s.bg(theme.sidebar_hover))
                     .role(Role::Tab)
                     .aria_selected(active)
-                    .aria_label(format!(
-                        "文件 {}",
-                        d.path.file_name().unwrap_or_default().to_string_lossy()
-                    ))
+                    .aria_label(format!("文件 {}", d.label()))
                     .tab_stop(true)
                     .on_click(cx.listener(move |s, _, _, cx| {
                         s.active = Some(id);
@@ -803,26 +859,22 @@ impl Render for FilePanel {
                         }
                     }))
                     .child(
-                        icon(file_icon(&d.path), theme.text_tertiary.into())
-                            .size(px(16.))
-                            .flex_none(),
+                        icon(
+                            if d.plan.is_some() {
+                                "plan"
+                            } else {
+                                file_icon(&d.path)
+                            },
+                            theme.text_tertiary.into(),
+                        )
+                        .size(px(16.))
+                        .flex_none(),
                     )
-                    .child(
-                        div().flex_1().min_w(px(0.)).truncate().child(
-                            d.path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .into_owned(),
-                        ),
-                    )
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(d.label()))
                     .child(
                         self.control(
                             ("close-file", id),
-                            &format!(
-                                "关闭 {}",
-                                d.path.file_name().unwrap_or_default().to_string_lossy()
-                            ),
+                            &format!("关闭 {}", d.label()),
                             "close-dialog",
                             theme,
                         )
@@ -1021,6 +1073,26 @@ impl Render for FilePanel {
                                 .size_full()
                                 .object_fit(ObjectFit::Contain),
                         ),
+                );
+            } else if let Some(plan) = &d.plan {
+                if let Some(preview) = &d.markdown {
+                    content = content.child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .min_h(px(0.0))
+                            .overflow_hidden()
+                            .child(preview.clone()),
+                    );
+                }
+                let text = plan.text.clone();
+                content = content.child(
+                    div().absolute().top(px(12.0)).right(px(16.0)).child(
+                        self.control("plan-panel-copy", "复制计划", "plan-copy", theme)
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()))
+                            }),
+                    ),
                 );
             } else if let Some(editor) = &d.editor {
                 if d.preview {
@@ -1264,7 +1336,9 @@ impl Render for FilePanel {
             .text_size(px(13.))
             .line_height(px(18.))
             .child(tabs)
-            .child(toolbar)
+            .when(!self.current().is_some_and(|d| d.plan.is_some()), |panel| {
+                panel.child(toolbar)
+            })
             .child(
                 div()
                     .flex_1()
@@ -1640,6 +1714,46 @@ mod tests {
             assert_eq!(p.pending_close, Some(active));
             assert_eq!(p.documents.len(), 1);
         });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn proposed_plan_tabs_are_read_only_deduplicated_and_excluded_from_file_context() {
+        use crate::agent::{AgentActivityStatus, AgentPlan};
+        let root = std::env::temp_dir().join(format!("gpui-plan-tab-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = gpui::TestApp::new();
+        app.update(super::super::file_editor::init);
+        let mut window = app.open_window_with_options(gpui::WindowOptions::default(), |_, cx| {
+            FilePanel::new(root.clone(), ThemeMode::Dark, cx)
+        });
+        let plan = AgentPlan {
+            id: "p".into(),
+            text: "# 最终计划\n\n原始内容".into(),
+            status: AgentActivityStatus::Completed,
+        };
+        window.update(|p, _, cx| p.open_plan(plan.clone(), cx));
+        app.run_until_parked();
+        window.draw();
+        window.update(|p, w, cx| {
+            assert_eq!(p.documents.len(), 1);
+            assert_eq!(p.current().unwrap().label(), "套餐");
+            assert!(p.current().unwrap().editor.is_none());
+            assert!(p.current().unwrap().markdown.is_some());
+            assert!(!p.has_unsaved(cx));
+            assert!(p.open_documents().is_empty());
+            p.save_all(cx);
+            p.reload(p.active.unwrap(), w, cx);
+            let mut updated = plan.clone();
+            updated.text = "# 新的权威内容".into();
+            p.open_plan(updated, cx);
+            assert_eq!(p.documents.len(), 1);
+            assert_eq!(
+                p.current().unwrap().plan.as_ref().unwrap().text,
+                "# 新的权威内容"
+            );
+        });
+        app.run_until_parked();
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

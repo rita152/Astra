@@ -28,6 +28,7 @@ use crate::{
 };
 
 mod preview;
+mod selection;
 pub use preview::MarkdownPreview;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -608,6 +609,7 @@ struct MarkdownPalette {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct MarkdownRenderStyle {
+    selectable: bool,
     layout: MarkdownLayout,
     palette: MarkdownPalette,
 }
@@ -615,6 +617,7 @@ struct MarkdownRenderStyle {
 impl MarkdownRenderStyle {
     fn new(theme: Theme) -> Self {
         Self {
+            selectable: false,
             layout: CHATGPT_MARKDOWN_LAYOUT,
             palette: MarkdownPalette {
                 text: theme.markdown_text,
@@ -654,6 +657,26 @@ enum SequenceContext {
 pub fn render_assistant_markdown(source: &str, theme: Theme, message_scope: &str) -> Div {
     let document = parse_markdown(source);
     render_markdown_document(&document, theme, markdown_hash(message_scope))
+}
+
+pub fn render_selectable_plan(source: &str, theme: Theme, scope: &str) -> Div {
+    let document = parse_markdown(source);
+    let mut style = MarkdownRenderStyle::new(theme);
+    style.selectable = true;
+    render_block_sequence(
+        &document.blocks,
+        style,
+        0,
+        SequenceContext::Root,
+        markdown_hash(scope),
+    )
+    .w_full()
+    .min_w(px(0.0))
+    .text_size(px(style.layout.base_size))
+    .line_height(px(style.layout.base_line_height))
+    .font(ui_font())
+    .font_weight(CHATGPT_MARKDOWN_BODY_WEIGHT)
+    .text_color(style.palette.text)
 }
 
 fn render_markdown_document(document: &MarkdownDocument, theme: Theme, identity_seed: u64) -> Div {
@@ -1013,7 +1036,15 @@ fn render_inline_block(
             .text_size(px(font_size))
             .line_height(px(line_height))
             .font_weight(font_weight)
-            .child(render_styled_text(content, style, font_weight))
+            .child(if style.selectable {
+                selection::selectable(
+                    inline_identity,
+                    render_styled_text(content, style, font_weight),
+                )
+                .into_any_element()
+            } else {
+                render_styled_text(content, style, font_weight).into_any_element()
+            })
     }
 }
 

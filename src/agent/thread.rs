@@ -2,8 +2,6 @@
 
 use std::path::PathBuf;
 
-use serde_json::Value;
-
 use super::{
     activity::{
         AgentCollaboration, AgentContextCompaction, AgentFileChange, AgentImageGeneration,
@@ -225,12 +223,9 @@ pub enum ThreadHistoryItem {
     ContextCompaction(AgentContextCompaction),
     Collaboration(AgentCollaboration),
     McpToolCall(Box<AgentMcpToolCall>),
-    WebSearch {
-        item_id: String,
-        query: String,
-        action: Value,
-        results: Value,
-    },
+    Plan(crate::agent::AgentPlan),
+    Sleep(crate::agent::AgentSleep),
+    WebSearch(crate::agent::AgentWebSearch),
     Unsupported {
         item_id: String,
         kind: String,

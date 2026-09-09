@@ -93,6 +93,10 @@ pub struct Theme {
     pub markdown_rule: Rgba,
     /// Shell/tool card fill measured from ChatGPT's `bg-secondary-soft-alpha`.
     pub command_surface: Rgba,
+    /// Proposed-plan card surfaces measured independently from command cards.
+    pub plan_surface: Rgba,
+    pub plan_border: Rgba,
+    pub plan_progress_surface: Rgba,
     /// Shell/tool card outline measured from ChatGPT's `border-strong`.
     pub command_border: Rgba,
     /// Shell `text-codex-description`: primary text at 70% opacity.
@@ -198,6 +202,9 @@ impl Theme {
                 markdown_table_header_surface: rgba(0x00000000),
                 markdown_rule: rgba(0x1a1c1f1e),
                 command_surface: rgba(0x0000000d),
+                plan_surface: rgba(0xffffffff),
+                plan_border: rgba(0x1a1c1f14),
+                plan_progress_surface: rgba(0xffffffff),
                 command_border: rgba(0x00000028),
                 command_text: rgba(0x1a1c1fb3),
                 command_muted: rgba(0x898989ff),
@@ -275,6 +282,9 @@ impl Theme {
                 markdown_rule: rgba(0xffffff28),
                 // CDP: rgba(255, 255, 255, .05) and .157 respectively.
                 command_surface: rgba(0xffffff0d),
+                plan_surface: rgba(0x232323ff),
+                plan_border: rgba(0xffffff15),
+                plan_progress_surface: rgba(0x272727ff),
                 command_border: rgba(0xffffff28),
                 command_text: rgba(0xdfdfdfb3),
                 command_muted: rgba(0x929292ff),

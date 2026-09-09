@@ -32,7 +32,8 @@ pub(super) struct ToolActivityGroupPresentation {
 
 impl ToolActivityGroupPresentation {
     pub(super) fn is_active(&self) -> bool {
-        self.activities.iter().any(|activity| matches!(activity,
+        self.activities.iter().any(|activity| matches!(activity, ConversationActivity::WebSearch(call) if call.status == crate::agent::AgentActivityStatus::InProgress))
+            || self.activities.iter().any(|activity| matches!(activity,
             ConversationActivity::McpToolCall(call) if call.status == AgentMcpToolCallStatus::InProgress))
             || self.reasoning
             .iter()
@@ -83,6 +84,7 @@ pub(super) enum ConversationListRow {
     },
     Thinking,
     CurrentResponseFooter {
+        id: String,
         message: String,
         completed_at: Option<String>,
     },
@@ -110,6 +112,15 @@ pub(super) fn flush_pending_tool_activity_group(
         return;
     }
 
+    if let [ConversationActivity::WebSearch(search)] = pending.activities.as_slice() {
+        units.push(ActivityStreamUnit::Standalone(
+            ConversationActivity::WebSearch(search.clone()),
+        ));
+        pending.activities.clear();
+        pending.reasoning.clear();
+        pending.id = None;
+        return;
+    }
     let id = pending.id.take().expect("a populated tool group has an id");
     units.push(ActivityStreamUnit::ToolGroup(
         ToolActivityGroupPresentation {
@@ -128,6 +139,7 @@ pub(super) fn activity_stream_units(
     let mut units = Vec::new();
     let mut pending = PendingToolActivityGroup::default();
     let mut active_reasoning = Vec::new();
+    let mut proposed_plan = None;
 
     for activity in activities {
         match activity {
@@ -140,6 +152,10 @@ pub(super) fn activity_stream_units(
                 // the next protocol items are commands from the same group.
                 pending.id = Some(reasoning.item_id.clone());
                 active_reasoning.push(reasoning.clone());
+            }
+            ConversationActivity::TurnPlan(_) => {}
+            ConversationActivity::Plan(plan) => {
+                proposed_plan = Some(plan.clone());
             }
             ConversationActivity::Reasoning(reasoning) => {
                 pending.id.get_or_insert_with(|| reasoning.item_id.clone());
@@ -155,7 +171,9 @@ pub(super) fn activity_stream_units(
                 pending.file_changes.push(change.clone());
                 pending.activities.push(activity.clone());
             }
-            ConversationActivity::WebSearch { item_id, .. } => {
+            ConversationActivity::WebSearch(crate::agent::AgentWebSearch {
+                id: item_id, ..
+            }) => {
                 pending.id.get_or_insert_with(|| item_id.clone());
                 pending.activities.push(activity.clone());
             }
@@ -170,6 +188,11 @@ pub(super) fn activity_stream_units(
         }
     }
     flush_pending_tool_activity_group(&mut pending, &mut units);
+    if let Some(plan) = proposed_plan {
+        units.push(ActivityStreamUnit::Standalone(ConversationActivity::Plan(
+            plan,
+        )));
+    }
     let mut merged = Vec::new();
     for unit in units {
         if let ActivityStreamUnit::Standalone(ConversationActivity::ImageView(image)) = unit {
@@ -398,7 +421,7 @@ pub(super) fn completed_tool_group_summary(
     let searches_web = group
         .activities
         .iter()
-        .any(|a| matches!(a, ConversationActivity::WebSearch { .. }));
+        .any(|a| matches!(a, ConversationActivity::WebSearch(_)));
     let text = if uses_computer {
         let suffix = if surfaces.iter().any(|s| s == "浏览器") {
             ""
@@ -461,7 +484,7 @@ pub(super) fn tool_group_row_count(group: &ToolActivityGroupPresentation) -> usi
             .filter(|a| {
                 matches!(
                     a,
-                    ConversationActivity::McpToolCall(_) | ConversationActivity::WebSearch { .. }
+                    ConversationActivity::McpToolCall(_) | ConversationActivity::WebSearch(_)
                 )
             })
             .count()
@@ -532,6 +555,11 @@ pub(super) fn conversation_list_rows(
                 rows.push(ConversationListRow::FileSummary(review));
             } else {
                 rows.push(ConversationListRow::CurrentResponseFooter {
+                    id: turn
+                        .resumed
+                        .as_ref()
+                        .map(|t| t.id.clone())
+                        .unwrap_or_else(|| format!("historical-{turn_index}")),
                     message: turn.assistant_message,
                     completed_at: turn.assistant_message_time,
                 });
@@ -572,6 +600,10 @@ pub(super) fn conversation_list_rows(
             rows.push(ConversationListRow::FileSummary(review));
         } else {
             rows.push(ConversationListRow::CurrentResponseFooter {
+                id: resumed_turn
+                    .as_ref()
+                    .map(|t| t.id.clone())
+                    .unwrap_or_else(|| "current".to_owned()),
                 message: assistant_message,
                 completed_at: assistant_message_time,
             });
@@ -722,7 +754,11 @@ pub(crate) fn resumed_activity_audit(activities: &[ConversationActivity]) -> ser
                 question,
                 answer,
             } => json!({"type":"questionReply","id":item_id,"question":question,"answer":answer}),
-            ConversationActivity::WebSearch { item_id, query, .. } => {
+            ConversationActivity::WebSearch(crate::agent::AgentWebSearch {
+                id: item_id,
+                query,
+                ..
+            }) => {
                 json!({"type":"webSearch","id":item_id,"query":query})
             }
             ConversationActivity::ContextCompaction(c) => {

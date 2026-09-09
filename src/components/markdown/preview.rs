@@ -73,6 +73,7 @@ pub struct MarkdownPreview {
     mode: ThemeMode,
     focus: FocusHandle,
     identity: u64,
+    selectable: bool,
 }
 
 impl MarkdownPreview {
@@ -86,9 +87,13 @@ impl MarkdownPreview {
             mode,
             focus: cx.focus_handle(),
             identity: markdown_hash(&cx.entity_id()),
+            selectable: false,
         }
     }
 
+    pub fn enable_text_selection(&mut self) {
+        self.selectable = true;
+    }
     pub fn set_document(&mut self, document: MarkdownDocument, cx: &mut Context<Self>) {
         let anchor = self.scroll.logical_scroll_top();
         let items = preview_items(&document);
@@ -141,7 +146,8 @@ impl Render for MarkdownPreview {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let document = self.document.clone();
         let items = self.items.clone();
-        let style = MarkdownRenderStyle::new(Theme::for_mode(self.mode));
+        let mut style = MarkdownRenderStyle::new(Theme::for_mode(self.mode));
+        style.selectable = self.selectable;
         let identity = self.identity;
         div()
             .id("file-markdown-preview")
@@ -155,7 +161,11 @@ impl Render for MarkdownPreview {
             .aria_label("Markdown 文件预览")
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|s, _, window, cx| s.focus.focus(window, cx)),
+                cx.listener(|s, _, window, cx| {
+                    if !window.default_prevented() {
+                        s.focus.focus(window, cx);
+                    }
+                }),
             )
             .on_key_down(cx.listener(Self::key_down))
             .text_size(px(style.layout.base_size))

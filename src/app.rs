@@ -2,6 +2,7 @@ mod bottom_panel;
 mod capture;
 mod conversations;
 mod image_preview;
+mod plan;
 mod project_creation;
 mod render;
 mod review;
@@ -74,6 +75,7 @@ pub struct ChatApp {
     terminal_panels: HashMap<ConversationKey, Entity<TerminalPanel>>,
     file_panels: HashMap<ConversationKey, Entity<FilePanel>>,
     review_panels: HashMap<ConversationKey, Entity<ReviewPanel>>,
+    plan_export_error: Option<String>,
     side_chat_panels: HashMap<ConversationKey, Entity<SideChatPanel>>,
     file_close_prompt_open: bool,
     terminal_return_focus_pending: bool,
@@ -237,6 +239,20 @@ impl ChatApp {
             cx.notify();
         })
         .detach();
+        cx.subscribe(
+            &home,
+            |this, _, event: &crate::components::home::OpenPlan, cx| {
+                this.open_plan(event.0.clone(), cx);
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &home,
+            |this, _, event: &crate::components::home::DownloadPlan, cx| {
+                this.download_plan(event.0.clone(), cx);
+            },
+        )
+        .detach();
         cx.subscribe(&home, |this, _, event: &OpenDiffReview, cx| {
             this.open_diff_review(event.0.clone(), cx);
         })
@@ -309,6 +325,7 @@ impl ChatApp {
             terminal_panels: HashMap::new(),
             file_panels: HashMap::new(),
             review_panels: HashMap::new(),
+            plan_export_error: None,
             side_chat_panels: HashMap::new(),
             file_close_prompt_open: false,
             terminal_return_focus_pending: false,

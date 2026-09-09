@@ -141,11 +141,27 @@ pub(super) fn render_activity_stream_unit(
                 collaboration_activity(home_entity, collaboration, expanded, theme)
                     .into_any_element()
             }
-            ConversationActivity::WebSearch {
-                item_id,
-                query,
-                results,
-            } => web_search_activity(item_id, query, results, theme).into_any_element(),
+            ConversationActivity::Plan(plan) => {
+                let feedback_open =
+                    expanded_commands.contains(&format!("plan-feedback-{}", plan.id));
+                let in_panel = expanded_commands.contains(&format!("plan-in-panel:{}", plan.id));
+                super::progress::plan_activity(
+                    home_entity,
+                    plan,
+                    feedback_open,
+                    in_panel,
+                    thinking_shimmer_progress,
+                    theme,
+                )
+                .into_any_element()
+            }
+            ConversationActivity::Sleep(sleep) => {
+                super::progress::sleep_activity(sleep, theme).into_any_element()
+            }
+            ConversationActivity::TurnPlan(_) => div().into_any_element(),
+            ConversationActivity::WebSearch(search) => {
+                web_search_activity(search, theme).into_any_element()
+            }
             ConversationActivity::QuestionReply {
                 item_id,
                 question,

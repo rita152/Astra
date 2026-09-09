@@ -156,6 +156,32 @@ impl ConversationState {
     pub(crate) fn apply_agent_event_batch(&mut self, events: Vec<AgentEvent>) -> bool {
         let mut finished = false;
         for event in events {
+            if matches!(
+                self.phase,
+                ConversationPhase::Complete
+                    | ConversationPhase::Stopped
+                    | ConversationPhase::Failed
+            ) && matches!(
+                &event,
+                AgentEvent::PlanUpdated(_)
+                    | AgentEvent::PlanDelta { .. }
+                    | AgentEvent::TurnPlanUpdated(_)
+                    | AgentEvent::WebSearchUpdated(_)
+                    | AgentEvent::SleepUpdated(_)
+            ) {
+                continue;
+            }
+            if matches!(
+                &event,
+                AgentEvent::PlanUpdated(_)
+                    | AgentEvent::PlanDelta { .. }
+                    | AgentEvent::TurnPlanUpdated(_)
+                    | AgentEvent::WebSearchUpdated(_)
+                    | AgentEvent::SleepUpdated(_)
+            ) && self.phase != ConversationPhase::Stopping
+            {
+                self.phase = ConversationPhase::Streaming;
+            }
             match event {
                 AgentEvent::ThreadCreated { thread_id } => {
                     self.thread_id = Some(thread_id.clone());
@@ -416,6 +442,25 @@ impl ConversationState {
                     if self.phase != ConversationPhase::Stopping {
                         self.phase = ConversationPhase::Streaming;
                     }
+                }
+                AgentEvent::PlanUpdated(v) => super::activity::upsert_progress_activity(
+                    &mut self.activities,
+                    ConversationActivity::Plan(v),
+                ),
+                AgentEvent::WebSearchUpdated(v) => super::activity::upsert_progress_activity(
+                    &mut self.activities,
+                    ConversationActivity::WebSearch(v),
+                ),
+                AgentEvent::SleepUpdated(v) => super::activity::upsert_progress_activity(
+                    &mut self.activities,
+                    ConversationActivity::Sleep(v),
+                ),
+                AgentEvent::TurnPlanUpdated(v) => super::activity::upsert_progress_activity(
+                    &mut self.activities,
+                    ConversationActivity::TurnPlan(v),
+                ),
+                AgentEvent::PlanDelta { item_id, delta } => {
+                    super::activity::append_plan_delta(&mut self.activities, item_id, delta)
                 }
                 AgentEvent::ContextCompactionUpdated(compaction) => {
                     upsert_context_compaction_activity(&mut self.activities, compaction);
@@ -835,6 +880,10 @@ impl ConversationState {
                     });
                 }
                 AgentEvent::Completed => {
+                    super::activity::finish_progress_activities(
+                        &mut self.activities,
+                        crate::agent::AgentActivityStatus::Completed,
+                    );
                     remove_unfinished_image_generations(&mut self.activities);
                     if self.safety_buffering {
                         self.model_status = None;
@@ -846,6 +895,10 @@ impl ConversationState {
                     break;
                 }
                 AgentEvent::Interrupted => {
+                    super::activity::finish_progress_activities(
+                        &mut self.activities,
+                        crate::agent::AgentActivityStatus::Interrupted,
+                    );
                     remove_unfinished_image_generations(&mut self.activities);
                     self.assistant_message_time = Some(current_local_time_label());
                     self.phase = ConversationPhase::Stopped;
@@ -854,6 +907,10 @@ impl ConversationState {
                     break;
                 }
                 AgentEvent::Failed(error) => {
+                    super::activity::finish_progress_activities(
+                        &mut self.activities,
+                        crate::agent::AgentActivityStatus::Failed,
+                    );
                     remove_unfinished_image_generations(&mut self.activities);
                     self.assistant_message = error.clone();
                     let already_visible = self.activities.iter().rev().any(|activity| {

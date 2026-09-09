@@ -224,3 +224,57 @@ pub struct AgentReasoning {
     pub summary: Vec<String>,
     pub content: Vec<String>,
 }
+
+/// Item lifecycle is independent of the enclosing turn outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentActivityStatus {
+    InProgress,
+    Completed,
+    Interrupted,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentPlan {
+    pub id: String,
+    pub text: String,
+    pub status: AgentActivityStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentPlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentPlanStep {
+    pub step: String,
+    pub status: AgentPlanStepStatus,
+}
+
+/// Turn-level progress does not contain or replace a proposed plan's text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTurnPlan {
+    pub turn_id: String,
+    pub explanation: Option<String>,
+    pub steps: Vec<AgentPlanStep>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentWebSearch {
+    pub id: String,
+    pub query: String,
+    pub action: Value,
+    pub results: Value,
+    pub extra: BTreeMap<String, Value>,
+    pub status: AgentActivityStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSleep {
+    pub id: String,
+    pub duration_ms: u64,
+    pub status: AgentActivityStatus,
+}

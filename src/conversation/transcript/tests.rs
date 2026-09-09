@@ -58,3 +58,107 @@ fn answered_clarification_retains_question_and_answer_separately() {
         None
     );
 }
+
+fn progress_history(status: HistoryTurnStatus, items: Vec<ThreadHistoryItem>) -> ThreadHistory {
+    use crate::agent::{HistoryItemDetail, ThreadActivity, ThreadSummary, ThreadTurn};
+    ThreadHistory {
+        thread: ThreadSummary {
+            thread_id: "history".into(),
+            title: "test".into(),
+            preview: String::new(),
+            cwd: "/tmp".into(),
+            project_id: None,
+            section: None,
+            created_at: 0,
+            updated_at: 0,
+            recency_at: None,
+            activity: ThreadActivity::Idle,
+        },
+        turns: vec![ThreadTurn {
+            turn_id: "turn".into(),
+            status,
+            items_view: HistoryItemDetail::Full,
+            items,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            error: None,
+        }],
+        next_turn_cursor: None,
+        backwards_turn_cursor: None,
+    }
+}
+#[test]
+fn history_progress_uses_final_plan_and_preserves_opaque_search_results() {
+    use crate::agent::{AgentActivityStatus as S, AgentPlan, AgentSleep, AgentWebSearch};
+    let plan = AgentPlan {
+        id: "plan".into(),
+        text: "final".into(),
+        status: S::Completed,
+    };
+    let search = AgentWebSearch {
+        id: "search".into(),
+        query: "Rust".into(),
+        action: serde_json::json!({"type":"findInPage","pattern":"Rust","url":null,"ext":true}),
+        results: serde_json::json!([{"future":42}]),
+        extra: Default::default(),
+        status: S::Completed,
+    };
+    let sleep = AgentSleep {
+        id: "sleep".into(),
+        duration_ms: 15000,
+        status: S::Completed,
+    };
+    let mut state = ConversationState::default();
+    state.hydrate_history(progress_history(
+        HistoryTurnStatus::Completed,
+        vec![
+            ThreadHistoryItem::Plan(plan.clone()),
+            ThreadHistoryItem::Plan(plan.clone()),
+            ThreadHistoryItem::WebSearch(search.clone()),
+            ThreadHistoryItem::Sleep(sleep.clone()),
+        ],
+    ));
+    assert_eq!(
+        state.activities,
+        vec![
+            ConversationActivity::Plan(plan),
+            ConversationActivity::WebSearch(search),
+            ConversationActivity::Sleep(sleep)
+        ]
+    );
+    assert_eq!(state.phase, ConversationPhase::Complete);
+}
+#[test]
+fn history_tail_wait_tracks_turn_outcome_without_inventing_elapsed_duration() {
+    use crate::agent::{AgentActivityStatus as S, AgentSleep};
+    for (turn, expected) in [
+        (HistoryTurnStatus::InProgress, S::InProgress),
+        (HistoryTurnStatus::Interrupted, S::Interrupted),
+        (HistoryTurnStatus::Failed, S::Failed),
+        (HistoryTurnStatus::Completed, S::Completed),
+    ] {
+        let mut state = ConversationState::default();
+        state.hydrate_history(progress_history(
+            turn,
+            vec![
+                ThreadHistoryItem::Sleep(AgentSleep {
+                    id: "earlier".into(),
+                    duration_ms: 0,
+                    status: S::Completed,
+                }),
+                ThreadHistoryItem::Sleep(AgentSleep {
+                    id: "tail".into(),
+                    duration_ms: 15000,
+                    status: S::Completed,
+                }),
+            ],
+        ));
+        assert!(
+            matches!(&state.activities[0],ConversationActivity::Sleep(v) if v.status==S::Completed)
+        );
+        assert!(
+            matches!(&state.activities[1],ConversationActivity::Sleep(v) if v.status==expected&&v.duration_ms==15000)
+        );
+    }
+}

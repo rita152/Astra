@@ -258,6 +258,11 @@ impl ManagedTurn {
         let mut outcome = None;
         for message in buffered {
             if outcome.is_some() {
+                if super::super::progress::is_progress_notification(&message)
+                    || message.get("method").and_then(Value::as_str) == Some("turn/completed")
+                {
+                    continue;
+                }
                 bail!("turn/completed 之后仍收到同一 turn 的缓存消息");
             }
             outcome = process_turn_message(

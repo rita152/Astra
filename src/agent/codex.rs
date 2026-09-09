@@ -8,6 +8,7 @@ mod manager;
 mod methods;
 mod notifications;
 mod permissions;
+mod progress;
 mod registry;
 mod requests;
 mod session;

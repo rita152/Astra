@@ -1008,3 +1008,6 @@ impl ComposerView {
         cx.notify();
     }
 }
+
+#[cfg(feature = "screenshot")]
+mod progress;

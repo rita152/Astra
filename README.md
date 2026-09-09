@@ -24,6 +24,7 @@ cargo run --release -- --theme=light
 | 侧边聊天 | 右侧入口、底部菜单或 `⌥⌘S` | 基于已有主会话创建临时对话；独立输入、模型、权限、轮次和中断；支持多标签与文件上下文 |
 
 - **历史与消息**：已完成轮次将最终答复之前的过程消息折叠，支持点击及 Enter／Space 展开。历史文件变更按路径汇总，保留原始 patch；Markdown 支持本地图片、带行号的文件链接和表格。
+- **计划与活动**：计划文本流式更新，以最终 plan item 覆盖；步骤进度独立显示在输入框上方，支持悬停及 Enter／Space 查看。计划卡支持复制、显式下载和只读文件标签；正文普通段落支持拖选、双击、复制及 Shift+方向键调整选择，只读计划不自动保存到工作区。搜索保留查询、action、结果及扩展 JSON，等待显示时长与状态；历史缺失的逐项时间和步骤快照不伪造，详见接入总表。
 - **文件保存**：停止输入约 400 ms 后自动保存，`Cmd+S` 立即保存；撤销／重做也写回磁盘。保留 UTF-8 BOM、CRLF 和权限，保存前检查外部修改。文本上限为 2 MiB、单行 64 KiB；仅访问本机文件系统。验收编辑行为时使用专用测试文件。
 - **Git 审查**：范围包括上一轮、未提交、未暂存、已暂存、已提交和分支；分支使用 merge-base。支持统一／拆分差异、文字差异、上下文展开和逐行评论；评论可单独或随提示词发送。写操作前校验工作区与 index，失败保留输入；还原新增文件时备份到 worktree Git 目录下的 `gpui-discarded/`。PR 创建使用本机 `gh`。
 - **面板生命周期**：收起面板或切换主会话保留终端、文件、审查和侧边聊天状态；应用退出后不恢复 shell 或临时侧边聊天。侧边标签支持拖动排序、`Ctrl+Tab`／`Ctrl+Shift+Tab` 切换、`Cmd+W` 关闭；有消息时确认关闭，连接失效后保留消息供查看和复制。
@@ -99,6 +100,7 @@ GPUI_UI_PREFERENCES_PATH="$PWD/artifacts/capture-preferences.json" \
 | `--review-root=/absolute/repository`、`--review-filter=src/example.rs` | 加载真实 Git 仓库；截图等待 diff 就绪 |
 | `--settings-page=appearance` | 直接打开设置页，页面列表见 `src/settings/mod.rs` |
 | `--image-generation-ui-state=running/completed/failed/load-error` | 固定图像生成状态；完成态另传 `--image-generation-path=/absolute/image.png` |
+| `--progress-ui-state=running/streaming/completed/interrupted` | 计划、搜索与等待的归约状态；streaming 定时产生增量、最终覆盖与 turn 完成，running 可通过停止按钮中断；实际历史用 `--resume-thread` 验证 |
 | `--typography-specimen`、`--typography-display=N` | 字体样本与目标显示器；实现及专用参数见 `src/typography.rs` |
 
 ### 专项入口

@@ -370,8 +370,7 @@ impl Render for ChatApp {
                     this.permission_confirmation_open = false;
                     cx.notify();
                 } else {
-                    this.home
-                        .update(cx, |home, cx| home.close_model_picker(cx));
+                    this.home.update(cx, |home, cx| { home.close_model_picker(cx); home.dismiss_plan_popovers(cx); });
                 }
             }))
             .when(self.showing_settings, |shell| {
@@ -900,6 +899,7 @@ impl Render for ChatApp {
                         ),
                 )
             })
+            .when_some(self.plan_export_error.clone(), |root, error| root.child(div().id("plan-export-error").role(Role::Alert).absolute().bottom(px(24.0)).right(px(24.0)).max_w(px(400.0)).p(px(12.0)).rounded(px(12.0)).bg(theme.surface).border_1().border_color(theme.border).text_color(theme.text).child(error)))
             .into_any_element()
     }
 }

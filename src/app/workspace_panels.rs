@@ -94,6 +94,17 @@ impl ChatApp {
                 .map(|h| h.cwd.clone())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             let panel = cx.new(|cx| FilePanel::new(cwd, self.mode, cx));
+            cx.observe(&panel, |this, panel, cx| {
+                if this.right_panel.open
+                    && this.right_panel.mode == Some(super::state::RightPanelMode::Files)
+                    && this.file_panels.get(&this.active_conversation) == Some(&panel)
+                {
+                    let item_id = panel.read(cx).active_plan_id();
+                    this.home
+                        .update(cx, |home, cx| home.set_plan_panel_for_view(item_id, cx));
+                }
+            })
+            .detach();
             self.file_panels.insert(key.clone(), panel);
         }
         self.file_panels[&key].update(cx, |p, cx| p.focus(cx));
