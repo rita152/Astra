@@ -212,10 +212,6 @@ impl PromptInput {
         cx.notify();
     }
 
-    pub fn set_submit_empty(&mut self, allow: bool) {
-        self.submit_empty = allow;
-    }
-
     pub fn submit(&mut self, cx: &mut Context<Self>) {
         let prompt = self.content.trim().to_owned();
         if !prompt.is_empty() || self.submit_empty {

@@ -967,6 +967,7 @@ fn resumed_historical_tool_group_keeps_its_disclosure_state() {
         items_view: HistoryItemDetail::Full,
         items: vec![
             ThreadHistoryItem::UserMessage {
+                client_message_id: None,
                 images: Vec::new(),
                 item_id: format!("{turn_id}-user"),
                 text: prompt.to_owned(),
@@ -1055,6 +1056,7 @@ fn dense_resumed_tool_group_preserves_row_height_and_scrolls_instead_of_overlapp
         |_, cx| HomeView::new(ThemeMode::Dark, cx),
     );
     let mut dense_items = vec![ThreadHistoryItem::UserMessage {
+        client_message_id: None,
         images: Vec::new(),
         item_id: "dense-user".to_owned(),
         text: "inspect the native material".to_owned(),
@@ -1101,6 +1103,7 @@ fn dense_resumed_tool_group_preserves_row_height_and_scrolls_instead_of_overlapp
                 status: HistoryTurnStatus::Completed,
                 items_view: HistoryItemDetail::Full,
                 items: vec![ThreadHistoryItem::UserMessage {
+                    client_message_id: None,
                     images: Vec::new(),
                     item_id: "current-user".to_owned(),
                     text: "continue".to_owned(),
@@ -1453,7 +1456,7 @@ fn uploaded_image_hitboxes_and_keyboard_keep_attachment_order() {
                 self.paths
                     .iter()
                     .cloned()
-                    .map(crate::agent::UserMessageImage::Local)
+                    .map(crate::agent::UserMessageAttachment::Local)
                     .collect(),
                 self.home.clone(),
                 Theme::for_mode(ThemeMode::Dark),

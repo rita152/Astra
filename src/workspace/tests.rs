@@ -308,6 +308,7 @@ impl AgentBackend for FakeWorkspaceBackend {
                 items: if full {
                     vec![
                         ThreadHistoryItem::UserMessage {
+                            client_message_id: None,
                             images: Vec::new(),
                             item_id: format!("{id}-user"),
                             text: format!("question {id}"),

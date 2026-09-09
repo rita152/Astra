@@ -39,6 +39,17 @@ fn unescape_commonmark_punctuation(source: &str) -> String {
     result
 }
 
+/// File-context paths emitted by our shared input encoder. Images are merged
+/// by the adapter, so a path appears only once in live and restored messages.
+pub(crate) fn user_message_context_files(source: &str) -> Vec<std::path::PathBuf> {
+    source
+        .trim_start_matches('\n')
+        .strip_prefix(ATTACHED_FILES_HEADER)
+        .and_then(|body| body.split("\n\n").next())
+        .and_then(|paths| serde_json::from_str(paths).ok())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::normalize_user_message_for_display;

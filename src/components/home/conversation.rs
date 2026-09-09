@@ -222,6 +222,29 @@ pub(super) fn conversation(
         let Some(row) = rows.get(index).cloned() else {
             return div().into_any_element();
         };
+        let continuation = matches!(
+            &row,
+            ConversationListRow::Activity {
+                unit: ActivityStreamUnit::Standalone(ConversationActivity::UserMessage { .. }),
+                ..
+            }
+        );
+        let row = match row {
+            ConversationListRow::Activity {
+                unit:
+                    ActivityStreamUnit::Standalone(ConversationActivity::UserMessage {
+                        text,
+                        images,
+                        ..
+                    }),
+                ..
+            } => ConversationListRow::CurrentUser {
+                message: text,
+                images,
+                time: String::new(),
+            },
+            row => row,
+        };
         let is_markdown = matches!(
             &row,
             ConversationListRow::AssistantMarkdown { .. }
@@ -272,6 +295,7 @@ pub(super) fn conversation(
                     .w_full()
                     .child(current_user_message(
                         super::messages::UserMessageContent {
+                            continuation,
                             text: message,
                             images,
                             time: time.unwrap_or_default(),
@@ -291,19 +315,23 @@ pub(super) fn conversation(
                 images,
                 time,
             } => (
-                current_user_message(
-                    super::messages::UserMessageContent {
-                        text: message,
-                        images,
-                        time,
-                    },
-                    user_message_actions_visible_for_capture,
-                    theme,
-                    window,
-                    home_entity.clone(),
-                    home_entity.read(_cx).content_width,
-                )
-                .into_any_element(),
+                div()
+                    .id(("current-turn-user", index))
+                    .w_full()
+                    .child(current_user_message(
+                        super::messages::UserMessageContent {
+                            continuation,
+                            text: message,
+                            images,
+                            time,
+                        },
+                        user_message_actions_visible_for_capture,
+                        theme,
+                        window,
+                        home_entity.clone(),
+                        home_entity.read(_cx).content_width,
+                    ))
+                    .into_any_element(),
                 0.0,
                 16.0,
             ),
@@ -354,10 +382,24 @@ pub(super) fn conversation(
             Some(ConversationListRow::CurrentResponseFooter { .. })
         ) {
             0.0
+        } else if matches!(
+            rows.get(index),
+            Some(ConversationListRow::CurrentResponseFooter { .. })
+        ) && matches!(
+            rows.get(index + 1),
+            Some(
+                ConversationListRow::HistoricalUser { .. }
+                    | ConversationListRow::CurrentUser { .. }
+            )
+        ) {
+            // CDP: a 26px toolbar followed by a 12px inter-turn gap.
+            // The shared toolbar already contributes its 3px top inset.
+            9.0
         } else {
             bottom_gap
         };
         div()
+            .id(("conversation-row", index))
             .w_full()
             .flex()
             .justify_center()

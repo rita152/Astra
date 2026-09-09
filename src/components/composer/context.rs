@@ -7,6 +7,7 @@ use gpui::{Context, KeyDownEvent, PathPromptOptions, Role, Window, deferred, div
 impl ComposerView {
     pub(super) fn toggle_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.context_menu_open = !self.context_menu_open;
+        self.context_focus_pending = self.context_menu_open;
         self.menu_open = false;
         self.permission_menu_open = false;
         if self.context_menu_open {
@@ -38,6 +39,9 @@ impl ComposerView {
         cx.notify();
     }
     pub(super) fn attach_paths(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
+        if !paths.is_empty() {
+            self.draft_revision = self.draft_revision.wrapping_add(1);
+        }
         for path in paths.into_iter().take(16) {
             if self.prompt_context.files.len() >= 16 {
                 break;
@@ -132,6 +136,7 @@ impl ComposerView {
                                     .cursor_pointer()
                                     .hover(move |s| s.bg(theme.sidebar_hover))
                                     .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.draft_revision = this.draft_revision.wrapping_add(1);
                                         this.prompt_context.files.retain(|file| file.path != path);
                                         cx.notify();
                                         cx.stop_propagation();
@@ -141,6 +146,8 @@ impl ComposerView {
                                             if matches!(e.keystroke.key.as_str(), "enter" | "space")
                                             {
                                                 if index < this.prompt_context.files.len() {
+                                                    this.draft_revision =
+                                                        this.draft_revision.wrapping_add(1);
                                                     this.prompt_context.files.remove(index);
                                                 }
                                                 cx.notify();
@@ -188,6 +195,16 @@ impl ComposerView {
             div()
                 .id("side-chat-context-menu")
                 .role(Role::Menu)
+                .key_context("ComposerContextMenu")
+                .on_action(
+                    cx.listener(|this, _: &super::DismissContextMenu, window, cx| {
+                        this.context_menu_open = false;
+                        this.context_focus_pending = false;
+                        this.prompt_focus_handle(cx).focus(window, cx);
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
                 .track_focus(&self.context_focus)
                 .absolute()
                 .bottom(px(50.0))

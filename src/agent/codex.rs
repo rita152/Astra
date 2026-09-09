@@ -7,6 +7,7 @@ mod auto_approval;
 mod backend;
 mod catalog;
 mod dispatch;
+mod input;
 mod items;
 mod manager;
 mod methods;

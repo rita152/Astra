@@ -933,6 +933,7 @@ fn history_fixture(thread_id: &str, message: &str) -> ThreadHistory {
             items_view: HistoryItemDetail::Full,
             items: vec![
                 ThreadHistoryItem::UserMessage {
+                    client_message_id: None,
                     images: Vec::new(),
                     item_id: format!("user-{thread_id}"),
                     text: message.to_owned(),
@@ -1331,4 +1332,43 @@ fn proposed_plan_export_writes_exact_markdown_and_reports_io_failure() {
             .as_ref()
             .is_some_and(|s| s.starts_with("无法保存计划"))
     }));
+}
+
+#[test]
+fn composer_context_escape_wins_over_the_application_fallback() {
+    let mut app = TestApp::new();
+    let mut window = app.open_window_with_options(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(1440.), px(900.)),
+            ))),
+            ..Default::default()
+        },
+        |_, cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "escape",
+                super::DismissPermissionUi,
+                None,
+            )]);
+            let mut chat = ChatApp::new(ThemeMode::Dark, false, cx);
+            chat.complete_startup_for_capture(cx);
+            chat
+        },
+    );
+    let composer = window.update(|chat, w, cx| {
+        let c = chat.home.read(cx).composer_entity();
+        c.read(cx).prompt_focus_handle(cx).focus(w, cx);
+        c
+    });
+    window.draw();
+    window.simulate_keystrokes("tab enter");
+    window.draw();
+    window.simulate_keystroke("escape");
+    window.draw();
+    window.simulate_input("scope-ok");
+    assert_eq!(
+        app.read_entity(&composer, |c, cx| c.prompt_text(cx).to_owned()),
+        "scope-ok"
+    );
 }

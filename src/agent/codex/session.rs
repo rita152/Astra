@@ -42,8 +42,17 @@ pub(super) struct TurnSessionState {
     pub(super) terminal: bool,
 }
 
+#[derive(Default)]
+pub(super) struct AgentMessageProgress {
+    pub(super) started: bool,
+    pub(super) has_output: bool,
+    pub(super) completed: bool,
+}
+
 pub(super) struct CodexTurnSession<W> {
     pub(super) writer: Mutex<Option<W>>,
+    pub(super) user_messages: Mutex<std::collections::HashMap<String, Value>>,
+    pub(super) agent_messages: Mutex<std::collections::HashMap<String, AgentMessageProgress>>,
     pub(super) state: Mutex<TurnSessionState>,
     pub(super) server_requests: Mutex<ServerRequestRegistry>,
     pub(super) process: Option<Arc<AppServerProcess>>,
@@ -59,6 +68,8 @@ impl<W: Write + Send> CodexTurnSession<W> {
     pub(super) fn new(writer: W, process: Option<Arc<AppServerProcess>>) -> Self {
         Self {
             writer: Mutex::new(Some(writer)),
+            user_messages: Mutex::new(Default::default()),
+            agent_messages: Mutex::new(Default::default()),
             state: Mutex::new(TurnSessionState::default()),
             server_requests: Mutex::new(ServerRequestRegistry::default()),
             process,

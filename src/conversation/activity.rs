@@ -52,6 +52,11 @@ pub(crate) enum ConversationActivity {
     AutoApprovalReview(Box<super::auto_approval::AutoApprovalReviewPresentation>),
     StrictReview(super::auto_approval::StrictReviewPresentation),
     GuardianWarning(crate::agent::AgentGuardianWarning),
+    UserMessage {
+        item_id: String,
+        text: String,
+        images: Vec<crate::agent::UserMessageAttachment>,
+    },
     AssistantMessage {
         item_id: String,
         text: String,

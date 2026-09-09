@@ -349,3 +349,53 @@ fn five_and_six_digit_line_numbers_do_not_double_the_diff_row_height() {
         });
     }
 }
+
+#[test]
+fn failed_submission_restores_comments_without_replacing_a_new_comment_draft() {
+    let mut app = TestApp::new();
+    let panel = app.new_entity(fixture);
+    app.update_entity(&panel, |panel, cx| {
+        panel.input.update(cx, |input, cx| {
+            input.set_text_silently("new unsaved comment", cx)
+        });
+        panel.comments.push(Comment {
+            id: 2,
+            path: "demo.rs".into(),
+            start: 1,
+            end: 1,
+            old: false,
+            text: "new saved comment".into(),
+        });
+        panel.restore_comments(
+            vec![
+                Comment {
+                    id: 1,
+                    path: panel
+                        .snapshot
+                        .root
+                        .join("demo.rs")
+                        .to_string_lossy()
+                        .into_owned(),
+                    start: 2,
+                    end: 2,
+                    old: false,
+                    text: "restored".into(),
+                },
+                Comment {
+                    id: 2,
+                    path: "demo.rs".into(),
+                    start: 1,
+                    end: 1,
+                    old: false,
+                    text: "old copy".into(),
+                },
+            ],
+            cx,
+        );
+        assert_eq!(panel.input.read(cx).text(), "new unsaved comment");
+        assert_eq!(panel.comments.len(), 2);
+        assert_eq!(panel.comments[0].text, "new saved comment");
+        assert_eq!(panel.comments[1].path, "demo.rs");
+        assert!(panel.next_comment > 2);
+    });
+}

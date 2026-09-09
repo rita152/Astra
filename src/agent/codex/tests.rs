@@ -280,6 +280,7 @@ fn turn_start_for_mode(mode: AgentPermissionMode, cwd: PathBuf) -> Value {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "permission probe".into(),
             cwd,
             project_id: None,
@@ -565,6 +566,7 @@ fn drives_one_complete_prompt_and_normalizes_stream_events() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "打个招呼".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -606,6 +608,12 @@ fn drives_one_complete_prompt_and_normalizes_stream_events() {
                 failure_reason: None,
             }),
             AgentEvent::Started,
+            AgentEvent::UserMessage {
+                item_id: "user_1".into(),
+                client_message_id: None,
+                text: "打个招呼".into(),
+                images: vec![]
+            },
             AgentEvent::AssistantMessageStarted {
                 item_id: "msg_1".into(),
             },
@@ -803,6 +811,7 @@ fn existing_thread_resumes_before_turn_start() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "继续对话".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -905,6 +914,7 @@ fn resume_goal_cleared_requires_a_matching_string_thread_id() {
             &mut reader,
             &session,
             &AgentRequest {
+                client_message_id: None,
                 prompt: "继续对话".into(),
                 cwd: PathBuf::from("/tmp/project"),
                 project_id: None,
@@ -957,6 +967,7 @@ fn goal_cleared_after_resumed_turn_start_fails_fast() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "继续对话".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -1008,6 +1019,7 @@ fn thread_started_must_match_the_canonical_thread_id_in_either_order() {
             &mut reader,
             &session,
             &AgentRequest {
+                client_message_id: None,
                 prompt: "检查生命周期关联".into(),
                 cwd: PathBuf::from("/tmp/project"),
                 project_id: None,
@@ -1044,6 +1056,7 @@ fn deferred_turn_is_not_forwarded_when_turn_start_fails() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "继续对话".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -1084,6 +1097,7 @@ fn deferred_batch_is_atomic_when_a_later_notification_mismatches() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "继续对话".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -1125,6 +1139,7 @@ fn active_goal_approval_is_discarded_when_turn_start_fails() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "继续对话".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -1177,6 +1192,7 @@ fn deferred_started_approval_and_resolution_keep_wire_order() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "继续对话".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -1231,6 +1247,7 @@ fn live_item_event_must_match_the_active_turn() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "继续对话".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -1272,6 +1289,7 @@ fn completed_turn_can_finish_before_turn_start_response() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "快速完成".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -1315,6 +1333,7 @@ fn resume_rpc_error_fails_closed_without_starting_or_turning() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "继续对话".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -1372,6 +1391,7 @@ fn resume_response_requires_the_requested_thread_id() {
             &mut reader,
             &session,
             &AgentRequest {
+                client_message_id: None,
                 prompt: "继续对话".into(),
                 cwd: PathBuf::from("/tmp/project"),
                 project_id: None,
@@ -1430,6 +1450,7 @@ fn resume_failure_cleanup_reaps_the_app_server_process() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "继续对话".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -1477,6 +1498,7 @@ fn pending_interrupt_uses_the_active_thread_and_turn_and_waits_for_terminal_stat
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "interrupt me".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -2184,6 +2206,7 @@ fn user_facing_notifications_are_normalized_without_ending_the_turn() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "probe notices".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -2254,6 +2277,7 @@ fn failed_turn_completion_is_the_terminal_event_and_keeps_error_details() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "fail".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -3031,6 +3055,7 @@ fn real_cli_safe_network_command_accept_once_round_trip() {
         .find(|model| model.is_default)
         .unwrap_or(&catalog.models[0]);
     let run = CodexAppServerBackend::new().run_prompt(AgentRequest {
+        client_message_id: None,
         prompt: "Use the shell to run exactly `curl -I https://example.com` and no other command. Request approval for network access, then wait for my decision.".into(),
         cwd: std::env::current_dir().unwrap(),
         project_id: None,
@@ -3223,7 +3248,23 @@ fn item_started_user_message_is_validated_without_duplicate_ui_event() {
 
     assert_eq!(outcome, None);
     assert!(!streamed_text);
-    assert!(rx.try_recv().is_err());
+    assert!(matches!(
+        rx.try_recv().unwrap(),
+        AgentEvent::UserMessage { .. }
+    ));
+    super::process_turn_message(
+        &session,
+        &message,
+        "thr_1",
+        "turn_1",
+        &tx,
+        &mut streamed_text,
+    )
+    .unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "an identical event is emitted only once"
+    );
 }
 
 #[test]
@@ -3311,7 +3352,23 @@ fn user_message_attachment_lifecycle_matches_generated_schema() {
             .unwrap(),
             None
         );
-        assert!(rx.try_recv().is_err());
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::UserMessage { .. }
+        ));
+        super::process_turn_message(
+            &session,
+            &message,
+            "thr_1",
+            "turn_1",
+            &tx,
+            &mut streamed_text,
+        )
+        .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "an identical event is emitted only once"
+        );
     }
 }
 
@@ -3342,7 +3399,23 @@ fn item_completed_user_message_is_validated_without_duplicate_ui_event() {
 
     assert_eq!(outcome, None);
     assert!(!streamed_text);
-    assert!(rx.try_recv().is_err());
+    assert!(matches!(
+        rx.try_recv().unwrap(),
+        AgentEvent::UserMessage { .. }
+    ));
+    super::process_turn_message(
+        &session,
+        &message,
+        "thr_1",
+        "turn_1",
+        &tx,
+        &mut streamed_text,
+    )
+    .unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "an identical event is emitted only once"
+    );
 }
 
 #[test]
@@ -4670,6 +4743,7 @@ fn thread_created_delivery_failure_stops_the_session() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "probe".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -4705,6 +4779,7 @@ fn active_turn_stops_at_the_first_unknown_method() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "probe".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -4753,6 +4828,7 @@ fn model_notifications_are_normalized_into_agent_events() {
         &mut reader,
         &session,
         &AgentRequest {
+            client_message_id: None,
             prompt: "probe".into(),
             cwd: PathBuf::from("/tmp/project"),
             project_id: None,
@@ -4803,4 +4879,48 @@ fn model_notifications_are_normalized_into_agent_events() {
             AgentEvent::Completed,
         ]
     );
+}
+
+#[test]
+fn continued_turn_accepts_a_later_assistant_item_without_deltas_once() {
+    let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+    let (tx, rx) = async_channel::unbounded();
+    let mut streamed = false;
+    let items = [
+        turn_item_message(
+            "item/started",
+            json!({"type":"agentMessage","id":"a","text":""}),
+        ),
+        json!({"method":"item/agentMessage/delta","params":{"threadId":"thr_1","turnId":"turn_1","itemId":"a","delta":"before"}}),
+        turn_item_message(
+            "item/completed",
+            json!({"type":"agentMessage","id":"a","text":"before"}),
+        ),
+        turn_item_message(
+            "item/started",
+            json!({"type":"agentMessage","id":"b","text":""}),
+        ),
+        turn_item_message(
+            "item/completed",
+            json!({"type":"agentMessage","id":"b","text":"after"}),
+        ),
+        turn_item_message(
+            "item/completed",
+            json!({"type":"agentMessage","id":"b","text":"after"}),
+        ),
+    ];
+    for message in items {
+        super::process_turn_message(&session, &message, "thr_1", "turn_1", &tx, &mut streamed)
+            .unwrap();
+    }
+    let received = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|e| {
+            if let AgentEvent::TextDelta(t) = e {
+                Some(t)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(received, vec!["before", "after"]);
 }

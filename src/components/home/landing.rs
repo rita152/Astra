@@ -92,7 +92,7 @@ pub(super) fn home(
                     .bottom(px(if side_chat {
                         composer_height + 60.0
                     } else {
-                        CONVERSATION_BOTTOM_INSET
+                        CONVERSATION_BOTTOM_INSET + (composer_height - 98.0).max(0.0)
                     }))
                     .w_full()
                     .flex()
@@ -155,7 +155,7 @@ pub(super) fn home(
                 if side_chat {
                     composer_height + 55.0
                 } else {
-                    CONVERSATION_BOTTOM_INSET
+                    CONVERSATION_BOTTOM_INSET + (composer_height - 98.0).max(0.0)
                 },
             ))
         })

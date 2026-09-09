@@ -79,6 +79,13 @@ pub enum AgentEvent {
     AutoApprovalReviewUpdated(Box<AgentAutoApprovalReview>),
     StrictReviewRequired(AgentStrictReviewRequirement),
     GuardianWarning(AgentGuardianWarning),
+    TurnReady(super::backend::AgentTurnIdentity),
+    UserMessage {
+        item_id: String,
+        client_message_id: Option<String>,
+        text: String,
+        images: Vec<super::thread::UserMessageAttachment>,
+    },
     Error {
         message: String,
         details: Option<String>,

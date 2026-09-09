@@ -106,6 +106,7 @@ pub type WorkspaceResult<T> = Result<T, WorkspaceError>;
 /// Agent-neutral input consumed by every coding-agent adapter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentRequest {
+    pub client_message_id: Option<String>,
     pub prompt: String,
     pub cwd: PathBuf,
     pub project_id: Option<ProjectId>,
@@ -128,6 +129,23 @@ pub struct AgentPromptContext {
 pub struct AgentInputFile {
     pub path: PathBuf,
     pub image: bool,
+}
+
+/// Identity of an accepted turn within exactly one connection generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTurnIdentity {
+    pub generation: u64,
+    pub thread_id: String,
+    pub turn_id: String,
+}
+
+/// Appending input cannot override the running turn's configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSteerRequest {
+    pub target: AgentTurnIdentity,
+    pub client_message_id: String,
+    pub prompt: String,
+    pub context: AgentPromptContext,
 }
 
 /// An independent, temporary conversation using a parent's history as context.
@@ -335,6 +353,12 @@ pub trait AgentBackend: Send + Sync {
         _before_thread_id: Option<ThreadId>,
     ) -> Receiver<WorkspaceResult<()>> {
         unsupported_receiver(AgentCapability::ThreadSectionMove)
+    }
+
+    fn steer_turn(&self, _request: AgentSteerRequest) -> Receiver<Result<(), String>> {
+        let (sender, receiver) = async_channel::bounded(1);
+        let _ = sender.send_blocking(Err("当前 coding agent 不支持运行中追加输入。".into()));
+        receiver
     }
 
     fn run_prompt(&self, request: AgentRequest) -> AgentRun;

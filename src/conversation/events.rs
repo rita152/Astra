@@ -226,8 +226,35 @@ impl ConversationState {
                         }
                     }
                 }
+                AgentEvent::TurnReady(identity) => {
+                    if self.thread_id.as_deref() == Some(identity.thread_id.as_str()) {
+                        self.turn_identity = Some(identity.clone());
+                        if self.phase == ConversationPhase::Starting {
+                            self.phase = ConversationPhase::Thinking;
+                        }
+                        for submission in self
+                            .submissions
+                            .iter_mut()
+                            .filter(|s| s.cycle == self.cycle && s.initial)
+                        {
+                            submission.target = Some(identity.clone());
+                            submission.status = super::SubmissionStatus::Accepted;
+                        }
+                    }
+                }
+                AgentEvent::UserMessage {
+                    item_id,
+                    client_message_id,
+                    text,
+                    images,
+                } => {
+                    self.receive_user_message(item_id, client_message_id, text, images);
+                }
                 AgentEvent::Started => {
-                    if self.phase != ConversationPhase::Stopping {
+                    if matches!(
+                        self.phase,
+                        ConversationPhase::Empty | ConversationPhase::Starting
+                    ) {
                         self.phase = ConversationPhase::Thinking;
                     }
                 }
@@ -899,6 +926,19 @@ impl ConversationState {
                         &mut self.activities,
                         crate::agent::AgentActivityStatus::Completed,
                     );
+                    if self
+                        .submissions
+                        .iter()
+                        .any(|s| s.cycle == self.cycle && !s.initial && s.item_id.is_some())
+                        && let Some(text) = self.activities.iter().rev().find_map(|a| match a {
+                            ConversationActivity::AssistantMessage { text, .. } => {
+                                Some(text.clone())
+                            }
+                            _ => None,
+                        })
+                    {
+                        self.assistant_message = text;
+                    }
                     remove_unfinished_image_generations(&mut self.activities);
                     if self.safety_buffering {
                         self.model_status = None;
@@ -953,6 +993,12 @@ impl ConversationState {
         if finished {
             self.clear_terminal_approvals();
             self.close_auto_approval_reviews();
+            for submission in self.submissions.iter_mut().filter(|s| {
+                s.cycle == self.cycle && s.initial && s.status == super::SubmissionStatus::Sending
+            }) {
+                submission.status =
+                    super::SubmissionStatus::Failed("提交未被接受。输入快照已保留。".into());
+            }
             self.active_turn.take();
         }
         finished

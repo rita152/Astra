@@ -105,6 +105,8 @@ struct RecordingBackend {
     connection_events: async_channel::Receiver<AgentConnectionEvent>,
     requests: Mutex<Vec<AgentRequest>>,
     runs: Mutex<Vec<async_channel::Sender<AgentEvent>>>,
+    steers: Mutex<Vec<crate::agent::AgentSteerRequest>>,
+    steer_results: Mutex<Vec<async_channel::Sender<Result<(), String>>>>,
 }
 
 impl RecordingBackend {
@@ -115,6 +117,8 @@ impl RecordingBackend {
             connection_events,
             requests: Mutex::new(Vec::new()),
             runs: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
+            steer_results: Mutex::new(Vec::new()),
         })
     }
 
@@ -146,6 +150,16 @@ impl AgentBackend for RecordingBackend {
         _mode: AgentPermissionMode,
     ) -> async_channel::Receiver<Result<AgentThreadSettings, String>> {
         async_channel::bounded(1).1
+    }
+
+    fn steer_turn(
+        &self,
+        request: crate::agent::AgentSteerRequest,
+    ) -> async_channel::Receiver<Result<(), String>> {
+        self.steers.lock().unwrap().push(request);
+        let (sender, receiver) = async_channel::bounded(1);
+        self.steer_results.lock().unwrap().push(sender);
+        receiver
     }
 
     fn run_prompt(&self, request: AgentRequest) -> AgentRun {
@@ -460,7 +474,8 @@ fn history_restore_normalizes_current_and_prior_user_messages() {
                 status: HistoryTurnStatus::Completed,
                 items_view: HistoryItemDetail::Full,
                 items: vec![ThreadHistoryItem::UserMessage {
-                    images: vec![crate::agent::UserMessageImage::Local("/tmp/first.png".into())],
+                    client_message_id: None,
+                    images: vec![crate::agent::UserMessageAttachment::Local("/tmp/first.png".into())],
                     item_id: "user-1".into(),
                     text: "短行 Short\n".into(),
                 }],
@@ -474,7 +489,8 @@ fn history_restore_normalizes_current_and_prior_user_messages() {
                 status: HistoryTurnStatus::Completed,
                 items_view: HistoryItemDetail::Full,
                 items: vec![ThreadHistoryItem::UserMessage {
-                    images: vec![crate::agent::UserMessageImage::Local("/tmp/second.png".into())],
+                    client_message_id: None,
+                    images: vec![crate::agent::UserMessageAttachment::Local("/tmp/second.png".into())],
                     item_id: "user-2".into(),
                     text: concat!(
                         "\n# Files mentioned by the user:\n\n",
@@ -505,7 +521,7 @@ fn history_restore_normalizes_current_and_prior_user_messages() {
     assert_eq!(prior[0].user_message, "短行 Short");
     assert_eq!(
         prior[0].user_images,
-        vec![crate::agent::UserMessageImage::Local(
+        vec![crate::agent::UserMessageAttachment::Local(
             "/tmp/first.png".into()
         )]
     );
@@ -516,7 +532,7 @@ fn history_restore_normalizes_current_and_prior_user_messages() {
     app.update_entity(&composer, |composer, _| {
         assert_eq!(
             composer.user_images(),
-            vec![crate::agent::UserMessageImage::Local(
+            vec![crate::agent::UserMessageAttachment::Local(
                 "/tmp/second.png".into()
             )]
         );
@@ -524,7 +540,7 @@ fn history_restore_normalizes_current_and_prior_user_messages() {
         assert!(composer.user_images().is_empty());
         assert_eq!(
             composer.conversation.transcript.last().unwrap().user_images,
-            vec![crate::agent::UserMessageImage::Local(
+            vec![crate::agent::UserMessageAttachment::Local(
                 "/tmp/second.png".into()
             )]
         );
@@ -2891,7 +2907,7 @@ fn prompt_accepts_native_text_and_clears_without_a_stale_ime_range() {
     window.update(|composer, window, cx| {
         assert!(
             composer
-                .prompt_input
+                .prompt_editor
                 .read(cx)
                 .focus_handle(cx)
                 .is_focused(window)
@@ -2899,16 +2915,16 @@ fn prompt_accepts_native_text_and_clears_without_a_stale_ime_range() {
     });
     window.simulate_input("hello");
     assert_eq!(
-        window.read(|composer, cx| composer.prompt_input.read(cx).text().to_owned()),
+        window.read(|composer, cx| composer.prompt_editor.read(cx).text().to_owned()),
         "hello"
     );
     window.update(|composer, _, cx| {
         composer
-            .prompt_input
-            .update(cx, |input, cx| input.clear(cx));
+            .prompt_editor
+            .update(cx, |input, cx| input.set_text_silently("", cx));
     });
     assert_eq!(
-        window.read(|composer, cx| composer.prompt_input.read(cx).text().to_owned()),
+        window.read(|composer, cx| composer.prompt_editor.read(cx).text().to_owned()),
         ""
     );
 }
@@ -2974,7 +2990,9 @@ fn review_comments_submit_through_the_existing_agent_run_and_clear_once() {
             }],
             cx,
         );
-        c.prompt_input.update(cx, |input, cx| input.submit(cx));
+        c.prompt_editor.update(cx, |_, cx| {
+            cx.emit(crate::components::file_editor::EditorEvent::Submit)
+        });
     });
     app.run_until_parked();
     let requests = backend.requests.lock().unwrap().clone();
@@ -2986,4 +3004,321 @@ fn review_comments_submit_through_the_existing_agent_run_and_clear_once() {
             .contains("src/中文.rs:R3–R5\n检查边界\n保持原有行为")
     );
     assert!(app.read_entity(&composer, |c, _| c.review_comments.is_empty()));
+}
+
+#[test]
+fn steer_composer_failure_does_not_overwrite_new_draft_and_recovery_keeps_context() {
+    let mut app = TestApp::new();
+    let backend = RecordingBackend::new();
+    let source: Arc<dyn AgentBackend> = backend.clone();
+    let composer = app.new_entity(|cx| ComposerView::new_with_backend(ThemeMode::Dark, source, cx));
+    app.update_entity(&composer, |c, cx| {
+        c.apply_model_catalog(test_model_catalog());
+        c.conversation.thread_id = Some("main".into());
+        c.submit_prompt("initial".into(), cx);
+        c.apply_agent_event_batch(vec![
+            AgentEvent::TurnReady(crate::agent::AgentTurnIdentity {
+                generation: 1,
+                thread_id: "main".into(),
+                turn_id: "turn".into(),
+            }),
+            AgentEvent::Started,
+        ]);
+        c.prompt_context.files.push(crate::agent::AgentInputFile {
+            path: "/tmp/file.rs".into(),
+            image: false,
+        });
+        c.submit_prompt("append".into(), cx);
+        c.prompt_editor
+            .update(cx, |input, cx| input.set_text_silently("new draft", cx));
+    });
+    backend.steer_results.lock().unwrap()[0]
+        .send_blocking(Err("rejected".into()))
+        .unwrap();
+    app.run_until_parked();
+    app.update_entity(&composer, |c, cx| {
+        assert_eq!(c.prompt_text(cx), "new draft");
+        assert!(c.prompt_context.files.is_empty());
+        assert_eq!(c.conversation.phase, ConversationPhase::Thinking);
+        let failed = c.conversation.submissions.last().unwrap();
+        assert!(matches!(
+            failed.status,
+            crate::conversation::SubmissionStatus::Failed(_)
+        ));
+        assert_eq!(
+            failed.draft.context.files[0].path,
+            PathBuf::from("/tmp/file.rs")
+        );
+        let id = failed.id.clone();
+        c.restore_submission(&id, cx);
+        assert_eq!(c.prompt_text(cx), "new draft");
+        c.clear_prompt(cx);
+        c.restore_submission(&id, cx);
+        assert_eq!(c.prompt_text(cx), "append");
+        assert_eq!(c.prompt_context.files.len(), 1);
+    });
+    assert_eq!(backend.requests.lock().unwrap().len(), 1);
+    assert_eq!(backend.steers.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn steer_composer_main_and_side_submit_independently_with_out_of_order_results() {
+    let mut app = TestApp::new();
+    let backend = RecordingBackend::new();
+    let source: Arc<dyn AgentBackend> = backend.clone();
+    let main = app.new_entity(|cx| ComposerView::new_with_backend(ThemeMode::Dark, source, cx));
+    let config = app.update_entity(&main, |c, cx| {
+        c.apply_model_catalog(test_model_catalog());
+        c.conversation.thread_id = Some("main".into());
+        c.submit_prompt("main initial".into(), cx);
+        c.side_chat_configuration().unwrap()
+    });
+    let source: Arc<dyn AgentBackend> = backend.clone();
+    let side =
+        app.new_entity(|cx| ComposerView::new_side_chat(ThemeMode::Dark, source, config, cx));
+    for (composer, thread) in [(&main, "main"), (&side, "side")] {
+        app.update_entity(composer, |c, cx| {
+            if thread == "side" {
+                c.set_side_thread("side".into(), cx);
+                c.submit_prompt("side initial".into(), cx);
+            }
+            c.apply_agent_event_batch(vec![
+                AgentEvent::TurnReady(crate::agent::AgentTurnIdentity {
+                    generation: 1,
+                    thread_id: thread.into(),
+                    turn_id: format!("turn-{thread}"),
+                }),
+                AgentEvent::Started,
+            ]);
+            c.submit_prompt(format!("append-{thread}"), cx);
+        });
+    }
+    app.update_entity(&main, |c, cx| c.submit_prompt("main second".into(), cx));
+    let requests = backend.steers.lock().unwrap().clone();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|r| r.target.thread_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["main", "side", "main"]
+    );
+    app.update_entity(&main, |c, _| {
+        c.apply_agent_event_batch(vec![AgentEvent::UserMessage {
+            item_id: "main-user-2".into(),
+            client_message_id: Some(requests[2].client_message_id.clone()),
+            text: "main second".into(),
+            images: vec![],
+        }])
+    });
+    backend.steer_results.lock().unwrap()[2]
+        .send_blocking(Ok(()))
+        .unwrap();
+    backend.steer_results.lock().unwrap()[1]
+        .send_blocking(Err("side rejected".into()))
+        .unwrap();
+    backend.steer_results.lock().unwrap()[0]
+        .send_blocking(Ok(()))
+        .unwrap();
+    app.run_until_parked();
+    app.read_entity(&main, |c, cx| {
+        assert_eq!(c.prompt_text(cx), "");
+        assert!(c.submission_error.is_none());
+        assert_eq!(c.conversation.phase, ConversationPhase::Thinking);
+    });
+    app.read_entity(&side, |c, cx| {
+        assert_eq!(c.prompt_text(cx), "append-side");
+        assert!(c.submission_error.is_some());
+        assert_eq!(c.conversation.phase, ConversationPhase::Thinking);
+    });
+    assert_eq!(backend.requests.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn steer_composer_starting_and_stopping_preserve_unsent_text_and_attachments() {
+    let mut app = TestApp::new();
+    let backend = RecordingBackend::new();
+    let source: Arc<dyn AgentBackend> = backend.clone();
+    let composer = app.new_entity(|cx| ComposerView::new_with_backend(ThemeMode::Dark, source, cx));
+    app.update_entity(&composer, |c, cx| {
+        c.apply_model_catalog(test_model_catalog());
+        c.submit_prompt("initial".into(), cx);
+        c.prompt_editor
+            .update(cx, |i, cx| i.set_text_silently("not yet", cx));
+        c.prompt_context.files.push(crate::agent::AgentInputFile {
+            path: "/tmp/image.png".into(),
+            image: true,
+        });
+        for phase in [ConversationPhase::Starting, ConversationPhase::Stopping] {
+            c.conversation.phase = phase;
+            c.submit_current_prompt(cx);
+            assert_eq!(c.prompt_text(cx), "not yet");
+            assert_eq!(c.prompt_context.files.len(), 1);
+            assert!(c.submission_error.is_some());
+            assert_eq!(c.conversation.phase, phase);
+        }
+    });
+    assert!(backend.steers.lock().unwrap().is_empty());
+    assert_eq!(backend.requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn steer_submit_restores_editor_focus_and_shift_enter_only_inserts_a_line() {
+    let mut app = TestApp::new();
+    let backend = RecordingBackend::new();
+    let source: Arc<dyn AgentBackend> = backend.clone();
+    let mut window = app.open_window_with_options(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(748.), px(180.)),
+            ))),
+            ..Default::default()
+        },
+        |_, cx| ComposerView::new_with_backend(ThemeMode::Dark, source, cx),
+    );
+    window.update(|c, window, cx| {
+        c.apply_model_catalog(test_model_catalog());
+        window.blur();
+        c.submit_prompt("initial".into(), cx);
+    });
+    window.draw();
+    window.simulate_input("next");
+    window.simulate_keystroke("shift-enter");
+    window.simulate_input("line");
+    assert_eq!(
+        window.read(|c, cx| c.prompt_text(cx).to_owned()),
+        "next\nline"
+    );
+    assert_eq!(backend.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        window.read(|c, _| c.conversation.phase),
+        ConversationPhase::Starting
+    );
+}
+
+#[test]
+fn composer_attachment_menu_returns_focus_to_the_editor_with_escape() {
+    let mut app = TestApp::new();
+    let mut window = app.open_window_with_options(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(748.), px(400.)),
+            ))),
+            ..Default::default()
+        },
+        |_, cx| ComposerView::new(ThemeMode::Dark, cx),
+    );
+    window.update(|c, w, cx| c.prompt_focus_handle(cx).focus(w, cx));
+    window.draw();
+    window.simulate_keystrokes("tab enter");
+    window.draw();
+    assert!(window.read(|c, _| c.context_menu_open));
+    window.update(|c, w, cx| {
+        c.prompt_editor.update(cx, |editor, cx| {
+            assert!(!gpui::EntityInputHandler::accepts_text_input(editor, w, cx));
+        })
+    });
+    window.simulate_keystroke("escape");
+    window.draw();
+    assert!(!window.read(|c, _| c.context_menu_open));
+    window.simulate_input("draft");
+    assert_eq!(window.read(|c, cx| c.prompt_text(cx).to_owned()), "draft");
+}
+
+#[test]
+fn late_accepted_steer_without_echo_can_be_recovered_after_terminal_without_resending() {
+    let mut app = TestApp::new();
+    let backend = RecordingBackend::new();
+    let source: Arc<dyn AgentBackend> = backend.clone();
+    let composer = app.new_entity(|cx| ComposerView::new_with_backend(ThemeMode::Dark, source, cx));
+    app.update_entity(&composer, |c, cx| {
+        c.apply_model_catalog(test_model_catalog());
+        c.conversation.thread_id = Some("main".into());
+        c.submit_prompt("initial".into(), cx);
+        c.apply_agent_event_batch(vec![AgentEvent::TurnReady(
+            crate::agent::AgentTurnIdentity {
+                generation: 1,
+                thread_id: "main".into(),
+                turn_id: "turn".into(),
+            },
+        )]);
+        c.prompt_context.files.push(crate::agent::AgentInputFile {
+            path: "/tmp/context.txt".into(),
+            image: false,
+        });
+        c.submit_prompt("accepted before stop".into(), cx);
+    });
+    backend.send_run_event(0, AgentEvent::Interrupted);
+    app.run_until_parked();
+    app.advance_clock(STREAM_UPDATE_INTERVAL);
+    app.run_until_parked();
+    backend.steer_results.lock().unwrap()[0]
+        .send_blocking(Ok(()))
+        .unwrap();
+    app.run_until_parked();
+    app.update_entity(&composer, |c, cx| {
+        assert_eq!(c.conversation.phase, ConversationPhase::Stopped);
+        let submission = c.conversation.submissions.last().unwrap();
+        assert_eq!(
+            submission.status,
+            crate::conversation::SubmissionStatus::Accepted
+        );
+        assert!(submission.item_id.is_none());
+        let id = submission.id.clone();
+        assert!(c.prompt_text(cx).is_empty());
+        c.restore_submission(&id, cx);
+        assert_eq!(c.prompt_text(cx), "accepted before stop");
+        assert_eq!(c.prompt_context.files.len(), 1);
+        assert_eq!(c.conversation.phase, ConversationPhase::Stopped);
+    });
+    assert_eq!(backend.requests.lock().unwrap().len(), 1);
+    assert_eq!(backend.steers.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn steer_failure_restores_comments_after_the_panels_programmatic_clear() {
+    let mut app = TestApp::new();
+    let backend = RecordingBackend::new();
+    let source: Arc<dyn AgentBackend> = backend.clone();
+    let composer = app.new_entity(|cx| ComposerView::new_with_backend(ThemeMode::Dark, source, cx));
+    app.update_entity(&composer, |c, cx| {
+        c.apply_model_catalog(test_model_catalog());
+        c.conversation.thread_id = Some("main".into());
+        c.submit_prompt("initial".into(), cx);
+        c.apply_agent_event_batch(vec![AgentEvent::TurnReady(
+            crate::agent::AgentTurnIdentity {
+                generation: 1,
+                thread_id: "main".into(),
+                turn_id: "turn".into(),
+            },
+        )]);
+        c.set_review_comments(
+            vec![crate::git_review::ReviewComment {
+                id: 1,
+                path: "/tmp/demo.rs".into(),
+                start: 1,
+                end: 2,
+                old: false,
+                text: "review snapshot".into(),
+            }],
+            cx,
+        );
+        c.submit_prompt("append with review".into(), cx);
+        c.set_review_comments(vec![], cx);
+    });
+    backend.steer_results.lock().unwrap()[0]
+        .send_blocking(Err("rejected".into()))
+        .unwrap();
+    app.run_until_parked();
+    app.read_entity(&composer, |c, cx| {
+        assert_eq!(c.prompt_text(cx), "append with review");
+        assert_eq!(c.review_comments.len(), 1);
+        assert_eq!(c.review_comments[0].text, "review snapshot");
+    });
+    assert!(
+        backend.steers.lock().unwrap()[0]
+            .prompt
+            .contains("/tmp/demo.rs:R1–R2")
+    );
 }

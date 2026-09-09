@@ -16,7 +16,7 @@ use crate::agent::{
 
 pub(crate) struct ConversationState {
     pub(crate) user_message: Option<String>,
-    pub(crate) user_images: Vec<crate::agent::UserMessageImage>,
+    pub(crate) user_images: Vec<crate::agent::UserMessageAttachment>,
     pub(crate) user_message_time: Option<String>,
     pub(crate) assistant_message: String,
     pub(crate) activities: Vec<ConversationActivity>,
@@ -29,6 +29,9 @@ pub(crate) struct ConversationState {
     pub(crate) history_loading: bool,
     pub(crate) history_error: Option<String>,
     pub(crate) cycle: u64,
+    pub(crate) turn_identity: Option<crate::agent::AgentTurnIdentity>,
+    pub(crate) submissions: Vec<super::UserSubmission>,
+    pub(crate) seen_user_items: std::collections::HashSet<String>,
     pub(crate) active_turn: Option<AgentInterruptHandle>,
     pub(crate) pending_connection_events: HashMap<String, Vec<AgentConnectionEvent>>,
     pub(crate) pending_review_events: HashMap<String, Vec<crate::agent::AgentEvent>>,
@@ -76,6 +79,9 @@ impl Default for ConversationState {
             history_loading: false,
             history_error: None,
             cycle: 0,
+            turn_identity: None,
+            submissions: Vec::new(),
+            seen_user_items: Default::default(),
             active_turn: None,
             pending_connection_events: HashMap::new(),
             pending_review_events: HashMap::new(),

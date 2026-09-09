@@ -68,12 +68,12 @@ pub(super) enum ConversationListRow {
     HistoricalUser {
         turn_index: usize,
         message: String,
-        images: Vec<crate::agent::UserMessageImage>,
+        images: Vec<crate::agent::UserMessageAttachment>,
         time: Option<String>,
     },
     CurrentUser {
         message: String,
-        images: Vec<crate::agent::UserMessageImage>,
+        images: Vec<crate::agent::UserMessageAttachment>,
         time: String,
     },
     AssistantMarkdown {
@@ -761,7 +761,10 @@ pub(super) fn append_turn_activity_rows(
                 || index >= final_start
                 || matches!(
                     &unit,
-                    ActivityStreamUnit::Standalone(ConversationActivity::QuestionReply { .. })
+                    ActivityStreamUnit::Standalone(
+                        ConversationActivity::QuestionReply { .. }
+                            | ConversationActivity::UserMessage { .. }
+                    )
                 ))
             .then_some(ConversationListRow::Activity {
                 unit,
@@ -802,6 +805,13 @@ pub(crate) fn resumed_activity_audit(activities: &[ConversationActivity]) -> ser
             ConversationActivity::ImageView(i) => json!({"type":"imageView","id":i.id}),
             ConversationActivity::ImageViews(images) => {
                 json!({"type":"imageViews","ids":images.iter().map(|i|&i.id).collect::<Vec<_>>()})
+            }
+            ConversationActivity::UserMessage {
+                item_id,
+                text,
+                images,
+            } => {
+                json!({"type":"userMessage","id":item_id,"text":text,"attachments":images.iter().map(|a|format!("{a:?}")).collect::<Vec<_>>()})
             }
             ConversationActivity::AssistantMessage { item_id, text } => {
                 json!({"type":"assistant","id":item_id,"text":text})

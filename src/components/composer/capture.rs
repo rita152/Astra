@@ -118,6 +118,13 @@ impl ComposerView {
         cx.notify();
     }
     pub fn submit_prompt_for_capture(&mut self, prompt: &str, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.conversation.begin_prompt(prompt);
+            cx.emit(ConversationChanged);
+            cx.notify();
+        }
+        #[cfg(not(test))]
         self.submit_prompt(prompt.to_owned(), cx);
     }
     pub fn set_command_tool_for_capture(&mut self, running: bool, cx: &mut Context<Self>) {

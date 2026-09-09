@@ -6,6 +6,7 @@ mod dispatch;
 mod events;
 mod protocol;
 mod side_conversation;
+mod steer;
 mod transport;
 mod turn;
 mod workspace;
@@ -136,6 +137,7 @@ impl ManagerInner {
             process: spawned.process,
             next_request_id: AtomicU64::new(1),
             pending_rpcs: Mutex::new(HashMap::new()),
+            completed_steer_rpcs: Mutex::new(Default::default()),
             state: Mutex::new(ConnectionState::default()),
             lifecycle_lock: Mutex::new(()),
             settings_lock: Mutex::new(()),

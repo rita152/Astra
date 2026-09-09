@@ -181,6 +181,44 @@ pub(super) fn render_activity_stream_unit(
             ConversationActivity::WebSearch(search) => {
                 web_search_activity(search, theme).into_any_element()
             }
+            ConversationActivity::UserMessage {
+                item_id,
+                text,
+                images,
+            } => div()
+                .id(SharedString::from(format!("steer-message-{item_id}")))
+                .w_full()
+                .flex()
+                .justify_end()
+                .child(
+                    div()
+                        .max_w_full()
+                        .w(px(515.2))
+                        .flex()
+                        .flex_col()
+                        .items_end()
+                        .when(!images.is_empty(), |v| {
+                            v.child(super::messages::user_message_images(
+                                images,
+                                home_entity,
+                                theme,
+                            ))
+                        })
+                        .child(
+                            div()
+                                .px(px(16.0))
+                                .py(px(10.0))
+                                .rounded(px(22.0))
+                                .bg(theme.user_message_surface)
+                                .text_color(theme.user_message_text)
+                                .child(render_assistant_markdown(
+                                    &text,
+                                    theme,
+                                    &format!("steer-{item_id}"),
+                                )),
+                        ),
+                )
+                .into_any_element(),
             ConversationActivity::QuestionReply {
                 item_id,
                 question,

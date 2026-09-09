@@ -23,7 +23,7 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 
 ## 连接与状态
 
-- **连接**：`ChatApp` 持有一个共享 manager。每个 generation 启动一个 `codex app-server --stdio`，只握手一次；单 reader 读取 stdout，stdin 串行写入完整 JSONL。所有 RPC 共用递增 request id，响应可乱序。
+- **连接**：`ChatApp` 持有一个共享 manager。每个 generation 启动一个 `codex app-server --stdio`，只握手一次；单 reader 读取 stdout，stdin 串行写入完整 JSONL。所有 RPC 共用递增 request id，响应可乱序；已消费的追加 RPC id 保留到 generation 结束，重复确认不再次更新提交。
 - **线程与轮次**：首次提示词执行 `thread/start → turn/start`；既有线程在当前 generation 未加载时先 resume，之后直接 start turn。同一线程最多一个活动 turn，不同线程可并行；start/resume/fork 共用串行生命周期注册表。
 - **归属与提前事件**：轮次事件按 `threadId + turnId` 路由；server request 按原始字符串／数字 id 记录所属轮次。`turn/start` 响应前的事件按 wire 顺序缓存，取得响应后验证并回放；错配 id、字段或枚举报错。
 - **审批与输入**：保留数字／字符串 request id 的区别，按到达顺序显示一张请求卡；键盘只响应当前可见请求。响应写入最多尝试一次，提交后等待 `serverRequest/resolved` 释放 responder；写入失败显示错误并阻止重复提交。文件审批关联同轮次、同 item 的原始 changes／patch，不使用聚合 turn diff 或当前磁盘内容代替。会话或轮次切换使旧点击失效；终态清理自身请求、响应句柄及临时关联。连接仅保留有上限的已释放 id／thread 标记，忽略已知重复或迟到的 resolved。
@@ -33,6 +33,27 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 - **工作区与历史**：以服务端稳定 id 管理项目和线程；置顶使用服务端 `Pinned` 分区，当前 schema 无 `isPinned`。历史先 `thread/read(includeTurns=false)`，再分页读取 `thread/turns/list(itemsView=full)`；实际非 full 的轮次由 `thread/items/list` 补全。不维护本地会话数据库。
 - **临时侧边聊天**：`thread/fork → thread/inject_items` 完成后才允许发送。父历史仅供参考，侧边说明禁止延续父任务或调用子 agent；新消息明确要求的修改才属于侧边请求。关闭使用 `thread/unsubscribe`；临时 id 只在所属 generation 使用，失效后保留可读消息，禁止 resume。
 
+### 运行中追加输入
+
+`AgentBackend::steer_turn` 只操作已接受的活动轮次。`turn/start` 响应校验后发布包含 generation、threadId、turnId 的身份；追加调用捕获该身份和独立提交 id，再按原连接的 request id 接收响应。追加不创建 AgentRun，不等待新的 `turn/started`，不清空输出、活动或审批，也不修改轮次终态。同一轮次的请求按提交顺序在后台写出，响应独立等待；这是客户端写入次序，不是服务端消息队列。发送与中断意图同步；请求已写出后的结束竞态交由服务端 `expectedTurnId` 前置条件决定，不自动改发 `turn/start`。
+
+| 提交时状态 | 行为 |
+|---|---|
+| 空闲／真实终态后再次手动发送 | 沿用 `turn/start` |
+| 正在启动、尚未取得已校验的 turnId | 保留草稿与附件，反馈尚未就绪 |
+| 有活动轮次 | 即时 `turn/steer`；模型、工作目录、权限与 plan/default 选择仅在下一次 `turn/start` 生效 |
+| 正在停止 | 保留输入，提示等待真实轮次终态后手动发送 |
+| RPC 拒绝／响应缺失或 turnId 不匹配 | 只更新该次提交的失败状态，保留文本、附件、审查评论快照；新草稿不被覆盖 |
+| 原连接失效／重建／临时聊天关闭 | 旧身份不能绑定新 generation，不 resume、不重发追加输入 |
+| 已接受后收到轮次终态或迟到 RPC | 结果只归属原提交；不恢复已经结束的轮次 |
+| 恢复到仍运行但非本 manager 持有的历史轮次 | 没有可用活动身份，保留输入并反馈尚未就绪 |
+
+每次发送有独立快照以及 Sending／Accepted／Failed 状态。服务端 `userMessage` 可先于响应到达；消息事件已证明接受后，即使确认响应丢失或校验失败，也保留 Accepted 并显示该提交的确认异常，不恢复或自动重发输入。`clientId` 优先关联本次 `clientUserMessageId`，缺省时按当前轮次尚未关联的内容与附件快照匹配，不将相同文本的多次合法提交合并。相同 item 内容的 started/completed 重复通知在协议层去重；会话层另按 item.id 和已关联的 clientId 防止重复气泡。消息更新保留原位置。历史保留 clientId，并据此关联已接受但尚未收到实时消息的回执；按服务端 item 顺序恢复后续用户消息，完成折叠不会隐藏追加消息。
+
+Composer 在运行中有草稿时显示“追加输入”，无草稿时显示停止；Enter 发送、Shift+Enter 换行。失败快照可显式恢复，自动恢复仅限草稿自发送后未修改且仍为空；已有新草稿时不覆盖。主会话与侧边聊天分别持有草稿、提交和事件流。提交快照只保留在当前应用会话中，不写入后端历史。RPC 已接受但尚未收到 userMessage 时显示接受回执；若轮次此时结束，仍保留回执和快照，并允许显式恢复副本，不把未收到的消息事件伪造到服务端历史，也不自动重发。
+
+`thread/queue/*` 与 `thread/queue/changed` 仍未接入；当前功能不排队等待下一轮。输入可选 `text_elements` 和图片 `detail` 未设置时按 schema 默认值省略；当前输入入口不增加音频、skill 或 mention 编辑能力。文件上下文仍使用文本包络；其中增加附件类型元数据供历史恢复，属于 input 文本，不增加 RPC 字段。旧混合包络若图片已转换为不透明 URL、无法判断路径类型，则保留原来的图片展示，不猜测额外文件卡。
+
 代码入口：协议位于 [src/agent/codex/](../src/agent/codex/)，领域类型位于 [src/agent/](../src/agent/)，工作区合并位于 [src/workspace.rs](../src/workspace.rs)，会话归约位于 [src/conversation/](../src/conversation/)。方法表的“入口”相对于 `src/agent/codex/`，省略 `.rs`。
 
 ## Item 与历史兼容
@@ -41,8 +62,8 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 
 | 类型 | 数据与兼容处理 | 展示行为 |
 |---|---|---|
-| `userMessage` | 校验 text/image/localImage/audio/localAudio/skill/mention；文本统一换行、解码显示转义并移除附件包络，历史保留图片顺序 | 实时不重复添加用户消息；恢复文本与附件 |
-| `agentMessage` | 历史保留 phase；最终答复优先取最后一条 final_answer，旧历史回退到最后一条未标注消息 | 仅已完成且可识别最终答复的轮次折叠过程前缀 |
+| `userMessage` | 校验 text/image/localImage/audio/localAudio/skill/mention；文本统一换行、解码显示转义并移除附件包络；从本应用路径包络及类型元数据恢复文件上下文，保留图片顺序（localImage 历史转换为 data URL 时也不重复生成文件卡） | 按 item.id/clientId 关联提交并去重；后续用户消息保留在当前 turn 的原始事件位置，历史不再合并到首条气泡 |
+| `agentMessage` | 实时按 item.id 记录流式／完成状态，后续无 delta 的完整消息仍显示；已完成 item 的重复完成或迟到 delta 不追加文本。历史保留 phase；最终答复优先取最后一条 final_answer，旧历史回退到最后一条未标注消息 | 仅已完成且可识别最终答复的轮次折叠过程前缀 |
 | `reasoning` | 按 item.id 与 summaryIndex/contentIndex 保存稀疏增量，保留开始／完成时间；不跨 item/index 合并 | 展示 summary，缺省时展示 content；完成后显示耗时 |
 | `commandExecution` | 保留 command、cwd、exitCode、commandActions；旧历史缺少 actions/cwd 时用空列表／线程目录 | 读取、搜索、列目录与 shell 分别显示，输出归属对应命令 |
 | `fileChange` | 保留 path、kind、diff；实时接受 patchUpdated 和 turn 聚合 diff；历史按路径汇总 | 文件卡及固定历史差异使用原始 patch；本机 Git 面板另由 Git/gh 提供工作区数据 |
@@ -218,8 +239,8 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 | `threadSection/update` | 默认 | 未接入 | — | — |
 | `turn/interrupt` | 默认 | 已接入 | 定向 threadId/turnId，每轮最多发送一次；等待真实 interrupted 终态，保持共享连接。 | `manager/turn` |
 | `turn/settings/update` | 实验 | 未接入 | — | — |
-| `turn/start` | 默认 | 已接入 | 文本及 localImage 输入、路径上下文、model/effort/serviceTier、可选 plan/default collaborationMode；新线程首轮附权限字段。以 result.turn.id 建立轮次归属。 | `manager/turn` |
-| `turn/steer` | 默认 | 未接入 | — | — |
+| `turn/start` | 默认 | 已接入 | 文本及 localImage 输入、路径上下文、model/effort/serviceTier、可选 plan/default collaborationMode；新线程首轮附权限字段。可选 clientUserMessageId；以 result.turn.id 建立轮次归属。 | `manager/turn`、`input` |
+| `turn/steer` | 默认 | 已接入 | 主会话／临时侧边聊天运行中即时追加：threadId、expectedTurnId、input、clientUserMessageId；校验 result.turnId。复用文本、localImage、文件路径上下文及审查评论编码；不传 model/cwd/权限等轮次覆盖字段。 | `manager/steer`、`input` |
 | `windowsSandbox/readiness` | 默认 | 未接入 | — | — |
 | `windowsSandbox/setupStart` | 默认 | 未接入 | — | — |
 

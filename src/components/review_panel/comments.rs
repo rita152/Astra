@@ -64,6 +64,35 @@ impl ReviewPanel {
                 .collect(),
         ));
     }
+    pub fn restore_comments(&mut self, comments: Vec<Comment>, cx: &mut Context<Self>) {
+        let root = if self.snapshot.root.as_os_str().is_empty() {
+            &self.cwd
+        } else {
+            &self.snapshot.root
+        };
+        for mut comment in comments {
+            if self
+                .comments
+                .iter()
+                .any(|existing| existing.id == comment.id)
+            {
+                continue;
+            }
+            if let Ok(relative) = std::path::Path::new(&comment.path).strip_prefix(root) {
+                comment.path = relative.to_string_lossy().into_owned();
+            }
+            self.next_comment = self.next_comment.max(comment.id.saturating_add(1));
+            self.comments.push(comment);
+        }
+        self.next_comment = self
+            .comments
+            .iter()
+            .fold(self.next_comment, |next, comment| {
+                next.max(comment.id.saturating_add(1))
+            });
+        self.emit_comments(cx);
+        self.rebuild(cx);
+    }
     pub fn clear_comments(&mut self, cx: &mut Context<Self>) {
         self.comments.clear();
         self.editing_comment = None;
