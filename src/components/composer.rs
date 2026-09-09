@@ -488,4 +488,6 @@ impl ComposerView {
 impl ComposerView {}
 
 #[cfg(test)]
+mod approval_tests;
+#[cfg(test)]
 mod tests;

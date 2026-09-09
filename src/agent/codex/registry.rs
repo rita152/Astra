@@ -5,10 +5,11 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
 
-use super::permissions::permission_profile_value;
+use super::{approvals::command_choice_value, permissions::permission_profile_value};
 use crate::agent::{
-    AgentCommandApprovalChoice, AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
-    AgentServerRequestId, AgentServerRequestMetadata, AgentUserInputResponse,
+    AgentCommandApprovalChoice, AgentFileApprovalChoice, AgentPermissionRequestProfile,
+    AgentPermissionsApprovalChoice, AgentServerRequestId, AgentServerRequestMetadata,
+    AgentUserInputResponse,
 };
 
 #[derive(Clone, Debug)]
@@ -31,6 +32,7 @@ pub(super) struct PendingPermissionsApprovalRequest {
 #[derive(Clone, Debug)]
 pub(super) enum PendingServerRequestPayload {
     CommandApproval(PendingCommandApproval),
+    FileApproval,
     UserInput(PendingUserInputRequest),
     PermissionsApproval(PendingPermissionsApprovalRequest),
 }
@@ -46,6 +48,7 @@ struct PendingServerRequest {
 pub(super) struct ServerRequestRegistry {
     pending: HashMap<AgentServerRequestId, PendingServerRequest>,
     completed: HashMap<AgentServerRequestId, AgentServerRequestMetadata>,
+    closed: bool,
 }
 
 pub(super) enum ServerRequestResolution {
@@ -54,18 +57,30 @@ pub(super) enum ServerRequestResolution {
 }
 
 impl ServerRequestRegistry {
+    pub(super) fn close(&mut self) {
+        self.closed = true;
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if self.closed {
+            bail!("Codex turn 已结束，server request 不再可回复或注册");
+        }
+        Ok(())
+    }
     pub(super) fn register_server_request(
         &mut self,
         metadata: AgentServerRequestMetadata,
         payload: PendingServerRequestPayload,
     ) -> Result<()> {
-        if self.pending.contains_key(&metadata.request_id) {
+        self.ensure_open()?;
+        if self.pending.contains_key(&metadata.request_id)
+            || self.completed.contains_key(&metadata.request_id)
+        {
             bail!(
                 "收到重复的 Codex server request id {:?}",
                 metadata.request_id
             );
         }
-        self.completed.remove(&metadata.request_id);
         self.pending.insert(
             metadata.request_id.clone(),
             PendingServerRequest {
@@ -125,6 +140,7 @@ impl ServerRequestRegistry {
         request_id: &AgentServerRequestId,
         choice: AgentCommandApprovalChoice,
     ) -> Result<Value> {
+        self.ensure_open()?;
         let request = self
             .pending
             .get_mut(request_id)
@@ -135,38 +151,50 @@ impl ServerRequestRegistry {
         let PendingServerRequestPayload::CommandApproval(command) = &request.payload else {
             bail!("request {request_id:?} 不是 command approval，拒绝错误类型的 responder")
         };
-        let decision = match choice {
-            AgentCommandApprovalChoice::Accept => command
-                .available_decisions
-                .iter()
-                .find(|decision| decision.as_str() == Some("accept"))
-                .cloned(),
-            // ChatGPT Desktop treats the visible Reject action as
-            // `decline` even when app-server advertises only `cancel`.
-            // The two values are not synonyms: `decline` rejects the item
-            // and lets the turn continue, while `cancel` interrupts it.
-            AgentCommandApprovalChoice::Decline => command
-                .available_decisions
-                .iter()
-                .any(|decision| matches!(decision.as_str(), Some("decline" | "cancel")))
-                .then(|| Value::String("decline".to_owned())),
-            AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment => command
-                .available_decisions
-                .iter()
-                .find(|decision| decision.get("acceptWithExecpolicyAmendment").is_some())
-                .cloned(),
-        }
-        .with_context(|| {
-            format!("command approval {request_id:?} 未提供所选 decision，拒绝越权回复")
-        })?;
+        let requested = command_choice_value(&choice);
+        let decision = command
+            .available_decisions
+            .iter()
+            .find(|decision| **decision == requested)
+            .cloned()
+            .with_context(|| {
+                format!("command approval {request_id:?} 未提供所选 decision，拒绝越权回复")
+            })?;
         request.responded = true;
         Ok(decision)
+    }
+
+    pub(super) fn file_decision(
+        &mut self,
+        request_id: &AgentServerRequestId,
+        choice: AgentFileApprovalChoice,
+    ) -> Result<Value> {
+        self.ensure_open()?;
+        let request = self
+            .pending
+            .get_mut(request_id)
+            .with_context(|| format!("file approval {request_id:?} 已经 resolved 或不存在"))?;
+        if request.responded {
+            bail!("file approval {request_id:?} 已经回复，拒绝重复 decision");
+        }
+        if !matches!(request.payload, PendingServerRequestPayload::FileApproval) {
+            bail!("request {request_id:?} 不是 file approval，拒绝错误类型的 responder");
+        }
+        let decision = match choice {
+            AgentFileApprovalChoice::Accept => "accept",
+            AgentFileApprovalChoice::AcceptForSession => "acceptForSession",
+            AgentFileApprovalChoice::Decline => "decline",
+            AgentFileApprovalChoice::Cancel => "cancel",
+        };
+        request.responded = true;
+        Ok(json!(decision))
     }
     pub(super) fn user_input_answers(
         &mut self,
         request_id: &AgentServerRequestId,
         response: AgentUserInputResponse,
     ) -> Result<Value> {
+        self.ensure_open()?;
         let request = self
             .pending
             .get_mut(request_id)
@@ -203,6 +231,7 @@ impl ServerRequestRegistry {
         request_id: &AgentServerRequestId,
         choice: AgentPermissionsApprovalChoice,
     ) -> Result<(Value, &'static str)> {
+        self.ensure_open()?;
         let request = self.pending.get_mut(request_id).with_context(|| {
             format!("permissions approval {request_id:?} 已经 resolved 或不存在")
         })?;
@@ -235,7 +264,8 @@ impl ServerRequestRegistry {
                     PendingServerRequestPayload::CommandApproval(approval) => {
                         Some(approval.params.clone())
                     }
-                    PendingServerRequestPayload::UserInput(_)
+                    PendingServerRequestPayload::FileApproval
+                    | PendingServerRequestPayload::UserInput(_)
                     | PendingServerRequestPayload::PermissionsApproval(_) => None,
                 };
                 (request.metadata.clone(), params, request.responded)

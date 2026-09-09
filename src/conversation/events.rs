@@ -5,8 +5,8 @@ use super::{
         ConversationActivity, ensure_reasoning_part, find_command_activity_mut,
         find_mcp_tool_call_activity_mut, find_reasoning_activity_mut, permission_presentation_data,
         remove_unfinished_image_generations, upsert_collaboration_activity,
-        upsert_command_activity, upsert_context_compaction_activity, upsert_file_change_activity,
-        upsert_mcp_tool_call_activity, upsert_reasoning_completed, upsert_reasoning_started,
+        upsert_command_activity, upsert_context_compaction_activity, upsert_mcp_tool_call_activity,
+        upsert_reasoning_completed, upsert_reasoning_started,
     },
     state::ConversationState,
     transcript::{ConversationPhase, current_local_time_label},
@@ -20,9 +20,7 @@ use crate::{
         AgentUserInputResponse, CommandExecution, CommandExecutionStatus,
     },
     components::{
-        approval::{
-            ApprovalCardStatus, ApprovalCardViewModel, ApprovalRequestPresentation, ApprovalScope,
-        },
+        approval::ApprovalCardStatus,
         file_change::DiffReviewPresentation,
         permissions_approval::{PermissionApprovalPresentation, PermissionApprovalStatus},
         user_input_request::{
@@ -382,7 +380,7 @@ impl ConversationState {
                     }
                 }
                 AgentEvent::FileChangeUpdated(change) => {
-                    upsert_file_change_activity(&mut self.activities, change, &self.cwd);
+                    self.file_change_updated(change);
                     if self.phase != ConversationPhase::Stopping {
                         self.phase = ConversationPhase::Streaming;
                     }
@@ -447,15 +445,11 @@ impl ConversationState {
                     }
                 }
                 AgentEvent::FileChangePatchUpdated { item_id, changes } => {
-                    upsert_file_change_activity(
-                        &mut self.activities,
-                        AgentFileChange {
-                            id: item_id,
-                            changes,
-                            status: AgentFileChangeStatus::InProgress,
-                        },
-                        &self.cwd,
-                    );
+                    self.file_change_updated(AgentFileChange {
+                        id: item_id,
+                        changes,
+                        status: AgentFileChangeStatus::InProgress,
+                    });
                 }
                 AgentEvent::TurnDiffUpdated { diff } => {
                     if let Some(ConversationActivity::FileChange(activity)) =
@@ -475,40 +469,10 @@ impl ConversationState {
                     }
                 }
                 AgentEvent::CommandApprovalRequested { request, responder } => {
-                    let context = AgentServerRequestMetadata {
-                        request_id: request.request_id.clone(),
-                        thread_id: request.thread_id.clone(),
-                        turn_id: request.turn_id.clone(),
-                        item_id: request.item_id.clone(),
-                        kind: AgentServerRequestKind::CommandApproval,
-                    };
-                    let request_id = request.request_id.ui_key();
-                    let presentation = if let Some(host) = request.network_host {
-                        ApprovalRequestPresentation::network(
-                            host,
-                            (!request.command.is_empty()).then_some(request.command),
-                            request.reason,
-                        )
-                    } else {
-                        ApprovalRequestPresentation::command(request.command, request.reason)
-                    };
-                    let mut model = ApprovalCardViewModel::pending(&request_id, presentation);
-                    model.set_available_decisions(
-                        request.allow_once,
-                        request.decline,
-                        request.cancel,
-                        request
-                            .can_accept_with_execpolicy_amendment
-                            .then_some(ApprovalScope::SimilarCommands),
-                    );
-                    self.server_request_contexts
-                        .insert(request_id.clone(), context);
-                    self.approval_responders
-                        .insert(request_id.clone(), responder);
-                    self.activities.push(ConversationActivity::Approval(model));
-                    if self.phase != ConversationPhase::Stopping {
-                        self.phase = ConversationPhase::Streaming;
-                    }
+                    self.command_approval_requested(request, responder);
+                }
+                AgentEvent::FileApprovalRequested { request, responder } => {
+                    self.file_approval_requested(request, responder);
                 }
                 AgentEvent::UserInputRequested { request, responder } => {
                     let context = AgentServerRequestMetadata {
@@ -661,6 +625,7 @@ impl ConversationState {
                     match request.kind {
                         AgentServerRequestKind::CommandApproval => {
                             self.approval_responders.remove(&request_id);
+                            self.command_approval_requests.remove(&request_id);
                             if let Some(ConversationActivity::Approval(model)) =
                                 self.activities.iter_mut().find(|activity| {
                                     matches!(activity, ConversationActivity::Approval(model) if model.request_id == request_id)
@@ -668,6 +633,12 @@ impl ConversationState {
                             {
                                 model.status = ApprovalCardStatus::Resolved;
                             }
+                        }
+                        AgentServerRequestKind::FileApproval => {
+                            self.file_approval_responders.remove(&request_id);
+                            if let Some(ConversationActivity::FileApproval(model)) = self.activities.iter_mut().find(|activity| {
+                                matches!(activity, ConversationActivity::FileApproval(model) if model.request_id == request_id)
+                            }) { model.status = crate::components::file_change::FileApprovalStatus::Resolved; }
                         }
                         AgentServerRequestKind::UserInput => {
                             self.user_input_responders.remove(&request_id);
@@ -724,6 +695,7 @@ impl ConversationState {
                     match request.kind {
                         AgentServerRequestKind::CommandApproval => {
                             self.approval_responders.remove(&request_id);
+                            self.command_approval_requests.remove(&request_id);
                             if let Some(ConversationActivity::Approval(model)) =
                                 self.activities.iter_mut().find(|activity| {
                                     matches!(activity, ConversationActivity::Approval(model) if model.request_id == request_id)
@@ -731,6 +703,12 @@ impl ConversationState {
                             {
                                 model.status = ApprovalCardStatus::Resolved;
                             }
+                        }
+                        AgentServerRequestKind::FileApproval => {
+                            self.file_approval_responders.remove(&request_id);
+                            if let Some(ConversationActivity::FileApproval(model)) = self.activities.iter_mut().find(|activity| {
+                                matches!(activity, ConversationActivity::FileApproval(model) if model.request_id == request_id)
+                            }) { model.status = crate::components::file_change::FileApprovalStatus::Resolved; }
                         }
                         AgentServerRequestKind::UserInput => {
                             self.user_input_responders.remove(&request_id);
@@ -879,6 +857,7 @@ impl ConversationState {
             }
         }
         if finished {
+            self.clear_terminal_approvals();
             self.active_turn.take();
         }
         finished

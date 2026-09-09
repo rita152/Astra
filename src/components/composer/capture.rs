@@ -42,6 +42,32 @@ use crate::{
 
 impl ComposerView {
     #[cfg(feature = "screenshot")]
+    pub fn replay_approvals(
+        &mut self,
+        run: crate::agent::AgentRun,
+        user_message: &str,
+        assistant_message: &str,
+        cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let cycle = self.conversation.begin_prompt(user_message);
+        self.conversation.cwd = cwd;
+        self.conversation.assistant_message = assistant_message.to_owned();
+        if !assistant_message.is_empty() {
+            self.conversation
+                .activities
+                .push(ConversationActivity::AssistantMessage {
+                    item_id: "approval-capture-message".into(),
+                    text: assistant_message.to_owned(),
+                });
+        }
+        let (events, interrupt) = run.into_parts();
+        self.conversation.active_turn = interrupt;
+        self.consume_agent_events(events, cycle, cx);
+        cx.emit(ConversationChanged);
+        cx.notify();
+    }
+    #[cfg(feature = "screenshot")]
     pub fn model_catalog_ready_for_capture(&self) -> Result<bool, String> {
         if cfg!(test) {
             return Ok(true);

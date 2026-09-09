@@ -1,7 +1,7 @@
 //! Connection-scoped RPC registry, thread reservations, and failure cleanup.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -51,8 +51,30 @@ pub(super) struct ConnectionState {
     pub(super) starting_turns: HashMap<String, Arc<ManagedTurn>>,
     pub(super) turns: HashMap<TurnKey, Arc<ManagedTurn>>,
     pub(super) server_request_owners: HashMap<AgentServerRequestId, TurnKey>,
+    resolved_server_requests: HashMap<AgentServerRequestId, String>,
+    resolved_server_request_order: VecDeque<AgentServerRequestId>,
     pub(super) settings_waiters: HashMap<String, Vec<Sender<Result<AgentThreadSettings, String>>>>,
     pub(super) remote_control_status: Option<Value>,
+}
+
+impl ConnectionState {
+    fn remember_resolved_request(&mut self, request_id: AgentServerRequestId, thread_id: String) {
+        // Retain only lightweight tombstones for late/duplicate notifications;
+        // never retain a turn, responder, command, or patch after resolution.
+        const RESOLVED_REQUEST_LIMIT: usize = 4096;
+        if self
+            .resolved_server_requests
+            .insert(request_id.clone(), thread_id)
+            .is_none()
+        {
+            self.resolved_server_request_order.push_back(request_id);
+        }
+        while self.resolved_server_request_order.len() > RESOLVED_REQUEST_LIMIT {
+            if let Some(id) = self.resolved_server_request_order.pop_front() {
+                self.resolved_server_requests.remove(&id);
+            }
+        }
+    }
 }
 
 pub(super) struct Connection {
@@ -267,6 +289,9 @@ impl Connection {
             .state
             .lock()
             .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?;
+        if state.resolved_server_requests.contains_key(&request_id) {
+            bail!("Codex server request id {request_id:?} 已经 resolved，拒绝重复请求");
+        }
         if let Some(existing) = state.server_request_owners.get(&request_id)
             && existing != &key
         {
@@ -280,17 +305,31 @@ impl Connection {
         Ok(())
     }
 
-    pub(super) fn server_request_owner(
+    pub(super) fn resolve_server_request_owner(
         &self,
         request_id: &AgentServerRequestId,
-    ) -> Result<TurnKey> {
-        self.state
+        thread_id: &str,
+    ) -> Result<Option<TurnKey>> {
+        let mut state = self
+            .state
             .lock()
-            .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?
-            .server_request_owners
-            .get(request_id)
-            .cloned()
-            .with_context(|| format!("serverRequest/resolved 引用了未知 request {request_id:?}"))
+            .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?;
+        let owner = state.server_request_owners.get(request_id).cloned();
+        let expected_thread = owner
+            .as_ref()
+            .map(|owner| &owner.thread_id)
+            .or_else(|| state.resolved_server_requests.get(request_id))
+            .with_context(|| format!("serverRequest/resolved 引用了未知 request {request_id:?}"))?;
+        if expected_thread != thread_id {
+            bail!(
+                "serverRequest/resolved threadId `{thread_id}` 与 request owner `{expected_thread}` 不一致"
+            );
+        }
+        if owner.is_some() {
+            state.server_request_owners.remove(request_id);
+            state.remember_resolved_request(request_id.clone(), thread_id.to_owned());
+        }
+        Ok(owner)
     }
 
     pub(super) fn finish_turn(&self, turn: &Arc<ManagedTurn>, result: Result<TurnOutcome>) {
@@ -321,6 +360,7 @@ impl Connection {
                 .collect::<Vec<_>>();
             for request_id in owned_keys {
                 state.server_request_owners.remove(&request_id);
+                state.remember_resolved_request(request_id, turn.thread_id.clone());
             }
         }
     }
@@ -352,6 +392,8 @@ impl Connection {
                 state.resume_bootstrap_threads.clear();
                 state.reserved_threads.clear();
                 state.server_request_owners.clear();
+                state.resolved_server_requests.clear();
+                state.resolved_server_request_order.clear();
                 let settings_waiters = std::mem::take(&mut state.settings_waiters);
                 (turns, settings_waiters)
             })

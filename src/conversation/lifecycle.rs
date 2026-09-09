@@ -18,6 +18,9 @@ impl ConversationState {
         self.assistant_message.clear();
         self.activities.clear();
         self.approval_responders.clear();
+        self.command_approval_requests.clear();
+        self.file_approval_responders.clear();
+        self.file_changes.clear();
         self.user_input_responders.clear();
         self.permissions_approval_responders.clear();
         self.server_request_contexts.clear();

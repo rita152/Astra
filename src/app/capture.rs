@@ -21,6 +21,27 @@ use crate::{
 
 impl ChatApp {
     #[cfg(feature = "screenshot")]
+    pub fn replay_approvals(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        match crate::agent::CodexAppServerBackend::replay_approvals(path) {
+            Ok(capture) => {
+                self.complete_startup_for_capture(cx);
+                self.home.update(cx, |home, cx| {
+                    home.replay_approvals(
+                        capture.run,
+                        &capture.user_message,
+                        &capture.assistant_message,
+                        capture.cwd,
+                        cx,
+                    )
+                });
+            }
+            Err(error) => {
+                eprintln!("审批回放失败：{error:#}");
+                cx.quit();
+            }
+        }
+    }
+    #[cfg(feature = "screenshot")]
     pub fn capture_review(&mut self, cwd: PathBuf, cx: &mut Context<Self>) {
         if let Some(host) = self.conversation_hosts.get_mut(&self.active_conversation) {
             host.cwd = cwd.clone();

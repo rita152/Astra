@@ -35,16 +35,19 @@ pub use events::{AgentConnectionEvent, AgentEvent};
 pub use message::normalize_user_message_for_display;
 pub use requests::{
     AgentAdditionalFileSystemPermissions, AgentAdditionalNetworkPermissions, AgentApprovalHandle,
-    AgentCommandApprovalChoice, AgentCommandApprovalRequest, AgentFileSystemAccess,
-    AgentFileSystemPath, AgentFileSystemPermissionEntry, AgentFileSystemSpecialPath,
-    AgentOptionalField, AgentPermissionRequestProfile, AgentPermissionsApprovalChoice,
-    AgentPermissionsApprovalHandle, AgentPermissionsApprovalRequest, AgentServerRequestFailureKind,
-    AgentServerRequestId, AgentServerRequestKind, AgentServerRequestMetadata, AgentUserInputAnswer,
-    AgentUserInputHandle, AgentUserInputOption, AgentUserInputQuestion, AgentUserInputRequest,
-    AgentUserInputResponse,
+    AgentCommandApprovalChoice, AgentCommandApprovalKind, AgentCommandApprovalRequest,
+    AgentFileApprovalChoice, AgentFileApprovalHandle, AgentFileApprovalRequest,
+    AgentFileSystemAccess, AgentFileSystemPath, AgentFileSystemPermissionEntry,
+    AgentFileSystemSpecialPath, AgentNetworkApprovalContext, AgentNetworkApprovalProtocol,
+    AgentNetworkPolicyAction, AgentNetworkPolicyAmendment, AgentOptionalField,
+    AgentPermissionRequestProfile, AgentPermissionsApprovalChoice, AgentPermissionsApprovalHandle,
+    AgentPermissionsApprovalRequest, AgentServerRequestFailureKind, AgentServerRequestId,
+    AgentServerRequestKind, AgentServerRequestMetadata, AgentUserInputAnswer, AgentUserInputHandle,
+    AgentUserInputOption, AgentUserInputQuestion, AgentUserInputRequest, AgentUserInputResponse,
 };
 pub(crate) use requests::{
-    AgentApprovalControl, AgentPermissionsApprovalControl, AgentUserInputControl,
+    AgentApprovalControl, AgentFileApprovalControl, AgentPermissionsApprovalControl,
+    AgentUserInputControl,
 };
 pub use status::{
     AgentAccountRateLimits, AgentConfigWarning, AgentCreditsSnapshot,

@@ -1770,19 +1770,31 @@ fn interleaved_server_requests_route_by_original_id_and_resolve_once() {
     endpoint.send(command_approval(json!(101), "thr_req_a", "turn_req_a"));
     endpoint.send(permissions_approval(json!(202), "thr_req_b", "turn_req_b"));
     endpoint.send(user_input(json!("input-a"), "thr_req_a", "turn_req_a"));
+    endpoint.send(
+        json!({"id":"101","method":"item/fileChange/requestApproval","params":{
+            "threadId":"thr_req_b","turnId":"turn_req_b","itemId":"file_b","startedAtMs":123,
+            "reason":null,"grantRoot":null
+        }}),
+    );
 
     let mut command = None;
     let mut input = None;
     let mut permissions = None;
+    let mut file = None;
     let deadline = Instant::now() + WAIT;
-    while (command.is_none() || input.is_none() || permissions.is_none())
+    while (command.is_none() || input.is_none() || permissions.is_none() || file.is_none())
         && Instant::now() < deadline
     {
-        for receiver in [&events_a, &events_b] {
+        for (expected_thread, receiver) in [("thr_req_a", &events_a), ("thr_req_b", &events_b)] {
             if let Ok(event) = receiver.try_recv() {
                 match event {
-                    AgentEvent::CommandApprovalRequested { responder, .. } => {
+                    AgentEvent::CommandApprovalRequested { request, responder } => {
+                        assert_eq!(request.thread_id, expected_thread);
                         command = Some(responder)
+                    }
+                    AgentEvent::FileApprovalRequested { request, responder } => {
+                        assert_eq!(request.thread_id, expected_thread);
+                        file = Some(responder)
                     }
                     AgentEvent::UserInputRequested { responder, .. } => input = Some(responder),
                     AgentEvent::PermissionsApprovalRequested { responder, .. } => {
@@ -1795,6 +1807,9 @@ fn interleaved_server_requests_route_by_original_id_and_resolve_once() {
         std::thread::sleep(Duration::from_millis(1));
     }
     let command = command.expect("missing command approval");
+    let file = file.expect("missing file approval");
+    file.respond(crate::agent::AgentFileApprovalChoice::AcceptForSession)
+        .unwrap();
     let input = input.expect("missing user input");
     let permissions = permissions.expect("missing permissions approval");
     command.respond(AgentCommandApprovalChoice::Accept).unwrap();
@@ -1813,17 +1828,19 @@ fn interleaved_server_requests_route_by_original_id_and_resolve_once() {
     assert!(input.respond(AgentUserInputResponse::default()).is_err());
 
     let mut response_ids = HashSet::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         let response = endpoint.recv();
         assert!(response.get("method").is_none());
         response_ids.insert(response["id"].clone());
     }
     assert_eq!(
         response_ids,
-        HashSet::from([json!(101), json!(202), json!("input-a")])
+        HashSet::from([json!(101), json!("101"), json!(202), json!("input-a")])
     );
     for (thread_id, request_id) in [
         ("thr_req_b", json!(202)),
+        ("thr_req_b", json!("101")),
+        ("thr_req_b", json!("101")),
         ("thr_req_a", json!("input-a")),
         ("thr_req_a", json!(101)),
     ] {
@@ -1849,11 +1866,22 @@ fn interleaved_server_requests_route_by_original_id_and_resolve_once() {
         resolved,
         HashSet::from([
             AgentServerRequestId::Number(101),
+            AgentServerRequestId::String("101".into()),
             AgentServerRequestId::Number(202),
             AgentServerRequestId::String("input-a".to_owned())
         ])
     );
     assert!(command.respond(AgentCommandApprovalChoice::Accept).is_err());
+    assert!(
+        file.respond(crate::agent::AgentFileApprovalChoice::Accept)
+            .is_err()
+    );
+    endpoint.send(json!({"method":"serverRequest/resolved","params":{"threadId":"thr_req_b","requestId":"101"}}));
+    let catalog = manager.load_model_catalog();
+    let model_request = endpoint.recv();
+    assert_eq!(model_request["method"], "model/list");
+    endpoint.respond(&model_request, model_page());
+    assert!(wait_value(&catalog).is_ok());
     drop(interrupt_a);
     drop(interrupt_b);
     manager.shutdown();
@@ -2111,7 +2139,7 @@ fn unknown_server_request_replies_method_not_found_then_fails_generation() {
     start_known_turn(&mut endpoint, "thr_unknown", "turn_unknown");
     endpoint.send(json!({
         "id": 999,
-        "method": "item/fileChange/requestApproval",
+        "method": "item/futureTool/requestApproval",
         "params": {
             "threadId": "thr_unknown", "turnId": "turn_unknown", "itemId": "file"
         }
@@ -2121,7 +2149,7 @@ fn unknown_server_request_replies_method_not_found_then_fails_generation() {
     assert_eq!(response["error"]["code"], -32601);
     assert!(matches!(
         collect_terminal(&events).last(),
-        Some(AgentEvent::Failed(message)) if message.contains("item/fileChange/requestApproval")
+        Some(AgentEvent::Failed(message)) if message.contains("item/futureTool/requestApproval")
     ));
     drop(interrupt);
     wait_for_process(&endpoint.process);

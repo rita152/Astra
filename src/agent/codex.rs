@@ -1,5 +1,8 @@
 //! Codex app-server adapter. Protocol details remain inside this module.
 
+#[cfg(feature = "screenshot")]
+mod approval_capture;
+mod approvals;
 mod backend;
 mod catalog;
 mod dispatch;
@@ -14,6 +17,8 @@ mod session;
 mod transport;
 mod workspace_protocol;
 
+#[cfg(test)]
+mod approvals_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]

@@ -30,11 +30,42 @@ pub(super) struct DisclosureRenderState {
 #[derive(Clone)]
 pub(super) struct ConversationRenderContext {
     pub(super) home_entity: Entity<HomeView>,
+    pub(super) approval_previews:
+        HashMap<String, Entity<crate::components::file_editor::FileEditor>>,
+    pub(super) approval_border_offset: f32,
+    pub(super) request_owner: RequestOwner,
     pub(super) theme: Theme,
     pub(super) thinking_shimmer_progress: f32,
     pub(super) response_feedback: i8,
     pub(super) user_message_actions_visible_for_capture: bool,
     pub(super) disclosures: Rc<DisclosureRenderState>,
+}
+
+#[derive(Clone)]
+pub(super) struct RequestOwner {
+    pub(super) composer: Entity<crate::components::composer::ComposerView>,
+    pub(super) cycle: u64,
+}
+
+impl RequestOwner {
+    pub(super) fn new(
+        composer: Entity<crate::components::composer::ComposerView>,
+        cx: &gpui::App,
+    ) -> Self {
+        let cycle = composer.read(cx).request_cycle();
+        Self { composer, cycle }
+    }
+    pub(super) fn matches(&self, home: &HomeView, cx: &gpui::App) -> bool {
+        self.composer == home.composer && self.cycle == self.composer.read(cx).request_cycle()
+    }
+    pub(super) fn scope(&self) -> gpui::SharedString {
+        format!(
+            "request-owner-{:?}-{}",
+            self.composer.entity_id(),
+            self.cycle
+        )
+        .into()
+    }
 }
 
 pub(super) struct MainConversationSnapshot {

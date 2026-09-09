@@ -594,11 +594,20 @@ fn live_command_approval_uses_existing_card_and_unmounts_on_resolved() {
                     item_id: "item_1".into(),
                     command: "git --version".into(),
                     reason: Some("需要读取版本".into()),
-                    network_host: None,
-                    allow_once: false,
-                    decline: true,
-                    cancel: false,
-                    can_accept_with_execpolicy_amendment: true,
+                    approval_id: None,
+                    kind: crate::agent::AgentCommandApprovalKind::Command,
+                    environment_id: None,
+                    started_at_ms: 1_000,
+                    cwd: None,
+                    network: None,
+                    additional_permissions: crate::agent::AgentOptionalField::Unspecified,
+                    available_decisions: vec![
+                        AgentCommandApprovalChoice::Decline,
+                        AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment(vec![
+                            "git".into(),
+                            "--version".into()
+                        ])
+                    ],
                 },
                 responder,
             },])
@@ -637,7 +646,10 @@ fn live_command_approval_uses_existing_card_and_unmounts_on_resolved() {
         *control.responses.lock().unwrap(),
         vec![(
             request_id.clone(),
-            AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment
+            AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment(vec![
+                "git".into(),
+                "--version".into()
+            ])
         )]
     );
 
@@ -659,7 +671,7 @@ fn live_command_approval_uses_existing_card_and_unmounts_on_resolved() {
 }
 
 #[test]
-fn live_command_approval_maps_cancel_to_decline_and_keeps_turn_running() {
+fn live_command_approval_sends_cancel_and_waits_for_server_terminal() {
     let mut app = TestApp::new();
     let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
     let request_id = AgentServerRequestId::String("approval-cancel".into());
@@ -675,11 +687,17 @@ fn live_command_approval_maps_cancel_to_decline_and_keeps_turn_running() {
                 item_id: "item_1".into(),
                 command: "pwd".into(),
                 reason: Some("仅显示当前目录".into()),
-                network_host: None,
-                allow_once: true,
-                decline: false,
-                cancel: true,
-                can_accept_with_execpolicy_amendment: false,
+                approval_id: None,
+                kind: crate::agent::AgentCommandApprovalKind::Command,
+                environment_id: None,
+                started_at_ms: 1_000,
+                cwd: None,
+                network: None,
+                additional_permissions: crate::agent::AgentOptionalField::Unspecified,
+                available_decisions: vec![
+                    AgentCommandApprovalChoice::Accept,
+                    AgentCommandApprovalChoice::Cancel,
+                ],
             },
             responder,
         }]);
@@ -700,14 +718,14 @@ fn live_command_approval_maps_cancel_to_decline_and_keeps_turn_running() {
     app.update_entity(&composer, |composer, cx| {
         composer.handle_approval_card_event(
             &ui_key,
-            ApprovalCardEvent::Decision(ApprovalDecision::Decline),
+            ApprovalCardEvent::Decision(ApprovalDecision::Cancel),
             cx,
         );
         assert_eq!(composer.conversation.phase, ConversationPhase::Streaming);
     });
     assert_eq!(
         *control.responses.lock().unwrap(),
-        vec![(request_id.clone(), AgentCommandApprovalChoice::Decline)]
+        vec![(request_id.clone(), AgentCommandApprovalChoice::Cancel)]
     );
 
     app.update_entity(&composer, |composer, _| {

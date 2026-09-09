@@ -90,6 +90,18 @@ pub(crate) enum ConversationActivity {
     },
 }
 
+impl ConversationActivity {
+    pub(crate) fn shows_request(&self) -> bool {
+        match self {
+            Self::Approval(model) => model.should_render(),
+            Self::FileApproval(model) => model.should_render(),
+            Self::PermissionsApproval(model) => model.should_render(),
+            Self::UserInput(model) => model.should_render(),
+            _ => false,
+        }
+    }
+}
+
 pub(crate) fn reasoning_parts_text(parts: &[String]) -> String {
     let Some((first, rest)) = parts.split_first() else {
         return String::new();

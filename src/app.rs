@@ -24,6 +24,7 @@ gpui::actions!(
     permission_ui,
     [
         DismissPermissionUi,
+        CaptureFrame,
         ToggleTerminal,
         ToggleReview,
         OpenFiles,

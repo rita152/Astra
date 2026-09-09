@@ -5,8 +5,8 @@ use gpui::{Context, KeyDownEvent};
 use super::{ComposerView, ConversationChanged};
 use crate::{
     agent::{
-        AgentCommandApprovalChoice, AgentPermissionsApprovalChoice, AgentUserInputAnswer,
-        AgentUserInputResponse,
+        AgentCommandApprovalChoice, AgentFileApprovalChoice, AgentPermissionsApprovalChoice,
+        AgentUserInputAnswer, AgentUserInputResponse,
     },
     components::{
         approval::{
@@ -14,8 +14,8 @@ use crate::{
             ApprovalMenuItem, ApprovalScope, ApprovalVisualState,
         },
         file_change::{
-            FileApprovalEvent, FileApprovalKeyboardFocus, FileApprovalMenuItem, FileApprovalStatus,
-            FileApprovalVisualState,
+            FileApprovalDecision, FileApprovalEvent, FileApprovalKeyboardFocus,
+            FileApprovalMenuItem, FileApprovalStatus, FileApprovalVisualState,
         },
         permissions_approval::{
             PermissionApprovalDecision, PermissionApprovalEvent, PermissionApprovalHover,
@@ -30,6 +30,69 @@ use crate::{
 };
 
 impl ComposerView {
+    pub(crate) fn request_cycle(&self) -> u64 {
+        self.conversation.cycle
+    }
+    pub(crate) fn has_visible_request(&self) -> bool {
+        self.conversation
+            .activities
+            .iter()
+            .any(|activity| match activity {
+                ConversationActivity::Approval(model) => model.should_render(),
+                ConversationActivity::FileApproval(model) => model.should_render(),
+                ConversationActivity::PermissionsApproval(model) => model.should_render(),
+                ConversationActivity::UserInput(model) => model.should_render(),
+                _ => false,
+            })
+    }
+    pub(crate) fn set_approval_preview_lines(
+        &mut self,
+        request_id: &str,
+        lines: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ConversationActivity::Approval(model)) = self.conversation.activities.iter_mut().find(|activity| matches!(activity, ConversationActivity::Approval(model) if model.request_id==request_id)) else { return; };
+        if model.preview_line_count != lines {
+            model.preview_line_count = lines;
+            cx.emit(ConversationChanged);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn file_approval_review(
+        &self,
+        request_id: &str,
+        file_index: usize,
+    ) -> Option<crate::components::file_change::DiffReviewPresentation> {
+        let model = self
+            .conversation
+            .activities
+            .iter()
+            .find_map(|activity| match activity {
+                ConversationActivity::FileApproval(model)
+                    if model.request_id == request_id && model.should_render() =>
+                {
+                    Some(model)
+                }
+                _ => None,
+            })?;
+        model.files.get(file_index)?;
+        let context = self.conversation.server_request_contexts.get(request_id)?;
+        let entry = self
+            .conversation
+            .file_changes
+            .get(&context.item_id)?
+            .changes
+            .get(file_index)?;
+        Some(
+            crate::components::file_change::DiffReviewPresentation::from_file_change_entries(
+                format!("approval-review-{request_id}-{file_index}"),
+                "待审批",
+                std::slice::from_ref(entry),
+                Some(&self.conversation.cwd),
+            ),
+        )
+    }
     pub fn handle_approval_card_event(
         &mut self,
         request_id: &str,
@@ -44,20 +107,79 @@ impl ComposerView {
         }) else {
             return;
         };
+        if event == ApprovalCardEvent::StopTurn {
+            if matches!(&self.conversation.activities[index],ConversationActivity::Approval(model) if model.status==ApprovalCardStatus::Failed)
+            {
+                self.stop_generation(cx);
+            }
+            return;
+        }
         if matches!(
             &self.conversation.activities[index],
-            ConversationActivity::Approval(model) if !model.should_render()
+            ConversationActivity::Approval(model) if !model.is_interactive() && !(model.status==ApprovalCardStatus::Failed && matches!(event,ApprovalCardEvent::TogglePreview|ApprovalCardEvent::OpenNetworkDestination))
         ) {
             return;
         }
 
         match event {
+            ApprovalCardEvent::StopTurn => return,
+            ApprovalCardEvent::OpenNetworkDestination => {
+                if let ConversationActivity::Approval(model) = &self.conversation.activities[index]
+                    && let crate::components::approval::ApprovalRequestPresentation::Network {
+                        destination,
+                        ..
+                    } = &model.request
+                {
+                    cx.open_url(destination);
+                }
+            }
+            ApprovalCardEvent::TogglePreview => {
+                if let ConversationActivity::Approval(model) =
+                    &mut self.conversation.activities[index]
+                {
+                    model.preview_expanded = !model.preview_expanded;
+                }
+            }
             ApprovalCardEvent::Decision(decision) => {
                 let choice = match decision {
+                    ApprovalDecision::ServerChoice(index) => {
+                        let Some(choice) = self
+                            .conversation
+                            .command_approval_requests
+                            .get(request_id)
+                            .and_then(|request| request.available_decisions.get(index))
+                            .cloned()
+                        else {
+                            return;
+                        };
+                        choice
+                    }
                     ApprovalDecision::AllowOnce => AgentCommandApprovalChoice::Accept,
                     ApprovalDecision::Decline => AgentCommandApprovalChoice::Decline,
+                    ApprovalDecision::Cancel => AgentCommandApprovalChoice::Cancel,
                     ApprovalDecision::AllowScoped(ApprovalScope::SimilarCommands) => {
-                        AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment
+                        let Some(choice) = self
+                            .conversation
+                            .command_approval_requests
+                            .get(request_id)
+                            .and_then(|request| {
+                                request.available_decisions.iter().find(|choice| {
+                                    matches!(
+                                        choice,
+                                        AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment(
+                                            _
+                                        )
+                                    )
+                                })
+                            })
+                            .cloned()
+                        else {
+                            return;
+                        };
+                        choice
+                    }
+                    ApprovalDecision::AllowScoped(ApprovalScope::Session) => {
+                        AgentCommandApprovalChoice::AcceptForSession
                     }
                     ApprovalDecision::AllowScoped(_) => return,
                 };
@@ -78,6 +200,13 @@ impl ComposerView {
                         }
                     }
                     Some(Err(error)) => {
+                        if let ConversationActivity::Approval(model) =
+                            &mut self.conversation.activities[index]
+                        {
+                            model.status = ApprovalCardStatus::Failed;
+                            model.failure_message =
+                                Some("无法写入审批响应，请停止此轮次后重试".to_owned());
+                        }
                         self.conversation
                             .activities
                             .push(ConversationActivity::ProtocolError {
@@ -92,6 +221,12 @@ impl ComposerView {
                             .server_request_contexts
                             .contains_key(request_id)
                         {
+                            if let ConversationActivity::Approval(model) =
+                                &mut self.conversation.activities[index]
+                            {
+                                model.status = ApprovalCardStatus::Failed;
+                                model.failure_message = Some("命令审批响应连接不存在".to_owned());
+                            }
                             self.conversation.activities.push(
                                 ConversationActivity::ProtocolError {
                                     message: "无法回复命令审批".to_owned(),
@@ -119,6 +254,7 @@ impl ComposerView {
                         Some(
                             ApprovalKeyboardFocus::MenuAllowOnce
                                 | ApprovalKeyboardFocus::MenuScoped(_)
+                                | ApprovalKeyboardFocus::MenuChoice(_)
                         )
                     ) {
                         model.keyboard_focus = Some(ApprovalKeyboardFocus::MenuToggle);
@@ -135,6 +271,9 @@ impl ComposerView {
                     return;
                 };
                 model.visual_state = ApprovalVisualState::SplitMenu { focused };
+                if let Some(ApprovalMenuItem::Choice(index)) = focused {
+                    model.keyboard_focus = Some(ApprovalKeyboardFocus::MenuChoice(index));
+                }
             }
             ApprovalCardEvent::KeyboardFocusChanged(focused) => {
                 let ConversationActivity::Approval(model) =
@@ -152,6 +291,11 @@ impl ComposerView {
                     Some(ApprovalKeyboardFocus::MenuScoped(scope)) => {
                         model.visual_state = ApprovalVisualState::SplitMenu {
                             focused: Some(ApprovalMenuItem::Scoped(scope)),
+                        };
+                    }
+                    Some(ApprovalKeyboardFocus::MenuChoice(index)) => {
+                        model.visual_state = ApprovalVisualState::SplitMenu {
+                            focused: Some(ApprovalMenuItem::Choice(index)),
                         };
                     }
                     _ => {}
@@ -331,62 +475,40 @@ impl ComposerView {
         cx.notify();
     }
     pub fn handle_approval_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
-        if let Some((request_id, card_event)) =
-            self.conversation.activities.iter().find_map(|activity| {
-                let ConversationActivity::Approval(model) = activity else {
-                    return None;
-                };
-                model.should_render().then(|| {
-                    model
-                        .keyboard_event(
-                            event.keystroke.key.as_str(),
-                            event.keystroke.modifiers.shift,
-                        )
-                        .map(|card_event| (model.request_id.clone(), card_event))
-                })?
-            })
-        {
-            self.handle_approval_card_event(&request_id, card_event, cx);
-            return true;
-        }
-
-        if let Some((request_id, card_event)) =
-            self.conversation.activities.iter().find_map(|activity| {
-                let ConversationActivity::PermissionsApproval(model) = activity else {
-                    return None;
-                };
-                model.should_render().then(|| {
-                    model
-                        .keyboard_event(
-                            event.keystroke.key.as_str(),
-                            event.keystroke.modifiers.shift,
-                        )
-                        .map(|card_event| (model.request_id.clone(), card_event))
-                })?
-            })
-        {
-            self.handle_permissions_approval_event(&request_id, card_event, cx);
-            return true;
-        }
-
-        let Some((request_id, card_event)) =
-            self.conversation.activities.iter().find_map(|activity| {
-                let ConversationActivity::FileApproval(model) = activity else {
-                    return None;
-                };
-                model.should_render().then(|| {
-                    model
-                        .keyboard_event(
-                            event.keystroke.key.as_str(),
-                            event.keystroke.modifiers.shift,
-                        )
-                        .map(|card_event| (model.request_id.clone(), card_event))
-                })?
-            })
+        let Some(activity) = self
+            .conversation
+            .activities
+            .iter()
+            .find(|activity| activity.shows_request())
         else {
             return false;
         };
-        self.handle_file_approval_event(&request_id, card_event, cx);
+        let key = event.keystroke.key.as_str();
+        let shift = event.keystroke.modifiers.shift;
+        match activity {
+            ConversationActivity::Approval(model) => {
+                let Some(event) = model.keyboard_event(key, shift) else {
+                    return false;
+                };
+                let id = model.request_id.clone();
+                self.handle_approval_card_event(&id, event, cx);
+            }
+            ConversationActivity::FileApproval(model) => {
+                let Some(event) = model.keyboard_event(key, shift) else {
+                    return false;
+                };
+                let id = model.request_id.clone();
+                self.handle_file_approval_event(&id, event, cx);
+            }
+            ConversationActivity::PermissionsApproval(model) => {
+                let Some(event) = model.keyboard_event(key, shift) else {
+                    return false;
+                };
+                let id = model.request_id.clone();
+                self.handle_permissions_approval_event(&id, event, cx);
+            }
+            _ => return false,
+        }
         true
     }
     pub fn handle_file_approval_event(
@@ -395,22 +517,93 @@ impl ComposerView {
         event: FileApprovalEvent,
         cx: &mut Context<Self>,
     ) {
-        let Some(model) = self
+        let Some(index) = self
             .conversation
             .activities
-            .iter_mut()
-            .find_map(|activity| {
-                let ConversationActivity::FileApproval(model) = activity else {
-                    return None;
-                };
-                (model.request_id == request_id).then_some(model)
-            })
+            .iter()
+            .position(|activity| matches!(activity, ConversationActivity::FileApproval(model) if model.request_id == request_id))
         else {
             return;
         };
+        let ConversationActivity::FileApproval(model) = &self.conversation.activities[index] else {
+            unreachable!()
+        };
+        if event == FileApprovalEvent::StopTurn {
+            if model.status == FileApprovalStatus::Failed {
+                self.stop_generation(cx);
+            }
+            return;
+        }
+        if !model.is_interactive() {
+            return;
+        }
+        if !model.changes_ready && matches!(event, FileApprovalEvent::ToggleMenu) {
+            return;
+        }
+
+        if let FileApprovalEvent::Decision(decision) = event {
+            if matches!(
+                decision,
+                FileApprovalDecision::AllowOnce | FileApprovalDecision::AllowAllEdits
+            ) && !model.changes_ready
+            {
+                return;
+            }
+            let choice = match decision {
+                FileApprovalDecision::AllowOnce => AgentFileApprovalChoice::Accept,
+                FileApprovalDecision::AllowAllEdits => AgentFileApprovalChoice::AcceptForSession,
+                FileApprovalDecision::Decline => AgentFileApprovalChoice::Decline,
+                FileApprovalDecision::Cancel => AgentFileApprovalChoice::Cancel,
+            };
+            let response = self
+                .conversation
+                .file_approval_responders
+                .get(request_id)
+                .map(|responder| responder.respond(choice));
+            let live_request = self
+                .conversation
+                .server_request_contexts
+                .contains_key(request_id);
+            let error = match response {
+                Some(Ok(())) => None,
+                Some(Err(error)) => Some(error),
+                None if live_request => Some("文件审批 responder 不存在".to_owned()),
+                None => None,
+            };
+            let ConversationActivity::FileApproval(model) =
+                &mut self.conversation.activities[index]
+            else {
+                unreachable!()
+            };
+            model.status = if error.is_some() {
+                FileApprovalStatus::Failed
+            } else {
+                FileApprovalStatus::Submitting
+            };
+            if let Some(error) = error {
+                model.failure_message = Some("无法写入文件审批响应，请停止此轮次后重试".to_owned());
+                self.conversation
+                    .activities
+                    .push(ConversationActivity::ProtocolError {
+                        message: "无法回复文件审批".to_owned(),
+                        details: Some(error),
+                        will_retry: false,
+                    });
+            }
+            cx.emit(ConversationChanged);
+            cx.notify();
+            return;
+        }
+
+        let ConversationActivity::FileApproval(model) = &mut self.conversation.activities[index]
+        else {
+            unreachable!()
+        };
 
         match event {
-            FileApprovalEvent::Decision(_) => model.status = FileApprovalStatus::Resolved,
+            FileApprovalEvent::Decision(_) => unreachable!(),
+            FileApprovalEvent::StopTurn => return,
+            FileApprovalEvent::ReviewFile(_) => return,
             FileApprovalEvent::ToggleMenu => {
                 model.visual_state = if model.visual_state.menu_open() {
                     if matches!(
@@ -429,6 +622,14 @@ impl ComposerView {
             }
             FileApprovalEvent::MenuFocusChanged(focused) => {
                 model.visual_state = FileApprovalVisualState::SplitMenu { focused };
+                if let Some(item) = focused {
+                    model.keyboard_focus = Some(match item {
+                        FileApprovalMenuItem::AllowOnce => FileApprovalKeyboardFocus::MenuAllowOnce,
+                        FileApprovalMenuItem::AllowAllEdits => {
+                            FileApprovalKeyboardFocus::MenuAllowAllEdits
+                        }
+                    });
+                }
             }
             FileApprovalEvent::KeyboardFocusChanged(focused) => {
                 model.keyboard_focus = focused;
@@ -642,6 +843,15 @@ impl ComposerView {
         cx.notify();
     }
     pub fn handle_user_input_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if !matches!(
+            self.conversation
+                .activities
+                .iter()
+                .find(|activity| activity.shows_request()),
+            Some(ConversationActivity::UserInput(_))
+        ) {
+            return false;
+        }
         let modifiers = event.keystroke.modifiers;
         let outcome = self
             .conversation

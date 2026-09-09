@@ -345,6 +345,10 @@ impl Render for ChatApp {
                 cx.stop_propagation();
             }))
             .on_key_down(cx.listener(Self::handle_project_creation_key))
+            .on_action(cx.listener(|_,_:&super::CaptureFrame,_window,_cx| {
+                #[cfg(feature = "screenshot")]
+                if let Ok(path) = std::env::var("GPUI_CAPTURE_OUTPUT") { crate::capture_frame(_window,path,3); }
+            }))
             .on_action(cx.listener(|this, _: &DismissPermissionUi, window, cx| {
                 if this.right_panel.open && this.right_panel.mode == Some(RightPanelMode::SideChat)
                     && let Some(panel) = this.side_chat_panels.get(&this.active_conversation)
@@ -434,9 +438,15 @@ impl Render for ChatApp {
                                             .px(px(CHAT_CONTENT_HORIZONTAL_GUTTER))
                                             .bg(theme.surface)
                                             .child(
-                                                self.home.clone().cached(
-                                                    StyleRefinement::default().size_full(),
-                                                ),
+                                                if self.home.read(cx).has_visible_request(cx) {
+                                                    // Approval focus, AX nodes and text selection
+                                                    // must remain registered on every frame.
+                                                    self.home.clone().into_any_element()
+                                                } else {
+                                                    self.home.clone().cached(
+                                                        StyleRefinement::default().size_full(),
+                                                    ).into_any_element()
+                                                },
                                             ),
                                     ))
                                     .when(self.right_panel.open, |row| {

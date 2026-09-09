@@ -13,6 +13,7 @@ pub(super) const UNDEFINED_METHOD_PARAMS_LIMIT: usize = 2_000;
 
 pub(super) const TURN_SCOPED_SERVER_METHODS: &[&str] = &[
     "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
     "item/permissions/requestApproval",
     "item/tool/requestUserInput",
     "tool/requestUserInput",
@@ -41,6 +42,7 @@ pub(super) fn is_defined_server_method(method: &str) -> bool {
     matches!(
         method,
         "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
             | "item/permissions/requestApproval"
             | "item/tool/requestUserInput"
             | "tool/requestUserInput"
@@ -138,6 +140,7 @@ pub(super) fn is_integrated_server_request_method(method: &str) -> bool {
     matches!(
         method,
         "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
             | "item/tool/requestUserInput"
             | "tool/requestUserInput"
             | "item/permissions/requestApproval"

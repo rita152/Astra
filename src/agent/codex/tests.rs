@@ -2406,10 +2406,25 @@ fn command_approval_enters_live_ui_and_replies_exactly_once() {
     };
     assert_eq!(request.request_id, AgentServerRequestId::Number(77));
     assert_eq!(request.command, "git --version");
-    assert!(request.allow_once);
-    assert!(request.decline);
-    assert!(!request.cancel);
-    assert!(request.can_accept_with_execpolicy_amendment);
+    assert!(
+        request
+            .available_decisions
+            .contains(&AgentCommandApprovalChoice::Accept)
+    );
+    assert!(
+        request
+            .available_decisions
+            .contains(&AgentCommandApprovalChoice::Decline)
+    );
+    assert!(
+        !request
+            .available_decisions
+            .contains(&AgentCommandApprovalChoice::Cancel)
+    );
+    assert!(request.available_decisions.iter().any(|choice| matches!(
+        choice,
+        AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment(_)
+    )));
 
     responder
         .respond(AgentCommandApprovalChoice::Accept)
@@ -2424,7 +2439,7 @@ fn command_approval_enters_live_ui_and_replies_exactly_once() {
 }
 
 #[test]
-fn current_cancel_advertisement_uses_chatgpt_style_decline() {
+fn current_cancel_advertisement_preserves_interrupt_decision() {
     let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
     let (tx, rx) = async_channel::unbounded();
     let message = current_command_approval_request(json!(78));
@@ -2434,15 +2449,27 @@ fn current_cancel_advertisement_uses_chatgpt_style_decline() {
     let AgentEvent::CommandApprovalRequested { request, responder } = event else {
         panic!("expected command approval event");
     };
-    assert!(request.allow_once);
-    assert!(!request.decline);
-    assert!(request.cancel);
+    assert!(
+        request
+            .available_decisions
+            .contains(&AgentCommandApprovalChoice::Accept)
+    );
+    assert!(
+        !request
+            .available_decisions
+            .contains(&AgentCommandApprovalChoice::Decline)
+    );
+    assert!(
+        request
+            .available_decisions
+            .contains(&AgentCommandApprovalChoice::Cancel)
+    );
 
     responder
-        .respond(AgentCommandApprovalChoice::Decline)
+        .respond(AgentCommandApprovalChoice::Cancel)
         .unwrap();
     let response: Value = serde_json::from_slice(&take_session_output(&session)).unwrap();
-    assert_eq!(response, json!({"id":78,"result":{"decision":"decline"}}));
+    assert_eq!(response, json!({"id":78,"result":{"decision":"cancel"}}));
 }
 
 #[test]
@@ -2464,7 +2491,9 @@ fn command_approval_preserves_string_ids_and_raw_execpolicy_decision() {
         AgentServerRequestId::String("77".into())
     );
     responder
-        .respond(AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment)
+        .respond(AgentCommandApprovalChoice::AcceptWithExecpolicyAmendment(
+            vec!["git".into(), "--version".into()],
+        ))
         .unwrap();
     let response: Value = serde_json::from_slice(&take_session_output(&session)).unwrap();
     assert_eq!(response["id"], json!("77"));
@@ -2691,31 +2720,23 @@ fn permissions_invalid_params_receive_minus_32602() {
 }
 
 #[test]
-fn unsupported_file_change_server_request_is_rejected() {
-    let (id, method) = (78_u64, "item/fileChange/requestApproval");
-    let input = format!(
-        "{}\n",
-        json!({
-            "id": id,
-            "method": method,
-            "params": {
-                "threadId": "thr_1",
-                "turnId": "turn_1",
-                "itemId": "item_1"
-            }
-        })
-    );
-    let mut reader = Cursor::new(input.into_bytes());
-    let mut output = Vec::new();
-
-    let error = wait_for_response(&mut reader, &mut output, INITIALIZE_ID, None)
-        .unwrap_err()
-        .to_string();
-    let response = String::from_utf8(output).unwrap();
-
-    assert!(error.contains(method));
-    assert!(response.contains(&format!("\"id\":{id}")));
-    assert!(response.contains("\"code\":-32601"));
+fn file_change_request_without_required_timestamp_is_rejected() {
+    let session = Arc::new(CodexTurnSession::new(Vec::new(), None));
+    let (tx, rx) = async_channel::unbounded();
+    let error = respond_to_server_request_on_session(
+        &session,
+        &json!({
+            "id":78,"method":"item/fileChange/requestApproval",
+            "params":{"threadId":"thr_1","turnId":"turn_1","itemId":"item_1"}
+        }),
+        &tx,
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("startedAtMs"));
+    let response: Value = serde_json::from_slice(&take_session_output(&session)).unwrap();
+    assert_eq!(response["id"], 78);
+    assert_eq!(response["error"]["code"], -32602);
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]
@@ -3030,7 +3051,11 @@ fn real_cli_safe_network_command_accept_once_round_trip() {
         match events.try_recv() {
             Ok(AgentEvent::CommandApprovalRequested { request, responder }) => {
                 eprintln!("real command approval: {request:#?}");
-                assert!(request.allow_once);
+                assert!(
+                    request
+                        .available_decisions
+                        .contains(&AgentCommandApprovalChoice::Accept)
+                );
                 approval_id = Some(request.request_id);
                 responder
                     .respond(AgentCommandApprovalChoice::Accept)

@@ -7,8 +7,9 @@ use super::{
     transcript::{ConversationPhase, ConversationTranscriptTurn, ResumedTurnPresentation},
 };
 use crate::agent::{
-    AgentAccountRateLimits, AgentApprovalHandle, AgentConnectionEvent, AgentEffectivePermissions,
-    AgentInterruptHandle, AgentMcpServerStartupStatus, AgentModel, AgentPermissionsApprovalHandle,
+    AgentAccountRateLimits, AgentApprovalHandle, AgentCommandApprovalRequest, AgentConnectionEvent,
+    AgentEffectivePermissions, AgentFileApprovalHandle, AgentFileChange, AgentInterruptHandle,
+    AgentMcpServerStartupStatus, AgentModel, AgentPermissionsApprovalHandle,
     AgentServerRequestMetadata, AgentThreadStatus, AgentThreadTokenUsage, AgentUserInputHandle,
     ProjectId,
 };
@@ -31,6 +32,9 @@ pub(crate) struct ConversationState {
     pub(crate) active_turn: Option<AgentInterruptHandle>,
     pub(crate) pending_connection_events: HashMap<String, Vec<AgentConnectionEvent>>,
     pub(crate) approval_responders: HashMap<String, AgentApprovalHandle>,
+    pub(crate) command_approval_requests: HashMap<String, AgentCommandApprovalRequest>,
+    pub(crate) file_approval_responders: HashMap<String, AgentFileApprovalHandle>,
+    pub(crate) file_changes: HashMap<String, AgentFileChange>,
     pub(crate) user_input_responders: HashMap<String, AgentUserInputHandle>,
     pub(crate) permissions_approval_responders: HashMap<String, AgentPermissionsApprovalHandle>,
     pub(crate) server_request_contexts: HashMap<String, AgentServerRequestMetadata>,
@@ -73,6 +77,9 @@ impl Default for ConversationState {
             active_turn: None,
             pending_connection_events: HashMap::new(),
             approval_responders: HashMap::new(),
+            command_approval_requests: HashMap::new(),
+            file_approval_responders: HashMap::new(),
+            file_changes: HashMap::new(),
             user_input_responders: HashMap::new(),
             permissions_approval_responders: HashMap::new(),
             server_request_contexts: HashMap::new(),

@@ -34,6 +34,8 @@ gpui::actions!(
 );
 pub fn init(cx: &mut App) {
     cx.bind_keys([
+        gpui::KeyBinding::new("cmd-c", EditorCopy, Some("ApprovalPreview")),
+        gpui::KeyBinding::new("cmd-a", EditorSelectAll, Some("ApprovalPreview")),
         gpui::KeyBinding::new("cmd-c", EditorCopy, Some("FileEditor")),
         gpui::KeyBinding::new("cmd-x", EditorCut, Some("FileEditor")),
         gpui::KeyBinding::new("cmd-v", EditorPaste, Some("FileEditor")),
@@ -147,6 +149,8 @@ pub struct FileEditor {
     prose_label: Option<String>,
     placeholder: String,
     composer: bool,
+    read_only: bool,
+    preview_collapsed: bool,
     focus: FocusHandle,
     marked: Option<Range<usize>>,
     rows: Vec<Row>,
@@ -209,6 +213,8 @@ impl FileEditor {
             prose_label: None,
             placeholder: String::new(),
             composer: false,
+            read_only: false,
+            preview_collapsed: false,
             mode,
             focus: cx.focus_handle(),
             marked: None,
@@ -237,6 +243,28 @@ impl FileEditor {
         editor.composer = true;
         editor
     }
+
+    /// A selectable command preview. It never registers a text-input handler
+    /// or emits edits, and shares the editor's Unicode-aware hit testing.
+    pub fn approval_preview(text: String, mode: ThemeMode, cx: &mut Context<Self>) -> Self {
+        let mut editor = Self::new(text, None, mode, cx);
+        editor.prose_label = Some("命令预览，只读".to_owned());
+        editor.read_only = true;
+        editor.preview_collapsed = true;
+        editor
+    }
+
+    pub fn set_preview_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        if self.preview_collapsed == expanded {
+            self.preview_collapsed = !expanded;
+            self.scroll = 0.0;
+            cx.notify();
+        }
+    }
+
+    pub fn visual_line_count(&self) -> usize {
+        self.rows.len().max(self.buffer.text.lines().count()).max(1)
+    }
     pub fn composer_height(&self) -> f32 {
         (self.rows.len().max(2) as f32 * self.line_height()).clamp(44.0, 220.0)
     }
@@ -254,7 +282,9 @@ impl FileEditor {
         self.reload(text.into(), cx);
     }
     fn line_height(&self) -> f32 {
-        if self.composer {
+        if self.read_only {
+            18.0
+        } else if self.composer {
             22.0
         } else if self.prose_label.is_some() {
             22.75
@@ -263,7 +293,9 @@ impl FileEditor {
         }
     }
     fn font_size(&self) -> f32 {
-        if self.composer {
+        if self.read_only {
+            12.0
+        } else if self.composer {
             14.0
         } else if self.prose_label.is_some() {
             13.0
@@ -308,6 +340,9 @@ impl FileEditor {
         self.marked.is_some()
     }
     pub fn undo(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if self.can_undo() {
             self.last_input = None;
             self.buffer.undo();
@@ -316,6 +351,9 @@ impl FileEditor {
         }
     }
     pub fn redo(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if self.can_redo() {
             self.last_input = None;
             self.buffer.redo();
@@ -331,6 +369,9 @@ impl FileEditor {
         cx.notify();
     }
     fn accepts(&mut self, range: &Range<usize>, text: &str, cx: &mut Context<Self>) -> bool {
+        if self.read_only {
+            return false;
+        }
         if self.buffer.text.len() - range.len() + text.len()
             > super::file_io::MAX_TEXT_BYTES as usize
         {
@@ -534,9 +575,13 @@ impl FileEditor {
     }
     fn prepare(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.bounds = Some(bounds);
-        let width = (f32::from(bounds.size.width) - self.gutter() - 16.).max(24.);
+        let width = (f32::from(bounds.size.width)
+            - self.gutter()
+            - if self.read_only { 0.0 } else { 16.0 })
+        .max(24.);
         if self.layout_dirty || (self.layout_width - width).abs() > 0.5 {
             let old_height = self.composer_height();
+            let old_rows = self.rows.len();
             self.rows.clear();
             self.layout_width = width;
             self.layout_dirty = false;
@@ -582,6 +627,11 @@ impl FileEditor {
                     if self.prose_label.is_some() {
                         run.font = ui_font();
                         run.color = theme.text.into();
+                    }
+                    if self.read_only {
+                        run.font.family = UI_MONOSPACE_FONT_FAMILY.into();
+                        run.font.weight = gpui::FontWeight::MEDIUM;
+                        run.color = theme.text_tertiary.into();
                     }
                     run.len = expanded.len();
                     if self
@@ -664,6 +714,9 @@ impl FileEditor {
             if self.composer && self.composer_height() != old_height {
                 cx.notify();
             }
+            if self.read_only && self.rows.len() != old_rows {
+                cx.notify();
+            }
         }
         let height = f32::from(bounds.size.height);
         if self.ensure_cursor {
@@ -681,6 +734,9 @@ impl FileEditor {
                 - height)
                 .max(0.),
         );
+        if self.preview_collapsed {
+            self.scroll = 0.0;
+        }
         let _ = cx;
     }
     fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
@@ -763,7 +819,8 @@ impl FileEditor {
                 window,
                 cx,
             );
-            if self.focus.is_focused(window)
+            if !self.read_only
+                && self.focus.is_focused(window)
                 && selection.is_empty()
                 && index == self.row_for(self.buffer.cursor)
             {
@@ -774,7 +831,9 @@ impl FileEditor {
                 ));
             }
         }
-        if self.rows.len() as f32 * self.line_height() > f32::from(bounds.size.height) {
+        if !self.preview_collapsed
+            && self.rows.len() as f32 * self.line_height() > f32::from(bounds.size.height)
+        {
             let height = f32::from(bounds.size.height);
             let total = self.rows.len() as f32 * self.line_height() + 16.;
             let thumb = (height * height / total).max(24.);
@@ -802,7 +861,11 @@ impl Render for FileEditor {
             .size_full()
             .overflow_hidden()
             .cursor(CursorStyle::IBeam)
-            .key_context("FileEditor")
+            .key_context(if self.read_only {
+                "ApprovalPreview"
+            } else {
+                "FileEditor"
+            })
             .track_focus(&self.focus)
             .role(gpui::Role::TextInput)
             .aria_label(
@@ -956,6 +1019,9 @@ impl Render for FileEditor {
                 cx.listener(|s, _, _, _| s.selecting = false),
             )
             .on_scroll_wheel(cx.listener(|s, e: &gpui::ScrollWheelEvent, _, cx| {
+                if s.preview_collapsed {
+                    return;
+                }
                 s.scroll -= f32::from(e.delta.pixel_delta(px(s.line_height())).y);
                 s.ensure_cursor = false;
                 cx.notify();
@@ -981,11 +1047,13 @@ impl Render for FileEditor {
                     },
                     move |b, _, w, cx| {
                         paint_entity.update(cx, |s, cx| {
-                            w.handle_input(
-                                &s.focus,
-                                ElementInputHandler::new(b, paint_entity.clone()),
-                                cx,
-                            );
+                            if !s.read_only {
+                                w.handle_input(
+                                    &s.focus,
+                                    ElementInputHandler::new(b, paint_entity.clone()),
+                                    cx,
+                                );
+                            }
                             s.paint(b, w, cx);
                         });
                     },
@@ -1117,6 +1185,37 @@ impl EntityInputHandler for FileEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_preview_keeps_unicode_selection_copy_and_never_edits_the_command() {
+        let mut app = gpui::TestApp::new();
+        app.update(init);
+        let text = "echo 中文 🦀\nprintf 'unchanged'\n";
+        let mut window = app.open_window_with_options(gpui::WindowOptions::default(), |_, cx| {
+            FileEditor::approval_preview(text.into(), ThemeMode::Dark, cx)
+        });
+        window.draw();
+        window.update(|editor, window, cx| {
+            window.focus(&editor.focus, cx);
+            editor.buffer.anchor = 0;
+            editor.buffer.cursor = editor.buffer.text.len();
+            editor.copy(cx);
+            assert_eq!(
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some(text)
+            );
+            editor.replace_text_in_range(Some(0..4), "changed", window, cx);
+            editor.replace_and_mark_text_in_range(None, "输入", Some(0..2), window, cx);
+            editor.replace("delete selection", cx);
+            editor.undo(cx);
+            editor.redo(cx);
+            assert_eq!(editor.text(), text);
+            assert!(!editor.composing());
+            assert!(!editor.can_undo());
+        });
+    }
 
     #[test]
     fn side_composer_commits_ime_before_enter_and_preserves_multiline_undo() {

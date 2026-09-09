@@ -418,6 +418,7 @@ pub(super) fn process_turn_message<W: Write + Send + 'static>(
         }
         Some(
             "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
             | "item/permissions/requestApproval"
             | "item/tool/requestUserInput"
             | "tool/requestUserInput"

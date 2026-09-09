@@ -6,15 +6,20 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use async_channel::Sender;
 use serde_json::{Value, json};
 
-use super::{registry::ServerRequestResolution, session::CodexTurnSession};
+use super::{
+    approvals::{parse_command_approval_request, parse_file_approval_request},
+    registry::ServerRequestResolution,
+    session::CodexTurnSession,
+};
 use crate::agent::{
     AgentAdditionalFileSystemPermissions, AgentAdditionalNetworkPermissions, AgentApprovalControl,
-    AgentApprovalHandle, AgentCommandApprovalRequest, AgentEvent, AgentFileSystemAccess,
-    AgentFileSystemPath, AgentFileSystemPermissionEntry, AgentFileSystemSpecialPath,
-    AgentOptionalField, AgentPermissionRequestProfile, AgentPermissionsApprovalControl,
-    AgentPermissionsApprovalHandle, AgentPermissionsApprovalRequest, AgentServerRequestId,
-    AgentServerRequestKind, AgentServerRequestMetadata, AgentUserInputControl,
-    AgentUserInputHandle, AgentUserInputOption, AgentUserInputQuestion, AgentUserInputRequest,
+    AgentApprovalHandle, AgentCommandApprovalRequest, AgentEvent, AgentFileApprovalControl,
+    AgentFileApprovalHandle, AgentFileApprovalRequest, AgentFileSystemAccess, AgentFileSystemPath,
+    AgentFileSystemPermissionEntry, AgentFileSystemSpecialPath, AgentOptionalField,
+    AgentPermissionRequestProfile, AgentPermissionsApprovalControl, AgentPermissionsApprovalHandle,
+    AgentPermissionsApprovalRequest, AgentServerRequestId, AgentServerRequestKind,
+    AgentServerRequestMetadata, AgentUserInputControl, AgentUserInputHandle, AgentUserInputOption,
+    AgentUserInputQuestion, AgentUserInputRequest,
 };
 
 pub(super) fn request_id_from_value(value: &Value) -> Result<AgentServerRequestId> {
@@ -44,6 +49,18 @@ pub(super) fn request_metadata_for_command(
         turn_id: request.turn_id.clone(),
         item_id: request.item_id.clone(),
         kind: AgentServerRequestKind::CommandApproval,
+    }
+}
+
+pub(super) fn request_metadata_for_file(
+    request: &AgentFileApprovalRequest,
+) -> AgentServerRequestMetadata {
+    AgentServerRequestMetadata {
+        request_id: request.request_id.clone(),
+        thread_id: request.thread_id.clone(),
+        turn_id: request.turn_id.clone(),
+        item_id: request.item_id.clone(),
+        kind: AgentServerRequestKind::FileApproval,
     }
 }
 
@@ -96,19 +113,11 @@ pub(super) fn respond_to_server_request_on_session<W: Write + Send + 'static>(
                     );
                 }
             };
-        if let Err(error) = session.register_command_approval(
+        session.register_command_approval(
             request_metadata_for_command(&request),
             params,
             available_decisions,
-        ) {
-            return reject_server_request(
-                session,
-                message,
-                -32600,
-                "Duplicate or invalid server request",
-                error,
-            );
-        }
+        )?;
         let control: Arc<dyn AgentApprovalControl> = session.clone();
         let responder = AgentApprovalHandle::new(request_id, control);
         if events
@@ -127,6 +136,39 @@ pub(super) fn respond_to_server_request_on_session<W: Write + Send + 'static>(
                 -32603,
                 "Unable to present server request",
                 error,
+            );
+        }
+        return Ok(());
+    }
+    if method == "item/fileChange/requestApproval" {
+        let request = match parse_file_approval_request(message) {
+            Ok(request) => request,
+            Err(error) => {
+                return reject_server_request(
+                    session,
+                    message,
+                    -32602,
+                    "Invalid item/fileChange/requestApproval params",
+                    error,
+                );
+            }
+        };
+        // A duplicate id already identifies another response. Never send an
+        // error under that same id and accidentally answer the original prompt.
+        session.register_file_approval(&request)?;
+        let control: Arc<dyn AgentFileApprovalControl> = session.clone();
+        let responder = AgentFileApprovalHandle::new(request.request_id.clone(), control);
+        if events
+            .send_blocking(AgentEvent::FileApprovalRequested { request, responder })
+            .is_err()
+        {
+            session.drain_pending_server_requests()?;
+            return reject_server_request(
+                session,
+                message,
+                -32603,
+                "Unable to present server request",
+                anyhow!("Composer file approval 事件通道已经关闭"),
             );
         }
         return Ok(());
@@ -256,116 +298,6 @@ pub(super) fn reject_server_request<W: Write + Send>(
             "{error:#}; 同时无法写入 JSON-RPC error response：{response_error:#}"
         )),
     }
-}
-
-pub(super) fn parse_command_approval_request(
-    message: &Value,
-) -> Result<(
-    AgentServerRequestId,
-    AgentCommandApprovalRequest,
-    Value,
-    Vec<Value>,
-)> {
-    let request_id = request_id_from_value(
-        message
-            .get("id")
-            .context("command approval request 缺少 JSON-RPC id")?,
-    )?;
-    let params = message
-        .get("params")
-        .and_then(Value::as_object)
-        .context("command approval request 缺少对象 params")?;
-    for field in ["kind", "threadId", "turnId", "itemId"] {
-        params
-            .get(field)
-            .and_then(Value::as_str)
-            .with_context(|| format!("command approval params.{field} 必须是字符串"))?;
-    }
-    params
-        .get("startedAtMs")
-        .and_then(Value::as_i64)
-        .context("command approval params.startedAtMs 必须是 int64")?;
-    match params.get("environmentId") {
-        Some(Value::String(_) | Value::Null) => {}
-        _ => bail!("command approval params.environmentId 必须是字符串或 null"),
-    }
-
-    let available_decisions = match params.get("availableDecisions") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(decisions)) => decisions.clone(),
-        Some(_) => bail!("command approval params.availableDecisions 必须是数组或 null"),
-    };
-    let allow_once = available_decisions
-        .iter()
-        .any(|decision| decision.as_str() == Some("accept"));
-    let decline = available_decisions
-        .iter()
-        .any(|decision| decision.as_str() == Some("decline"));
-    let cancel = available_decisions
-        .iter()
-        .any(|decision| decision.as_str() == Some("cancel"));
-    let accept_with_execpolicy_amendment = available_decisions
-        .iter()
-        .find(|decision| decision.get("acceptWithExecpolicyAmendment").is_some())
-        .cloned();
-
-    let optional_string = |field: &str| -> Result<Option<String>> {
-        match params.get(field) {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::String(value)) => Ok(Some(value.clone())),
-            Some(_) => bail!("command approval params.{field} 必须是字符串或 null"),
-        }
-    };
-    let command = optional_string("command")?
-        .or_else(|| {
-            params
-                .get("commandActions")
-                .and_then(Value::as_array)
-                .and_then(|actions| actions.first())
-                .and_then(|action| action.get("command"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_default();
-    let network_host = match params.get("networkApprovalContext") {
-        None | Some(Value::Null) => None,
-        Some(Value::Object(context)) => Some(
-            context
-                .get("host")
-                .and_then(Value::as_str)
-                .context("command approval params.networkApprovalContext.host 必须是字符串")?
-                .to_owned(),
-        ),
-        Some(_) => bail!("command approval params.networkApprovalContext 必须是对象或 null"),
-    };
-    let request = AgentCommandApprovalRequest {
-        request_id: request_id.clone(),
-        thread_id: params["threadId"]
-            .as_str()
-            .expect("validated above")
-            .to_owned(),
-        turn_id: params["turnId"]
-            .as_str()
-            .expect("validated above")
-            .to_owned(),
-        item_id: params["itemId"]
-            .as_str()
-            .expect("validated above")
-            .to_owned(),
-        command,
-        reason: optional_string("reason")?,
-        network_host,
-        allow_once,
-        decline,
-        cancel,
-        can_accept_with_execpolicy_amendment: accept_with_execpolicy_amendment.is_some(),
-    };
-    Ok((
-        request_id,
-        request,
-        Value::Object(params.clone()),
-        available_decisions,
-    ))
 }
 
 pub(super) fn required_request_string(

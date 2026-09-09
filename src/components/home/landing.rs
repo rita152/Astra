@@ -38,30 +38,32 @@ pub(super) fn home(
         activities: conversation_activity,
         list: conversation_list,
     } = snapshot;
-    let pending_command_approval = conversation_activity.iter().find_map(|activity| {
-        let ConversationActivity::Approval(model) = activity else {
-            return None;
+    let visible_request = conversation_activity
+        .iter()
+        .find(|activity| activity.shows_request());
+    let pending_command_approval =
+        if let Some(ConversationActivity::Approval(model)) = visible_request {
+            Some(model.clone())
+        } else {
+            None
         };
-        model.should_render().then(|| model.clone())
-    });
-    let pending_user_input = conversation_activity.iter().find_map(|activity| {
-        let ConversationActivity::UserInput(model) = activity else {
-            return None;
+    let pending_user_input = if let Some(ConversationActivity::UserInput(model)) = visible_request {
+        Some(model.clone())
+    } else {
+        None
+    };
+    let pending_file_approval =
+        if let Some(ConversationActivity::FileApproval(model)) = visible_request {
+            Some(model.clone())
+        } else {
+            None
         };
-        model.should_render().then(|| model.clone())
-    });
-    let pending_file_approval = conversation_activity.iter().find_map(|activity| {
-        let ConversationActivity::FileApproval(model) = activity else {
-            return None;
+    let pending_permissions_approval =
+        if let Some(ConversationActivity::PermissionsApproval(model)) = visible_request {
+            Some(model.clone())
+        } else {
+            None
         };
-        model.should_render().then(|| model.clone())
-    });
-    let pending_permissions_approval = conversation_activity.iter().find_map(|activity| {
-        let ConversationActivity::PermissionsApproval(model) = activity else {
-            return None;
-        };
-        model.should_render().then(|| model.clone())
-    });
     let blocking_request_pending = pending_command_approval.is_some()
         || pending_user_input.is_some()
         || pending_file_approval.is_some()
@@ -165,7 +167,14 @@ pub(super) fn home(
             )
         })
         .when_some(pending_command_approval, |root, model| {
-            let card = command_approval_card(home_entity.clone(), model, theme);
+            let preview = render.approval_previews.get(&model.request_id).cloned();
+            let card = command_approval_card(
+                home_entity.clone(),
+                render.request_owner.clone(),
+                model,
+                theme,
+                preview,
+            );
             root.when_some(card, |root, card| {
                 root.child(
                     div()
@@ -175,13 +184,19 @@ pub(super) fn home(
                         .bottom(px(16.0))
                         .w_full()
                         .max_w(px(736.0))
-                        .child(card),
+                        .child(
+                            div()
+                                .relative()
+                                .left(px(render.approval_border_offset))
+                                .child(card),
+                        ),
                 )
             })
         })
         .when_some(pending_user_input, |root, model| {
             let card = user_input_request_card(
                 home_entity.clone(),
+                render.request_owner.clone(),
                 model,
                 theme,
                 user_input_other.clone(),
@@ -198,7 +213,12 @@ pub(super) fn home(
             })
         })
         .when_some(pending_file_approval, |root, model| {
-            let card = file_approval_card(home_entity.clone(), model, theme);
+            let card = file_approval_card(
+                home_entity.clone(),
+                render.request_owner.clone(),
+                model,
+                theme,
+            );
             root.when_some(card, |root, card| {
                 root.child(
                     div()
@@ -207,15 +227,22 @@ pub(super) fn home(
                         .w_full()
                         .max_w(px(736.0))
                         .child(
-                            // CDP 39-43 rasterize the left edge one pixel before
-                            // GPUI at the same fractional CSS coordinate.
-                            div().relative().left(px(1.671_875)).w_full().child(card),
+                            div()
+                                .relative()
+                                .left(px(render.approval_border_offset))
+                                .w_full()
+                                .child(card),
                         ),
                 )
             })
         })
         .when_some(pending_permissions_approval, |root, model| {
-            let card = permissions_approval_card(home_entity.clone(), model, theme);
+            let card = permissions_approval_card(
+                home_entity.clone(),
+                render.request_owner.clone(),
+                model,
+                theme,
+            );
             root.when_some(card, |root, card| {
                 root.child(
                     div()

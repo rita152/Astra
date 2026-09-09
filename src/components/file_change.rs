@@ -21,10 +21,9 @@ use crate::{
 pub const FILE_APPROVAL_HEADER_HEIGHT: f32 = 76.0;
 pub const FILE_APPROVAL_ACTIONS_HEIGHT: f32 = 52.0;
 pub const FILE_APPROVAL_BUTTON_HEIGHT: f32 = 28.0;
-pub const FILE_APPROVAL_MENU_TOP: f32 = 64.0;
 pub const FILE_APPROVAL_MENU_WIDTH: f32 = 168.0;
-pub const FILE_APPROVAL_MENU_HEIGHT: f32 = 67.125;
-pub const FILE_APPROVAL_MENU_ROW_HEIGHT: f32 = 28.5625;
+pub const FILE_APPROVAL_MENU_HEIGHT: f32 = 67.140625;
+pub const FILE_APPROVAL_MENU_ROW_HEIGHT: f32 = 28.570313;
 pub const FILE_APPROVAL_FILE_ROW_HEIGHT: f32 = 33.0;
 pub const FILE_APPROVAL_FILES_VERTICAL_PADDING: f32 = 16.0;
 pub const FILE_APPROVAL_FILES_MAX_HEIGHT: f32 = 200.0;
@@ -73,6 +72,8 @@ fn element_id(prefix: &str, id: &str) -> SharedString {
 pub enum FileApprovalStatus {
     #[default]
     Pending,
+    Submitting,
+    Failed,
     Resolved,
 }
 
@@ -81,6 +82,7 @@ pub enum FileApprovalDecision {
     AllowOnce,
     AllowAllEdits,
     Decline,
+    Cancel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +154,11 @@ pub struct FileApprovalPresentation {
     pub status: FileApprovalStatus,
     pub visual_state: FileApprovalVisualState,
     pub keyboard_focus: Option<FileApprovalKeyboardFocus>,
+    pub review: Option<DiffReviewPresentation>,
+    pub grant_root: Option<String>,
+    pub failure_message: Option<String>,
+    /// An approval without its item/started patch is never silently approved.
+    pub changes_ready: bool,
     /// Stable native scroll state. Keeping the handle with the presentation
     /// prevents an unrelated rerender from snapping an eight-file request
     /// back to its first row.
@@ -166,6 +173,10 @@ impl PartialEq for FileApprovalPresentation {
             && self.status == other.status
             && self.visual_state == other.visual_state
             && self.keyboard_focus == other.keyboard_focus
+            && self.review == other.review
+            && self.grant_root == other.grant_root
+            && self.failure_message == other.failure_message
+            && self.changes_ready == other.changes_ready
     }
 }
 
@@ -184,6 +195,10 @@ impl FileApprovalPresentation {
             status: FileApprovalStatus::Pending,
             visual_state: FileApprovalVisualState::Default,
             keyboard_focus: None,
+            review: None,
+            grant_root: None,
+            failure_message: None,
+            changes_ready: true,
             file_list_scroll: ScrollHandle::new(),
         }
     }
@@ -197,6 +212,13 @@ impl FileApprovalPresentation {
     }
 
     pub fn should_render(&self) -> bool {
+        matches!(
+            self.status,
+            FileApprovalStatus::Pending | FileApprovalStatus::Failed
+        )
+    }
+
+    pub fn is_interactive(&self) -> bool {
         self.status == FileApprovalStatus::Pending
     }
 
@@ -223,11 +245,44 @@ impl FileApprovalPresentation {
     }
 
     pub fn card_height(&self) -> f32 {
-        FILE_APPROVAL_HEADER_HEIGHT + self.files_height() + FILE_APPROVAL_ACTIONS_HEIGHT
+        2.0 + FILE_APPROVAL_HEADER_HEIGHT
+            + self.files_height()
+            + FILE_APPROVAL_ACTIONS_HEIGHT
+            + if self.failure_message.is_some() {
+                40.0
+            } else {
+                0.0
+            }
     }
 
     pub fn keyboard_event(&self, key: &str, shift: bool) -> Option<FileApprovalEvent> {
+        if self.status == FileApprovalStatus::Failed && key == "escape" {
+            return Some(FileApprovalEvent::StopTurn);
+        }
+        if !self.is_interactive() {
+            return None;
+        }
+        if !self.changes_ready {
+            return match key {
+                "tab" => Some(FileApprovalEvent::KeyboardFocusChanged(Some(
+                    FileApprovalKeyboardFocus::Decline,
+                ))),
+                "escape" if shift => {
+                    Some(FileApprovalEvent::Decision(FileApprovalDecision::Cancel))
+                }
+                "escape" => Some(FileApprovalEvent::Decision(FileApprovalDecision::Decline)),
+                "enter" | "space"
+                    if self.keyboard_focus == Some(FileApprovalKeyboardFocus::Decline) =>
+                {
+                    Some(FileApprovalEvent::Decision(FileApprovalDecision::Decline))
+                }
+                _ => None,
+            };
+        }
         match key {
+            "escape" if shift && !self.visual_state.menu_open() => {
+                Some(FileApprovalEvent::Decision(FileApprovalDecision::Cancel))
+            }
             "tab" => {
                 let next = if self.visual_state.menu_open() {
                     match (self.keyboard_focus, shift) {
@@ -285,9 +340,10 @@ impl FileApprovalPresentation {
                 Some(FileApprovalKeyboardFocus::MenuAllowAllEdits) => Some(
                     FileApprovalEvent::Decision(FileApprovalDecision::AllowAllEdits),
                 ),
-                Some(FileApprovalKeyboardFocus::AllowOnce) | None
-                    if !self.visual_state.menu_open() =>
-                {
+                Some(FileApprovalKeyboardFocus::AllowOnce) if !self.visual_state.menu_open() => {
+                    Some(FileApprovalEvent::Decision(FileApprovalDecision::AllowOnce))
+                }
+                None if key == "enter" && !self.visual_state.menu_open() => {
                     Some(FileApprovalEvent::Decision(FileApprovalDecision::AllowOnce))
                 }
                 _ => None,
@@ -388,6 +444,8 @@ pub enum FileApprovalEvent {
     ToggleMenu,
     MenuFocusChanged(Option<FileApprovalMenuItem>),
     KeyboardFocusChanged(Option<FileApprovalKeyboardFocus>),
+    ReviewFile(usize),
+    StopTurn,
 }
 
 pub type FileApprovalCallback = UiCallback<FileApprovalEvent>;
@@ -416,6 +474,29 @@ struct FilePalette {
 }
 
 impl FilePalette {
+    fn for_approval(theme: Theme) -> Self {
+        let mut palette = Self::for_theme(theme);
+        if palette.mode == ThemeMode::Dark {
+            palette.card = rgba(0x2d2d2dff);
+            palette.text = rgba(0xffffffff);
+            palette.approval_secondary = rgba(0xffffffa6);
+            palette.approval_icon = rgba(0xffffffa6);
+            palette.approval_decline_text = rgba(0xffffffff);
+            palette.approval_primary_text = rgba(0x2d2d2dff);
+            palette.primary = rgba(0xffffffff);
+            palette.primary_hover = rgba(0xffffffcc);
+            palette.added = rgba(0x40c977ff);
+            palette.deleted = rgba(0xfa423eff);
+        } else {
+            palette.approval_secondary = rgba(0x1a1c1fa6);
+            palette.approval_decline_text = rgba(0x1a1c1fff);
+            palette.approval_primary_text = rgba(0xffffffff);
+            palette.tertiary = rgba(0x1a1c1f7e);
+            palette.added = rgba(0x00a240ff);
+            palette.deleted = rgba(0xba2623ff);
+        }
+        palette
+    }
     fn for_theme(theme: Theme) -> Self {
         if theme.surface == rgba(0x181818ff) {
             Self {
@@ -474,18 +555,6 @@ impl FilePalette {
             }
         }
     }
-
-    fn approval_shadows(self) -> Vec<BoxShadow> {
-        let (short_shadow, ambient_shadow, outline) = match self.mode {
-            ThemeMode::Light => (rgba(0x0000000d), rgba(0x00000007), rgba(0x1a1c1f10)),
-            ThemeMode::Dark => (rgba(0x0000000a), rgba(0x0000000d), rgba(0xffffff14)),
-        };
-        vec![
-            BoxShadow::new(px(0.0), px(0.0), outline.into()).spread_radius(px(0.5)),
-            BoxShadow::new(px(0.0), px(3.0), short_shadow.into()).blur_radius(px(7.5)),
-            BoxShadow::new(px(0.0), px(0.0), ambient_shadow.into()).blur_radius(px(20.0)),
-        ]
-    }
 }
 
 /// Render the captured Edit files approval card. Resolved requests are
@@ -500,12 +569,12 @@ pub fn render_file_approval_card(
         return None;
     }
 
-    let palette = FilePalette::for_theme(theme);
+    let palette = FilePalette::for_approval(theme);
     let header = div()
         .id(element_id("file-approval-header", &model.request_id))
         .role(Role::Alert)
         .aria_label(format!("编辑文件，{}", model.question()))
-        .h(px(FILE_APPROVAL_HEADER_HEIGHT))
+        .min_h(px(FILE_APPROVAL_HEADER_HEIGHT))
         .px(px(16.0))
         .pt(px(16.0))
         .pb(px(12.0))
@@ -518,7 +587,7 @@ pub fn render_file_approval_card(
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .text_size(px(12.95))
+                .text_size(px(13.0))
                 .line_height(px(20.0))
                 .font_weight(FontWeight::NORMAL)
                 .text_color(palette.approval_secondary)
@@ -527,38 +596,51 @@ pub fn render_file_approval_card(
         )
         .child(
             div()
-                .h(px(20.0))
+                .id(element_id("file-approval-question", &model.request_id))
+                .max_h(px(160.0))
                 .min_w(px(0.0))
-                .overflow_hidden()
-                .text_size(px(13.95))
+                .overflow_y_scroll()
+                .text_size(px(14.0))
                 .line_height(px(20.0))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(palette.text)
                 .child(model.question().to_owned()),
         );
 
-    let files = render_approval_files(model, palette);
+    let files = render_approval_files(model, palette, callback.clone());
     let actions = render_file_approval_actions(model, palette, callback.clone());
 
     let card_height = model.card_height();
-    let card = div()
-        .h(px(card_height))
+    let mut card = div()
+        .min_h(px(card_height))
         .w_full()
         .overflow_hidden()
         .rounded(px(25.0))
         .bg(palette.card)
-        .shadow(palette.approval_shadows())
+        .border_1()
+        .border_color(palette.outline)
         .child(header)
-        .child(files)
-        .child(actions);
+        .child(files);
+    if let Some(error) = &model.failure_message {
+        card = card.child(
+            div()
+                .id(element_id("file-approval-error", &model.request_id))
+                .role(Role::Alert)
+                .aria_label(error.clone())
+                .h(px(40.0))
+                .px(px(16.0))
+                .text_size(px(13.0))
+                .line_height(px(20.0))
+                .text_color(theme.warning)
+                .child(error.clone()),
+        );
+    }
+    card = card.child(actions);
 
     let mut result = div()
         .id(element_id("file-approval-card", &model.request_id))
         .relative()
-        // CDP's conversation column starts at x=.671875. Match that phase so
-        // native text and icons land on the same device pixels as Chromium.
-        .left(px(0.671875))
-        .h(px(card_height))
+        .min_h(px(card_height))
         .w_full()
         .child(card);
 
@@ -573,7 +655,11 @@ pub fn render_file_approval_card(
     Some(result)
 }
 
-fn render_approval_files(model: &FileApprovalPresentation, palette: FilePalette) -> Stateful<Div> {
+fn render_approval_files(
+    model: &FileApprovalPresentation,
+    palette: FilePalette,
+    callback: FileApprovalCallback,
+) -> Stateful<Div> {
     let mut list = div()
         .id(element_id("file-approval-files-scroll", &model.request_id))
         .h(px(model.file_list_viewport_height()))
@@ -587,6 +673,7 @@ fn render_approval_files(model: &FileApprovalPresentation, palette: FilePalette)
 
     for (index, file) in model.files.iter().enumerate() {
         let (directory, name) = file.directory_and_name();
+        let open = callback.clone();
         list = list.child(
             div()
                 .id(element_id(
@@ -596,7 +683,7 @@ fn render_approval_files(model: &FileApprovalPresentation, palette: FilePalette)
                 .h(px(FILE_APPROVAL_FILE_ROW_HEIGHT))
                 .flex_none()
                 .min_w(px(0.0))
-                .role(Role::Group)
+                .role(Role::Button)
                 .aria_label(format!(
                     "{}，增加 {} 行，删除 {} 行",
                     file.path, file.additions, file.deletions
@@ -604,17 +691,12 @@ fn render_approval_files(model: &FileApprovalPresentation, palette: FilePalette)
                 .px(px(6.0))
                 .flex()
                 .items_center()
-                .rounded(px(11.0))
-                // The computed fill is transparent in CDP 24/39. Paint the
-                // identical opaque card color here so GPUI's shadow primitive
-                // cannot show through the row interior.
-                .bg(palette.card)
-                // Electron applies `elevation-stroke` as a shadow, so it does
-                // not consume a layout pixel like a CSS border would.
-                .shadow(vec![
-                    BoxShadow::new(px(0.0), px(0.0), palette.outline.into()).spread_radius(px(0.5)),
-                ])
-                .text_size(px(14.35))
+                .gap(px(10.0))
+                .cursor_pointer()
+                .on_click(move |_, window, cx| {
+                    open.emit(FileApprovalEvent::ReviewFile(index), window, cx)
+                })
+                .text_size(px(14.0))
                 .line_height(px(21.0))
                 .font_family(UI_FONT_FAMILY)
                 .text_color(palette.text)
@@ -624,7 +706,7 @@ fn render_approval_files(model: &FileApprovalPresentation, palette: FilePalette)
                         .flex_1()
                         .flex()
                         .items_center()
-                        .font_weight(FontWeight::NORMAL)
+                        .font_weight(FontWeight::MEDIUM)
                         .truncate()
                         .child(
                             div()
@@ -647,12 +729,40 @@ fn render_approval_files(model: &FileApprovalPresentation, palette: FilePalette)
                 )),
         );
     }
+    if !model.changes_ready {
+        list = list.child(
+            div()
+                .h(px(33.0))
+                .px(px(6.0))
+                .text_size(px(13.0))
+                .text_color(palette.tertiary)
+                .child("正在加载待审批的文件更改…"),
+        );
+    }
     div()
         .id(element_id("file-approval-files", &model.request_id))
         .h(px(model.files_height()))
         .px(px(16.0))
         .py(px(8.0))
-        .child(list)
+        .child(
+            div()
+                .rounded(px(12.5))
+                .overflow_hidden()
+                .bg(palette.card)
+                .shadow(vec![
+                    BoxShadow::new(
+                        px(0.0),
+                        px(0.0),
+                        if palette.mode == ThemeMode::Dark {
+                            rgba(0xffffff28).into()
+                        } else {
+                            palette.outline.into()
+                        },
+                    )
+                    .spread_radius(px(0.5)),
+                ])
+                .child(list),
+        )
 }
 
 fn render_file_approval_actions(
@@ -660,6 +770,35 @@ fn render_file_approval_actions(
     palette: FilePalette,
     callback: FileApprovalCallback,
 ) -> Div {
+    if !model.is_interactive() {
+        return div()
+            .h(px(FILE_APPROVAL_ACTIONS_HEIGHT))
+            .px(px(16.0))
+            .pt(px(8.0))
+            .pb(px(16.0))
+            .flex()
+            .justify_end()
+            .child(
+                div()
+                    .id(element_id("file-approval-stop", &model.request_id))
+                    .role(Role::Button)
+                    .aria_label("停止当前轮次")
+                    .h(px(28.0))
+                    .px(px(8.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(palette.outline)
+                    .text_color(palette.text)
+                    .text_size(px(13.0))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        callback.emit(FileApprovalEvent::StopTurn, window, cx)
+                    })
+                    .child("停止当前轮次"),
+            );
+    }
     let decline_callback = callback.clone();
     let decline = div()
         .id(element_id("file-approval-decline", &model.request_id))
@@ -681,7 +820,7 @@ fn render_file_approval_actions(
                 palette.soft
             },
         )
-        .text_size(px(12.95))
+        .text_size(px(13.0))
         .line_height(px(18.0))
         .text_color(palette.approval_decline_text)
         .cursor_pointer()
@@ -722,9 +861,12 @@ fn render_file_approval_actions(
         .border_l_1()
         .border_color(palette.approval_button_border)
         .bg(primary_fill)
-        .text_size(px(12.95))
+        .text_size(px(13.0))
         .line_height(px(18.0))
         .text_color(palette.approval_primary_text)
+        .when(!model.changes_ready || !model.is_interactive(), |button| {
+            button.opacity(0.4)
+        })
         .cursor_pointer()
         .hover(move |button| button.bg(palette.primary_hover))
         .on_click(move |_, window, cx| {
@@ -742,6 +884,9 @@ fn render_file_approval_actions(
         .id(element_id("file-approval-menu-toggle", &model.request_id))
         .role(Role::Button)
         .aria_label("审批选项")
+        .when(!model.changes_ready || !model.is_interactive(), |button| {
+            button.opacity(0.4)
+        })
         .h(px(FILE_APPROVAL_BUTTON_HEIGHT))
         .w(px(23.0))
         .pl(px(2.0))
@@ -800,8 +945,8 @@ fn render_file_approval_menu(
         .role(Role::Menu)
         .aria_label("审批选项")
         .absolute()
-        .top(px(FILE_APPROVAL_MENU_TOP))
-        .right(px(16.0))
+        .bottom(px(47.0))
+        .right(px(17.75))
         .w(px(FILE_APPROVAL_MENU_WIDTH))
         .h(px(FILE_APPROVAL_MENU_HEIGHT))
         .p(px(4.0))
@@ -847,6 +992,7 @@ fn file_approval_menu_row(
     div()
         .id(id)
         .role(Role::MenuItem)
+        .aria_label(label)
         .h(px(FILE_APPROVAL_MENU_ROW_HEIGHT))
         .w_full()
         .px(px(8.0))
@@ -932,8 +1078,8 @@ fn approval_change_counts(additions: u32, deletions: u32, palette: FilePalette) 
         .flex()
         .items_center()
         .gap(px(4.0))
-        .text_size(px(14.0))
-        .line_height(px(21.0))
+        .text_size(px(16.0))
+        .line_height(px(16.0))
         .child(
             div()
                 .text_color(palette.added)
@@ -2557,11 +2703,10 @@ mod tests {
     fn file_approval_geometry_matches_cdp() {
         let model = approval();
         assert_eq!(model.files_height(), 49.0);
-        assert_eq!(model.card_height(), 177.0);
-        assert_eq!(FILE_APPROVAL_MENU_TOP, 64.0);
+        assert_eq!(model.card_height(), 179.0);
         assert_eq!(FILE_APPROVAL_MENU_WIDTH, 168.0);
-        assert_eq!(FILE_APPROVAL_MENU_HEIGHT, 67.125);
-        assert_eq!(FILE_APPROVAL_MENU_ROW_HEIGHT, 28.5625);
+        assert_eq!(FILE_APPROVAL_MENU_HEIGHT, 67.140625);
+        assert_eq!(FILE_APPROVAL_MENU_ROW_HEIGHT, 28.570313);
     }
 
     #[test]
@@ -2579,7 +2724,7 @@ mod tests {
         assert_eq!(model.file_list_content_height(), 66.0);
         assert_eq!(model.file_list_viewport_height(), 66.0);
         assert_eq!(model.files_height(), 82.0);
-        assert_eq!(model.card_height(), 210.0);
+        assert_eq!(model.card_height(), 212.0);
         assert_eq!(model.files[0].directory_and_name(), ("/tmp/", "first.txt"));
         assert_eq!(model.files[1].directory_and_name(), ("/tmp/", "second.txt"));
     }
@@ -2597,7 +2742,7 @@ mod tests {
         assert_eq!(model.file_list_content_height(), 264.0);
         assert_eq!(model.file_list_viewport_height(), 200.0);
         assert_eq!(model.files_height(), 216.0);
-        assert_eq!(model.card_height(), 344.0);
+        assert_eq!(model.card_height(), 346.0);
     }
 
     #[test]

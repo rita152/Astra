@@ -36,6 +36,46 @@ fn simulate_next_frame(app: &mut TestApp, window: &TestAppWindow<ChatApp>, elaps
 }
 
 #[test]
+fn approval_shortcuts_remain_registered_across_unrelated_shell_repaints() {
+    use crate::components::approval::{ApprovalShortcut, init};
+    let mut app = TestApp::new();
+    app.update(|cx| {
+        cx.bind_keys([gpui::KeyBinding::new(
+            "escape",
+            super::DismissPermissionUi,
+            None,
+        )]);
+        init(cx);
+    });
+    let mut window = app.open_window_with_options(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(1440.), px(900.)),
+            ))),
+            ..Default::default()
+        },
+        |_, cx| ChatApp::new(ThemeMode::Dark, false, cx),
+    );
+    window.update(|chat, _, cx| {
+        chat.complete_startup_for_capture(cx);
+        chat.set_file_approval_for_capture("default", cx);
+    });
+    window.draw();
+    for _ in 0..4 {
+        window.update(|_, _, cx| cx.notify());
+        window.draw();
+        window.update(|_, window, cx| {
+            assert!(window.is_action_available(&ApprovalShortcut("escape"), cx))
+        });
+    }
+    window.simulate_keystrokes("shift-tab enter down escape");
+    assert!(window.read(|chat, cx| chat.home.read(cx).has_visible_request(cx)));
+    window.simulate_keystroke("escape");
+    assert!(!window.read(|chat, cx| chat.home.read(cx).has_visible_request(cx)));
+}
+
+#[test]
 fn startup_logo_blinks_in_place_without_disappearing() {
     assert_eq!(startup_loading_logo_opacity(0.0), 1.0);
     assert!((startup_loading_logo_opacity(0.5) - 0.32).abs() < f32::EPSILON);

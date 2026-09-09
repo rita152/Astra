@@ -17,12 +17,14 @@ use super::{
         PendingUserInputRequest, ServerRequestRegistry, ServerRequestResolution,
     },
     requests::{
-        request_id_value, request_metadata_for_permissions, request_metadata_for_user_input,
+        request_id_value, request_metadata_for_file, request_metadata_for_permissions,
+        request_metadata_for_user_input,
     },
     transport::{AppServerProcess, send},
 };
 use crate::agent::{
-    AgentApprovalControl, AgentCommandApprovalChoice, AgentEvent, AgentInterruptControl,
+    AgentApprovalControl, AgentCommandApprovalChoice, AgentEvent, AgentFileApprovalChoice,
+    AgentFileApprovalControl, AgentFileApprovalRequest, AgentInterruptControl,
     AgentInterruptOutcome, AgentPermissionsApprovalChoice, AgentPermissionsApprovalControl,
     AgentPermissionsApprovalRequest, AgentServerRequestFailureKind, AgentServerRequestId,
     AgentServerRequestMetadata, AgentUserInputControl, AgentUserInputRequest,
@@ -68,6 +70,24 @@ impl<W: Write + Send> CodexTurnSession<W> {
         metadata: AgentServerRequestMetadata,
         payload: PendingServerRequestPayload,
     ) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("Codex turn 会话状态锁已损坏"))?;
+        if state.terminal {
+            bail!("Codex turn 已结束，拒绝注册 server request");
+        }
+        if state
+            .thread_id
+            .as_ref()
+            .is_some_and(|id| id != &metadata.thread_id)
+            || state
+                .turn_id
+                .as_ref()
+                .is_some_and(|id| id != &metadata.turn_id)
+        {
+            bail!("server request 与当前 thread/turn 不一致");
+        }
         self.lock_server_requests()?
             .register_server_request(metadata, payload)
     }
@@ -97,6 +117,13 @@ impl<W: Write + Send> CodexTurnSession<W> {
                     .map(|question| question.id.clone())
                     .collect(),
             }),
+        )
+    }
+
+    pub(super) fn register_file_approval(&self, request: &AgentFileApprovalRequest) -> Result<()> {
+        self.register_server_request(
+            request_metadata_for_file(request),
+            PendingServerRequestPayload::FileApproval,
         )
     }
 
@@ -131,6 +158,26 @@ impl<W: Write + Send> CodexTurnSession<W> {
             .lock_server_requests()?
             .command_decision(request_id, choice)?;
         self.send(json!({ "id": request_id_value(request_id), "result": { "decision": decision } }))
+            .with_context(|| {
+                format!(
+                    "写入 command approval {request_id:?} 的 JSON-RPC response 失败；请勿重复提交"
+                )
+            })
+    }
+
+    pub(super) fn respond_to_file_approval(
+        &self,
+        request_id: &AgentServerRequestId,
+        choice: AgentFileApprovalChoice,
+    ) -> Result<()> {
+        self.ensure_server_request_responses_open(request_id)?;
+        let decision = self
+            .lock_server_requests()?
+            .file_decision(request_id, choice)?;
+        self.send(json!({ "id": request_id_value(request_id), "result": { "decision": decision } }))
+            .with_context(|| {
+                format!("写入 file approval {request_id:?} 的 JSON-RPC response 失败；请勿重复提交")
+            })
     }
 
     pub(super) fn respond_to_user_input(
@@ -246,6 +293,9 @@ impl<W: Write + Send> CodexTurnSession<W> {
         if let Ok(mut state) = self.state.lock() {
             state.terminal = true;
         }
+        if let Ok(mut requests) = self.server_requests.lock() {
+            requests.close();
+        }
     }
 
     pub(super) fn close_writer(&self) {
@@ -336,6 +386,17 @@ impl<W: Write + Send + 'static> AgentApprovalControl for CodexTurnSession<W> {
         choice: AgentCommandApprovalChoice,
     ) -> Result<(), String> {
         self.respond_to_command_approval(request_id, choice)
+            .map_err(|error| format!("{error:#}"))
+    }
+}
+
+impl<W: Write + Send + 'static> AgentFileApprovalControl for CodexTurnSession<W> {
+    fn respond(
+        &self,
+        request_id: &AgentServerRequestId,
+        choice: AgentFileApprovalChoice,
+    ) -> Result<(), String> {
+        self.respond_to_file_approval(request_id, choice)
             .map_err(|error| format!("{error:#}"))
     }
 }

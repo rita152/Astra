@@ -25,8 +25,8 @@ use std::{
 };
 
 use gpui::{
-    Context, Div, Entity, FocusHandle, KeyDownEvent, ListState, MouseButton, Render, ScrollHandle,
-    Window, div, point, prelude::*, px, relative,
+    Context, Div, Entity, FocusHandle, Focusable, KeyDownEvent, ListState, MouseButton, Render,
+    ScrollHandle, Window, div, point, prelude::*, px, relative,
 };
 
 use crate::{
@@ -37,6 +37,7 @@ use crate::{
             RequestFullAccessConfirmation,
         },
         file_change::{DiffReviewPresentation, FileApprovalEvent, FileChangeActivityEvent},
+        file_editor::FileEditor,
         icons::suggestion_icon,
         permissions_approval::PermissionApprovalEvent,
         user_input_request::UserInputRequestEvent,
@@ -105,6 +106,8 @@ pub struct HomeView {
     command_scroll_handles: HashMap<String, ScrollHandle>,
     expanded_collaborations: HashSet<String>,
     approval_focus: FocusHandle,
+    approval_previews: HashMap<String, Entity<FileEditor>>,
+    focused_approval_request: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,6 +227,22 @@ const MCP_TOOL_CALL_ICON_TEXT_GAP: f32 = 6.0;
 const MCP_TOOL_CALL_TEXT_SIZE: f32 = 14.0;
 
 impl HomeView {
+    pub(crate) fn has_visible_request(&self, cx: &gpui::App) -> bool {
+        self.composer.read(cx).has_visible_request()
+    }
+    #[cfg(feature = "screenshot")]
+    pub fn replay_approvals(
+        &mut self,
+        run: crate::agent::AgentRun,
+        user_message: &str,
+        assistant_message: &str,
+        cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |composer, cx| {
+            composer.replay_approvals(run, user_message, assistant_message, cwd, cx)
+        });
+    }
     #[cfg(test)]
     pub fn new(mode: ThemeMode, cx: &mut Context<Self>) -> Self {
         let backend: Arc<dyn AgentBackend> = Arc::new(CodexAppServerBackend::new());
@@ -301,6 +320,8 @@ impl HomeView {
             command_scroll_handles: HashMap::new(),
             expanded_collaborations: HashSet::new(),
             approval_focus: cx.focus_handle(),
+            approval_previews: HashMap::new(),
+            focused_approval_request: None,
         };
         view.refresh_conversation_cache(cx);
         view.observe_composer(composer, cx);
@@ -400,6 +421,8 @@ impl HomeView {
     }
 
     pub fn set_composer(&mut self, composer: Entity<ComposerView>, cx: &mut Context<Self>) {
+        self.approval_previews.clear();
+        self.focused_approval_request = None;
         self.observe_composer(composer.clone(), cx);
         self.composer = composer;
         self.conversation_list = conversation_list_state(0);
@@ -429,7 +452,26 @@ impl HomeView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(feature = "screenshot")]
+        if std::env::var_os("GPUI_CAPTURE_OUTPUT").is_some()
+            && matches!(
+                event.keystroke.key.as_str(),
+                "enter" | "escape" | "tab" | "space" | "up" | "down"
+            )
+        {
+            eprintln!(
+                "approval-key: {} shift={}",
+                event.keystroke.key, event.keystroke.modifiers.shift
+            );
+        }
         let other_focus = self.composer.read(cx).user_input_other_focus_handle(cx);
+        let preview_focused = self
+            .approval_previews
+            .values()
+            .any(|preview| preview.focus_handle(cx).is_focused(window));
+        if preview_focused && !matches!(event.keystroke.key.as_str(), "tab" | "escape") {
+            return;
+        }
         if other_focus.is_focused(window)
             && !matches!(event.keystroke.key.as_str(), "tab" | "escape")
         {
@@ -439,7 +481,9 @@ impl HomeView {
             composer.handle_approval_key(event, cx) || composer.handle_user_input_key(event, cx)
         });
         if handled {
-            if other_focus.is_focused(window) && event.keystroke.key.as_str() == "tab" {
+            if preview_focused
+                || other_focus.is_focused(window) && event.keystroke.key.as_str() == "tab"
+            {
                 window.focus(&self.approval_focus, cx);
             }
             cx.stop_propagation();
@@ -779,6 +823,16 @@ impl HomeView {
         event: FileApprovalEvent,
         cx: &mut Context<Self>,
     ) {
+        if let FileApprovalEvent::ReviewFile(index) = event {
+            if let Some(review) = self
+                .composer
+                .read(cx)
+                .file_approval_review(request_id, index)
+            {
+                cx.emit(OpenDiffReview(review));
+            }
+            return;
+        }
         self.composer.update(cx, |composer, cx| {
             composer.handle_file_approval_event(request_id, event, cx)
         });
@@ -1210,6 +1264,65 @@ impl Render for HomeView {
             };
         let user_input_other = self.composer.read(cx).user_input_other_entity();
         let user_input_other_focus = self.composer.read(cx).user_input_other_focus_handle(cx);
+        let preview_requests = conversation_activity
+            .iter()
+            .filter_map(|activity| match activity {
+                ConversationActivity::Approval(model) if model.should_render() => {
+                    model.request.preview().map(|text| {
+                        (
+                            model.request_id.clone(),
+                            text.to_owned(),
+                            model.preview_expanded,
+                        )
+                    })
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        self.approval_previews
+            .retain(|id, _| preview_requests.iter().any(|(request, _, _)| request == id));
+        for (id, text, expanded) in preview_requests {
+            if !self.approval_previews.contains_key(&id) {
+                let preview =
+                    cx.new(|cx| FileEditor::approval_preview(text.clone(), self.mode, cx));
+                let owner = self.composer.clone();
+                let request_id = id.clone();
+                cx.observe(&preview, move |_, preview, cx| {
+                    let lines = preview.read(cx).visual_line_count();
+                    owner.update(cx, |composer, cx| {
+                        composer.set_approval_preview_lines(&request_id, lines, cx)
+                    });
+                })
+                .detach();
+                self.approval_previews.insert(id.clone(), preview);
+            }
+            self.approval_previews[&id].update(cx, |preview, cx| {
+                if preview.text() != text {
+                    preview.reload(text, cx);
+                }
+                if preview.mode != self.mode {
+                    preview.set_mode(self.mode, cx);
+                }
+                preview.set_preview_expanded(expanded, cx);
+            });
+        }
+        let pending_request_id = conversation_activity
+            .iter()
+            .find_map(|activity| match activity {
+                ConversationActivity::Approval(model) if model.should_render() => {
+                    Some(model.request_id.clone())
+                }
+                ConversationActivity::FileApproval(model) if model.should_render() => {
+                    Some(model.request_id.clone())
+                }
+                ConversationActivity::PermissionsApproval(model) if model.should_render() => {
+                    Some(model.request_id.clone())
+                }
+                ConversationActivity::UserInput(model) if model.should_render() => {
+                    Some(model.request_id.clone())
+                }
+                _ => None,
+            });
         let blocking_keyboard_request_pending = self.presentation != HomePresentation::Subagent
             && conversation_activity.iter().any(|activity| {
                 matches!(activity, ConversationActivity::Approval(model) if model.should_render())
@@ -1218,6 +1331,7 @@ impl Render for HomeView {
                     || matches!(activity, ConversationActivity::UserInput(model) if model.should_render())
             });
         if blocking_keyboard_request_pending
+            && self.focused_approval_request != pending_request_id
             && !self.approval_focus.is_focused(window)
             && !user_input_other_focus.is_focused(window)
         {
@@ -1228,6 +1342,7 @@ impl Render for HomeView {
             let prompt_focus = self.composer.read(cx).prompt_focus_handle(cx);
             window.focus(&prompt_focus, cx);
         }
+        self.focused_approval_request = pending_request_id;
         // Disclosure state belongs to every visible turn. On resume, all but
         // the last turn live in `transcript`; syncing only the current turn
         // immediately pruned a historical group id after its header was
@@ -1371,6 +1486,9 @@ impl Render for HomeView {
             HomePresentation::Conversation | HomePresentation::SideChat => home(
                 ConversationRenderContext {
                     home_entity: cx.entity(),
+                    approval_previews: self.approval_previews.clone(),
+                    approval_border_offset: 0.5 / window.scale_factor(),
+                    request_owner: context::RequestOwner::new(self.composer.clone(), cx),
                     theme,
                     thinking_shimmer_progress: self.thinking_shimmer_progress,
                     response_feedback: self.response_feedback,
@@ -1415,6 +1533,9 @@ impl Render for HomeView {
             HomePresentation::Subagent => subagent_conversation(
                 ConversationRenderContext {
                     home_entity: cx.entity(),
+                    approval_previews: self.approval_previews.clone(),
+                    approval_border_offset: 0.5 / window.scale_factor(),
+                    request_owner: context::RequestOwner::new(self.composer.clone(), cx),
                     theme,
                     thinking_shimmer_progress: self.thinking_shimmer_progress,
                     response_feedback: self.response_feedback,
@@ -1441,7 +1562,34 @@ impl Render for HomeView {
         };
         let measured_home = cx.entity();
         content
+            .when(blocking_keyboard_request_pending, |content| {
+                content.key_context(
+                    if self
+                        .approval_previews
+                        .values()
+                        .any(|preview| preview.focus_handle(cx).is_focused(window))
+                    {
+                        "ApprovalText"
+                    } else {
+                        "ApprovalCard"
+                    },
+                )
+            })
             .track_focus(&self.approval_focus)
+            .on_action(cx.listener(
+                |home, action: &crate::components::approval::ApprovalShortcut, window, cx| {
+                    home.handle_approval_key(
+                        &KeyDownEvent {
+                            keystroke: gpui::Keystroke::parse(action.0)
+                                .expect("registered approval shortcut"),
+                            is_held: false,
+                            prefer_character_input: false,
+                        },
+                        window,
+                        cx,
+                    );
+                },
+            ))
             .on_key_down(cx.listener(Self::handle_approval_key))
             .child(
                 gpui::canvas(

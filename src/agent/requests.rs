@@ -14,6 +14,7 @@ pub enum AgentServerRequestId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AgentServerRequestKind {
     CommandApproval,
+    FileApproval,
     UserInput,
     PermissionsApproval,
 }
@@ -50,26 +51,129 @@ pub struct AgentCommandApprovalRequest {
     pub thread_id: String,
     pub turn_id: String,
     pub item_id: String,
+    pub approval_id: Option<String>,
+    pub kind: AgentCommandApprovalKind,
+    pub environment_id: Option<String>,
+    pub started_at_ms: i64,
+    pub cwd: Option<String>,
     pub command: String,
     pub reason: Option<String>,
-    pub network_host: Option<String>,
-    pub allow_once: bool,
-    /// Whether the server listed the legacy `decline` decision.
-    pub decline: bool,
-    /// Whether the server listed `cancel`. This enables the ChatGPT-compatible
-    /// Reject affordance, but that affordance still sends `decline` so the turn
-    /// can continue.
-    pub cancel: bool,
-    pub can_accept_with_execpolicy_amendment: bool,
+    pub network: Option<AgentNetworkApprovalContext>,
+    pub additional_permissions: AgentOptionalField<AgentPermissionRequestProfile>,
+    /// Ordered, validated choices. A missing/null wire list uses the protocol's
+    /// legacy choices, with amendments only when the server proposes them.
+    pub available_decisions: Vec<AgentCommandApprovalChoice>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentCommandApprovalKind {
+    Command,
+    WriteStdin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentNetworkApprovalContext {
+    pub host: String,
+    pub protocol: AgentNetworkApprovalProtocol,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentNetworkApprovalProtocol {
+    Http,
+    Https,
+    Socks5Tcp,
+    Socks5Udp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentNetworkPolicyAction {
+    Allow,
+    Deny,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentNetworkPolicyAmendment {
+    pub host: String,
+    pub action: AgentNetworkPolicyAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentCommandApprovalChoice {
     Accept,
+    AcceptForSession,
     /// Reject this command item while allowing the active turn to continue.
     Decline,
-    AcceptWithExecpolicyAmendment,
+    /// Reject the command and interrupt its turn. Never substitute `decline`.
+    Cancel,
+    AcceptWithExecpolicyAmendment(Vec<String>),
+    ApplyNetworkPolicyAmendment(AgentNetworkPolicyAmendment),
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentFileApprovalRequest {
+    pub request_id: AgentServerRequestId,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub started_at_ms: i64,
+    pub reason: Option<String>,
+    pub grant_root: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentFileApprovalChoice {
+    Accept,
+    AcceptForSession,
+    Decline,
+    Cancel,
+}
+
+pub(crate) trait AgentFileApprovalControl: Send + Sync {
+    fn respond(
+        &self,
+        request_id: &AgentServerRequestId,
+        choice: AgentFileApprovalChoice,
+    ) -> Result<(), String>;
+}
+
+#[derive(Clone)]
+pub struct AgentFileApprovalHandle {
+    request_id: AgentServerRequestId,
+    control: Arc<dyn AgentFileApprovalControl>,
+}
+
+impl AgentFileApprovalHandle {
+    pub(crate) fn new(
+        request_id: AgentServerRequestId,
+        control: Arc<dyn AgentFileApprovalControl>,
+    ) -> Self {
+        Self {
+            request_id,
+            control,
+        }
+    }
+
+    pub fn respond(&self, choice: AgentFileApprovalChoice) -> Result<(), String> {
+        self.control.respond(&self.request_id, choice)
+    }
+}
+
+impl fmt::Debug for AgentFileApprovalHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentFileApprovalHandle")
+            .field("request_id", &self.request_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for AgentFileApprovalHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.request_id == other.request_id && Arc::ptr_eq(&self.control, &other.control)
+    }
+}
+
+impl Eq for AgentFileApprovalHandle {}
 
 pub(crate) trait AgentApprovalControl: Send + Sync {
     fn respond(

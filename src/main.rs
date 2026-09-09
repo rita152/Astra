@@ -126,6 +126,23 @@ fn save_screenshot(window: &gpui::Window, path: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "screenshot")]
+fn capture_frame(window: &mut gpui::Window, path: String, frames: usize) {
+    window.on_next_frame(move |window, cx| {
+        if frames>1 {window.refresh();capture_frame(window,path,frames-1);} else {
+            match save_screenshot(window,&path) {
+                Ok(())=>{
+                    let metadata=serde_json::json!({"viewportWidth":f32::from(window.viewport_size().width),"viewportHeight":f32::from(window.viewport_size().height),"dpr":window.scale_factor(),"source":"GPUI render_to_image; no resizing or alignment","keyContexts":format!("{:?}",window.context_stack()),"approvalActionAvailable":window.is_action_available(&components::approval::ApprovalShortcut("escape"),cx)});
+                    let _=std::fs::write(format!("{path}.render.json"),serde_json::to_vec_pretty(&metadata).unwrap());
+                    println!("capture-frame: {path}");
+                }
+                Err(error)=>eprintln!("capture-frame failed: {error:#}"),
+            }
+        }
+    });
+    window.refresh();
+}
+
+#[cfg(feature = "screenshot")]
 fn schedule_screenshot(window: &mut gpui::Window, path: String, frames: usize) {
     window.on_next_frame(move |window, cx| {
         if frames > 1 {
@@ -340,6 +357,11 @@ fn main() {
         arg.strip_prefix("--approval-ui-state=")
             .map(ToOwned::to_owned)
     });
+    #[cfg(feature = "screenshot")]
+    let approval_replay = args.iter().find_map(|arg| {
+        arg.strip_prefix("--approval-replay=")
+            .map(std::path::PathBuf::from)
+    });
     let user_input_ui_state = args.iter().find_map(|arg| {
         arg.strip_prefix("--user-input-ui-state=")
             .map(ToOwned::to_owned)
@@ -498,6 +520,12 @@ fn main() {
         })
         .run(move |cx: &mut App| {
             typography::initialize_fonts(cx);
+            #[cfg(feature = "screenshot")]
+            cx.bind_keys([gpui::KeyBinding::new(
+                "cmd-shift-f12",
+                app::CaptureFrame,
+                None,
+            )]);
             cx.bind_keys([
                 gpui::KeyBinding::new("ctrl-`", app::ToggleTerminal, None),
                 gpui::KeyBinding::new("ctrl-shift-g", app::ToggleReview, None),
@@ -531,6 +559,8 @@ fn main() {
             components::terminal::init(cx);
             components::file_editor::init(cx);
             components::side_chat::init(cx);
+            // GPUI resolves equal keystrokes in reverse registration order.
+            components::approval::init(cx);
             cx.bind_keys([gpui::KeyBinding::new("cmd-p", app::OpenFiles, None)]);
             let bounds = Bounds::centered(None, size(px(window_width), px(window_height)), cx);
             let initial_bounds = if start_maximized {
@@ -702,6 +732,10 @@ fn main() {
                         }
                         if let Some(state) = approval_ui_state.as_deref() {
                             app.set_approval_for_capture(&approval_ui_kind, state, cx);
+                        }
+                        #[cfg(feature = "screenshot")]
+                        if let Some(path) = &approval_replay {
+                            app.replay_approvals(path, cx);
                         }
                         if let Some(state) = user_input_ui_state.as_deref() {
                             app.set_user_input_for_capture(state, cx);

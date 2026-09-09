@@ -7,9 +7,10 @@ use super::{
     },
     catalog::AgentThreadSettings,
     requests::{
-        AgentApprovalHandle, AgentCommandApprovalRequest, AgentPermissionsApprovalHandle,
-        AgentPermissionsApprovalRequest, AgentServerRequestFailureKind, AgentServerRequestMetadata,
-        AgentUserInputHandle, AgentUserInputRequest,
+        AgentApprovalHandle, AgentCommandApprovalRequest, AgentFileApprovalHandle,
+        AgentFileApprovalRequest, AgentPermissionsApprovalHandle, AgentPermissionsApprovalRequest,
+        AgentServerRequestFailureKind, AgentServerRequestMetadata, AgentUserInputHandle,
+        AgentUserInputRequest,
     },
     status::{
         AgentAccountRateLimits, AgentConfigWarning, AgentMcpServerStartupStatus, AgentThreadStatus,
@@ -140,6 +141,10 @@ pub enum AgentEvent {
     CommandApprovalRequested {
         request: AgentCommandApprovalRequest,
         responder: AgentApprovalHandle,
+    },
+    FileApprovalRequested {
+        request: AgentFileApprovalRequest,
+        responder: AgentFileApprovalHandle,
     },
     UserInputRequested {
         request: AgentUserInputRequest,

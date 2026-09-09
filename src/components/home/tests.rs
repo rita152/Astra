@@ -1958,6 +1958,14 @@ fn file_approval_surface_drives_focus_enter_and_escape() {
     };
 
     let mut app = TestApp::new();
+    app.update(|cx| {
+        cx.bind_keys([KeyBinding::new(
+            "escape",
+            crate::app::DismissPermissionUi,
+            None,
+        )]);
+        crate::components::approval::init(cx);
+    });
     let mut window = app.open_window_with_options(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -2036,6 +2044,36 @@ fn file_approval_surface_drives_focus_enter_and_escape() {
             |activity| matches!(activity, ConversationActivity::FileApproval(model) if !model.should_render())
         ));
     });
+}
+
+#[test]
+fn a_mouse_press_from_the_previous_conversation_cannot_approve_the_next_one() {
+    use crate::{components::composer::ComposerView, conversation::ConversationActivity};
+    let mut app = TestApp::new();
+    let second = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+    app.update_entity(&second, |composer, cx| {
+        composer.set_file_approval_for_capture("default", cx)
+    });
+    let mut window = app.open_window_with_options(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(900.), px(700.)),
+            ))),
+            ..Default::default()
+        },
+        |_, cx| HomeView::new(ThemeMode::Dark, cx),
+    );
+    window.update(|home, _, cx| home.set_file_approval_for_capture("default", cx));
+    window.draw();
+    let button = point(px(730.), px(654.));
+    window.simulate_mouse_down(button, MouseButton::Left);
+    window.update(|home, _, cx| home.set_composer(second.clone(), cx));
+    window.draw();
+    window.simulate_mouse_up(button, MouseButton::Left);
+    assert!(window.read(|home,cx|home.composer.read(cx).conversation_render_snapshot().5.iter().any(|activity|matches!(activity,ConversationActivity::FileApproval(model) if model.should_render()))));
+    window.simulate_click(button, MouseButton::Left);
+    assert!(!window.read(|home,cx|home.composer.read(cx).conversation_render_snapshot().5.iter().any(|activity|matches!(activity,ConversationActivity::FileApproval(model) if model.should_render()))));
 }
 
 #[test]

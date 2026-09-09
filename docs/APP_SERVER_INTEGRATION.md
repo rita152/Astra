@@ -14,10 +14,10 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 
 | 状态 | 数量 | 判定 |
 |---|---|---|
-| 已接入 | 63 | 表中声明的产品行为已连通协议、领域数据和 UI／副作用；不表示消费全部可选字段 |
+| 已接入 | 65 | 表中声明的产品行为已连通协议、领域数据和 UI／副作用；不表示消费全部可选字段 |
 | 后端已接入 | 2 | 已实现读取或校验，尚无对应可见 UI 调用方或展示 |
-| 部分接入 | 4 | 只支持部分类型、有效变体或限定生命周期窗口 |
-| 未接入 | 179 | 客户端不发送；服务端请求按原 id 回复 `-32601` 并终止当前连接，服务端通知直接报错并终止连接 |
+| 部分接入 | 3 | 只支持部分类型、有效变体或限定生命周期窗口 |
+| 未接入 | 178 | 客户端不发送；服务端请求按原 id 回复 `-32601` 并终止当前连接，服务端通知直接报错并终止连接 |
 
 未接入行的“—”沿用上述规则。`tool/requestUserInput` 是兼容别名，不计入本版本 schema 的 248 项。
 
@@ -26,7 +26,7 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 - **连接**：`ChatApp` 持有一个共享 manager。每个 generation 启动一个 `codex app-server --stdio`，只握手一次；单 reader 读取 stdout，stdin 串行写入完整 JSONL。所有 RPC 共用递增 request id，响应可乱序。
 - **线程与轮次**：首次提示词执行 `thread/start → turn/start`；既有线程在当前 generation 未加载时先 resume，之后直接 start turn。同一线程最多一个活动 turn，不同线程可并行；start/resume/fork 共用串行生命周期注册表。
 - **归属与提前事件**：轮次事件按 `threadId + turnId` 路由；server request 按原始字符串／数字 id 记录所属轮次。`turn/start` 响应前的事件按 wire 顺序缓存，取得响应后验证并回放；错配 id、字段或枚举报错。
-- **审批与输入**：响应最多一次，提交后禁用交互，等待 `serverRequest/resolved` 释放 responder。结束轮次只清理自身请求；过期 responder 不得作用于后续轮次。
+- **审批与输入**：保留数字／字符串 request id 的区别，按到达顺序显示一张请求卡；键盘只响应当前可见请求。响应写入最多尝试一次，提交后等待 `serverRequest/resolved` 释放 responder；写入失败显示错误并阻止重复提交。文件审批关联同轮次、同 item 的原始 changes／patch，不使用聚合 turn diff 或当前磁盘内容代替。会话或轮次切换使旧点击失效；终态清理自身请求、响应句柄及临时关联。连接仅保留有上限的已释放 id／thread 标记，忽略已知重复或迟到的 resolved。
 - **终止与恢复**：turn 完成、中断或业务失败不关闭共享进程。EOF、崩溃、写失败或致命协议错误使旧 generation 的 pending RPC 和活动轮次各失败一次；回收旧进程后，下一次显式操作可重建连接，不自动重放提示词。应用退出时幂等终止并 wait 子进程。
 - **状态通知**：应用／线程状态通过 `AgentConnectionEvent` 快照订阅，轮次事件进入各自 `AgentRun`。工作区通知可先于 RPC 响应；内存覆盖层防止迟到列表撤销重命名、移动、归档或删除。
 - **工作区与历史**：以服务端稳定 id 管理项目和线程；置顶使用服务端 `Pinned` 分区，当前 schema 无 `isPinned`。历史先 `thread/read(includeTurns=false)`，再分页读取 `thread/turns/list(itemsView=full)`；实际非 full 的轮次由 `thread/items/list` 补全。不维护本地会话数据库。
@@ -231,8 +231,8 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 | `attestation/generate` | 默认 | 未接入 | — | — |
 | `currentTime/read` | 实验 | 未接入 | — | — |
 | `execCommandApproval` | 默认 | 未接入 | 旧版命令审批；不与 v2 item 请求混用。 | — |
-| `item/commandExecution/requestApproval` | 默认 | 部分接入 | 仅支持普通命令、reason、网络 host 和 accept/decline/execpolicy 决策；尚未承接 writeStdin、approvalId、网络 protocol、additionalPermissions、proposedNetworkPolicyAmendments、acceptForSession/applyNetworkPolicyAmendment 等变体。 | `requests`、`registry` |
-| `item/fileChange/requestApproval` | 默认 | 未接入 | 文件审批卡有展示与测试实现，尚未接入该 RPC。 | — |
+| `item/commandExecution/requestApproval` | 默认 | 已接入 | kind 缺省为 command，支持 writeStdin；保留 approvalId、startedAtMs、nullable environmentId/cwd/command/reason、网络 host/protocol 与 additionalPermissions。availableDecisions 缺省／null 使用历史决策及服务端建议；显式空列表显示错误。按有序决策及完整策略载荷校验 accept、acceptForSession、decline、cancel、execpolicy 和网络 allow/deny，拒绝未提供的决策；cancel 不改写为 decline。 | `approvals`、`requests`、`registry` |
+| `item/fileChange/requestApproval` | 默认 | 已接入 | 校验 threadId/turnId/itemId/startedAtMs，保留 nullable reason/grantRoot。原始 item changes 到达前仅允许拒绝；支持 accept、acceptForSession、decline、cancel，原 id 回传并等待 resolved。文件行打开对应原始补丁；grantRoot 是 schema 标注的不稳定提示，不由客户端自行扩大写入权限。 | `approvals`、`requests`、`registry`、`dispatch` |
 | `item/permissions/requestApproval` | 默认 | 已接入 | 校验 thread/turn/item、cwd、startedAtMs、nullable environmentId/reason；保留 read/write、entries、glob 深度、path/glob/special path 与 nullable network。允许只返回请求子集及 turn/session scope，拒绝返回空权限。 | `requests`、`permissions`、`registry` |
 | `item/tool/call` | 默认 | 未接入 | — | — |
 | `item/tool/requestUserInput` | 默认 | 已接入 | 保留 question id/header/question/options/isOther/isSecret、isBlocking、nullable autoResolutionMs；返回 question id → 字符串数组的 answers，Debug 隐去答案；兼容 tool/requestUserInput 别名。 | `requests`、`registry` |
@@ -285,7 +285,7 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 | `process/outputDelta` | 默认 | 未接入 | — | — |
 | `project/changed` | 默认 | 已接入 | projectId、created/updated/deleted；刷新或移除项目，可先于 RPC 响应。 | `manager/dispatch` |
 | `remoteControl/status/changed` | 默认 | 后端已接入 | 校验 status/serverName/installationId、nullable environmentId，保存连接快照；无 Composer UI。 | `manager/dispatch`、`notifications` |
-| `serverRequest/resolved` | 默认 | 已接入 | 按原类型 requestId 找到所属轮次，再核对 thread/item/kind 并释放审批或输入 responder；未知、错配、过期请求报错。 | `manager/dispatch`、`requests`、`registry` |
+| `serverRequest/resolved` | 默认 | 已接入 | 按原类型 requestId 找到所属轮次，再核对 thread/item/kind，释放命令／文件／权限审批或输入 responder 与活动 owner。已知同线程的重复及终态后迟到通知幂等忽略；未知 id 或错配 thread 报错；过期 handle 始终不可回复。 | `manager/dispatch`、`manager/connection`、`requests`、`registry` |
 | `skills/changed` | 默认 | 未接入 | — | — |
 | `thread/archived` | 默认 | 已接入 | 按 threadId 移除最近、项目及置顶条目，刷新归档；覆盖迟到快照。 | `manager/dispatch` |
 | `thread/closed` | 默认 | 已接入 | 从当前 generation 的已加载集合移除并发布关闭状态；侧边聊天保留消息，禁用发送。 | `manager/dispatch` |

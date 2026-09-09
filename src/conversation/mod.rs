@@ -4,6 +4,7 @@ mod activity;
 mod events;
 mod lifecycle;
 mod model;
+mod requests;
 mod state;
 mod stream;
 mod transcript;

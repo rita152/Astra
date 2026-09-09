@@ -156,17 +156,15 @@ impl ManagerInner {
                         .pointer("/params/requestId")
                         .context("serverRequest/resolved 缺少 params.requestId")?,
                 )?;
-                let owner = connection.server_request_owner(&request_id)?;
                 let notification_thread = message
                     .pointer("/params/threadId")
                     .and_then(Value::as_str)
                     .context("serverRequest/resolved 缺少字符串 params.threadId")?;
-                if notification_thread != owner.thread_id {
-                    bail!(
-                        "serverRequest/resolved threadId `{notification_thread}` 与 request owner `{}` 不一致",
-                        owner.thread_id
-                    );
-                }
+                let Some(owner) =
+                    connection.resolve_server_request_owner(&request_id, notification_thread)?
+                else {
+                    return Ok(());
+                };
                 let turn = connection.turn_for_key(&owner)?;
                 let mut dispatch = turn
                     .dispatch
