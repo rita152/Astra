@@ -5,6 +5,7 @@ use super::{
         AgentCollaboration, AgentContextCompaction, AgentFileChange, AgentFileChangeEntry,
         AgentImageGeneration, AgentImageView, AgentMcpToolCall, AgentReasoning, CommandExecution,
     },
+    auto_approval::{AgentAutoApprovalReview, AgentGuardianWarning, AgentStrictReviewRequirement},
     catalog::AgentThreadSettings,
     requests::{
         AgentApprovalHandle, AgentCommandApprovalRequest, AgentFileApprovalHandle,
@@ -23,6 +24,9 @@ use super::{
 /// loaded thread rather than to one particular turn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentConnectionEvent {
+    AutoApprovalReviewUpdated(Box<AgentAutoApprovalReview>),
+    StrictReviewRequired(AgentStrictReviewRequirement),
+    GuardianWarning(AgentGuardianWarning),
     Warning {
         thread_id: Option<String>,
         message: String,
@@ -68,6 +72,13 @@ pub enum AgentEvent {
         thread_id: String,
     },
     Started,
+    TurnIdentified {
+        thread_id: String,
+        turn_id: String,
+    },
+    AutoApprovalReviewUpdated(Box<AgentAutoApprovalReview>),
+    StrictReviewRequired(AgentStrictReviewRequirement),
+    GuardianWarning(AgentGuardianWarning),
     Error {
         message: String,
         details: Option<String>,

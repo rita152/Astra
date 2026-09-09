@@ -33,6 +33,8 @@ pub(super) struct ToolActivityGroupPresentation {
 impl ToolActivityGroupPresentation {
     pub(super) fn is_active(&self) -> bool {
         self.activities.iter().any(|activity| matches!(activity,
+            ConversationActivity::AutoApprovalReview(review) if review.status() == crate::agent::AgentAutoApprovalReviewStatus::InProgress))
+            || self.activities.iter().any(|activity| matches!(activity,
             ConversationActivity::McpToolCall(call) if call.status == AgentMcpToolCallStatus::InProgress))
             || self.reasoning
             .iter()
@@ -125,11 +127,59 @@ pub(super) fn flush_pending_tool_activity_group(
 pub(super) fn activity_stream_units(
     activities: &[ConversationActivity],
 ) -> Vec<ActivityStreamUnit> {
+    let target_id = |a: &ConversationActivity| match a {
+        ConversationActivity::Command(c) => Some(c.id.clone()),
+        ConversationActivity::FileChange(c) => Some(c.item_id.clone()),
+        ConversationActivity::McpToolCall(c) => Some(c.id.clone()),
+        _ => None,
+    };
+    let mut attached = std::collections::HashMap::<String, Vec<ConversationActivity>>::new();
+    let mut attached_keys = HashSet::new();
+    for activity in activities {
+        let ConversationActivity::AutoApprovalReview(review) = activity else {
+            continue;
+        };
+        if review.status() == crate::agent::AgentAutoApprovalReviewStatus::Approved {
+            continue;
+        }
+        let Some(target) = review.review.target_item_id.as_ref() else {
+            continue;
+        };
+        if activities.iter().any(|a| {
+            target_id(a).as_ref() == Some(target)
+                && !(matches!(a, ConversationActivity::McpToolCall(_))
+                    && review.status() == crate::agent::AgentAutoApprovalReviewStatus::Denied)
+        }) {
+            let mut model = review.clone();
+            model.attached_to_item = true;
+            attached
+                .entry(target.clone())
+                .or_default()
+                .push(ConversationActivity::AutoApprovalReview(model));
+            attached_keys.insert(review.review.key.clone());
+        }
+    }
+    let activities = activities
+        .iter()
+        .flat_map(|activity| {
+            if let ConversationActivity::AutoApprovalReview(review) = activity
+                && (review.status() == crate::agent::AgentAutoApprovalReviewStatus::Approved
+                    || attached_keys.contains(&review.review.key))
+            {
+                return Vec::new();
+            }
+            let mut result = vec![activity.clone()];
+            if let Some(id) = target_id(activity) {
+                result.extend(attached.remove(&id).unwrap_or_default());
+            }
+            result
+        })
+        .collect::<Vec<_>>();
     let mut units = Vec::new();
     let mut pending = PendingToolActivityGroup::default();
     let mut active_reasoning = Vec::new();
 
-    for activity in activities {
+    for activity in &activities {
         match activity {
             ConversationActivity::Reasoning(reasoning) if reasoning.is_active() => {
                 // The desktop app treats the active reasoning row as a live
@@ -161,6 +211,11 @@ pub(super) fn activity_stream_units(
             }
             ConversationActivity::McpToolCall(call) if is_computer_use_call(call) => {
                 pending.id.get_or_insert_with(|| call.id.clone());
+                pending.activities.push(activity.clone());
+            }
+            ConversationActivity::AutoApprovalReview(review)
+                if review.attached_to_item && !pending.activities.is_empty() =>
+            {
                 pending.activities.push(activity.clone());
             }
             standalone => {
@@ -538,11 +593,13 @@ pub(super) fn conversation_list_rows(
             }
         }
     }
-    rows.push(ConversationListRow::CurrentUser {
-        message: user_message,
-        images: user_images,
-        time: user_message_time,
-    });
+    if !user_message.is_empty() || !user_images.is_empty() || phase != ConversationPhase::Empty {
+        rows.push(ConversationListRow::CurrentUser {
+            message: user_message,
+            images: user_images,
+            time: user_message_time,
+        });
+    }
     if conversation_activity.is_empty() {
         if !assistant_message.is_empty() {
             rows.push(ConversationListRow::AssistantMarkdown {

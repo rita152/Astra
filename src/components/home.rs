@@ -3,6 +3,8 @@ use crate::agent::CodexAppServerBackend;
 
 mod activity;
 mod animation;
+#[cfg(test)]
+mod auto_approval_tests;
 mod collaboration;
 mod context;
 mod conversation;
@@ -105,6 +107,10 @@ pub struct HomeView {
     resumed_turn_focus: HashMap<String, FocusHandle>,
     command_scroll_handles: HashMap<String, ScrollHandle>,
     expanded_collaborations: HashSet<String>,
+    auto_review_views: HashMap<
+        crate::agent::AgentAutoApprovalReviewKey,
+        Entity<crate::components::auto_approval::AutoApprovalReviewView>,
+    >,
     approval_focus: FocusHandle,
     approval_previews: HashMap<String, Entity<FileEditor>>,
     focused_approval_request: Option<String>,
@@ -274,6 +280,37 @@ impl HomeView {
         Self::with_composer(mode, HomePresentation::Subagent, composer, cx)
     }
 
+    fn sync_auto_review_view(
+        &mut self,
+        review: &crate::conversation::AutoApprovalReviewPresentation,
+        cx: &mut Context<Self>,
+    ) {
+        let view = self
+            .auto_review_views
+            .entry(review.review.key.clone())
+            .or_insert_with(|| {
+                let target = cx.weak_entity();
+                cx.new(|cx| {
+                    let mut view = crate::components::auto_approval::AutoApprovalReviewView::new(
+                        review.clone(),
+                        self.mode,
+                        cx,
+                    );
+                    view.on_change(crate::components::callback::UiCallback::new(
+                        move |(), _, cx| {
+                            let _ = target.update(cx, |home, cx| {
+                                home.conversation_list.remeasure();
+                                home.conversation_cache_dirty = true;
+                                cx.notify();
+                            });
+                        },
+                    ));
+                    view
+                })
+            });
+        view.update(cx, |view, cx| view.sync(review.clone(), self.mode, cx));
+    }
+
     fn with_composer(
         mode: ThemeMode,
         presentation: HomePresentation,
@@ -319,6 +356,7 @@ impl HomeView {
             resumed_turn_focus: HashMap::new(),
             command_scroll_handles: HashMap::new(),
             expanded_collaborations: HashSet::new(),
+            auto_review_views: HashMap::new(),
             approval_focus: cx.focus_handle(),
             approval_previews: HashMap::new(),
             focused_approval_request: None,
@@ -487,6 +525,21 @@ impl HomeView {
                 window.focus(&self.approval_focus, cx);
             }
             cx.stop_propagation();
+        } else if self.conversation_rows.iter().any(|row| match row {
+            ConversationListRow::Activity {
+                unit: ActivityStreamUnit::Standalone(ConversationActivity::AutoApprovalReview(_)),
+                ..
+            } => true,
+            ConversationListRow::Activity {
+                unit: ActivityStreamUnit::ToolGroup(group),
+                ..
+            } => group
+                .activities
+                .iter()
+                .any(|a| matches!(a, ConversationActivity::AutoApprovalReview(_))),
+            _ => false,
+        }) {
+            crate::components::auto_approval::navigate_tab(event, window, cx);
         }
     }
 
@@ -1399,12 +1452,22 @@ impl Render for HomeView {
             self.sync_tool_group_disclosure_transitions(&visible_activity_units, window, cx);
             for unit in &visible_activity_units {
                 match unit {
+                    ActivityStreamUnit::Standalone(ConversationActivity::AutoApprovalReview(
+                        review,
+                    )) => {
+                        self.sync_auto_review_view(review, cx);
+                    }
                     ActivityStreamUnit::Standalone(ConversationActivity::Command(command)) => {
                         self.command_scroll_handles
                             .entry(command.id.clone())
                             .or_default();
                     }
                     ActivityStreamUnit::ToolGroup(group) => {
+                        for activity in &group.activities {
+                            if let ConversationActivity::AutoApprovalReview(review) = activity {
+                                self.sync_auto_review_view(review, cx);
+                            }
+                        }
                         for command in &group.commands {
                             self.command_scroll_handles
                                 .entry(command.id.clone())
@@ -1476,7 +1539,7 @@ impl Render for HomeView {
             }
         }
         if self.presentation == HomePresentation::Subagent {
-            if phase == ConversationPhase::Empty {
+            if phase == ConversationPhase::Empty && conversation_activity.is_empty() {
                 self.conversation_scroll.set_offset(point(px(0.0), px(0.0)));
             } else if scroll_should_follow_output(&self.conversation_scroll) {
                 self.conversation_scroll.scroll_to_bottom();
@@ -1505,6 +1568,7 @@ impl Render for HomeView {
                         expanded_commands: self.expanded_commands.clone(),
                         command_scroll_handles: self.command_scroll_handles.clone(),
                         expanded_collaborations: self.expanded_collaborations.clone(),
+                        auto_review_views: self.auto_review_views.clone(),
                     }),
                 },
                 self.composer.clone(),
@@ -1551,6 +1615,7 @@ impl Render for HomeView {
                         expanded_commands: self.expanded_commands.clone(),
                         command_scroll_handles: self.command_scroll_handles.clone(),
                         expanded_collaborations: self.expanded_collaborations.clone(),
+                        auto_review_views: self.auto_review_views.clone(),
                     }),
                 },
                 transcript,

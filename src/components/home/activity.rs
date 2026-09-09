@@ -65,6 +65,7 @@ pub(super) fn render_activity_stream_unit(
                 home_entity,
                 group,
                 ToolGroupDisclosure {
+                    review_views: render.disclosures.auto_review_views.clone(),
                     expanded,
                     disclosure_progress,
                     chevron_progress,
@@ -77,6 +78,24 @@ pub(super) fn render_activity_stream_unit(
             .into_any_element()
         }
         ActivityStreamUnit::Standalone(activity) => match activity {
+            ConversationActivity::AutoApprovalReview(review) => div()
+                .w_full()
+                .children(
+                    render
+                        .disclosures
+                        .auto_review_views
+                        .get(&review.review.key)
+                        .cloned(),
+                )
+                .into_any_element(),
+            ConversationActivity::StrictReview(requirement) => {
+                crate::components::auto_approval::strict_review(&requirement, theme)
+                    .into_any_element()
+            }
+            ConversationActivity::GuardianWarning(warning) => {
+                crate::components::auto_approval::guardian_warning(&warning, theme)
+                    .into_any_element()
+            }
             ConversationActivity::AssistantMessage { item_id, text } if !text.is_empty() => {
                 render_assistant_markdown(&text, theme, &item_id).into_any_element()
             }

@@ -3,6 +3,7 @@
 #[cfg(feature = "screenshot")]
 mod approval_capture;
 mod approvals;
+mod auto_approval;
 mod backend;
 mod catalog;
 mod dispatch;

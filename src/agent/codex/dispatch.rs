@@ -417,7 +417,11 @@ pub(super) fn process_turn_message<W: Write + Send + 'static>(
             }));
         }
         Some(
-            "item/commandExecution/requestApproval"
+            "item/autoApprovalReview/started"
+            | "item/autoApprovalReview/completed"
+            | "autoApprovalReview/strictReviewRequired"
+            | "guardianWarning"
+            | "item/commandExecution/requestApproval"
             | "item/fileChange/requestApproval"
             | "item/permissions/requestApproval"
             | "item/tool/requestUserInput"

@@ -361,7 +361,10 @@ impl WorkspaceStore {
                     });
                 });
             }
-            AgentConnectionEvent::Warning { .. }
+            AgentConnectionEvent::AutoApprovalReviewUpdated(_)
+            | AgentConnectionEvent::StrictReviewRequired(_)
+            | AgentConnectionEvent::GuardianWarning(_)
+            | AgentConnectionEvent::Warning { .. }
             | AgentConnectionEvent::ConfigWarning(_)
             | AgentConnectionEvent::McpServerStartupStatusUpdated(_)
             | AgentConnectionEvent::ThreadSettingsUpdated { .. }

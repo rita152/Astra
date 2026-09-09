@@ -90,6 +90,28 @@ impl ManagerInner {
         message: &Value,
     ) -> Result<()> {
         match method {
+            "guardianWarning" => {
+                self.publish_connection_event(AgentConnectionEvent::GuardianWarning(
+                    super::super::auto_approval::parse_guardian_warning(message)?,
+                ));
+                Ok(())
+            }
+            method if super::super::auto_approval::REVIEW_METHODS.contains(&method) => {
+                // Review observations outlive the turn event channel. Route all
+                // of them by their explicit identity through the thread hub;
+                // they must never bind a pending turn/start or race its cleanup.
+                let event = parse_agent_notification(message)?.context("review event 缺失")?;
+                match event {
+                    AgentEvent::AutoApprovalReviewUpdated(review) => self.publish_connection_event(
+                        AgentConnectionEvent::AutoApprovalReviewUpdated(review),
+                    ),
+                    AgentEvent::StrictReviewRequired(requirement) => self.publish_connection_event(
+                        AgentConnectionEvent::StrictReviewRequired(requirement),
+                    ),
+                    _ => unreachable!("REVIEW_METHODS maps only review observations"),
+                }
+                Ok(())
+            }
             "thread/started" => self.handle_thread_started(connection, message),
             "thread/goal/cleared" => self.handle_resume_goal_cleared(connection, message),
             "project/changed" => {

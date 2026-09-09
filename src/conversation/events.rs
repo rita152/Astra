@@ -96,6 +96,13 @@ pub(crate) fn merge_account_rate_limits(
 impl ConversationState {
     pub(crate) fn apply_connection_event(&mut self, event: AgentConnectionEvent) -> bool {
         let scoped_thread_id = match &event {
+            AgentConnectionEvent::AutoApprovalReviewUpdated(review) => {
+                Some(review.key.thread_id.as_str())
+            }
+            AgentConnectionEvent::StrictReviewRequired(requirement) => {
+                Some(requirement.thread_id.as_str())
+            }
+            AgentConnectionEvent::GuardianWarning(warning) => Some(warning.thread_id.as_str()),
             AgentConnectionEvent::Warning { thread_id, .. } => thread_id.as_deref(),
             AgentConnectionEvent::McpServerStartupStatusUpdated(status) => {
                 status.thread_id.as_deref()
@@ -126,6 +133,13 @@ impl ConversationState {
             return false;
         }
         let event = match event {
+            AgentConnectionEvent::AutoApprovalReviewUpdated(review) => {
+                AgentEvent::AutoApprovalReviewUpdated(review)
+            }
+            AgentConnectionEvent::StrictReviewRequired(requirement) => {
+                AgentEvent::StrictReviewRequired(requirement)
+            }
+            AgentConnectionEvent::GuardianWarning(warning) => AgentEvent::GuardianWarning(warning),
             AgentConnectionEvent::Warning { message, .. } => AgentEvent::Warning { message },
             AgentConnectionEvent::ConfigWarning(warning) => AgentEvent::ConfigWarning(warning),
             AgentConnectionEvent::McpServerStartupStatusUpdated(status) => {
@@ -154,7 +168,30 @@ impl ConversationState {
     pub(crate) fn apply_agent_event_batch(&mut self, events: Vec<AgentEvent>) -> bool {
         let mut finished = false;
         for event in events {
+            if finished
+                && !matches!(
+                    &event,
+                    AgentEvent::AutoApprovalReviewUpdated(_)
+                        | AgentEvent::StrictReviewRequired(_)
+                        | AgentEvent::GuardianWarning(_)
+                )
+            {
+                continue;
+            }
             match event {
+                AgentEvent::TurnIdentified { thread_id, turn_id } => {
+                    if self.thread_id.as_deref() == Some(thread_id.as_str()) {
+                        self.turn_id = Some(turn_id);
+                        self.replay_pending_reviews();
+                    }
+                }
+                AgentEvent::AutoApprovalReviewUpdated(review) => {
+                    self.apply_auto_approval_review(*review)
+                }
+                AgentEvent::StrictReviewRequired(requirement) => {
+                    self.apply_strict_review(requirement)
+                }
+                AgentEvent::GuardianWarning(warning) => self.apply_guardian_warning(warning),
                 AgentEvent::ThreadCreated { thread_id } => {
                     self.thread_id = Some(thread_id.clone());
                     if let Some(pending) = self.pending_connection_events.remove(&thread_id) {
@@ -782,7 +819,7 @@ impl ConversationState {
                     self.model_status = Some("需要账户验证".to_owned());
                     self.safety_buffering = false;
                     finished = true;
-                    break;
+                    continue;
                 }
                 AgentEvent::ModelSafetyBufferingUpdated {
                     model,
@@ -821,7 +858,7 @@ impl ConversationState {
                     self.assistant_message_time = Some(current_local_time_label());
                     self.phase = ConversationPhase::Complete;
                     finished = true;
-                    break;
+                    continue;
                 }
                 AgentEvent::Interrupted => {
                     remove_unfinished_image_generations(&mut self.activities);
@@ -829,7 +866,7 @@ impl ConversationState {
                     self.phase = ConversationPhase::Stopped;
                     self.safety_buffering = false;
                     finished = true;
-                    break;
+                    continue;
                 }
                 AgentEvent::Failed(error) => {
                     remove_unfinished_image_generations(&mut self.activities);
@@ -852,12 +889,13 @@ impl ConversationState {
                     self.phase = ConversationPhase::Failed;
                     self.safety_buffering = false;
                     finished = true;
-                    break;
+                    continue;
                 }
             }
         }
         if finished {
             self.clear_terminal_approvals();
+            self.close_auto_approval_reviews();
             self.active_turn.take();
         }
         finished

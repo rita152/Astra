@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use async_channel::{Receiver, Sender};
 
-use crate::agent::AgentConnectionEvent;
+use crate::agent::{AgentAutoApprovalReviewStatus, AgentConnectionEvent};
 
 #[derive(Default)]
 pub(super) struct ConnectionEventHub {
@@ -22,9 +22,38 @@ impl ConnectionEventHub {
         receiver
     }
 
-    pub(super) fn publish(&mut self, event: AgentConnectionEvent) {
-        self.snapshots
-            .insert(connection_event_key(&event), event.clone());
+    pub(super) fn publish(&mut self, mut event: AgentConnectionEvent) {
+        let key = connection_event_key(&event);
+        if let AgentConnectionEvent::AutoApprovalReviewUpdated(update) = &mut event
+            && let Some(AgentConnectionEvent::AutoApprovalReviewUpdated(existing)) =
+                self.snapshots.get(&key)
+        {
+            if (existing.completed_at_ms.is_some() && update.completed_at_ms.is_none())
+                || (existing.status != AgentAutoApprovalReviewStatus::InProgress
+                    && update.status == AgentAutoApprovalReviewStatus::InProgress)
+                || existing
+                    .completed_at_ms
+                    .zip(update.completed_at_ms)
+                    .is_some_and(|(old, new)| new < old)
+            {
+                return;
+            }
+            if update.rationale.is_none() {
+                update.rationale.clone_from(&existing.rationale);
+            }
+            if update.risk_level.is_none() {
+                update.risk_level.clone_from(&existing.risk_level);
+            }
+            if update.user_authorization.is_none() {
+                update
+                    .user_authorization
+                    .clone_from(&existing.user_authorization);
+            }
+            if update.as_ref() == existing.as_ref() {
+                return;
+            }
+        }
+        self.snapshots.insert(key, event.clone());
         self.subscribers
             .retain(|subscriber| subscriber.send_blocking(event.clone()).is_ok());
     }
@@ -32,6 +61,13 @@ impl ConnectionEventHub {
 
 pub(super) fn connection_event_key(event: &AgentConnectionEvent) -> String {
     match event {
+        AgentConnectionEvent::AutoApprovalReviewUpdated(review) => {
+            format!("auto-review:{:?}", review.key)
+        }
+        AgentConnectionEvent::StrictReviewRequired(requirement) => {
+            format!("strict-review:{:?}", requirement)
+        }
+        AgentConnectionEvent::GuardianWarning(warning) => format!("guardian-warning:{warning:?}"),
         AgentConnectionEvent::Warning { thread_id, message } => {
             format!("warning:{thread_id:?}:{message}")
         }

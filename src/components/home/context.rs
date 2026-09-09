@@ -25,6 +25,10 @@ pub(super) struct DisclosureRenderState {
     pub(super) expanded_commands: HashSet<String>,
     pub(super) command_scroll_handles: HashMap<String, ScrollHandle>,
     pub(super) expanded_collaborations: HashSet<String>,
+    pub(super) auto_review_views: HashMap<
+        crate::agent::AgentAutoApprovalReviewKey,
+        Entity<crate::components::auto_approval::AutoApprovalReviewView>,
+    >,
 }
 
 #[derive(Clone)]
@@ -89,6 +93,10 @@ pub(super) struct CurrentTurnRows<'a> {
 }
 
 pub(super) struct ToolGroupDisclosure {
+    pub(super) review_views: HashMap<
+        crate::agent::AgentAutoApprovalReviewKey,
+        Entity<crate::components::auto_approval::AutoApprovalReviewView>,
+    >,
     pub(super) expanded: bool,
     pub(super) disclosure_progress: f32,
     pub(super) chevron_progress: f32,

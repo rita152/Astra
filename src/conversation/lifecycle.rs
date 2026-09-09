@@ -11,6 +11,7 @@ use crate::agent::{
 impl ConversationState {
     pub(crate) fn begin_prompt(&mut self, prompt: &str) -> u64 {
         self.commit_current_turn();
+        self.turn_id = None;
         self.history_loading = false;
         self.history_error = None;
         self.user_message = Some(normalize_user_message_for_display(prompt));
