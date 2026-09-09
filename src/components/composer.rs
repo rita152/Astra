@@ -11,6 +11,7 @@ mod render;
 mod requests;
 mod runtime;
 mod side_chat;
+mod submissions;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -100,6 +101,10 @@ impl gpui::EventEmitter<OpenReviewComments> for ComposerView {}
 
 pub struct ReviewCommentsSubmitted;
 impl gpui::EventEmitter<ReviewCommentsSubmitted> for ComposerView {}
+pub struct ReviewCommentsRestored(pub Vec<crate::git_review::ReviewComment>);
+impl gpui::EventEmitter<ReviewCommentsRestored> for ComposerView {}
+
+gpui::actions!(composer, [DismissContextMenu]);
 
 const MODEL_PICKER_WIDTH: f32 = 224.0;
 const MODEL_PICKER_SUBMENU_GAP: f32 = 1.0;
@@ -130,16 +135,19 @@ pub struct ComposerView {
     conversation: ConversationState,
     backend: Arc<dyn AgentBackend>,
     mode: ThemeMode,
-    prompt_input: Entity<PromptInput>,
-    side_editor: Option<Entity<crate::components::file_editor::FileEditor>>,
+    prompt_editor: Entity<crate::components::file_editor::FileEditor>,
+    side_chat: bool,
     side_ready: bool,
     available_width: Option<f32>,
     trailing_margin: Option<f32>,
     prompt_context: crate::agent::AgentPromptContext,
     context_menu_open: bool,
     context_focus: FocusHandle,
+    context_focus_pending: bool,
     focus_prompt_pending: bool,
     review_comments: Vec<crate::git_review::ReviewComment>,
+    draft_revision: u64,
+    submission_error: Option<String>,
     user_input_other_input: Entity<PromptInput>,
     model_menu_focus: FocusHandle,
     model_menu_focused_item: usize,
@@ -178,18 +186,36 @@ impl ComposerView {
         backend: Arc<dyn AgentBackend>,
         cx: &mut Context<Self>,
     ) -> Self {
+        cx.bind_keys([gpui::KeyBinding::new(
+            "escape",
+            DismissContextMenu,
+            Some("ComposerContextMenu"),
+        )]);
         let connection_events = backend.subscribe_connection_events();
-        let prompt_input = cx.new(|cx| PromptInput::new(mode, cx));
+        let prompt_editor = cx.new(|cx| {
+            let mut editor = crate::components::file_editor::FileEditor::composer(mode, cx);
+            editor.set_accessible_name("聊天输入框");
+            editor
+        });
+        cx.observe(&prompt_editor, |_, _, cx| cx.notify()).detach();
         let user_input_other_input = cx.new(|cx| {
             PromptInput::inline_other(mode, "否，并告诉 ChatGPT 应该如何做得不同", false, cx)
         });
-        cx.subscribe(&prompt_input, |_, _, _: &PromptChanged, cx| {
-            cx.notify();
-        })
-        .detach();
-        cx.subscribe(&prompt_input, |this, _, event: &PromptSubmitted, cx| {
-            this.submit_prompt(event.0.clone(), cx);
-        })
+        cx.subscribe(
+            &prompt_editor,
+            |this, editor, event: &crate::components::file_editor::EditorEvent, cx| {
+                match event {
+                    crate::components::file_editor::EditorEvent::Changed => {
+                        this.draft_revision = this.draft_revision.wrapping_add(1);
+                    }
+                    crate::components::file_editor::EditorEvent::Submit => {
+                        this.submit_prompt(editor.read(cx).text().to_owned(), cx);
+                    }
+                    crate::components::file_editor::EditorEvent::Save => {}
+                }
+                cx.notify();
+            },
+        )
         .detach();
         cx.subscribe(
             &user_input_other_input,
@@ -247,16 +273,19 @@ impl ComposerView {
             conversation: ConversationState::default(),
             backend,
             mode,
-            prompt_input,
-            side_editor: None,
+            prompt_editor,
+            side_chat: false,
             side_ready: true,
             available_width: None,
             trailing_margin: None,
             prompt_context: Default::default(),
             context_menu_open: false,
             context_focus: cx.focus_handle(),
+            context_focus_pending: false,
             focus_prompt_pending: false,
             review_comments: Vec::new(),
+            draft_revision: 0,
+            submission_error: None,
             user_input_other_input,
             model_menu_focus: cx.focus_handle(),
             model_menu_focused_item: 0,
@@ -366,7 +395,7 @@ impl ComposerView {
         cx.notify();
     }
 
-    pub fn user_images(&self) -> Vec<crate::agent::UserMessageImage> {
+    pub fn user_images(&self) -> Vec<crate::agent::UserMessageAttachment> {
         self.conversation.user_images()
     }
 
@@ -397,11 +426,8 @@ impl ComposerView {
 
     pub fn set_mode(&mut self, mode: ThemeMode, cx: &mut Context<Self>) {
         self.mode = mode;
-        self.prompt_input
-            .update(cx, |input, cx| input.set_mode(mode, cx));
-        if let Some(editor) = &self.side_editor {
-            editor.update(cx, |editor, cx| editor.set_mode(mode, cx));
-        }
+        self.prompt_editor
+            .update(cx, |editor, cx| editor.set_mode(mode, cx));
         self.user_input_other_input
             .update(cx, |input, cx| input.set_mode(mode, cx));
         cx.notify();
@@ -412,10 +438,10 @@ impl ComposerView {
         comments: Vec<crate::git_review::ReviewComment>,
         cx: &mut Context<Self>,
     ) {
-        self.review_comments = comments;
-        self.prompt_input.update(cx, |input, _| {
-            input.set_submit_empty(!self.review_comments.is_empty())
-        });
+        if self.review_comments != comments {
+            self.draft_revision = self.draft_revision.wrapping_add(1);
+            self.review_comments = comments;
+        }
         cx.notify();
     }
 
@@ -470,10 +496,7 @@ impl ComposerView {
     }
 
     pub fn prompt_focus_handle(&self, cx: &gpui::App) -> FocusHandle {
-        self.side_editor.as_ref().map_or_else(
-            || self.prompt_input.read(cx).focus_handle(cx),
-            |editor| editor.read(cx).focus_handle(cx),
-        )
+        self.prompt_editor.read(cx).focus_handle(cx)
     }
 
     pub fn user_input_other_entity(&self) -> Entity<PromptInput> {

@@ -35,7 +35,7 @@ pub(crate) enum ConversationPhase {
 pub(crate) struct ConversationTranscriptTurn {
     pub phase: ConversationPhase,
     pub user_message: String,
-    pub user_images: Vec<crate::agent::UserMessageImage>,
+    pub user_images: Vec<crate::agent::UserMessageAttachment>,
     pub user_message_time: Option<String>,
     pub assistant_message: String,
     pub assistant_message_time: Option<String>,
@@ -217,6 +217,10 @@ impl ConversationState {
         self.phase = ConversationPhase::Failed;
     }
     pub(crate) fn hydrate_history(&mut self, history: ThreadHistory) {
+        self.reconcile_history_submissions(&history);
+        if self.active_turn.is_none() {
+            self.turn_identity = None;
+        }
         self.thread_id = Some(history.thread.thread_id.clone());
         self.cwd = history.thread.cwd.clone();
         self.project_id = history.thread.project_id.clone();
@@ -226,6 +230,8 @@ impl ConversationState {
             .turns
             .iter()
             .map(|turn| {
+                let mut seen_users = std::collections::HashSet::new();
+                let mut seen_clients = std::collections::HashSet::new();
                 let mut user_messages = Vec::new();
                 let mut user_images = Vec::new();
                 let mut assistant_messages = Vec::new();
@@ -234,10 +240,11 @@ impl ConversationState {
                     match item {
                         ThreadHistoryItem::UserMessage {
                             item_id,
+                            client_message_id,
                             text,
                             images,
                         } => {
-                            user_images.extend(images.iter().cloned());
+                            if !seen_users.insert(item_id.clone()) || client_message_id.as_ref().is_some_and(|id| !seen_clients.insert(id.clone())) { continue; }
                             if let Some(replies) = resumed_question_replies(text) {
                                 activities.extend(replies.into_iter().map(|(question, answer)| {
                                     ConversationActivity::QuestionReply {
@@ -246,8 +253,13 @@ impl ConversationState {
                                         answer,
                                     }
                                 }));
-                            } else {
+                            } else if user_messages.is_empty() {
                                 user_messages.push(normalize_user_message_for_display(text));
+                                user_images.extend(images.iter().cloned());
+                            } else if !activities.iter().any(|activity| matches!(activity, ConversationActivity::UserMessage { item_id: id, .. } if id == item_id)) {
+                                activities.push(ConversationActivity::UserMessage {
+                                    item_id: item_id.clone(), text: normalize_user_message_for_display(text), images: images.clone(),
+                                });
                             }
                         }
                         ThreadHistoryItem::AssistantMessage { item_id, text, .. } => {
@@ -420,7 +432,7 @@ impl ConversationState {
             resumed: self.resumed_turn.take(),
         });
     }
-    pub(crate) fn user_images(&self) -> Vec<crate::agent::UserMessageImage> {
+    pub(crate) fn user_images(&self) -> Vec<crate::agent::UserMessageAttachment> {
         self.user_images.clone()
     }
     pub(crate) fn resumed_turn(&self) -> Option<ResumedTurnPresentation> {

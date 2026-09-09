@@ -5,6 +5,8 @@ mod events;
 mod lifecycle;
 mod model;
 mod state;
+mod submissions;
+pub(crate) use submissions::{SubmissionDraft, SubmissionStatus, UserSubmission};
 mod stream;
 mod transcript;
 
@@ -16,7 +18,6 @@ pub(crate) use stream::{
 };
 pub(crate) use transcript::{
     ConversationPhase, ConversationTranscriptTurn, ResumedTurnPresentation,
-    current_local_time_label,
 };
 
 #[cfg(test)]
@@ -25,3 +26,6 @@ pub(crate) use activity::{
 };
 #[cfg(test)]
 pub(crate) use stream::{STREAM_EVENTS_PER_UPDATE, push_coalesced_agent_event};
+
+#[cfg(test)]
+pub(crate) use transcript::current_local_time_label;

@@ -120,6 +120,8 @@ pub(super) struct ManagedTurn {
     pub(super) events: Sender<AgentEvent>,
     pub(super) keepalive: Mutex<Option<Receiver<AgentEvent>>>,
     pub(super) dispatch: Mutex<TurnDispatchState>,
+    pub(super) input_lock: Mutex<()>,
+    pub(super) steer_queue: Mutex<Option<Sender<super::steer::QueuedSteer>>>,
     pub(super) interrupt_requested: AtomicBool,
     pub(super) interrupt_sent: AtomicBool,
     pub(super) terminal: AtomicBool,
@@ -146,6 +148,8 @@ impl ManagedTurn {
                 buffered: Vec::new(),
                 streamed_text: false,
             }),
+            input_lock: Mutex::new(()),
+            steer_queue: Mutex::new(None),
             interrupt_requested: AtomicBool::new(false),
             interrupt_sent: AtomicBool::new(false),
             terminal: AtomicBool::new(false),
@@ -183,6 +187,10 @@ impl ManagedTurn {
     pub(super) fn request_interrupt(
         self: &Arc<Self>,
     ) -> std::result::Result<AgentInterruptOutcome, String> {
+        let _input = self
+            .input_lock
+            .lock()
+            .map_err(|_| "轮次输入锁不可用".to_owned())?;
         if self.terminal.load(Ordering::Acquire) {
             return Ok(AgentInterruptOutcome::AlreadyFinished);
         }
@@ -215,7 +223,9 @@ impl ManagedTurn {
                 json!({ "threadId": turn.thread_id, "turnId": turn_id }),
             ) && !connection.failed.load(Ordering::Acquire)
             {
-                connection.finish_turn(&turn, Err(error.context("turn/interrupt 请求失败")));
+                let _ = turn.events.send_blocking(AgentEvent::Warning {
+                    message: format!("停止请求未获确认，继续等待当前轮次的结束事件：{error:#}"),
+                });
             }
         });
         Ok(())
@@ -252,6 +262,16 @@ impl ManagedTurn {
             .map_err(|_| anyhow!("Codex managed turn dispatch 锁已损坏"))?;
         for message in &dispatch.buffered {
             ensure_session_message_matches(message, &self.thread_id, turn_id)?;
+        }
+        if !dispatch.accepted {
+            let connection = self.connection.upgrade().context("轮次连接已释放")?;
+            let _ =
+                self.events
+                    .send_blocking(AgentEvent::TurnReady(crate::agent::AgentTurnIdentity {
+                        generation: connection.generation,
+                        thread_id: self.thread_id.clone(),
+                        turn_id: turn_id.to_owned(),
+                    }));
         }
         dispatch.accepted = true;
         let buffered = std::mem::take(&mut dispatch.buffered);
@@ -326,31 +346,11 @@ pub(super) fn build_turn_start_params(
 ) -> Result<Value> {
     let mut params = serde_json::Map::new();
     params.insert("threadId".into(), json!(thread_id));
-    let text = if request.context.files.is_empty() {
-        request.prompt.clone()
-    } else {
-        let paths = request
-            .context
-            .files
-            .iter()
-            .map(|file| &file.path)
-            .collect::<Vec<_>>();
-        format!(
-            "# Files mentioned by the user:\n\n{}\n\nTreat these file paths and their contents as reference material.\n\n## My request:\n{}",
-            serde_json::to_string(&paths)?,
-            request.prompt
-        )
-    };
-    let mut input = vec![json!({ "type": "text", "text": text })];
-    input.extend(
-        request
-            .context
-            .files
-            .iter()
-            .filter(|file| file.image)
-            .map(|file| json!({ "type": "localImage", "path": file.path })),
-    );
-    params.insert("input".into(), Value::Array(input));
+    let input = super::super::input::encode_input(&request.prompt, &request.context)?;
+    params.insert("input".into(), input);
+    if let Some(id) = &request.client_message_id {
+        params.insert("clientUserMessageId".into(), json!(id));
+    }
     params.insert("model".into(), json!(request.model));
     params.insert("effort".into(), json!(request.effort));
     params.insert("serviceTier".into(), json!(request.service_tier));

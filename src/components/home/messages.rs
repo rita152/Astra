@@ -187,11 +187,11 @@ pub(super) fn user_message_bubble(
 }
 
 pub(super) fn user_message_images(
-    images: Vec<crate::agent::UserMessageImage>,
+    images: Vec<crate::agent::UserMessageAttachment>,
     home: Entity<HomeView>,
     theme: Theme,
 ) -> Div {
-    use crate::agent::UserMessageImage;
+    use crate::agent::UserMessageAttachment;
     let width = images.len() as f32 * 88.0 - 8.0;
     div().w(px(width)).max_w_full().mb(px(8.0)).child(
         div()
@@ -204,11 +204,23 @@ pub(super) fn user_message_images(
             .child(div().w(px(width)).flex().gap(px(8.0)).children(
                 images.into_iter().enumerate().map(|(index, image)| {
                     let unavailable = match &image {
-                        UserMessageImage::Local(path) => !path.is_file(),
-                        UserMessageImage::Unavailable(_) => true,
-                        UserMessageImage::Remote(_) => false,
+                        UserMessageAttachment::Local(path) => !path.is_file(),
+                        UserMessageAttachment::Unavailable(_) => true,
+                        UserMessageAttachment::Remote(_) | UserMessageAttachment::File(_) => false,
                     };
-                    let thumbnail = if unavailable {
+                    let thumbnail = if let UserMessageAttachment::File(path) = &image {
+                        div()
+                            .p(px(6.0))
+                            .text_size(px(11.0))
+                            .text_color(theme.text)
+                            .child(
+                                path.file_name()
+                                    .unwrap_or(path.as_os_str())
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            )
+                            .into_any_element()
+                    } else if unavailable {
                         div()
                             .p(px(6.0))
                             .text_size(px(11.0))
@@ -217,9 +229,12 @@ pub(super) fn user_message_images(
                             .into_any_element()
                     } else {
                         let source: gpui::ImageSource = match &image {
-                            UserMessageImage::Local(path) => path.clone().into(),
-                            UserMessageImage::Remote(url) => SharedString::from(url.clone()).into(),
-                            UserMessageImage::Unavailable(_) => unreachable!(),
+                            UserMessageAttachment::Local(path) => path.clone().into(),
+                            UserMessageAttachment::Remote(url) => {
+                                SharedString::from(url.clone()).into()
+                            }
+                            UserMessageAttachment::Unavailable(_)
+                            | UserMessageAttachment::File(_) => unreachable!(),
                         };
                         gpui::img(source)
                             .size_full()
@@ -245,7 +260,11 @@ pub(super) fn user_message_images(
                         .when(!unavailable, |element| {
                             element
                                 .role(Role::Button)
-                                .aria_label(format!("打开图片 {}", index + 1))
+                                .aria_label(if let UserMessageAttachment::File(path) = &image {
+                                    format!("打开文件 {}", path.display())
+                                } else {
+                                    format!("打开图片 {}", index + 1)
+                                })
                                 .focusable()
                                 .tab_stop(true)
                                 .cursor_pointer()
@@ -277,23 +296,25 @@ pub(super) fn user_message_images(
 }
 
 pub(super) fn open_user_image(
-    image: &crate::agent::UserMessageImage,
+    image: &crate::agent::UserMessageAttachment,
     home: &Entity<HomeView>,
     cx: &mut gpui::App,
 ) {
     match image {
-        crate::agent::UserMessageImage::Local(path) => {
+        crate::agent::UserMessageAttachment::Local(path) => {
             home.update(cx, |_, cx| cx.emit(OpenImagePreview(path.clone())))
         }
-        crate::agent::UserMessageImage::Remote(url) => cx.open_url(url),
-        crate::agent::UserMessageImage::Unavailable(_) => {}
+        crate::agent::UserMessageAttachment::Remote(url) => cx.open_url(url),
+        crate::agent::UserMessageAttachment::File(path) => cx.open_with_system(path),
+        crate::agent::UserMessageAttachment::Unavailable(_) => {}
     }
     cx.stop_propagation();
 }
 
 pub(super) struct UserMessageContent {
+    pub(super) continuation: bool,
     pub(super) text: String,
-    pub(super) images: Vec<crate::agent::UserMessageImage>,
+    pub(super) images: Vec<crate::agent::UserMessageAttachment>,
     pub(super) time: String,
 }
 
@@ -306,24 +327,30 @@ pub(super) fn current_user_message(
     content_width: f32,
 ) -> Div {
     let UserMessageContent {
+        continuation,
         text: user_message,
         images: user_images,
         time: user_message_time,
     } = message;
+    let reserve_footer = !continuation || actions_visible_for_capture;
     let hover_group: SharedString = "user-message-hover".into();
     let copied_user_message = user_message.clone();
     let keyboard_user_message = user_message.clone();
     div()
         .min_h(px(USER_MESSAGE_VERTICAL_PADDING * 2.0
             + USER_MESSAGE_LINE_HEIGHT
-            + USER_MESSAGE_FOOTER_OFFSET
-            + USER_MESSAGE_FOOTER_HEIGHT))
+            + if reserve_footer {
+                USER_MESSAGE_FOOTER_OFFSET + USER_MESSAGE_FOOTER_HEIGHT
+            } else {
+                0.0
+            }))
         .w_full()
         .flex()
         .flex_col()
         .items_end()
         .child(
             div()
+                .relative()
                 .group(hover_group.clone())
                 .w(px(content_width.min(CONVERSATION_CONTENT_MAX_WIDTH)
                     * USER_MESSAGE_MAX_WIDTH_RATIO))
@@ -346,6 +373,11 @@ pub(super) fn current_user_message(
                 })
                 .child(
                     div()
+                        .when(!reserve_footer, |footer| {
+                            footer.absolute().right_0().bottom(px(
+                                -(USER_MESSAGE_FOOTER_OFFSET + USER_MESSAGE_FOOTER_HEIGHT)
+                            ))
+                        })
                         .mt(px(USER_MESSAGE_FOOTER_OFFSET))
                         .mx(px(USER_MESSAGE_FOOTER_SIDE_MARGIN))
                         .h(px(USER_MESSAGE_FOOTER_HEIGHT))

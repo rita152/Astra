@@ -49,6 +49,11 @@ impl ReasoningActivityPresentation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConversationActivity {
+    UserMessage {
+        item_id: String,
+        text: String,
+        images: Vec<crate::agent::UserMessageAttachment>,
+    },
     AssistantMessage {
         item_id: String,
         text: String,

@@ -9,7 +9,7 @@ use gpui::{Entity, ListState, ScrollHandle};
 
 use super::{ConfigWarningFile, ConversationListRow, HomeView};
 use crate::{
-    agent::UserMessageImage,
+    agent::UserMessageAttachment,
     conversation::{ConversationActivity, ConversationPhase, ResumedTurnPresentation},
     theme::Theme,
 };
@@ -49,7 +49,7 @@ pub(super) struct MainConversationSnapshot {
 pub(super) struct CurrentTurnRows<'a> {
     pub(super) phase: ConversationPhase,
     pub(super) user_message: String,
-    pub(super) user_images: Vec<UserMessageImage>,
+    pub(super) user_images: Vec<UserMessageAttachment>,
     pub(super) user_message_time: String,
     pub(super) assistant_message: String,
     pub(super) assistant_message_time: Option<String>,

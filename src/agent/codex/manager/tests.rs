@@ -30,6 +30,7 @@ use crate::agent::{
 const WAIT: Duration = Duration::from_secs(3);
 
 mod side_conversation;
+mod steer;
 
 #[test]
 fn history_retains_message_phase_and_semantic_command_actions() {
@@ -85,7 +86,8 @@ fn history_user_message_matches_live_text_with_attachment_content() {
     assert_eq!(
         item,
         ThreadHistoryItem::UserMessage {
-            images: vec![crate::agent::UserMessageImage::Local(
+            client_message_id: None,
+            images: vec![crate::agent::UserMessageAttachment::Local(
                 "/tmp/capture.png".into()
             )],
             item_id: "user_attachment_1".into(),
@@ -96,7 +98,7 @@ fn history_user_message_matches_live_text_with_attachment_content() {
 
 #[test]
 fn image_only_history_preserves_order_and_recovers_embedded_images() {
-    use crate::agent::UserMessageImage;
+    use crate::agent::UserMessageAttachment;
     let item = parse_history_item(&json!({
         "type": "userMessage", "id": "image-only-regression",
         "content": [
@@ -110,7 +112,7 @@ fn image_only_history_preserves_order_and_recovers_embedded_images() {
     };
     assert!(text.is_empty());
     assert_eq!(images.len(), 3);
-    let UserMessageImage::Local(path) = &images[0] else {
+    let UserMessageAttachment::Local(path) = &images[0] else {
         panic!()
     };
     assert!(
@@ -118,8 +120,11 @@ fn image_only_history_preserves_order_and_recovers_embedded_images() {
             .unwrap()
             .starts_with(b"\x89PNG\r\n\x1a\n")
     );
-    assert_eq!(images[1], UserMessageImage::Local("/tmp/second.png".into()));
-    assert!(matches!(&images[2], UserMessageImage::Unavailable(_)));
+    assert_eq!(
+        images[1],
+        UserMessageAttachment::Local("/tmp/second.png".into())
+    );
+    assert!(matches!(&images[2], UserMessageAttachment::Unavailable(_)));
 }
 
 #[test]
@@ -496,6 +501,7 @@ fn manager_with_fake() -> (CodexAppServerManager, Arc<FakeSpawner>) {
 
 fn request(prompt: &str, thread_id: Option<&str>) -> AgentRequest {
     AgentRequest {
+        client_message_id: None,
         prompt: prompt.to_owned(),
         cwd: "/tmp/project".into(),
         project_id: None,

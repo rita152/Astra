@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use async_channel::Sender;
+use async_channel::{Receiver, Sender};
 use serde_json::{Value, json};
 
 use super::{
@@ -50,6 +50,7 @@ pub(super) struct ConnectionState {
     pub(super) reserved_threads: HashSet<String>,
     pub(super) starting_turns: HashMap<String, Arc<ManagedTurn>>,
     pub(super) turns: HashMap<TurnKey, Arc<ManagedTurn>>,
+    pub(super) finished_turns: HashSet<TurnKey>,
     pub(super) server_request_owners: HashMap<AgentServerRequestId, TurnKey>,
     pub(super) settings_waiters: HashMap<String, Vec<Sender<Result<AgentThreadSettings, String>>>>,
     pub(super) remote_control_status: Option<Value>,
@@ -61,6 +62,7 @@ pub(super) struct Connection {
     pub(super) process: Arc<dyn ManagedProcess>,
     pub(super) next_request_id: AtomicU64,
     pub(super) pending_rpcs: Mutex<HashMap<u64, PendingRpc>>,
+    pub(super) completed_steer_rpcs: Mutex<HashSet<u64>>,
     pub(super) state: Mutex<ConnectionState>,
     pub(super) lifecycle_lock: Mutex<()>,
     pub(super) settings_lock: Mutex<()>,
@@ -75,6 +77,17 @@ impl Connection {
     }
 
     pub(super) fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.begin_request(method, params)?
+            .recv_blocking()
+            .map_err(|_| anyhow!("`{method}` response channel 在返回前关闭"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub(super) fn begin_request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Receiver<Result<Value, String>>> {
         if self.failed.load(Ordering::Acquire) {
             bail!("Codex app-server connection generation 已失败");
         }
@@ -85,16 +98,21 @@ impl Connection {
             bail!(message);
         }
         let (sender, receiver) = async_channel::bounded(1);
-        self.pending_rpcs
+        let mut pending = self
+            .pending_rpcs
             .lock()
-            .map_err(|_| anyhow!("Codex pending request registry 锁已损坏"))?
-            .insert(
-                request_id,
-                PendingRpc {
-                    method: method.to_owned(),
-                    sender,
-                },
-            );
+            .map_err(|_| anyhow!("Codex pending request registry 锁已损坏"))?;
+        if self.failed.load(Ordering::Acquire) {
+            bail!("Codex app-server connection generation 已失败");
+        }
+        pending.insert(
+            request_id,
+            PendingRpc {
+                method: method.to_owned(),
+                sender,
+            },
+        );
+        drop(pending);
         if let Err(error) = self.send_message(json!({
             "method": method,
             "id": request_id,
@@ -105,10 +123,7 @@ impl Connection {
             }
             return Err(error).with_context(|| format!("写入 `{method}` 请求失败"));
         }
-        receiver
-            .recv_blocking()
-            .map_err(|_| anyhow!("`{method}` response channel 在返回前关闭"))?
-            .map_err(anyhow::Error::msg)
+        Ok(receiver)
     }
 
     pub(super) fn handle_response(&self, message: Value) -> Result<()> {
@@ -120,8 +135,24 @@ impl Connection {
             .pending_rpcs
             .lock()
             .map_err(|_| anyhow!("Codex pending request registry 锁已损坏"))?
-            .remove(&request_id)
-            .with_context(|| format!("收到未知或重复的 JSON-RPC response id `{request_id}`"))?;
+            .remove(&request_id);
+        let Some(pending) = pending else {
+            if self
+                .completed_steer_rpcs
+                .lock()
+                .map_err(|_| anyhow!("追加响应注册表锁已损坏"))?
+                .contains(&request_id)
+            {
+                return Ok(());
+            }
+            bail!("收到未知或重复的 JSON-RPC response id `{request_id}`");
+        };
+        if pending.method == "turn/steer" {
+            self.completed_steer_rpcs
+                .lock()
+                .map_err(|_| anyhow!("追加响应注册表锁已损坏"))?
+                .insert(request_id);
+        }
         let (result, fatal_error) = match (message.get("result"), message.get("error")) {
             (Some(_), None) => (Ok(message), None),
             (None, Some(error)) => (
@@ -294,8 +325,13 @@ impl Connection {
     }
 
     pub(super) fn finish_turn(&self, turn: &Arc<ManagedTurn>, result: Result<TurnOutcome>) {
-        turn.finish(result);
         if let Ok(mut state) = self.state.lock() {
+            if let Some(turn_id) = turn.turn_id() {
+                state.finished_turns.insert(TurnKey {
+                    thread_id: turn.thread_id.clone(),
+                    turn_id,
+                });
+            }
             state.reserved_threads.remove(&turn.thread_id);
             if state
                 .starting_turns
@@ -323,6 +359,7 @@ impl Connection {
                 state.server_request_owners.remove(&request_id);
             }
         }
+        turn.finish(result);
     }
 
     pub(super) fn fail_all(&self, message: &str) {

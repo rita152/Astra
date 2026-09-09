@@ -14,7 +14,7 @@ use crate::agent::{
     AgentFileChange, AgentFileChangeEntry, AgentFileChangeKind, AgentFileChangeStatus,
     AgentImageView, AgentThreadActiveFlag, FilterValue, HistoryItemDetail, HistoryTurnStatus,
     Project, SortDirection, ThreadActivity, ThreadHistoryItem, ThreadListRequest, ThreadSection,
-    ThreadSectionAppearance, ThreadSummary, ThreadTurn, UserMessageImage,
+    ThreadSectionAppearance, ThreadSummary, ThreadTurn, UserMessageAttachment,
     normalize_user_message_for_display,
 };
 
@@ -261,7 +261,7 @@ pub(super) fn parse_history_item(value: &Value) -> Result<ThreadHistoryItem> {
                     |(index, part)| match part.get("type").and_then(Value::as_str) {
                         Some("localImage") => Some(
                             string_field(part, "path", "localImage")
-                                .map(|path| UserMessageImage::Local(path.into())),
+                                .map(|path| UserMessageAttachment::Local(path.into())),
                         ),
                         Some("image") => Some(string_field(part, "url", "image").map(|url| {
                             if url.starts_with("data:image/") {
@@ -271,21 +271,27 @@ pub(super) fn parse_history_item(value: &Value) -> Result<ThreadHistoryItem> {
                                     &format!("user-{index}-{:016x}", hash.finish()),
                                     &url,
                                 ) {
-                                    Ok(path) => UserMessageImage::Local(path),
-                                    Err(_) => {
-                                        UserMessageImage::Unavailable("无法读取图片附件".into())
-                                    }
+                                    Ok(path) => UserMessageAttachment::Local(path),
+                                    Err(_) => UserMessageAttachment::Unavailable(
+                                        "无法读取图片附件".into(),
+                                    ),
                                 }
                             } else {
-                                UserMessageImage::Remote(url)
+                                UserMessageAttachment::Remote(url)
                             }
                         })),
                         _ => None,
                     },
                 )
                 .collect::<Result<Vec<_>>>()?;
+            let ordered = super::input::restore_attachments(&text, images);
             Ok(ThreadHistoryItem::UserMessage {
-                images,
+                client_message_id: optional_nullable_string_field(
+                    value,
+                    "clientId",
+                    "userMessage item",
+                )?,
+                images: ordered,
                 item_id,
                 // The answer envelope contains JSON escaping, not Markdown.
                 // Preserve it for the resumed question/answer presentation.

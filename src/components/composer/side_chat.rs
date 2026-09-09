@@ -3,11 +3,10 @@
 use super::{ComposerView, ConversationChanged, PermissionMode};
 use crate::{
     agent::{AgentBackend, AgentEffectivePermissions, AgentModel, SideConversationRequest},
-    components::file_editor::{EditorEvent, FileEditor},
     conversation::ConversationPhase,
     theme::ThemeMode,
 };
-use gpui::{App, AppContext, Context};
+use gpui::{App, Context};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -43,17 +42,9 @@ impl ComposerView {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self::new_with_backend(mode, backend, cx);
-        let editor = cx.new(|cx| FileEditor::composer(mode, cx));
-        cx.observe(&editor, |_, _, cx| cx.notify()).detach();
-        cx.subscribe(&editor, |this, editor, event: &EditorEvent, cx| {
-            if matches!(event, EditorEvent::Submit) {
-                let text = editor.read(cx).text().to_owned();
-                this.submit_prompt(text, cx);
-            }
-            cx.notify();
-        })
-        .detach();
-        view.side_editor = Some(editor);
+        view.side_chat = true;
+        view.prompt_editor
+            .update(cx, |editor, _| editor.set_accessible_name("侧边聊天输入框"));
         view.side_ready = false;
         view.conversation.cwd = config.request.cwd;
         view.conversation.models = config.models;
@@ -109,18 +100,12 @@ impl ComposerView {
     }
 
     pub(crate) fn prompt_text<'a>(&'a self, cx: &'a App) -> &'a str {
-        self.side_editor.as_ref().map_or_else(
-            || self.prompt_input.read(cx).text(),
-            |editor| editor.read(cx).text(),
-        )
+        self.prompt_editor.read(cx).text()
     }
 
     pub(super) fn clear_prompt(&mut self, cx: &mut Context<Self>) {
-        if let Some(editor) = &self.side_editor {
-            editor.update(cx, |editor, cx| editor.set_text_silently("", cx));
-        } else {
-            self.prompt_input.update(cx, |input, cx| input.clear(cx));
-        }
+        self.prompt_editor
+            .update(cx, |editor, cx| editor.set_text_silently("", cx));
     }
 
     pub(super) fn submit_current_prompt(&mut self, cx: &mut Context<Self>) {
@@ -129,6 +114,10 @@ impl ComposerView {
     }
 
     pub(crate) fn close_side_menus(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu_open {
+            self.focus_prompt_pending = true;
+        }
+        self.context_focus_pending = false;
         self.menu_open = false;
         self.permission_menu_open = false;
         self.submenu = None;
@@ -137,9 +126,11 @@ impl ComposerView {
     }
 
     pub(crate) fn side_composer_height(&self, cx: &App) -> f32 {
-        self.side_editor
-            .as_ref()
-            .map_or(98.0, |editor| editor.read(cx).composer_height() + 54.0)
+        self.composer_body_height(cx) + self.submission_feedback_height()
+    }
+    pub(super) fn composer_body_height(&self, cx: &App) -> f32 {
+        self.prompt_editor.read(cx).composer_height()
+            + 54.0
             + if self.prompt_context.files.is_empty() {
                 0.0
             } else {

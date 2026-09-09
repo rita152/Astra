@@ -22,8 +22,8 @@ pub use activity::{
 pub(crate) use backend::AgentInterruptControl;
 pub use backend::{
     AgentBackend, AgentCapabilities, AgentCapability, AgentInputFile, AgentInterruptHandle,
-    AgentInterruptOutcome, AgentPromptContext, AgentRequest, AgentRun, SideConversationRequest,
-    WorkspaceError, WorkspaceResult,
+    AgentInterruptOutcome, AgentPromptContext, AgentRequest, AgentRun, AgentSteerRequest,
+    AgentTurnIdentity, SideConversationRequest, WorkspaceError, WorkspaceResult,
 };
 pub use catalog::{
     AgentActivePermissionProfile, AgentEffectivePermissions, AgentModel, AgentModelCatalog,
@@ -33,6 +33,7 @@ pub use catalog::{
 pub use codex::{CodexAppServerBackend, CodexAppServerManager};
 pub use events::{AgentConnectionEvent, AgentEvent};
 pub use message::normalize_user_message_for_display;
+pub(crate) use message::user_message_context_files;
 pub use requests::{
     AgentAdditionalFileSystemPermissions, AgentAdditionalNetworkPermissions, AgentApprovalHandle,
     AgentCommandApprovalChoice, AgentCommandApprovalRequest, AgentFileSystemAccess,
@@ -57,5 +58,5 @@ pub use thread::{
     ProjectChange, ProjectId, SortDirection, ThreadActivity, ThreadHistory, ThreadHistoryItem,
     ThreadHistoryItemEntry, ThreadId, ThreadListRequest, ThreadMetadataUpdate, ThreadSearchResult,
     ThreadSection, ThreadSectionAppearance, ThreadSectionId, ThreadSortKey, ThreadSummary,
-    ThreadTurn, UpdateProject, UserMessageImage,
+    ThreadTurn, UpdateProject, UserMessageAttachment,
 };

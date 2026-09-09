@@ -192,6 +192,10 @@ impl AgentBackend for CodexAppServerBackend {
             .move_thread_to_section(thread_id, section_id, before_thread_id)
     }
 
+    fn steer_turn(&self, request: crate::agent::AgentSteerRequest) -> Receiver<Result<(), String>> {
+        self.manager.steer_turn(request)
+    }
+
     fn run_prompt(&self, request: AgentRequest) -> AgentRun {
         self.manager.run_prompt(request)
     }

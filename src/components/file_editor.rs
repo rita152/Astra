@@ -255,7 +255,7 @@ impl FileEditor {
     }
     fn line_height(&self) -> f32 {
         if self.composer {
-            22.0
+            20.0
         } else if self.prose_label.is_some() {
             22.75
         } else {
@@ -995,6 +995,10 @@ impl Render for FileEditor {
     }
 }
 impl EntityInputHandler for FileEditor {
+    fn accepts_text_input(&self, window: &mut Window, _: &mut Context<Self>) -> bool {
+        self.focus.is_focused(window)
+    }
+
     fn text_for_range(
         &mut self,
         r: Range<usize>,

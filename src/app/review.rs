@@ -80,6 +80,7 @@ impl ChatApp {
             if let Some(host) = self.conversation_hosts.get(&key) {
                 let panel = panel.downgrade();
                 let changed_panel = panel.clone();
+                let restored_panel = panel.clone();
                 cx.subscribe(
                     &host.composer,
                     move |_, composer, _: &crate::components::composer::ConversationChanged, cx| {
@@ -94,6 +95,14 @@ impl ChatApp {
                     &host.composer,
                     move |_, _, _: &crate::components::composer::ReviewCommentsSubmitted, cx| {
                         let _ = panel.update(cx, |p, cx| p.clear_comments(cx));
+                    },
+                )
+                .detach();
+                cx.subscribe(
+                    &host.composer,
+                    move |_, _, event: &crate::components::composer::ReviewCommentsRestored, cx| {
+                        let _ = restored_panel
+                            .update(cx, |panel, cx| panel.restore_comments(event.0.clone(), cx));
                     },
                 )
                 .detach();

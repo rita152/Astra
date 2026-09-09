@@ -266,6 +266,18 @@ impl ManagerInner {
                     .and_then(Value::as_str)
                     .with_context(|| format!("{method} 消息缺少字符串 params.threadId"))?;
                 let turn_id = turn_id_from_turn_message(message)?;
+                let finished = connection
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("轮次注册表锁不可用"))?
+                    .finished_turns
+                    .contains(&super::connection::TurnKey {
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.clone(),
+                    });
+                if finished {
+                    return Ok(());
+                }
                 let turn = connection.bind_starting_turn(thread_id, &turn_id)?;
                 if let Some(outcome) = turn.ingest(message)? {
                     connection.finish_turn(&turn, Ok(outcome));

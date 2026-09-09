@@ -74,18 +74,27 @@ pub(super) fn process_turn_message<W: Write + Send + 'static>(
             let item_type = required_turn_item_type(message, item)?;
             match item_type {
                 "userMessage" => {
-                    validate_user_message(item)
+                    forward_user_message(session, item, events)
                         .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
                 "agentMessage" => {
                     let (item_id, _text) = parse_agent_message(item)
                         .map_err(|error| turn_item_protocol_error(message, error))?;
-                    send_turn_event(
-                        events,
-                        AgentEvent::AssistantMessageStarted { item_id },
-                        "item/started agentMessage",
-                    )
-                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                    let mut messages = session
+                        .agent_messages
+                        .lock()
+                        .map_err(|_| anyhow!("助手消息注册表锁不可用"))?;
+                    let progress = messages.entry(item_id.clone()).or_default();
+                    if !progress.started && !progress.completed {
+                        progress.started = true;
+                        *streamed_text = false;
+                        send_turn_event(
+                            events,
+                            AgentEvent::AssistantMessageStarted { item_id },
+                            "item/started agentMessage",
+                        )
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    }
                 }
                 "reasoning" => {
                     let reasoning = parse_reasoning(item)
@@ -181,8 +190,18 @@ pub(super) fn process_turn_message<W: Write + Send + 'static>(
             }
         }
         Some("item/agentMessage/delta") => {
-            let _item_id = required_notification_string(message, "itemId")?;
+            let item_id = required_notification_string(message, "itemId")?;
             let delta = required_notification_string(message, "delta")?;
+            let mut messages = session
+                .agent_messages
+                .lock()
+                .map_err(|_| anyhow!("助手消息注册表锁不可用"))?;
+            let progress = messages.entry(item_id).or_default();
+            if progress.completed {
+                return Ok(None);
+            }
+            progress.has_output = true;
+            drop(messages);
             send_turn_event(
                 events,
                 AgentEvent::TextDelta(delta),
@@ -295,21 +314,28 @@ pub(super) fn process_turn_message<W: Write + Send + 'static>(
             let item_type = required_turn_item_type(message, item)?;
             match item_type {
                 "userMessage" => {
-                    validate_user_message(item)
+                    forward_user_message(session, item, events)
                         .map_err(|error| turn_item_protocol_error(message, error))?;
                 }
                 "agentMessage" => {
-                    let (_item_id, text) = parse_agent_message(item)
+                    let (item_id, text) = parse_agent_message(item)
                         .map_err(|error| turn_item_protocol_error(message, error))?;
-                    match *streamed_text {
-                        true => Ok(()),
-                        false => send_turn_event(
+                    let mut messages = session
+                        .agent_messages
+                        .lock()
+                        .map_err(|_| anyhow!("助手消息注册表锁不可用"))?;
+                    let progress = messages.entry(item_id).or_default();
+                    if !progress.has_output && !progress.completed {
+                        send_turn_event(
                             events,
                             AgentEvent::TextDelta(text),
                             "item/completed agentMessage",
                         )
-                        .map_err(|error| turn_item_protocol_error(message, error)),
-                    }?;
+                        .map_err(|error| turn_item_protocol_error(message, error))?;
+                    }
+                    progress.has_output = true;
+                    progress.completed = true;
+                    *streamed_text = true;
                 }
                 "reasoning" => {
                     let reasoning = parse_reasoning(item)
@@ -458,4 +484,42 @@ pub(super) fn send_turn_event(
     events
         .send_blocking(event)
         .map_err(|_| anyhow!("Composer `{source}` 事件通道已经关闭"))
+}
+
+fn forward_user_message<W: Write + Send + 'static>(
+    session: &CodexTurnSession<W>,
+    item: &serde_json::Map<String, Value>,
+    events: &Sender<AgentEvent>,
+) -> Result<()> {
+    validate_user_message(item)?;
+    let value = Value::Object(item.clone());
+    let id = item["id"].as_str().expect("validated item id");
+    let mut seen = session
+        .user_messages
+        .lock()
+        .map_err(|_| anyhow!("用户消息注册表锁不可用"))?;
+    if seen.get(id) == Some(&value) {
+        return Ok(());
+    }
+    seen.insert(id.to_owned(), value.clone());
+    drop(seen);
+    if let crate::agent::ThreadHistoryItem::UserMessage {
+        item_id,
+        client_message_id,
+        text,
+        images,
+    } = super::workspace_protocol::parse_history_item(&value)?
+    {
+        send_turn_event(
+            events,
+            AgentEvent::UserMessage {
+                item_id,
+                text,
+                images,
+                client_message_id,
+            },
+            "userMessage",
+        )?;
+    }
+    Ok(())
 }

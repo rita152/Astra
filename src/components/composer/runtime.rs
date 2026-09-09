@@ -9,8 +9,7 @@ use super::{ComposerView, ConversationChanged, ConversationThreadCreated};
 use crate::{
     agent::{AgentConnectionEvent, AgentEvent, AgentRequest},
     conversation::{
-        ConversationActivity, ConversationPhase, STREAM_DISCONNECTED_MESSAGE,
-        STREAM_UPDATE_INTERVAL, collect_ready_agent_events, current_local_time_label,
+        STREAM_DISCONNECTED_MESSAGE, STREAM_UPDATE_INTERVAL, collect_ready_agent_events,
         ensure_closed_batch_is_terminal,
     },
 };
@@ -35,48 +34,50 @@ impl ComposerView {
         })
         .detach();
     }
-    pub(super) fn submit_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
-        if !self.side_ready
-            || (prompt.trim().is_empty()
-                && self.review_comments.is_empty()
-                && self.prompt_context.files.is_empty())
-            || matches!(
-                self.conversation.phase,
-                ConversationPhase::Starting
-                    | ConversationPhase::Thinking
-                    | ConversationPhase::Streaming
-                    | ConversationPhase::Stopping
-            )
+    pub(super) fn submit_prompt(&mut self, raw_prompt: String, cx: &mut Context<Self>) {
+        if raw_prompt.trim().is_empty()
+            && self.review_comments.is_empty()
+            && self.prompt_context.files.is_empty()
         {
             return;
         }
-
-        let selection = if self.conversation.selected_model.is_empty()
-            || self.conversation.selected_effort.is_empty()
-        {
-            Err(self
-                .conversation
-                .model_catalog_error
-                .clone()
-                .unwrap_or_else(|| "没有可用的 Codex 模型".to_owned()))
-        } else {
-            Ok((
-                self.conversation.selected_model.clone(),
-                self.conversation.selected_effort.clone(),
-                self.conversation.selected_service_tier.clone(),
-            ))
-        };
-
-        // Failed validation must preserve a side-chat draft and its attachments.
-        if self.side_editor.is_some() && selection.is_err() {
-            self.conversation.permission_error = Some("没有可用模型，请选择模型后重试。".into());
+        self.focus_prompt_pending = true;
+        if !self.side_ready {
+            self.submission_error =
+                Some("聊天连接不可用，输入已保留。请重新连接或新建侧边聊天。".into());
             cx.notify();
             return;
         }
-        let prompt = if prompt.trim().is_empty() && !self.prompt_context.files.is_empty() {
+        let running = self.is_running();
+        let target = if running {
+            match self.conversation.steer_target() {
+                Ok(target) => Some(target),
+                Err(error) => {
+                    self.submission_error = Some(error);
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if !running
+            && (self.conversation.selected_model.is_empty()
+                || self.conversation.selected_effort.is_empty())
+        {
+            self.submission_error = Some("没有可用模型，请选择模型后重试。输入已保留。".into());
+            cx.notify();
+            return;
+        }
+        let draft = crate::conversation::SubmissionDraft {
+            text: raw_prompt.clone(),
+            context: self.prompt_context.clone(),
+            comments: self.review_comments.clone(),
+        };
+        let prompt = if raw_prompt.trim().is_empty() && !self.prompt_context.files.is_empty() {
             "请查看附加文件。".to_owned()
         } else {
-            prompt
+            raw_prompt
         };
         let prompt = if self.review_comments.is_empty() {
             prompt
@@ -87,14 +88,28 @@ impl ComposerView {
                 crate::git_review::comments_prompt(&self.review_comments)
             )
         };
-        let cycle = self.conversation.begin_prompt(&prompt);
-        let prompt_context = self.prompt_context.clone();
-        self.conversation.user_images = prompt_context
-            .files
-            .iter()
-            .filter(|file| file.image)
-            .map(|file| crate::agent::UserMessageImage::Local(file.path.clone()))
-            .collect();
+        if !running {
+            self.conversation.begin_prompt(&prompt);
+            self.conversation.user_images = draft
+                .context
+                .files
+                .iter()
+                .map(|file| {
+                    if file.image {
+                        crate::agent::UserMessageAttachment::Local(file.path.clone())
+                    } else {
+                        crate::agent::UserMessageAttachment::File(file.path.clone())
+                    }
+                })
+                .collect();
+        }
+        let id = self.conversation.record_submission(
+            draft.clone(),
+            crate::agent::normalize_user_message_for_display(&prompt),
+            !running,
+        );
+        self.submission_error = None;
+        self.draft_revision = self.draft_revision.wrapping_add(1);
         self.menu_open = false;
         self.permission_menu_open = false;
         self.permission_menu_keyboard_focus = false;
@@ -102,47 +117,106 @@ impl ComposerView {
         self.clear_prompt(cx);
         self.prompt_context.files.clear();
         self.context_menu_open = false;
-
-        let (model, effort, service_tier) = match selection {
-            Ok(selection) => selection,
-            Err(error) => {
-                self.conversation.assistant_message = error.clone();
-                self.conversation
-                    .activities
-                    .push(ConversationActivity::Error { message: error });
-                self.conversation.assistant_message_time = Some(current_local_time_label());
-                self.conversation.phase = ConversationPhase::Failed;
-                cx.emit(ConversationChanged);
-                cx.notify();
-                return;
-            }
-        };
         if !self.review_comments.is_empty() {
             self.review_comments.clear();
-            self.prompt_input
-                .update(cx, |input, _| input.set_submit_empty(false));
             cx.emit(super::ReviewCommentsSubmitted);
         }
-        self.conversation.actual_model = Some(model.clone());
-        self.conversation.model_status = None;
-        self.conversation.safety_buffering = false;
+        let draft_revision = self.draft_revision;
+        if let Some(target) = target {
+            let receiver = self.backend.steer_turn(crate::agent::AgentSteerRequest {
+                target,
+                client_message_id: id.clone(),
+                prompt,
+                context: draft.context.clone(),
+            });
+            cx.spawn(async move |this, cx| {
+                let result = receiver.recv().await.unwrap_or_else(|_| {
+                    Err("追加输入响应连接已关闭，接受状态未知。输入快照已保留。".into())
+                });
+                let _ = this.update(cx, |this, cx| {
+                    this.conversation.resolve_submission(&id, result);
+                    let failure = this
+                        .conversation
+                        .submissions
+                        .iter()
+                        .find(|s| s.id == id)
+                        .and_then(|s| {
+                            if let crate::conversation::SubmissionStatus::Failed(error) = &s.status
+                            {
+                                Some((error.clone(), s.cycle))
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some((error, submission_cycle)) = failure
+                        && submission_cycle == this.conversation.cycle
+                    {
+                        this.submission_error = Some(error);
+                        if this.draft_revision == draft_revision && this.draft_is_empty(cx) {
+                            this.restore_submission(&id, cx);
+                        }
+                    }
+                    cx.emit(ConversationChanged);
+                    cx.notify();
+                });
+            })
+            .detach();
+        } else {
+            let cycle = self.conversation.cycle;
+            let model = self.conversation.selected_model.clone();
+            self.conversation.actual_model = Some(model.clone());
+            self.conversation.model_status = None;
+            self.conversation.safety_buffering = false;
+            let run = self.backend.run_prompt(AgentRequest {
+                client_message_id: Some(id),
+                prompt,
+                cwd: self.conversation.cwd.clone(),
+                project_id: self.conversation.project_id.clone(),
+                thread_id: self.conversation.thread_id.clone(),
+                model,
+                effort: self.conversation.selected_effort.clone(),
+                service_tier: self.conversation.selected_service_tier.clone(),
+                permission_mode: self.permission_mode.agent_mode(),
+                context: draft.context,
+            });
+            let (receiver, interrupt) = run.into_parts();
+            self.conversation.active_turn = interrupt;
+            self.consume_agent_events(receiver, cycle, cx);
+        }
         cx.emit(ConversationChanged);
         cx.notify();
+    }
 
-        let run = self.backend.run_prompt(AgentRequest {
-            prompt,
-            cwd: self.conversation.cwd.clone(),
-            project_id: self.conversation.project_id.clone(),
-            thread_id: self.conversation.thread_id.clone(),
-            model,
-            effort,
-            service_tier,
-            permission_mode: self.permission_mode.agent_mode(),
-            context: prompt_context,
-        });
-        let (receiver, interrupt) = run.into_parts();
-        self.conversation.active_turn = interrupt;
-        self.consume_agent_events(receiver, cycle, cx);
+    pub(super) fn draft_is_empty(&self, cx: &gpui::App) -> bool {
+        self.prompt_text(cx).is_empty()
+            && self.prompt_context.files.is_empty()
+            && self.review_comments.is_empty()
+    }
+
+    pub(super) fn restore_submission(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.draft_is_empty(cx) {
+            self.submission_error = Some("请先保存或清空当前草稿，再恢复失败的输入。".into());
+            cx.notify();
+            return;
+        }
+        if let Some(draft) = self
+            .conversation
+            .submissions
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.draft.clone())
+        {
+            self.prompt_editor
+                .update(cx, |editor, cx| editor.set_text_silently(&draft.text, cx));
+            self.prompt_context = draft.context;
+            self.review_comments = draft.comments;
+            if !self.review_comments.is_empty() {
+                cx.emit(super::ReviewCommentsRestored(self.review_comments.clone()));
+            }
+            self.focus_prompt_pending = true;
+            self.draft_revision = self.draft_revision.wrapping_add(1);
+            cx.notify();
+        }
     }
     pub(super) fn consume_agent_events(
         &mut self,

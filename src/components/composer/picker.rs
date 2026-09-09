@@ -304,6 +304,12 @@ impl ComposerView {
         cx.notify();
     }
     pub fn close_picker(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu_open {
+            self.context_menu_open = false;
+            self.context_focus_pending = false;
+            self.focus_prompt_pending = true;
+            cx.notify();
+        }
         if self.menu_open {
             self.menu_open = false;
             self.submenu = None;

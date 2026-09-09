@@ -94,23 +94,32 @@ impl ComposerView {
                 | ConversationPhase::Streaming
                 | ConversationPhase::Stopping
         );
+        let show_stop = generation_active && prompt_is_empty;
         div()
             .w_full()
             .relative()
-            .when(self.side_editor.is_some(), |composer| composer
-                .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| this.attach_paths(paths.paths().to_vec(), cx))))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && this.context_menu_open {
+                    this.context_menu_open = false;
+                    this.prompt_focus_handle(cx).focus(window, cx);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }))
+            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| this.attach_paths(paths.paths().to_vec(), cx)))
             .flex()
             .flex_col()
             .gap(px(0.0))
-            .when(!conversation_started && self.side_editor.is_none(), |composer| {
+            .when(!conversation_started && !self.side_chat, |composer| {
                 composer.child(context_toolbar(theme))
             })
+            .child(self.submission_feedback(theme, cx))
             .child(
                 div()
                     .h(px(if self.review_comments.is_empty() {
-                        self.side_composer_height(cx)
+                        self.composer_body_height(cx)
                     } else {
-                        self.side_composer_height(cx) + 32.0
+                        self.composer_body_height(cx) + 32.0
                     }))
                     .w_full()
                     .rounded(px(COMPOSER_CORNER_RADIUS))
@@ -132,7 +141,7 @@ impl ComposerView {
                     .font_weight(gpui::FontWeight::NORMAL)
                     .px(px(8.0))
                     .py(px(12.0))
-                    .when(self.side_editor.is_some(), |d| d.pt(px(14.0)).pb(px(8.0)))
+                    .pt(px(14.0)).pb(px(8.0))
                     .when(!self.prompt_context.files.is_empty(), |d| d.child(self.render_attachments(theme, cx)))
                     .when(!self.review_comments.is_empty(), |d| {
                         d.child(
@@ -171,19 +180,15 @@ impl ComposerView {
                                 ),
                         )
                     })
-                    .when_some(self.side_editor.clone(), |d, editor| {
-                        let height = editor.read(cx).composer_height();
-                        d.child(div().h(px(height)).flex_none().mx(px(4.0)).child(editor))
-                    })
-                    .when(self.side_editor.is_none(), |d| d.child(self.prompt_input.clone()))
+                    .child(div().h(px(self.prompt_editor.read(cx).composer_height())).flex_none().mx(px(4.0)).child(self.prompt_editor.clone()))
                     .when(self.dictation_state == DictationState::Idle, |composer| {
                         composer.child(
                             div()
-                                .h(px(if self.side_editor.is_some() { 28.0 } else { 36.0 }))
+                                .h(px(28.0))
                                 .flex_none()
-                                .when(self.side_editor.is_some(), |d| d.mt(px(4.0)))
+                                .mt(px(4.0))
                                 .relative()
-                                .top(px(if self.side_editor.is_some() { 0.0 } else { 7.0 }))
+                                .top(px(0.0))
                                 .flex()
                                 .items_center()
                                 .child(
@@ -199,9 +204,8 @@ impl ComposerView {
                                                 .aria_label("添加文件等内容")
                                                 .focusable()
                                                 .tab_stop(true)
-                                                .when(self.side_editor.is_some(), |button| button
-                                                    .on_click(cx.listener(|this, _, window, cx| { this.toggle_context(window, cx); cx.stop_propagation(); }))
-                                                    .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, window, cx| { if matches!(e.keystroke.key.as_str(), "enter" | "space" | "down") { this.toggle_context(window, cx); cx.stop_propagation(); } })))
+                                                .on_click(cx.listener(|this, _, window, cx| { this.toggle_context(window, cx); cx.stop_propagation(); }))
+                                                    .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, window, cx| { if matches!(e.keystroke.key.as_str(), "enter" | "space" | "down") { this.toggle_context(window, cx); cx.stop_propagation(); } }))
                                                 .size(px(28.0))
                                                 .rounded_full()
                                                 .flex()
@@ -378,12 +382,12 @@ impl ComposerView {
                                                     div()
                                                         .id("composer-voice")
                                                         .role(gpui::Role::Button)
-                                                        .aria_label(if generation_active { "停止生成" } else { "发送" })
+                                                        .aria_label(if show_stop { "停止生成" } else if generation_active { "追加输入" } else { "发送" })
                                                         .focusable()
                                                         .tab_stop(true)
                                                         .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                                                             if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                                                if this.is_running() { this.stop_generation(cx); }
+                                                                if this.is_running() && this.prompt_text(cx).trim().is_empty() && this.prompt_context.files.is_empty() && this.review_comments.is_empty() { this.stop_generation(cx); }
                                                                 else { this.submit_current_prompt(cx); }
                                                                 cx.stop_propagation();
                                                             }
@@ -398,23 +402,23 @@ impl ComposerView {
                                                         .when(
                                                             prompt_is_empty
                                                                 && conversation_started
-                                                                && !generation_active,
+                                                                && !show_stop,
                                                             |button| button.opacity(0.4),
                                                         )
                                                         .when(
                                                             !prompt_is_empty
-                                                                || generation_active
+                                                                || show_stop
                                                                 || !conversation_started,
                                                             |button| button.cursor_pointer(),
                                                         )
-                                                        .when(!generation_active, |button| {
+                                                        .when(!show_stop, |button| {
                                                             button.on_click(cx.listener(
                                                                 |this, _, _, cx| {
                                                                     this.submit_current_prompt(cx);
                                                                 },
                                                             ))
                                                         })
-                                                        .when(generation_active, |button| {
+                                                        .when(show_stop, |button| {
                                                             button.on_click(cx.listener(
                                                                 |this, _, _, cx| {
                                                                     this.stop_generation(cx)
@@ -423,7 +427,7 @@ impl ComposerView {
                                                         })
                                                         .child(
                                                             icon(
-                                                                if generation_active {
+                                                                if show_stop {
                                                                     "composer-stop"
                                                                 } else if !prompt_is_empty
                                                                     || conversation_started
@@ -435,7 +439,7 @@ impl ComposerView {
                                                                 theme.button_text.into(),
                                                             )
                                                             .size(px(
-                                                                if generation_active
+                                                                if show_stop
                                                                     || !prompt_is_empty
                                                                     || conversation_started
                                                                 {
@@ -643,6 +647,12 @@ impl Render for ComposerView {
         if self.focus_prompt_pending {
             self.prompt_focus_handle(cx).focus(window, cx);
             self.focus_prompt_pending = false;
+        }
+        if self.context_focus_pending {
+            self.context_focus_pending = false;
+            if self.context_menu_open {
+                self.context_focus.focus(window, cx);
+            }
         }
         self.render_composer(
             f32::from(window.viewport_size().width),
