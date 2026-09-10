@@ -6,6 +6,7 @@ mod auto_approval;
 mod backend;
 mod catalog;
 mod codex;
+mod config;
 mod events;
 mod message;
 mod requests;
@@ -34,9 +35,15 @@ pub use backend::{
 pub use catalog::{
     AgentActivePermissionProfile, AgentEffectivePermissions, AgentModel, AgentModelCatalog,
     AgentPermissionMode, AgentPermissionProfile, AgentReasoningEffort, AgentServiceTier,
-    AgentThreadSettings,
+    AgentThreadPermissionResult, AgentThreadPermissionUpdate, AgentThreadSettings,
+    AgentThreadSettingsSnapshot,
 };
 pub use codex::{CodexAppServerBackend, CodexAppServerManager};
+pub use config::{
+    AgentConfigChoiceSet, AgentConfigEdit, AgentConfigError, AgentConfigErrorKind,
+    AgentConfigLayer, AgentConfigReceipt, AgentConfigRequirements, AgentConfigSaveResult,
+    AgentConfigSnapshot, AgentConfigSource, AgentConfigWrite, config_value,
+};
 pub use events::{AgentConnectionEvent, AgentEvent};
 pub use message::normalize_user_message_for_display;
 pub(crate) use message::user_message_context_files;

@@ -13,6 +13,7 @@ use crate::{
 
 impl ChatApp {
     pub(super) fn switch_home_to(&mut self, key: ConversationKey, cx: &mut Context<Self>) {
+        self.cancel_permission_confirmation(cx);
         let Some(host) = self.conversation_hosts.get(&key) else {
             return;
         };

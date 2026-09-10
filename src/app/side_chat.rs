@@ -72,8 +72,7 @@ impl ChatApp {
                         this.image_preview.zoom = 1.0;
                     }
                     SideChatEvent::FullAccess(composer) => {
-                        this.permission_confirmation_target = Some(composer.clone());
-                        this.permission_confirmation_open = true;
+                        this.open_permission_confirmation(composer.clone(), cx);
                     }
                     SideChatEvent::SkipCloseConfirmation(skip) => {
                         this.workspace_store

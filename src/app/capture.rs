@@ -344,7 +344,7 @@ impl ChatApp {
     }
     pub fn open_permission_confirmation_for_capture(&mut self, cx: &mut Context<Self>) {
         self.enable_permission_ui_for_capture(cx);
-        self.permission_confirmation_open = true;
+        self.open_permission_confirmation(self.home.read(cx).composer_entity(), cx);
         cx.notify();
     }
     pub fn open_project_creation_remote_for_capture(&mut self, cx: &mut Context<Self>) {

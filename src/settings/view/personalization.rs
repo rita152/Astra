@@ -211,7 +211,7 @@ impl SettingsView {
                 vec![self.agent_row(
                     personality.title,
                     personality.subtitle,
-                    self.agent_select("亲和", 72.0, theme),
+                    self.config_control("personality", theme, cx),
                     true,
                     theme,
                 )],

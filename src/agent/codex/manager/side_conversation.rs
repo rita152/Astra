@@ -109,6 +109,9 @@ impl CodexAppServerManager {
             {
                 bail!("thread/fork response 与 thread/started 的 id 不一致");
             }
+            if let Some(settings) = super::super::notifications::lifecycle_settings(&response)? {
+                state.thread_settings.insert(id.to_owned(), settings);
+            }
             state.loaded_threads.insert(id.to_owned());
             Ok(id.to_owned())
         })();
@@ -188,6 +191,9 @@ impl CodexAppServerManager {
             thread.closed = true;
             thread.generation
         };
+        if let Ok(mut queues) = self.inner.permission_queues.lock() {
+            queues.remove(id);
+        }
         let connection = self
             .inner
             .state
@@ -201,10 +207,15 @@ impl CodexAppServerManager {
             return Ok(());
         };
         let turns = {
-            let state = connection
+            let mut state = connection
                 .state
                 .lock()
                 .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?;
+            if let Some(waiter) = state.settings_waiters.remove(id) {
+                let _ = waiter
+                    .sender
+                    .try_send(Err("侧边聊天已关闭，权限更新未确认".into()));
+            }
             state
                 .turns
                 .values()

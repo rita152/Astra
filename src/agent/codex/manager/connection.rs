@@ -46,6 +46,7 @@ pub(super) struct PendingThreadLifecycle {
 pub(super) struct ConnectionState {
     pub(super) loaded_threads: HashSet<String>,
     pub(super) pending_thread_lifecycle: Option<PendingThreadLifecycle>,
+    pub(super) permission_probe_threads: VecDeque<String>,
     pub(super) resume_bootstrap_threads: HashSet<String>,
     pub(super) reserved_threads: HashSet<String>,
     pub(super) starting_turns: HashMap<String, Arc<ManagedTurn>>,
@@ -55,7 +56,9 @@ pub(super) struct ConnectionState {
     pub(super) server_request_owners: HashMap<AgentServerRequestId, TurnKey>,
     resolved_server_requests: HashMap<AgentServerRequestId, String>,
     resolved_server_request_order: VecDeque<AgentServerRequestId>,
-    pub(super) settings_waiters: HashMap<String, Vec<Sender<Result<AgentThreadSettings, String>>>>,
+    pub(super) settings_waiters: HashMap<String, super::settings::SettingsWaiter>,
+    pub(super) thread_settings: HashMap<String, AgentThreadSettings>,
+    pub(super) confirmed_settings: HashMap<String, VecDeque<AgentThreadSettings>>,
     pub(super) remote_control_status: Option<Value>,
 }
 
@@ -85,10 +88,9 @@ pub(super) struct Connection {
     pub(super) process: Arc<dyn ManagedProcess>,
     pub(super) next_request_id: AtomicU64,
     pub(super) pending_rpcs: Mutex<HashMap<u64, PendingRpc>>,
-    pub(super) completed_steer_rpcs: Mutex<HashSet<u64>>,
+    pub(super) completed_control_rpcs: Mutex<HashSet<u64>>,
     pub(super) state: Mutex<ConnectionState>,
     pub(super) lifecycle_lock: Mutex<()>,
-    pub(super) settings_lock: Mutex<()>,
     pub(super) failed: AtomicBool,
     pub(super) manager: Weak<ManagerInner>,
 }
@@ -100,7 +102,34 @@ impl Connection {
     }
 
     pub(super) fn request(&self, method: &str, params: Value) -> Result<Value> {
-        self.begin_request(method, params)?
+        let receiver = self.begin_request(method, params)?;
+        if matches!(
+            method,
+            "config/read"
+                | "configRequirements/read"
+                | "config/batchWrite"
+                | "thread/settings/update"
+        ) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match receiver.try_recv() {
+                    Ok(result) => return result.map_err(anyhow::Error::msg),
+                    Err(async_channel::TryRecvError::Closed) => {
+                        bail!("`{method}` 连接在返回前关闭")
+                    }
+                    Err(async_channel::TryRecvError::Empty) => {}
+                }
+                if std::time::Instant::now() >= deadline {
+                    let message = format!(
+                        "`{method}` 等待响应超时，结果未确认；连接已关闭，请重新读取后核对"
+                    );
+                    self.fail_protocol(message.clone());
+                    bail!(message);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        receiver
             .recv_blocking()
             .map_err(|_| anyhow!("`{method}` response channel 在返回前关闭"))?
             .map_err(anyhow::Error::msg)
@@ -161,7 +190,7 @@ impl Connection {
             .remove(&request_id);
         let Some(pending) = pending else {
             if self
-                .completed_steer_rpcs
+                .completed_control_rpcs
                 .lock()
                 .map_err(|_| anyhow!("追加响应注册表锁已损坏"))?
                 .contains(&request_id)
@@ -170,14 +199,25 @@ impl Connection {
             }
             bail!("收到未知或重复的 JSON-RPC response id `{request_id}`");
         };
-        if pending.method == "turn/steer" {
-            self.completed_steer_rpcs
+        if matches!(
+            pending.method.as_str(),
+            "turn/steer" | "thread/settings/update" | "config/batchWrite"
+        ) {
+            self.completed_control_rpcs
                 .lock()
                 .map_err(|_| anyhow!("追加响应注册表锁已损坏"))?
                 .insert(request_id);
         }
         let (result, fatal_error) = match (message.get("result"), message.get("error")) {
             (Some(_), None) => (Ok(message), None),
+            (None, Some(_))
+                if matches!(
+                    pending.method.as_str(),
+                    "config/read" | "configRequirements/read" | "config/batchWrite"
+                ) =>
+            {
+                (Ok(message), None)
+            }
             (None, Some(error)) => (
                 Err(format!(
                     "Codex JSON-RPC `{}` 请求 {request_id} 失败：{error}",
@@ -439,10 +479,8 @@ impl Connection {
         for turn in turns {
             turn.finish(Err(anyhow!(message.to_owned())));
         }
-        for (_, waiters) in settings_waiters {
-            for waiter in waiters {
-                let _ = waiter.send_blocking(Err(message.to_owned()));
-            }
+        for (_, waiter) in settings_waiters {
+            let _ = waiter.sender.try_send(Err(message.to_owned()));
         }
     }
 }

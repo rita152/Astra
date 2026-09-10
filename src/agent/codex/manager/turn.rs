@@ -381,7 +381,7 @@ pub(super) fn build_turn_start_params(
             permissions,
             runtime_workspace_roots: runtime_roots,
         } = super::super::permission_fields(
-            request.permission_mode,
+            request.permission_mode.clone(),
             &request.cwd,
             thread_id,
             false,
@@ -643,6 +643,9 @@ impl CodexAppServerManager {
             drop(state);
             connection.fail_protocol(message.clone());
             bail!(message);
+        }
+        if let Some(settings) = super::super::notifications::lifecycle_settings(&response)? {
+            state.thread_settings.insert(canonical.clone(), settings);
         }
         state.loaded_threads.insert(canonical.clone());
         if thread_id.is_some() && keep_resume_bootstrap {

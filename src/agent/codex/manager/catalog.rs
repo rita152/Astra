@@ -5,20 +5,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, bail};
 use async_channel::Receiver;
 use serde_json::json;
 
 use super::{
-    super::{
-        MODEL_LIST_PAGE_SIZE, ModelListResponse, PermissionProfileListResponse,
-        thread_settings_update_request,
-    },
+    super::{MODEL_LIST_PAGE_SIZE, ModelListResponse},
     CodexAppServerManager,
 };
-use crate::agent::{
-    AgentModel, AgentModelCatalog, AgentPermissionMode, AgentPermissionProfile, AgentThreadSettings,
-};
+use crate::agent::{AgentModel, AgentModelCatalog, AgentPermissionProfile};
 
 impl CodexAppServerManager {
     pub(in crate::agent::codex) fn load_model_catalog(
@@ -101,85 +96,8 @@ impl CodexAppServerManager {
         cwd: &Path,
     ) -> Result<Vec<AgentPermissionProfile>> {
         let connection = self.inner.ensure_connection()?;
-        let response = connection.request(
-            "permissionProfile/list",
-            json!({ "cursor": null, "limit": 100, "cwd": cwd }),
-        )?;
-        let result = response
-            .get("result")
-            .cloned()
-            .context("permissionProfile/list 响应缺少 result")?;
-        let page: PermissionProfileListResponse = match serde_json::from_value(result) {
-            Ok(page) => page,
-            Err(error) => {
-                let message = format!("无法解析 permissionProfile/list 响应：{error}");
-                connection.fail_protocol(message.clone());
-                bail!(message);
-            }
-        };
-        if page.next_cursor.is_some() {
-            bail!("permissionProfile/list 返回了超出 100 项的 profile；当前客户端不应静默截断");
-        }
-        Ok(page
-            .data
-            .into_iter()
-            .map(|profile| AgentPermissionProfile {
-                id: profile.id,
-                allowed: profile.allowed,
-                extends: profile.extends,
-            })
-            .collect())
-    }
-    pub(in crate::agent::codex) fn update_thread_permissions(
-        &self,
-        thread_id: String,
-        cwd: PathBuf,
-        mode: AgentPermissionMode,
-    ) -> Receiver<Result<AgentThreadSettings, String>> {
-        let (sender, receiver) = async_channel::bounded(1);
-        let manager = self.clone();
-        std::thread::spawn(move || {
-            let result = manager
-                .update_thread_permissions_blocking(&thread_id, &cwd, mode)
-                .map_err(|error| format!("{error:#}"));
-            let _ = sender.send_blocking(result);
-        });
-        receiver
-    }
-    pub(super) fn update_thread_permissions_blocking(
-        &self,
-        thread_id: &str,
-        cwd: &Path,
-        mode: AgentPermissionMode,
-    ) -> Result<AgentThreadSettings> {
-        let connection = self.inner.ensure_connection()?;
-        self.ensure_thread_loaded(&connection, Some(thread_id), None, false)?;
-        let _settings_guard = connection
-            .settings_lock
-            .lock()
-            .map_err(|_| anyhow!("Codex thread settings lifecycle 锁已损坏"))?;
-        let params = thread_settings_update_request(0, thread_id, cwd, mode)?
-            .get("params")
-            .cloned()
-            .context("thread/settings/update builder 缺少 params")?;
-        let (sender, receiver) = async_channel::bounded(1);
-        connection
-            .state
-            .lock()
-            .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?
-            .settings_waiters
-            .entry(thread_id.to_owned())
-            .or_default()
-            .push(sender);
-        if let Err(error) = connection.request("thread/settings/update", params) {
-            if let Ok(mut state) = connection.state.lock() {
-                state.settings_waiters.remove(thread_id);
-            }
-            return Err(error);
-        }
-        receiver
-            .recv_blocking()
-            .map_err(|_| anyhow!("thread/settings/updated waiter 在返回前关闭"))?
-            .map_err(anyhow::Error::msg)
+        super::super::catalog::permission_profile_pages(cwd, |params| {
+            connection.request("permissionProfile/list", params)
+        })
     }
 }

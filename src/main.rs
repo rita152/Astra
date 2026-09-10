@@ -1,6 +1,7 @@
 mod agent;
 mod app;
 mod components;
+mod configuration;
 mod conversation;
 mod git_review;
 mod media;
@@ -539,6 +540,9 @@ fn main() {
                 gpui::KeyBinding::new("ctrl-`", app::ToggleTerminal, None),
                 gpui::KeyBinding::new("ctrl-shift-g", app::ToggleReview, None),
                 gpui::KeyBinding::new("cmd-alt-s", app::OpenSideChat, None),
+                gpui::KeyBinding::new("cmd-,", app::OpenSettingsPage, None),
+                gpui::KeyBinding::new("tab", app::NextSettingsControl, Some("Settings")),
+                gpui::KeyBinding::new("shift-tab", app::PreviousSettingsControl, Some("Settings")),
             ]);
             cx.set_window_appearance(Some(match mode {
                 ThemeMode::Light => WindowAppearance::Light,

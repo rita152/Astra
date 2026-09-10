@@ -159,6 +159,12 @@ impl ManagerInner {
                 let thread_id = required_param_string(message, "threadId", method)?;
                 if let Ok(mut state) = connection.state.lock() {
                     state.loaded_threads.remove(&thread_id);
+                    state.thread_settings.remove(&thread_id);
+                    if let Some(waiter) = state.settings_waiters.remove(&thread_id) {
+                        let _ = waiter
+                            .sender
+                            .try_send(Err("线程已关闭，权限更新未确认".into()));
+                    }
                 }
                 self.publish_connection_event(AgentConnectionEvent::ThreadClosed { thread_id });
                 Ok(())
@@ -204,25 +210,55 @@ impl ManagerInner {
                     .and_then(Value::as_str)
                     .context("thread/settings/updated 缺少字符串 params.threadId")?
                     .to_owned();
+                if self
+                    .temporary_threads
+                    .lock()
+                    .map_err(|_| anyhow!("临时聊天状态不可用"))?
+                    .get(&thread_id)
+                    .is_some_and(|thread| {
+                        thread.closed || thread.generation != connection.generation
+                    })
+                {
+                    return Ok(());
+                }
                 let Some(AgentEvent::ThreadSettingsUpdated(settings)) =
                     parse_agent_notification(message)?
                 else {
                     bail!("thread/settings/updated 未映射为 AgentThreadSettings");
                 };
-                if settings.permissions.is_some() {
-                    let waiters = connection
+                {
+                    let mut state = connection
                         .state
                         .lock()
-                        .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?
-                        .settings_waiters
-                        .remove(&thread_id)
-                        .unwrap_or_default();
-                    for waiter in waiters {
-                        let _ = waiter.send_blocking(Ok(settings.clone()));
+                        .map_err(|_| anyhow!("连接状态不可用"))?;
+                    if let Some(waiter) = state.settings_waiters.get_mut(&thread_id) {
+                        if waiter.observed.is_none()
+                            && super::settings::settings_match(&waiter.expected, &settings)
+                        {
+                            waiter.observed = Some(settings.clone());
+                            let _ = waiter.sender.try_send(Ok(settings));
+                        }
+                        // A pending operation is published only after its own RPC
+                        // also succeeds. Mismatched/duplicate receipts stay isolated.
+                        return Ok(());
+                    }
+                    if state
+                        .confirmed_settings
+                        .get(&thread_id)
+                        .is_some_and(|history| history.contains(&settings))
+                    {
+                        return Ok(());
                     }
                 }
+                connection
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("连接状态不可用"))?
+                    .thread_settings
+                    .insert(thread_id.clone(), settings.clone());
                 self.publish_connection_event(AgentConnectionEvent::ThreadSettingsUpdated {
                     thread_id,
+                    generation: connection.generation,
                     settings,
                 });
                 Ok(())
@@ -317,7 +353,9 @@ impl ManagerInner {
             .state
             .lock()
             .map_err(|_| anyhow!("Codex connection state 锁已损坏"))?;
-        if state.loaded_threads.contains(&thread_id) {
+        if state.loaded_threads.contains(&thread_id)
+            || state.permission_probe_threads.contains(&thread_id)
+        {
             return Ok(());
         }
         if let Some(pending) = state.pending_thread_lifecycle.as_mut() {

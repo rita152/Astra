@@ -80,8 +80,7 @@ impl PermissionMode {
 
 /// Opens the native full-access confirmation dialog.
 ///
-/// Permission selection is currently local Composer state; changing the real
-/// app-server policy remains a separate protocol operation.
+/// The original composer remains the target while the confirmation is open.
 pub struct RequestFullAccessConfirmation;
 impl gpui::EventEmitter<RequestFullAccessConfirmation> for ComposerView {}
 
@@ -165,10 +164,21 @@ pub struct ComposerView {
     /// launches enable it by default; visual similarity is no longer a
     /// visibility gate.
     permission_ui_enabled: bool,
+    connection_event_task: Option<gpui::Task<()>>,
     permission_mode: PermissionMode,
     permission_update_cycle: u64,
+    permission_selected_profile: Option<String>,
+    permission_confirmation_selection: Option<AgentPermissionMode>,
+    permission_catalog_cycle: u64,
+    permission_catalog_loading: bool,
+    permission_effective_loading: bool,
+    permission_read_cycle: u64,
+    permission_catalog_error: Option<String>,
+    permission_config: Option<crate::agent::AgentConfigSnapshot>,
+    permission_profiles: Vec<crate::agent::AgentPermissionProfile>,
     permission_menu_focus: FocusHandle,
     permission_menu_focused_item: usize,
+    permission_menu_scroll: gpui::ScrollHandle,
     permission_menu_keyboard_focus: bool,
     permission_menu_open: bool,
     approval_resolved_capture: bool,
@@ -299,17 +309,31 @@ impl ComposerView {
             dictation_state: DictationState::Idle,
             dictation_cycle: 0,
             permission_ui_enabled: true,
-            permission_mode: PermissionMode::Full,
+            connection_event_task: None,
+            permission_mode: PermissionMode::Custom,
             permission_update_cycle: 0,
+            permission_selected_profile: None,
+            permission_confirmation_selection: None,
+            permission_catalog_cycle: 0,
+            permission_catalog_loading: false,
+            permission_effective_loading: false,
+            permission_read_cycle: 0,
+            permission_catalog_error: None,
+            permission_config: None,
+            permission_profiles: Vec::new(),
             permission_menu_focus: cx.focus_handle().tab_stop(true),
             permission_menu_focused_item: 0,
+            permission_menu_scroll: gpui::ScrollHandle::new(),
             permission_menu_keyboard_focus: false,
             permission_menu_open: false,
             approval_resolved_capture: false,
         };
         view.consume_connection_events(connection_events, cx);
         #[cfg(not(test))]
-        view.load_model_catalog(cx);
+        {
+            view.load_model_catalog(cx);
+            view.load_permission_catalog(cx);
+        }
         view
     }
 
@@ -375,8 +399,18 @@ impl ComposerView {
         thread_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        if self.conversation.cwd != cwd || self.conversation.thread_id != thread_id {
+            self.permission_update_cycle = self.permission_update_cycle.wrapping_add(1);
+            self.conversation.permission_change = None;
+            self.permission_confirmation_selection = None;
+        }
+        let changed_cwd = self.conversation.cwd != cwd;
         self.conversation
             .set_workspace_context(cwd, project_id, thread_id);
+        if changed_cwd {
+            self.permission_config = None;
+            self.load_permission_catalog(cx);
+        }
         cx.notify();
     }
 
@@ -394,6 +428,7 @@ impl ComposerView {
 
     pub fn hydrate_history(&mut self, history: ThreadHistory, cx: &mut Context<Self>) {
         self.conversation.hydrate_history(history);
+        self.load_effective_permissions(cx);
         cx.emit(ConversationChanged);
         cx.notify();
     }
@@ -420,6 +455,25 @@ impl ComposerView {
     }
 
     fn apply_connection_event(&mut self, event: AgentConnectionEvent) -> bool {
+        if let AgentConnectionEvent::ThreadSettingsUpdated { generation, .. } = &event
+            && self
+                .permission_config
+                .as_ref()
+                .is_some_and(|config| config.generation > *generation)
+        {
+            return false;
+        }
+        if let AgentConnectionEvent::ThreadSettingsUpdated {
+            thread_id,
+            settings,
+            ..
+        } = &event
+            && self.conversation.thread_id.as_ref() == Some(thread_id)
+            && self.conversation.permission_change.is_none()
+            && let Some(permissions) = &settings.permissions
+        {
+            self.sync_permission_selection(permissions);
+        }
         self.conversation.apply_connection_event(event)
     }
 

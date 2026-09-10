@@ -2,6 +2,7 @@ mod bottom_panel;
 mod capture;
 mod conversations;
 mod image_preview;
+mod permissions;
 mod plan;
 mod project_creation;
 mod render;
@@ -29,7 +30,10 @@ gpui::actions!(
         ToggleTerminal,
         ToggleReview,
         OpenFiles,
-        OpenSideChat
+        OpenSideChat,
+        OpenSettingsPage,
+        NextSettingsControl,
+        PreviousSettingsControl
     ]
 );
 
@@ -83,6 +87,10 @@ pub struct ChatApp {
     right_panel: RightPanelState,
     image_preview: ImagePreviewState,
     permission_confirmation_open: bool,
+    permission_confirmation_focus: gpui::FocusHandle,
+    permission_confirmation_focus_pending: bool,
+    permission_confirmation_choice: usize,
+    permission_confirmation_keyboard: bool,
     permission_confirmation_target: Option<Entity<ComposerView>>,
     project_creation: ProjectCreationState,
 }
@@ -155,7 +163,7 @@ impl ChatApp {
         workspace_store.refresh_all();
         #[cfg(not(test))]
         let workspace_receiver = workspace_store.subscribe();
-        let settings = cx.new(|_| SettingsView::new(mode));
+        let settings = cx.new(|cx| SettingsView::new(mode, agent_backend.clone(), cx));
         let home = cx.new(|cx| HomeView::new_with_backend(mode, agent_backend.clone(), cx));
         let initial_composer = home.read(cx).composer_entity();
         let initial_cwd = std::env::current_dir().unwrap_or_default();
@@ -173,8 +181,7 @@ impl ChatApp {
             },
         );
         cx.subscribe(&sidebar, |this, _, _: &OpenSettings, cx| {
-            this.showing_settings = true;
-            cx.notify();
+            this.open_settings(cx);
         })
         .detach();
         cx.subscribe(&sidebar, |this, _, _: &OpenProjectCreation, cx| {
@@ -191,8 +198,22 @@ impl ChatApp {
         .detach();
         cx.subscribe(&settings, |this, _, _: &CloseSettings, cx| {
             this.showing_settings = false;
+            if let Some(host) = this.conversation_hosts.get(&this.active_conversation) {
+                host.composer
+                    .update(cx, |composer, cx| composer.refresh_draft_defaults(cx));
+            }
             cx.notify();
         })
+        .detach();
+        cx.subscribe(
+            &settings,
+            |this, _, _: &crate::settings::ConfigSaveFinished, cx| {
+                for host in this.conversation_hosts.values() {
+                    host.composer
+                        .update(cx, |composer, cx| composer.refresh_draft_defaults(cx));
+                }
+            },
+        )
         .detach();
         cx.subscribe(&settings, |this, _, event: &ChangeTheme, cx| {
             this.mode = event.0;
@@ -230,9 +251,7 @@ impl ChatApp {
         })
         .detach();
         cx.subscribe(&home, |this, _, _: &RequestFullAccessConfirmation, cx| {
-            this.permission_confirmation_open = true;
-            this.permission_confirmation_target = Some(this.home.read(cx).composer_entity());
-            cx.notify();
+            this.open_permission_confirmation(this.home.read(cx).composer_entity(), cx);
         })
         .detach();
         cx.subscribe(&home, |this, _, _: &ModelCatalogLoadFinished, cx| {
@@ -333,12 +352,23 @@ impl ChatApp {
             right_panel: RightPanelState::new(cx),
             image_preview: ImagePreviewState::new(cx),
             permission_confirmation_open: false,
+            permission_confirmation_focus: cx.focus_handle(),
+            permission_confirmation_focus_pending: false,
+            permission_confirmation_choice: 0,
+            permission_confirmation_keyboard: false,
             permission_confirmation_target: None,
             project_creation: ProjectCreationState::new(cx),
         }
     }
 
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        let cwd = self
+            .conversation_hosts
+            .get(&self.active_conversation)
+            .map(|host| host.cwd.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        self.settings
+            .update(cx, |settings, cx| settings.set_config_context(cwd, cx));
         self.showing_settings = true;
         cx.notify();
     }

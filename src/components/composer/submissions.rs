@@ -16,7 +16,11 @@ impl ComposerView {
                     || (!s.initial && s.item_id.is_none())
             })
             .count();
-        ((count + usize::from(self.submission_error.is_some())) as f32 * 32.0).min(128.0)
+        ((count
+            + usize::from(self.submission_error.is_some())
+            + usize::from(self.conversation.permission_error.is_some())) as f32
+            * 32.0)
+            .min(128.0)
     }
     pub(super) fn submission_feedback(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
         let mut view = div()
@@ -29,6 +33,18 @@ impl ComposerView {
             .gap(px(0.0))
             .text_size(px(14.0))
             .text_color(theme.text);
+        if let Some(error) = &self.conversation.permission_error {
+            view = view.child(
+                div()
+                    .id("permission-update-error")
+                    .role(gpui::Role::Alert)
+                    .px(px(10.))
+                    .min_h(px(32.))
+                    .text_size(px(12.))
+                    .text_color(theme.warning)
+                    .child(error.clone()),
+            );
+        }
         if let Some(error) = &self.submission_error {
             view = view.child(
                 div()

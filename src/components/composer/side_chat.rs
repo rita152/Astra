@@ -14,6 +14,7 @@ pub(crate) struct SideChatConfiguration {
     pub request: SideConversationRequest,
     models: Vec<AgentModel>,
     permission_mode: PermissionMode,
+    permission_profile: Option<String>,
     permissions: Option<AgentEffectivePermissions>,
 }
 
@@ -31,6 +32,7 @@ impl ComposerView {
             },
             models: self.conversation.models.clone(),
             permission_mode: self.permission_mode,
+            permission_profile: self.permission_selected_profile.clone(),
             permissions: self.conversation.effective_permissions.clone(),
         })
     }
@@ -52,6 +54,7 @@ impl ComposerView {
         view.conversation.selected_effort = config.request.effort.unwrap_or_default();
         view.conversation.selected_service_tier = config.request.service_tier;
         view.permission_mode = config.permission_mode;
+        view.permission_selected_profile = config.permission_profile;
         view.conversation.effective_permissions = config.permissions;
         view.conversation.slider_index = view
             .selected_model_entry()
@@ -68,6 +71,7 @@ impl ComposerView {
     pub(crate) fn set_side_thread(&mut self, id: String, cx: &mut Context<Self>) {
         self.conversation.thread_id = Some(id);
         self.side_ready = true;
+        self.load_permission_catalog(cx);
         cx.notify();
     }
 
@@ -96,6 +100,8 @@ impl ComposerView {
 
     pub(crate) fn close_side_chat(&mut self, cx: &mut Context<Self>) {
         self.side_ready = false;
+        self.permission_update_cycle = self.permission_update_cycle.wrapping_add(1);
+        self.conversation.permission_change = None;
         self.stop_generation(cx);
     }
 

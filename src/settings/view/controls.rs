@@ -9,6 +9,38 @@ use crate::{
 };
 
 impl SettingsView {
+    pub(super) fn agent_select(
+        &self,
+        label: &'static str,
+        width: f32,
+        theme: Theme,
+    ) -> gpui::AnyElement {
+        div()
+            .w(px(width))
+            .h(px(28.0))
+            .flex_none()
+            .px(px(12.0))
+            .rounded(px(12.5))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.settings_control)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(6.0))
+            .text_size(px(14.0))
+            .line_height(px(18.0))
+            .whitespace_nowrap()
+            .child(label)
+            .child(
+                svg()
+                    .path("icons/chevron-down.svg")
+                    .size(px(16.0))
+                    .text_color(theme.text_tertiary),
+            )
+            .into_any_element()
+    }
+
     pub(super) fn switch_control(
         &self,
         checked: bool,

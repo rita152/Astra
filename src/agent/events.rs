@@ -36,6 +36,7 @@ pub enum AgentConnectionEvent {
     ThreadStatusChanged(AgentThreadStatus),
     ThreadSettingsUpdated {
         thread_id: String,
+        generation: u64,
         settings: AgentThreadSettings,
     },
     ProjectChanged {

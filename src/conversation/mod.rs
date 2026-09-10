@@ -1,5 +1,8 @@
 //! Conversation state and event processing, independent of GPUI entities.
 
+mod permissions;
+pub(crate) use permissions::PermissionChange;
+
 mod activity;
 mod auto_approval;
 mod events;

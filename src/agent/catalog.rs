@@ -33,12 +33,13 @@ pub struct AgentModelCatalog {
     pub models: Vec<AgentModel>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentPermissionMode {
     Request,
     Assist,
     Full,
     Custom,
+    Profile(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,16 +50,16 @@ pub struct AgentActivePermissionProfile {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentEffectivePermissions {
-    pub approval_policy: String,
+    pub approval_policy: Value,
     pub approvals_reviewer: String,
     pub sandbox_policy: Option<Value>,
     pub active_permission_profile: Option<AgentActivePermissionProfile>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct AgentPermissionProfile {
     pub id: String,
+    pub description: Option<String>,
     pub allowed: bool,
     pub extends: Option<String>,
 }
@@ -70,4 +71,29 @@ pub struct AgentThreadSettings {
     pub service_tier: Option<String>,
     pub cwd: String,
     pub permissions: Option<AgentEffectivePermissions>,
+}
+
+/// A permission mutation is scoped to the original view operation and connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentThreadPermissionUpdate {
+    pub thread_id: String,
+    pub cwd: std::path::PathBuf,
+    pub mode: AgentPermissionMode,
+    pub expected_generation: Option<u64>,
+    pub operation_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentThreadPermissionResult {
+    pub thread_id: String,
+    pub generation: u64,
+    pub operation_id: u64,
+    pub settings: AgentThreadSettings,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentThreadSettingsSnapshot {
+    pub thread_id: String,
+    pub generation: u64,
+    pub settings: AgentThreadSettings,
 }

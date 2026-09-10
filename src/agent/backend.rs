@@ -5,9 +5,7 @@ use std::{collections::BTreeSet, fmt, path::PathBuf, sync::Arc};
 use async_channel::Receiver;
 
 use super::{
-    catalog::{
-        AgentModelCatalog, AgentPermissionMode, AgentPermissionProfile, AgentThreadSettings,
-    },
+    catalog::{AgentModelCatalog, AgentPermissionMode, AgentPermissionProfile},
     events::{AgentConnectionEvent, AgentEvent},
     thread::{
         CreateProject, HistoryItemDetail, Page, PageRequest, Project, ProjectId,
@@ -227,17 +225,44 @@ pub trait AgentBackend: Send + Sync {
     }
     #[cfg_attr(test, allow(dead_code))]
     fn load_model_catalog(&self) -> Receiver<Result<AgentModelCatalog, String>>;
-    #[allow(dead_code)]
     fn load_permission_profiles(
         &self,
         cwd: PathBuf,
     ) -> Receiver<Result<Vec<AgentPermissionProfile>, String>>;
     fn update_thread_permissions(
         &self,
-        thread_id: String,
-        cwd: PathBuf,
-        mode: AgentPermissionMode,
-    ) -> Receiver<Result<AgentThreadSettings, String>>;
+        request: super::AgentThreadPermissionUpdate,
+    ) -> Receiver<Result<super::AgentThreadPermissionResult, String>>;
+
+    fn load_thread_settings(
+        &self,
+        _thread_id: String,
+        _generation: u64,
+    ) -> Receiver<Result<super::AgentThreadSettingsSnapshot, String>> {
+        let (sender, receiver) = async_channel::bounded(1);
+        let _ = sender.try_send(Err("此后端不支持读取线程设置".into()));
+        receiver
+    }
+
+    fn config_choices(&self) -> Vec<super::AgentConfigChoiceSet> {
+        Vec::new()
+    }
+    fn read_config(
+        &self,
+        _cwd: PathBuf,
+    ) -> Receiver<Result<super::AgentConfigSnapshot, super::AgentConfigError>> {
+        let (sender, receiver) = async_channel::bounded(1);
+        let _ = sender.try_send(Err(super::AgentConfigError::unavailable()));
+        receiver
+    }
+    fn write_config(
+        &self,
+        _write: super::AgentConfigWrite,
+    ) -> Receiver<Result<super::AgentConfigSaveResult, super::AgentConfigError>> {
+        let (sender, receiver) = async_channel::bounded(1);
+        let _ = sender.try_send(Err(super::AgentConfigError::unavailable()));
+        receiver
+    }
 
     fn list_projects(&self, _page: PageRequest) -> Receiver<WorkspaceResult<Page<Project>>> {
         unsupported_receiver(AgentCapability::ProjectList)

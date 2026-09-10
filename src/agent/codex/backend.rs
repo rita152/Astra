@@ -7,12 +7,11 @@ use async_channel::Receiver;
 
 use super::manager::CodexAppServerManager;
 use crate::agent::{
-    AgentBackend, AgentConnectionEvent, AgentModelCatalog, AgentPermissionMode,
-    AgentPermissionProfile, AgentRequest, AgentRun, AgentThreadSettings, CreateProject,
-    HistoryItemDetail, Page, PageRequest, Project, ProjectId, SideConversationRequest,
-    ThreadHistoryItemEntry, ThreadId, ThreadListRequest, ThreadMetadataUpdate, ThreadSearchResult,
-    ThreadSection, ThreadSectionAppearance, ThreadSectionId, ThreadSummary, ThreadTurn,
-    UpdateProject, WorkspaceResult,
+    AgentBackend, AgentConnectionEvent, AgentModelCatalog, AgentPermissionProfile, AgentRequest,
+    AgentRun, CreateProject, HistoryItemDetail, Page, PageRequest, Project, ProjectId,
+    SideConversationRequest, ThreadHistoryItemEntry, ThreadId, ThreadListRequest,
+    ThreadMetadataUpdate, ThreadSearchResult, ThreadSection, ThreadSectionAppearance,
+    ThreadSectionId, ThreadSummary, ThreadTurn, UpdateProject, WorkspaceResult,
 };
 
 /// Codex CLI adapter. JSON-RPC details intentionally stay inside this module.
@@ -72,11 +71,33 @@ impl AgentBackend for CodexAppServerBackend {
 
     fn update_thread_permissions(
         &self,
+        request: crate::agent::AgentThreadPermissionUpdate,
+    ) -> Receiver<Result<crate::agent::AgentThreadPermissionResult, String>> {
+        self.manager.update_thread_permissions(request)
+    }
+
+    fn load_thread_settings(
+        &self,
         thread_id: String,
+        generation: u64,
+    ) -> Receiver<Result<crate::agent::AgentThreadSettingsSnapshot, String>> {
+        self.manager.load_thread_settings(thread_id, generation)
+    }
+
+    fn config_choices(&self) -> Vec<crate::agent::AgentConfigChoiceSet> {
+        super::config::config_choices()
+    }
+    fn read_config(
+        &self,
         cwd: PathBuf,
-        mode: AgentPermissionMode,
-    ) -> Receiver<Result<AgentThreadSettings, String>> {
-        self.manager.update_thread_permissions(thread_id, cwd, mode)
+    ) -> Receiver<Result<crate::agent::AgentConfigSnapshot, crate::agent::AgentConfigError>> {
+        self.manager.read_config(cwd)
+    }
+    fn write_config(
+        &self,
+        write: crate::agent::AgentConfigWrite,
+    ) -> Receiver<Result<crate::agent::AgentConfigSaveResult, crate::agent::AgentConfigError>> {
+        self.manager.write_config(write)
     }
 
     fn list_projects(&self, page: PageRequest) -> Receiver<WorkspaceResult<Page<Project>>> {

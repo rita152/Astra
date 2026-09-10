@@ -1,10 +1,12 @@
 //! Application-owned connection generations, startup, and shutdown.
 
 mod catalog;
+mod config;
 mod connection;
 mod dispatch;
 mod events;
 mod protocol;
+mod settings;
 mod side_conversation;
 mod steer;
 mod transport;
@@ -46,6 +48,8 @@ struct ManagerInner {
     shutdown_once: AtomicBool,
     // Retain retired identities until app exit so an expired in-memory thread
     // can never accidentally fall through to disk-based thread/resume.
+    permission_queues:
+        Mutex<HashMap<String, async_channel::Sender<settings::QueuedPermissionUpdate>>>,
     temporary_threads: Mutex<HashMap<String, side_conversation::TemporaryThread>>,
 }
 
@@ -137,10 +141,9 @@ impl ManagerInner {
             process: spawned.process,
             next_request_id: AtomicU64::new(1),
             pending_rpcs: Mutex::new(HashMap::new()),
-            completed_steer_rpcs: Mutex::new(Default::default()),
+            completed_control_rpcs: Mutex::new(Default::default()),
             state: Mutex::new(ConnectionState::default()),
             lifecycle_lock: Mutex::new(()),
-            settings_lock: Mutex::new(()),
             failed: AtomicBool::new(false),
             manager: Arc::downgrade(self),
         });
@@ -174,7 +177,8 @@ impl ManagerInner {
                 },
                 "capabilities": {
                     "experimentalApi": true,
-                    "requestAttestation": false
+                    "requestAttestation": false,
+                    "optOutNotificationMethods": super::methods::UNRENDERED_NOTIFICATIONS
                 }
             }),
         ) {
@@ -213,6 +217,9 @@ impl ManagerInner {
             None => message,
         };
         connection.fail_all(&message);
+        if let Ok(mut hub) = self.connection_events.lock() {
+            hub.snapshots.retain(|_,event| !matches!(event,AgentConnectionEvent::ThreadSettingsUpdated {generation:old,..} if *old==generation));
+        }
         let closed_temporary = self
             .temporary_threads
             .lock()
@@ -265,6 +272,9 @@ impl ManagerInner {
                 .map(|connection| connection.generation)
         };
         self.connection_ready.notify_all();
+        if let Ok(mut queues) = self.permission_queues.lock() {
+            queues.clear();
+        }
         if let Some(generation) = generation {
             self.fail_generation(
                 generation,
@@ -316,6 +326,7 @@ impl CodexAppServerManager {
                 connection_ready: Condvar::new(),
                 connection_events: Mutex::new(ConnectionEventHub::default()),
                 shutdown_once: AtomicBool::new(false),
+                permission_queues: Mutex::new(HashMap::new()),
                 temporary_threads: Mutex::new(HashMap::new()),
             }),
         }

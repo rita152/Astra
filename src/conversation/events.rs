@@ -271,9 +271,14 @@ impl ConversationState {
                         self.permission_error = None;
                     }
                     self.selected_model = settings.model.clone();
-                    if let Some(effort) = &settings.effort {
-                        self.selected_effort = effort.clone();
-                    }
+                    self.selected_effort = settings
+                        .effort
+                        .clone()
+                        .or_else(|| {
+                            self.selected_model_entry()
+                                .map(|model| model.default_reasoning_effort.clone())
+                        })
+                        .unwrap_or_default();
                     self.selected_service_tier = settings.service_tier.clone();
                     self.slider_index = self
                         .selected_model_entry()

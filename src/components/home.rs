@@ -659,11 +659,6 @@ impl HomeView {
         });
     }
 
-    pub fn confirm_full_access(&mut self, cx: &mut Context<Self>) {
-        self.composer
-            .update(cx, |composer, cx| composer.confirm_full_access(cx));
-    }
-
     pub fn open_permission_menu_for_capture(&mut self, cx: &mut Context<Self>) {
         self.composer.update(cx, |composer, cx| {
             composer.open_permission_menu_for_capture(cx)

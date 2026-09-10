@@ -6,6 +6,7 @@ mod approvals;
 mod auto_approval;
 mod backend;
 mod catalog;
+mod config;
 mod dispatch;
 mod input;
 mod items;
@@ -28,7 +29,7 @@ mod test_support;
 mod tests;
 
 pub use backend::CodexAppServerBackend;
-use catalog::{MODEL_LIST_PAGE_SIZE, ModelListResponse, PermissionProfileListResponse};
+use catalog::{MODEL_LIST_PAGE_SIZE, ModelListResponse};
 use dispatch::process_turn_message;
 use items::{
     materialize_image_generation_result, parse_collaboration, parse_command_execution,

@@ -12,7 +12,7 @@ use async_channel::Sender;
 use serde_json::{Value, json};
 
 use super::{
-    catalog::{MODEL_LIST_PAGE_SIZE, ModelListResponse, PermissionProfileListResponse},
+    catalog::{MODEL_LIST_PAGE_SIZE, ModelListResponse},
     dispatch::process_turn_message,
     methods::{
         TURN_SCOPED_SERVER_METHODS, ensure_server_method_is_defined,
@@ -169,7 +169,8 @@ pub(super) fn initialize_connection<R: BufRead, W: Write>(
                 },
                 "capabilities": {
                     "experimentalApi": true,
-                    "requestAttestation": false
+                    "requestAttestation": false,
+                    "optOutNotificationMethods": super::methods::UNRENDERED_NOTIFICATIONS
                 }
             }
         }),
@@ -195,7 +196,8 @@ pub(super) fn initialize_turn_connection<R: BufRead, W: Write + Send + 'static>(
             },
             "capabilities": {
                 "experimentalApi": true,
-                "requestAttestation": false
+                "requestAttestation": false,
+                    "optOutNotificationMethods": super::methods::UNRENDERED_NOTIFICATIONS
             }
         }
     }))?;
@@ -266,34 +268,16 @@ pub(super) fn drive_permission_profiles<R: BufRead, W: Write>(
     cwd: &Path,
 ) -> Result<Vec<AgentPermissionProfile>> {
     initialize_connection(reader, writer, None)?;
-    send(
-        writer,
-        json!({
-            "method": "permissionProfile/list",
-            "id": PERMISSION_PROFILE_LIST_ID,
-            "params": { "cursor": null, "limit": 100, "cwd": cwd }
-        }),
-    )?;
-    let response = wait_for_response(reader, writer, PERMISSION_PROFILE_LIST_ID, None)?;
-    let page: PermissionProfileListResponse = serde_json::from_value(
-        response
-            .get("result")
-            .cloned()
-            .context("permissionProfile/list 响应缺少 result")?,
-    )
-    .context("无法解析 permissionProfile/list 响应")?;
-    if page.next_cursor.is_some() {
-        bail!("permissionProfile/list 返回了超出 100 项的 profile；当前客户端不应静默截断");
-    }
-    Ok(page
-        .data
-        .into_iter()
-        .map(|profile| AgentPermissionProfile {
-            id: profile.id,
-            allowed: profile.allowed,
-            extends: profile.extends,
-        })
-        .collect())
+    let mut id = PERMISSION_PROFILE_LIST_ID;
+    super::catalog::permission_profile_pages(cwd, |params| {
+        let request_id = id;
+        id += 1;
+        send(
+            writer,
+            json!({"method":"permissionProfile/list","id":request_id,"params":params}),
+        )?;
+        wait_for_response(reader, writer, request_id, None)
+    })
 }
 
 #[cfg(test)]
@@ -441,7 +425,12 @@ pub(super) fn drive_session<R: BufRead, W: Write + Send + 'static>(
             sandbox_policy,
             permissions,
             runtime_workspace_roots: runtime_roots,
-        } = permission_fields(request.permission_mode, &request.cwd, &thread_id, false)?;
+        } = permission_fields(
+            request.permission_mode.clone(),
+            &request.cwd,
+            &thread_id,
+            false,
+        )?;
         turn_params.insert("approvalPolicy".into(), json!(approval_policy));
         turn_params.insert("approvalsReviewer".into(), json!(approvals_reviewer));
         turn_params.insert("sandboxPolicy".into(), json!(sandbox_policy));

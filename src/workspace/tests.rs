@@ -6,10 +6,9 @@ use std::{
 
 use super::*;
 use crate::agent::{
-    AgentCapability, AgentEvent, AgentModelCatalog, AgentPermissionMode, AgentPermissionProfile,
-    AgentRequest, AgentRun, AgentThreadSettings, CommandExecutionStatus, HistoryItemDetail,
-    HistoryTurnStatus, Page, PageRequest, ThreadHistoryItem, ThreadHistoryItemEntry, ThreadSection,
-    ThreadTurn,
+    AgentCapability, AgentEvent, AgentModelCatalog, AgentPermissionProfile, AgentRequest, AgentRun,
+    CommandExecutionStatus, HistoryItemDetail, HistoryTurnStatus, Page, PageRequest,
+    ThreadHistoryItem, ThreadHistoryItemEntry, ThreadSection, ThreadTurn,
 };
 
 fn response<T: Send + 'static>(value: T) -> Receiver<T> {
@@ -105,10 +104,8 @@ impl AgentBackend for DelayedThreadListBackend {
 
     fn update_thread_permissions(
         &self,
-        _thread_id: String,
-        _cwd: PathBuf,
-        _mode: AgentPermissionMode,
-    ) -> Receiver<Result<AgentThreadSettings, String>> {
+        _request: crate::agent::AgentThreadPermissionUpdate,
+    ) -> Receiver<Result<crate::agent::AgentThreadPermissionResult, String>> {
         response(Err("not used".to_owned()))
     }
 
@@ -190,10 +187,8 @@ impl AgentBackend for FakeWorkspaceBackend {
 
     fn update_thread_permissions(
         &self,
-        _thread_id: String,
-        _cwd: PathBuf,
-        _mode: AgentPermissionMode,
-    ) -> Receiver<Result<AgentThreadSettings, String>> {
+        _request: crate::agent::AgentThreadPermissionUpdate,
+    ) -> Receiver<Result<crate::agent::AgentThreadPermissionResult, String>> {
         response(Err("not used".to_owned()))
     }
 

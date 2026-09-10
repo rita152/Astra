@@ -53,10 +53,39 @@ impl SettingsView {
         };
         div()
             .id(slug)
+            .role(gpui::Role::Button)
+            .aria_label(item.label)
+            .aria_selected(selected)
+            .focusable()
+            .tab_stop(true)
+            .on_key_down(
+                cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                    match event.keystroke.key.as_str() {
+                        "enter" | "space" => {
+                            this.select(slug, cx);
+                            cx.stop_propagation();
+                        }
+                        "up" => {
+                            window.focus_prev(cx);
+                            cx.stop_propagation();
+                        }
+                        "down" => {
+                            window.focus_next(cx);
+                            cx.stop_propagation();
+                        }
+                        _ => cx.propagate(),
+                    }
+                }),
+            )
             .h(px(29.0))
             .flex_none()
             .px(px(8.0))
             .rounded(px(12.5))
+            .focus_visible(move |style| {
+                style.bg(theme.sidebar_hover).shadow(vec![
+                    gpui::BoxShadow::new(px(0.), px(0.), theme.accent.into()).spread_radius(px(2.)),
+                ])
+            })
             .flex()
             .items_center()
             .gap(px(8.0))

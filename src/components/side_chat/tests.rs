@@ -1,7 +1,7 @@
 use super::*;
 use crate::agent::{
-    AgentConnectionEvent, AgentModelCatalog, AgentPermissionMode, AgentPermissionProfile,
-    AgentRequest, AgentRun, AgentThreadSettings, SideConversationRequest, WorkspaceResult,
+    AgentConnectionEvent, AgentModelCatalog, AgentPermissionProfile, AgentRequest, AgentRun,
+    SideConversationRequest, WorkspaceResult,
 };
 use gpui::prelude::*;
 use std::sync::Mutex;
@@ -34,10 +34,8 @@ impl AgentBackend for Backend {
     }
     fn update_thread_permissions(
         &self,
-        _: String,
-        _: PathBuf,
-        _: AgentPermissionMode,
-    ) -> async_channel::Receiver<Result<AgentThreadSettings, String>> {
+        _request: crate::agent::AgentThreadPermissionUpdate,
+    ) -> async_channel::Receiver<Result<crate::agent::AgentThreadPermissionResult, String>> {
         async_channel::bounded(1).1
     }
     fn run_prompt(&self, _: AgentRequest) -> AgentRun {

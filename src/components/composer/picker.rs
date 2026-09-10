@@ -22,7 +22,10 @@ use crate::{
 
 impl ComposerView {
     pub(super) fn apply_model_catalog(&mut self, catalog: AgentModelCatalog) {
-        self.conversation.apply_model_catalog(catalog)
+        self.conversation.apply_model_catalog(catalog);
+        if let Some(config) = &self.permission_config {
+            self.conversation.apply_config_defaults(config);
+        }
     }
     pub(super) fn apply_model_selection(
         &mut self,
@@ -31,6 +34,7 @@ impl ComposerView {
         preferred_service_tier: Option<String>,
         preserve_standard_tier: bool,
     ) {
+        self.conversation.model_user_selected = true;
         self.conversation.apply_model_selection(
             index,
             preferred_effort,
@@ -49,6 +53,7 @@ impl ComposerView {
         else {
             return;
         };
+        self.conversation.model_user_selected = true;
         self.conversation.selected_effort = effort;
         self.conversation.slider_index = index;
         self.conversation.actual_model = None;
@@ -56,6 +61,7 @@ impl ComposerView {
         self.conversation.safety_buffering = false;
     }
     pub(super) fn select_service_tier_at(&mut self, index: usize) {
+        self.conversation.model_user_selected = true;
         self.conversation.selected_service_tier = if index == 0 {
             None
         } else {
@@ -105,10 +111,11 @@ impl ComposerView {
         (effort == "ultra").then_some("更快消耗使用额度")
     }
     pub(super) fn selected_effort_label(&self) -> String {
-        if self.conversation.selected_effort.is_empty() {
+        let effort = self.request_effort();
+        if effort.is_empty() {
             "—".to_owned()
         } else {
-            Self::effort_label(&self.conversation.selected_effort).to_owned()
+            Self::effort_label(&effort).to_owned()
         }
     }
     pub(super) fn selected_service_tier_label(&self) -> String {

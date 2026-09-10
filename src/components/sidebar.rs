@@ -2389,9 +2389,8 @@ mod tests {
     use crate::{
         agent::{
             AgentBackend, AgentCapabilities, AgentCapability, AgentConnectionEvent, AgentEvent,
-            AgentModelCatalog, AgentPermissionMode, AgentPermissionProfile, AgentRequest, AgentRun,
-            AgentThreadSettings, Page, PageRequest, Project, ThreadActivity, ThreadListRequest,
-            ThreadSummary, WorkspaceResult,
+            AgentModelCatalog, AgentPermissionProfile, AgentRequest, AgentRun, Page, PageRequest,
+            Project, ThreadActivity, ThreadListRequest, ThreadSummary, WorkspaceResult,
         },
         theme::ThemeMode,
         workspace::WorkspaceStore,
@@ -2444,10 +2443,8 @@ mod tests {
 
         fn update_thread_permissions(
             &self,
-            _thread_id: String,
-            _cwd: PathBuf,
-            _mode: AgentPermissionMode,
-        ) -> Receiver<Result<AgentThreadSettings, String>> {
+            _request: crate::agent::AgentThreadPermissionUpdate,
+        ) -> Receiver<Result<crate::agent::AgentThreadPermissionResult, String>> {
             response(Err("not used".to_owned()))
         }
 

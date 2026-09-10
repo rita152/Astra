@@ -244,3 +244,41 @@ fn side_conversation_file_context_and_planning_use_typed_turn_input() {
     let params = super::super::turn::build_turn_start_params(&request, "side", false).unwrap();
     assert_eq!(params["collaborationMode"]["mode"], "default");
 }
+
+#[test]
+fn closing_side_chat_cancels_permission_confirmation_and_rejects_queued_changes() {
+    let (manager, spawner) = manager_with_fake();
+    let opened = manager.open_side_conversation(side_request());
+    let mut endpoint = spawner.next_endpoint();
+    handshake(&mut endpoint);
+    accept_fork(&mut endpoint, "side-permission");
+    accept_boundary(&mut endpoint, "side-permission");
+    wait_value(&opened).unwrap();
+    let update = crate::agent::AgentThreadPermissionUpdate {
+        thread_id: "side-permission".into(),
+        cwd: "/tmp/project".into(),
+        mode: AgentPermissionMode::Profile(":workspace".into()),
+        expected_generation: Some(1),
+        operation_id: 42,
+    };
+    let pending = manager.update_thread_permissions(update.clone());
+    let profiles = endpoint.recv();
+    assert_eq!(profiles["method"], "permissionProfile/list");
+    endpoint.respond(
+        &profiles,
+        json!({"data":[{"id":":workspace","allowed":true}]}),
+    );
+    let settings = endpoint.recv();
+    assert_eq!(settings["method"], "thread/settings/update");
+    let closed = manager.close_side_conversation("side-permission".into());
+    let close = endpoint.recv();
+    assert_eq!(close["method"], "thread/unsubscribe");
+    endpoint.respond(&close, json!({"status":"unsubscribed"}));
+    wait_value(&closed).unwrap();
+    endpoint.respond(&settings, json!({}));
+    assert!(wait_value(&pending).is_err());
+    let stale = manager.update_thread_permissions(update);
+    assert!(wait_value(&stale).unwrap_err().contains("连接已结束"));
+    assert!(endpoint.from_client.try_recv().is_err());
+    manager.shutdown();
+}

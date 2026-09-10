@@ -4,6 +4,41 @@ use super::state::ConversationState;
 use crate::agent::{AgentModel, AgentModelCatalog};
 
 impl ConversationState {
+    pub(crate) fn apply_config_defaults(&mut self, config: &crate::agent::AgentConfigSnapshot) {
+        if self.thread_id.is_some() || self.model_user_selected || self.user_message.is_some() {
+            return;
+        }
+        let requirements = config.requirements.as_ref();
+        let string = |key: &str| {
+            requirements
+                .and_then(|requirements| requirements.enforced.get(key))
+                .filter(|value| !value.is_null())
+                .or_else(|| config.effective.get(key))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        if let Some(model) = string("model") {
+            self.selected_model = model;
+        }
+        if let Some(effort) = string("model_reasoning_effort") {
+            self.selected_effort = effort;
+        }
+        self.selected_service_tier = string("service_tier");
+        self.plan_default_effort = config
+            .effective
+            .get("plan_mode_reasoning_effort")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        if let Some(index) = self.selected_model_entry().and_then(|model| {
+            model
+                .supported_reasoning_efforts
+                .iter()
+                .position(|effort| effort.id == self.selected_effort)
+        }) {
+            self.slider_index = index;
+        }
+    }
+
     pub(crate) fn apply_model_catalog(&mut self, catalog: AgentModelCatalog) {
         let previous_model = self.selected_model.clone();
         let previous_effort = self.selected_effort.clone();
@@ -105,5 +140,39 @@ impl ConversationState {
             .find(|model| model.model == model_name || model.id == model_name)
             .map(|model| model.display_name.as_str())
             .unwrap_or(model_name)
+    }
+}
+
+#[cfg(test)]
+mod config_default_tests {
+    use super::*;
+    #[test]
+    fn session_static_defaults_apply_to_new_untouched_drafts_only() {
+        let mut state = ConversationState::default();
+        let mut config = crate::agent::AgentConfigSnapshot {
+            generation: 1,
+            cwd: "/work".into(),
+            effective: serde_json::json!({"model":"model-a","model_reasoning_effort":"ultra","plan_mode_reasoning_effort":"max","service_tier":"priority"}),
+            origins: Default::default(),
+            layers: None,
+            requirements: None,
+            value_aliases: Default::default(),
+            value_defaults: Default::default(),
+            profile_parents: Default::default(),
+            required_fields: Default::default(),
+        };
+        state.apply_config_defaults(&config);
+        assert_eq!(state.selected_model, "model-a");
+        assert_eq!(state.selected_effort, "ultra");
+        assert_eq!(state.plan_default_effort.as_deref(), Some("max"));
+        assert_eq!(state.selected_service_tier.as_deref(), Some("priority"));
+        state.thread_id = Some("existing".into());
+        config.effective["model"] = serde_json::json!("model-b");
+        state.apply_config_defaults(&config);
+        assert_eq!(state.selected_model, "model-a");
+        state.thread_id = None;
+        state.model_user_selected = true;
+        state.apply_config_defaults(&config);
+        assert_eq!(state.selected_model, "model-a");
     }
 }

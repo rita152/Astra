@@ -170,13 +170,21 @@ pub(super) fn permission_risk_row(
                 .flex_col()
                 .text_size(px(13.0))
                 .line_height(px(18.0))
-                .child(div().text_color(theme.text).child(title))
+                .child(div().text_color(theme.markdown_text).child(title))
                 .child(div().text_color(theme.text_tertiary).child(detail)),
         )
 }
 
 impl Render for ChatApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.permission_confirmation_focus_pending {
+            if self.permission_confirmation_open {
+                self.permission_confirmation_focus.focus(window, cx);
+            } else {
+                self.root_focus.focus(window, cx);
+            }
+            self.permission_confirmation_focus_pending = false;
+        }
         let review_overlay =
             if self.right_panel.open && self.right_panel.mode == Some(RightPanelMode::Review) {
                 self.review_panels
@@ -297,6 +305,9 @@ impl Render for ChatApp {
             })
             .size_full()
             .track_focus(&self.root_focus)
+            .key_context(if self.showing_settings {"Settings"} else {"ChatApp"})
+            .on_action(cx.listener(|this,_:&super::NextSettingsControl,window,cx|{this.settings.update(cx,|settings,cx|settings.advance_focus(false,window,cx));cx.stop_propagation();}))
+            .on_action(cx.listener(|this,_:&super::PreviousSettingsControl,window,cx|{this.settings.update(cx,|settings,cx|settings.advance_focus(true,window,cx));cx.stop_propagation();}))
             .relative()
             .flex()
             .font(ui_font())
@@ -345,11 +356,20 @@ impl Render for ChatApp {
                 cx.stop_propagation();
             }))
             .on_key_down(cx.listener(Self::handle_project_creation_key))
+            .on_action(cx.listener(|this,_:&super::OpenSettingsPage,_,cx|{this.open_settings(cx);cx.stop_propagation();}))
             .on_action(cx.listener(|_,_:&super::CaptureFrame,_window,_cx| {
                 #[cfg(feature = "screenshot")]
                 if let Ok(path) = std::env::var("GPUI_CAPTURE_OUTPUT") { crate::capture_frame(_window,path,3); }
             }))
             .on_action(cx.listener(|this, _: &DismissPermissionUi, window, cx| {
+                if this.showing_settings {
+                    this.settings.update(cx, |settings, cx| settings.dismiss_transient(window, cx));
+                    cx.stop_propagation(); return;
+                }
+                if this.permission_confirmation_open {
+                    this.resolve_permission_confirmation(false, window, cx);
+                    cx.stop_propagation(); return;
+                }
                 if this.right_panel.open && this.right_panel.mode == Some(RightPanelMode::SideChat)
                     && let Some(panel) = this.side_chat_panels.get(&this.active_conversation)
                     && panel.update(cx, |panel, cx| panel.dismiss_transient(cx)) {
@@ -370,9 +390,6 @@ impl Render for ChatApp {
                     this.close_bottom_panel_menu(cx);
                 } else if this.project_creation.open {
                     this.close_project_creation(cx);
-                } else if this.permission_confirmation_open {
-                    this.permission_confirmation_open = false;
-                    cx.notify();
                 } else {
                     this.home.update(cx, |home, cx| { home.close_model_picker(cx); home.dismiss_plan_popovers(cx); });
                 }
@@ -478,6 +495,9 @@ impl Render for ChatApp {
                         .child(
                             div()
                                 .id("permission-confirmation-dialog")
+                                .role(gpui::Role::Dialog).aria_label("要开启完整访问权限吗？")
+                                .track_focus(&self.permission_confirmation_focus)
+                                .on_key_down(cx.listener(Self::permission_confirmation_key))
                                 .w(px(520.0))
                                 .h(px(376.6875))
                                 .rounded(px(25.0))
@@ -492,14 +512,14 @@ impl Render for ChatApp {
                                 .p(px(20.0))
                                 .flex()
                                 .flex_col()
-                                .text_color(theme.text)
+                                .text_color(theme.markdown_text)
                                 .child(
                                     div()
                                         .h(px(28.0))
                                         .flex()
                                         .items_start()
                                         .gap(px(8.0))
-                                        .child(icon("permission-warning", theme.text.into()).size(px(20.0)))
+                                        .child(icon("permission-warning", theme.markdown_text.into()).size(px(20.0)))
                                         .child(
                                             div()
                                                 .text_size(px(20.0))
@@ -514,7 +534,7 @@ impl Render for ChatApp {
                                         .text_size(px(14.0))
                                         .line_height(px(21.0))
                                         .text_color(theme.text_tertiary)
-                                        .child("Codex 将能够在未经您许可的情况下，在这台计算机上的任何位置运行命令、\n使用互联网，以及创建和编辑文件。这包括但不限于："),
+                                        .child("Codex 将能够在未经您许可的情况下，在这台计算机上的任何位置运行命令、使用互联网，以及创建和编辑文件。这包括但不限于："),
                                 )
                                 .child(
                                     div()
@@ -548,6 +568,8 @@ impl Render for ChatApp {
                                         .child(
                                             div()
                                                 .id("permission-confirmation-cancel")
+                                                .role(gpui::Role::Button).aria_label("取消")
+                                                .when(self.permission_confirmation_keyboard&&self.permission_confirmation_choice==0,|button|button.aria_active_descendant().shadow(vec![BoxShadow::new(px(0.),px(0.),theme.accent.into()).spread_radius(px(2.))]))
                                                 .h(px(36.0))
                                                 .px(px(20.0))
                                                 .rounded_full()
@@ -557,15 +579,14 @@ impl Render for ChatApp {
                                                 .text_size(px(14.0))
                                                 .cursor_pointer()
                                                 .hover(move |style| style.bg(theme.text.alpha(0.10)))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.permission_confirmation_open = false;
-                                                    cx.notify();
-                                                }))
+                                                .on_click(cx.listener(|this,_,window,cx|this.resolve_permission_confirmation(false,window,cx)))
                                                 .child("取消"),
                                         )
                                         .child(
                                             div()
                                                 .id("permission-confirmation-confirm")
+                                                .role(gpui::Role::Button).aria_label("确认")
+                                                .when(self.permission_confirmation_keyboard&&self.permission_confirmation_choice==1,|button|button.aria_active_descendant().shadow(vec![BoxShadow::new(px(0.),px(0.),theme.accent.into()).spread_radius(px(2.))]))
                                                 .h(px(36.0))
                                                 .px(px(20.0))
                                                 .rounded_full()
@@ -577,13 +598,7 @@ impl Render for ChatApp {
                                                 .text_color(rgba(0xff6764ff))
                                                 .cursor_pointer()
                                                 .hover(|style| style.bg(rgba(0xff676433)))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.permission_confirmation_open = false;
-                                                    if let Some(composer) = this.permission_confirmation_target.take() {
-                                                        composer.update(cx, |composer, cx| composer.confirm_full_access(cx));
-                                                    } else { this.home.update(cx, |home, cx| home.confirm_full_access(cx)); }
-                                                    cx.notify();
-                                                }))
+                                                .on_click(cx.listener(|this,_,window,cx|this.resolve_permission_confirmation(true,window,cx)))
                                                 .child(icon("permission-warning", rgba(0xff6764ff).into()).size(px(16.0)))
                                                 .child("确认"),
                                         ),

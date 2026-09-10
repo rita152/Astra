@@ -105,7 +105,7 @@ impl ComposerView {
                     this.prompt_focus_handle(cx).focus(window, cx);
                     cx.notify();
                     cx.stop_propagation();
-                }
+                } else {cx.propagate();}
             }))
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| this.attach_paths(paths.paths().to_vec(), cx)))
             .flex()

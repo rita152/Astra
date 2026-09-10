@@ -484,17 +484,18 @@ pub(super) fn parse_agent_notification(message: &Value) -> Result<Option<AgentEv
                                     .and_then(Value::as_str)
                                     .context("activePermissionProfile.id 必须是字符串")?
                                     .to_owned(),
-                                extends: profile
-                                    .get("extends")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned),
+                                extends: optional_string_at(
+                                    message,
+                                    "/params/threadSettings/activePermissionProfile/extends",
+                                    "activePermissionProfile.extends",
+                                )?,
                             }),
                         };
                     Some(AgentEffectivePermissions {
-                        approval_policy: required_string_at(
-                            message,
-                            "/params/threadSettings/approvalPolicy",
-                            "params.threadSettings.approvalPolicy",
+                        approval_policy: parse_approval_policy(
+                            message
+                                .pointer("/params/threadSettings/approvalPolicy")
+                                .context("缺少 approvalPolicy")?,
                         )?,
                         approvals_reviewer: required_string_at(
                             message,
@@ -647,4 +648,35 @@ pub(super) fn turn_failure_message(message: &Value) -> Result<String> {
         Some(details) if !message_text.contains(&details) => format!("{message_text}\n{details}"),
         _ => message_text,
     })
+}
+
+fn parse_approval_policy(value: &Value) -> anyhow::Result<Value> {
+    // AskForApproval is an open string or granular object union. Preserve the
+    // structured policy; unknown future strings must not become permissive defaults.
+    if value.is_string() || value.get("granular").is_some_and(Value::is_object) {
+        Ok(value.clone())
+    } else {
+        anyhow::bail!("approvalPolicy 必须是字符串或 granular 策略对象")
+    }
+}
+
+/// Lifecycle responses use `reasoningEffort`/`sandbox`; notifications use
+/// `effort`/`sandboxPolicy`. Normalize both through the same settings decoder.
+pub(super) fn lifecycle_settings(
+    response: &Value,
+) -> anyhow::Result<Option<crate::agent::AgentThreadSettings>> {
+    let Some(result) = response
+        .get("result")
+        .filter(|result| result.get("model").is_some())
+    else {
+        return Ok(None);
+    };
+    let message = serde_json::json!({"method":"thread/settings/updated","params":{"threadId":result.pointer("/thread/id"),"threadSettings":{
+        "model":result.get("model"),"effort":result.get("reasoningEffort"),"serviceTier":result.get("serviceTier"),"cwd":result.get("cwd"),
+        "approvalPolicy":result.get("approvalPolicy"),"approvalsReviewer":result.get("approvalsReviewer"),"sandboxPolicy":result.get("sandbox"),"activePermissionProfile":result.get("activePermissionProfile")
+    }}});
+    match parse_agent_notification(&message)? {
+        Some(crate::agent::AgentEvent::ThreadSettingsUpdated(settings)) => Ok(Some(settings)),
+        _ => anyhow::bail!("线程响应未包含有效设置"),
+    }
 }

@@ -16,7 +16,6 @@ pub(super) struct ModelListResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub(super) struct PermissionProfileListResponse {
     pub(super) data: Vec<PermissionProfileListEntry>,
     #[serde(default)]
@@ -25,12 +24,52 @@ pub(super) struct PermissionProfileListResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub(super) struct PermissionProfileListEntry {
     pub(super) id: String,
+    #[serde(default)]
+    pub(super) description: Option<String>,
     pub(super) allowed: bool,
     #[serde(default)]
     pub(super) extends: Option<String>,
+}
+
+pub(super) fn permission_profile_pages(
+    cwd: &std::path::Path,
+    mut request: impl FnMut(serde_json::Value) -> anyhow::Result<serde_json::Value>,
+) -> anyhow::Result<Vec<crate::agent::AgentPermissionProfile>> {
+    use anyhow::Context as _;
+    use serde_json::json;
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = std::collections::HashSet::new();
+    let mut profiles = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    loop {
+        let response = request(json!({"cwd":cwd,"cursor":cursor,"limit":100}))?;
+        let page: PermissionProfileListResponse = serde_json::from_value(
+            response
+                .get("result")
+                .cloned()
+                .context("permissionProfile/list 缺少 result")?,
+        )?;
+        for entry in page.data {
+            if !seen_ids.insert(entry.id.clone()) {
+                anyhow::bail!("权限配置出现重复 id：{}", entry.id);
+            }
+            profiles.push(crate::agent::AgentPermissionProfile {
+                id: entry.id,
+                description: entry.description,
+                allowed: entry.allowed,
+                extends: entry.extends,
+            });
+        }
+        let Some(next) = page.next_cursor else {
+            return Ok(profiles);
+        };
+        if !seen_cursors.insert(next.clone()) {
+            anyhow::bail!("permissionProfile/list 返回循环分页 cursor：{next}");
+        }
+        cursor = Some(next);
+    }
 }
 
 #[derive(Debug, Deserialize)]

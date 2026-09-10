@@ -51,6 +51,8 @@ pub(crate) struct ConversationState {
     pub(crate) account_rate_limits: Option<AgentAccountRateLimits>,
     pub(crate) models: Vec<AgentModel>,
     pub(crate) model_catalog_error: Option<String>,
+    pub(crate) model_user_selected: bool,
+    pub(crate) plan_default_effort: Option<String>,
     pub(crate) selected_model: String,
     pub(crate) selected_effort: String,
     pub(crate) selected_service_tier: Option<String>,
@@ -59,6 +61,7 @@ pub(crate) struct ConversationState {
     pub(crate) safety_buffering: bool,
     pub(crate) slider_index: usize,
     pub(crate) effective_permissions: Option<AgentEffectivePermissions>,
+    pub(crate) permission_change: Option<super::PermissionChange>,
     pub(crate) permission_error: Option<String>,
 }
 
@@ -100,6 +103,8 @@ impl Default for ConversationState {
             account_rate_limits: None,
             models: Vec::new(),
             model_catalog_error: None,
+            model_user_selected: false,
+            plan_default_effort: None,
             selected_model: String::new(),
             selected_effort: String::new(),
             selected_service_tier: None,
@@ -108,6 +113,7 @@ impl Default for ConversationState {
             safety_buffering: false,
             slider_index: 0,
             effective_permissions: None,
+            permission_change: None,
             permission_error: None,
         }
     }

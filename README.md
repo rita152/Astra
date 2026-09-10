@@ -22,10 +22,13 @@ cargo run --release -- --theme=light
 | 文件 | 右侧“文件”、底部菜单或 `Cmd+P` | 文件树、路径筛选、多标签编辑、Markdown 预览、图片查看，以及聊天文件链接定位 |
 | 审查 | 右侧“审查”、文件卡“审核”或 `Ctrl+Shift+G` | 查看历史补丁和 Git diff，添加评论，暂存、还原、提交、建分支、推送及创建 PR |
 | 侧边聊天 | 右侧入口、底部菜单或 `⌥⌘S` | 基于已有主会话创建临时对话；独立输入、模型、权限、轮次和中断；支持多标签与文件上下文 |
+| 配置 | 账户菜单 → 设置 → 配置，或 `⌘,` | 按当前会话工作目录读取有效配置、来源和受管限制；编辑用户层、批量保存并回读，保留冲突或失败草稿 |
 
 - **运行中追加输入**：主会话和临时侧边聊天均可在运行中继续输入，按 Enter 或点击“追加输入”立即发送到当前轮次；Shift+Enter 换行。无草稿时显示停止按钮。启动尚未就绪、正在停止或连接失效时保留输入并反馈原因；失败可恢复该次文本、附件与审查评论快照，随后编辑的新草稿不会被覆盖。此入口使用 `turn/steer`，不提供服务端消息队列，不自动将失败追加重发为新轮次。
 - **历史与消息**：同一轮次的追加消息保留各自位置和附件；已完成轮次将最终答复之前的过程消息折叠，支持点击及 Enter／Space 展开。历史文件变更按路径汇总，保留原始 patch；Markdown 支持本地图片、带行号的文件链接和表格。
 - **审批**：命令、终端输入、文件修改与附加权限使用原生审批卡，支持一次允许、会话允许及服务端提供的执行／网络策略。并发请求依次显示，提交后等待服务端释放；失败可见且不可重复提交，可停止当前轮次退出错误状态。文件行查看该次请求的原始补丁，长命令可展开、滚动、选择和复制。`Tab`／方向键导航，`Enter` 激活，`Esc` 关闭菜单或拒绝；文件审批的 `Shift+Esc` 拒绝并停止轮次。
+- **权限选择**：输入框权限菜单读取服务端 profile 全部页面，展示可用范围与禁用原因；主会话和侧边聊天分别更新。已有线程等待 RPC 成功及匹配的有效设置通知后才显示生效；更新影响后续轮次。完整访问权限须经确认弹层，支持 Tab／方向键、Enter／Space 和 Esc。新线程的“自定义”继承服务端默认值。
+- **配置保存**：单项与多项修改均使用 `config/batchWrite`，带用户层路径和版本；项目层与受管层只读。页面区分继承、显式值、受管值、文件写入与覆盖，冲突须重新读取并核对草稿后保存；结果未知时不自动重试。模型、推理强度、Plan 推理强度、服务等级和个性默认值用于后续创建的线程；已打开的线程不因静态默认值保存而热更新。来源详情可选择和复制，其他尚未接入的设置入口仍保留原有边界。
 - **自动复核**：显示自动审核中的动作、拒绝／超时／停止结果，以及额外安全检查和 Guardian 提示；支持鼠标、Tab、Enter／Space 展开和说明文字选择复制；两层展开使用 300 ms 高度／透明度过渡，并遵循减少动态效果设置。通过态隐藏并保留内存记录，复核结果不结束会话轮次；严格复核不生成审批按钮。协议与恢复边界见接入总表。
 - **计划与活动**：计划文本流式更新，以最终 plan item 覆盖；步骤进度独立显示在输入框上方，支持悬停及 Enter／Space 查看。计划卡支持复制、显式下载和只读文件标签；正文普通段落支持拖选、双击、复制及 Shift+方向键调整选择，只读计划不自动保存到工作区。搜索保留查询、action、结果及扩展 JSON，等待显示时长与状态；历史缺失的逐项时间和步骤快照不伪造，详见接入总表。
 - **文件保存**：停止输入约 400 ms 后自动保存，`Cmd+S` 立即保存；撤销／重做也写回磁盘。保留 UTF-8 BOM、CRLF 和权限，保存前检查外部修改。文本上限为 2 MiB、单行 64 KiB；仅访问本机文件系统。验收编辑行为时使用专用测试文件。
@@ -43,6 +46,7 @@ cargo run --release -- --theme=light
 | [src/agent/codex/manager/](src/agent/codex/manager/) | 共享连接、轮次路由、目录与工作区请求、临时侧边线程；生命周期入口在 `manager.rs` |
 | [src/workspace.rs](src/workspace.rs)、[src/workspace/](src/workspace/) | 工作区状态与通知合并；`loaders.rs` 分页读取，`preferences.rs` 原子保存 UI 偏好 |
 | [src/conversation/](src/conversation/) | 会话状态、事件归约、流式批处理与历史恢复；不持有 GPUI Entity／Context，仍复用组件中的展示数据类型 |
+| [src/configuration.rs](src/configuration.rs)、[src/agent/config.rs](src/agent/config.rs) | 配置快照、来源、受管限制、按目录保留的编辑草稿、保存回执与回读核验；Codex 编解码位于适配器，配置不写入 UI preferences |
 | [src/components/](src/components/) | Composer 输入与交互、Home 时间线、审批、文件、终端、审查及侧边聊天；各功能的渲染与测试就近维护 |
 | [src/git_review.rs](src/git_review.rs)、[src/git_review/](src/git_review/) | 不依赖 GPUI 或具体 agent 的 Git/gh 操作、diff、版本校验、命令回收和评论数据 |
 | [src/app.rs](src/app.rs)、[src/app/](src/app/) | 服务装配、会话 host、面板挂载、项目创建与全局图片预览 |
@@ -61,7 +65,10 @@ cargo check --all-targets
 cargo check --all-targets --features screenshot
 cargo build --features screenshot
 git diff --check
+python3 scripts/verify_config_permissions.py --output artifacts/config-permissions-smoke
 ```
+
+配置专项验证使用本机 CLI 和指定输出目录内的独立 `CODEX_HOME`／Git 项目，执行真实读取、批量写入、覆盖、版本冲突、校验失败、null 删除、profile 分页、线程权限回执和进程重启验证；不发送模型请求，也不修改用户现有配置。输出包含协议消息、测试配置和结果 JSON。
 
 Clippy 零告警要求限于第一方包。`cargo test` 默认忽略真实模型请求和两项手动滚动基准；基准测量 GPUI 测试窗口的事件与布局耗时，不代表屏幕 FPS：
 

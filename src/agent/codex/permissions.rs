@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::agent::{
@@ -137,61 +137,10 @@ pub(super) fn workspace_roots(cwd: &Path, thread_id: &str) -> Vec<String> {
     roots
 }
 
-pub(super) fn workspace_write_policy(roots: &[String], network_access: bool) -> Value {
-    json!({
-        "type": "workspaceWrite",
-        "writableRoots": roots,
-        "networkAccess": network_access,
-        "excludeTmpdirEnvVar": false,
-        "excludeSlashTmp": false
-    })
-}
-
-pub(super) fn custom_sandbox_policy(cwd: &Path, roots: &[String]) -> Result<Value> {
-    let config_paths = [
-        std::env::var_os("CODEX_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-            .map(|path| path.join("config.toml")),
-        Some(cwd.join(".codex/config.toml")),
-    ];
-    let mut merged = toml::Value::Table(toml::map::Map::new());
-    for path in config_paths
-        .into_iter()
-        .flatten()
-        .filter(|path| path.is_file())
-    {
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("无法读取 {}", path.display()))?;
-        let parsed: toml::Value =
-            toml::from_str(&text).with_context(|| format!("无法解析 {}", path.display()))?;
-        if let (Some(target), Some(source)) = (merged.as_table_mut(), parsed.as_table()) {
-            target.extend(source.clone());
-        }
-    }
-    let mode = merged
-        .get("sandbox_mode")
-        .and_then(toml::Value::as_str)
-        .unwrap_or("workspace-write");
-    match mode {
-        "danger-full-access" => Ok(json!({ "type": "dangerFullAccess" })),
-        "read-only" => Ok(json!({ "type": "readOnly" })),
-        "workspace-write" => {
-            let network = merged
-                .get("sandbox_workspace_write")
-                .and_then(|value| value.get("network_access"))
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(false);
-            Ok(workspace_write_policy(roots, network))
-        }
-        other => bail!("config.toml 中的 sandbox_mode `{other}` 不受支持"),
-    }
-}
-
 /// Explicit wire fields shared by turn/start and thread/settings/update.
 pub(super) struct PermissionFields {
-    pub(super) approval_policy: String,
-    pub(super) approvals_reviewer: String,
+    pub(super) approval_policy: Option<Value>,
+    pub(super) approvals_reviewer: Option<String>,
     pub(super) sandbox_policy: Option<Value>,
     pub(super) permissions: Option<String>,
     pub(super) runtime_workspace_roots: Option<Vec<String>>,
@@ -207,38 +156,30 @@ pub(super) fn permission_fields(
     let (approval_policy, approvals_reviewer, sandbox_policy, permissions, runtime_workspace_roots) =
         match mode {
             AgentPermissionMode::Request => (
-                "on-request".into(),
-                "user".into(),
-                Some(workspace_write_policy(&roots, false)),
-                existing_thread_update.then(|| ":workspace".into()),
+                Some(json!("on-request")),
+                Some("user".into()),
+                None,
+                Some(":workspace".into()),
                 None,
             ),
             AgentPermissionMode::Assist => (
-                "on-request".into(),
-                if existing_thread_update {
-                    "guardian_subagent"
-                } else {
-                    "auto_review"
-                }
-                .into(),
-                Some(workspace_write_policy(&roots, false)),
-                existing_thread_update.then(|| ":workspace".into()),
+                Some(json!("on-request")),
+                Some("auto_review".into()),
+                None,
+                Some(":workspace".into()),
                 None,
             ),
             AgentPermissionMode::Full => (
-                "never".into(),
-                "user".into(),
+                Some(json!("never")),
+                Some("user".into()),
                 None,
                 Some(":danger-full-access".into()),
                 (!existing_thread_update).then_some(roots),
             ),
-            AgentPermissionMode::Custom => (
-                "on-request".into(),
-                "user".into(),
-                Some(custom_sandbox_policy(cwd, &roots)?),
-                None,
-                (!existing_thread_update).then_some(roots),
-            ),
+            // The new thread inherits resolved server defaults. Existing threads are
+            // resolved by the manager before invoking settings/update.
+            AgentPermissionMode::Custom => (None, None, None, None, None),
+            AgentPermissionMode::Profile(id) => (None, None, None, Some(id), None),
         };
     Ok(PermissionFields {
         approval_policy,
@@ -264,18 +205,16 @@ pub(super) fn thread_settings_update_request(
     } = permission_fields(mode, cwd, thread_id, true)?;
     let mut params = serde_json::Map::new();
     params.insert("threadId".into(), json!(thread_id));
-    params.insert("approvalPolicy".into(), json!(approval_policy));
-    params.insert("approvalsReviewer".into(), json!(approvals_reviewer));
-    if mode == AgentPermissionMode::Custom {
-        params.insert(
-            "sandboxPolicy".into(),
-            sandbox_policy.context("Custom 缺少 sandboxPolicy")?,
-        );
-    } else {
-        params.insert(
-            "permissions".into(),
-            json!(permissions.context("权限模式缺少 profile")?),
-        );
+    if let Some(policy) = approval_policy {
+        params.insert("approvalPolicy".into(), policy);
+    }
+    if let Some(reviewer) = approvals_reviewer {
+        params.insert("approvalsReviewer".into(), json!(reviewer));
+    }
+    if let Some(profile) = permissions {
+        params.insert("permissions".into(), json!(profile));
+    } else if let Some(sandbox) = sandbox_policy {
+        params.insert("sandboxPolicy".into(), sandbox);
     }
     Ok(json!({ "method": "thread/settings/update", "id": id, "params": params }))
 }

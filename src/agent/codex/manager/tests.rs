@@ -30,6 +30,8 @@ use crate::agent::{
 const WAIT: Duration = Duration::from_secs(3);
 
 mod auto_approval;
+mod config;
+mod settings;
 mod side_conversation;
 mod steer;
 
@@ -1438,11 +1440,13 @@ fn all_rpc_families_share_unique_connection_ids_and_out_of_order_responses() {
     assert_eq!(model_request["method"], "model/list");
 
     let profiles = manager.load_permission_profiles("/tmp/project".into());
-    let settings = manager.update_thread_permissions(
-        "thr_settings".to_owned(),
-        "/tmp/project".into(),
-        AgentPermissionMode::Request,
-    );
+    let settings = manager.update_thread_permissions(crate::agent::AgentThreadPermissionUpdate {
+        thread_id: "thr_settings".into(),
+        cwd: "/tmp/project".into(),
+        mode: AgentPermissionMode::Request,
+        expected_generation: Some(1),
+        operation_id: 1,
+    });
     let run = manager.run_prompt(request("rpc turn", Some("thr_turn")));
     let (turn_events, turn_interrupt) = run.into_parts();
 
@@ -1462,6 +1466,12 @@ fn all_rpc_families_share_unique_connection_ids_and_out_of_order_responses() {
             let thread_id = message["params"]["threadId"].as_str().unwrap();
             endpoint.respond(&message, json!({ "thread": { "id": thread_id } }));
         } else {
+            if method == "permissionProfile/list" {
+                endpoint.respond(
+                    &message,
+                    json!({"data":[{"id":":workspace","allowed":true}],"nextCursor":null}),
+                );
+            }
             requests.insert(method.to_owned(), message);
         }
     }
@@ -1497,16 +1507,12 @@ fn all_rpc_families_share_unique_connection_ids_and_out_of_order_responses() {
         json!({ "turn": { "id": "turn_rpc" } }),
     );
     endpoint.respond(requests.get("thread/settings/update").unwrap(), json!({}));
-    endpoint.respond(
-        requests.get("permissionProfile/list").unwrap(),
-        json!({ "data": [{"id":":workspace","allowed":true,"extends":null}], "nextCursor": null }),
-    );
     endpoint.respond(requests.get("model/list").unwrap(), model_page());
     complete(&endpoint, "thr_turn", "turn_rpc", "completed");
 
     assert_eq!(wait_value(&models).unwrap().models.len(), 1);
     assert_eq!(wait_value(&profiles).unwrap().len(), 1);
-    assert_eq!(wait_value(&settings).unwrap().model, "gpt-test");
+    assert_eq!(wait_value(&settings).unwrap().settings.model, "gpt-test");
     assert_eq!(
         collect_terminal(&turn_events).last(),
         Some(&AgentEvent::Completed)

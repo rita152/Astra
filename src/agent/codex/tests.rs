@@ -325,7 +325,7 @@ fn permission_mode_requests_match_the_four_protocol_shapes() {
         thread_settings_update_request(7, "thr_1", &cwd, AgentPermissionMode::Assist).unwrap();
     assert_eq!(
         assist.pointer("/params/approvalsReviewer"),
-        Some(&json!("guardian_subagent"))
+        Some(&json!("auto_review"))
     );
     assert_eq!(
         assist.pointer("/params/permissions"),
@@ -346,29 +346,20 @@ fn permission_mode_requests_match_the_four_protocol_shapes() {
         Some(&json!(":danger-full-access"))
     );
 
-    let temp = std::env::temp_dir().join(format!("gpui-permission-custom-{}", std::process::id()));
-    std::fs::create_dir_all(temp.join(".codex")).unwrap();
-    std::fs::write(
-        temp.join(".codex/config.toml"),
-        "sandbox_mode = \"danger-full-access\"\n",
+    let custom =
+        thread_settings_update_request(7, "thr_1", &cwd, AgentPermissionMode::Custom).unwrap();
+    assert_eq!(custom["params"], json!({"threadId":"thr_1"}));
+    let named = thread_settings_update_request(
+        8,
+        "thr_1",
+        &cwd,
+        AgentPermissionMode::Profile("org-profile".into()),
     )
     .unwrap();
-    let custom =
-        thread_settings_update_request(7, "thr_1", &temp, AgentPermissionMode::Custom).unwrap();
     assert_eq!(
-        custom.pointer("/params/approvalPolicy"),
-        Some(&json!("on-request"))
+        named["params"],
+        json!({"threadId":"thr_1","permissions":"org-profile"})
     );
-    assert_eq!(
-        custom.pointer("/params/approvalsReviewer"),
-        Some(&json!("user"))
-    );
-    assert_eq!(
-        custom.pointer("/params/sandboxPolicy/type"),
-        Some(&json!("dangerFullAccess"))
-    );
-    assert!(custom.pointer("/params/permissions").is_none());
-    std::fs::remove_dir_all(temp).unwrap();
 }
 
 #[test]
@@ -382,11 +373,11 @@ fn first_turn_carries_each_permission_mode_and_assist_uses_effective_reviewer() 
         request.pointer("/params/approvalsReviewer"),
         Some(&json!("user"))
     );
+    assert_eq!(request.pointer("/params/sandboxPolicy"), Some(&Value::Null));
     assert_eq!(
-        request.pointer("/params/sandboxPolicy/type"),
-        Some(&json!("workspaceWrite"))
+        request.pointer("/params/permissions"),
+        Some(&json!(":workspace"))
     );
-    assert_eq!(request.pointer("/params/permissions"), Some(&Value::Null));
     assert_eq!(
         request.pointer("/params/runtimeWorkspaceRoots"),
         Some(&Value::Null)
@@ -409,28 +400,14 @@ fn first_turn_carries_each_permission_mode_and_assist_uses_effective_reviewer() 
             .is_some_and(Value::is_array)
     );
 
-    let temp = std::env::temp_dir().join(format!(
-        "gpui-permission-turn-custom-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(temp.join(".codex")).unwrap();
-    std::fs::write(
-        temp.join(".codex/config.toml"),
-        "sandbox_mode = \"danger-full-access\"\n",
-    )
-    .unwrap();
-    let custom = turn_start_for_mode(AgentPermissionMode::Custom, temp.clone());
-    assert_eq!(
-        custom.pointer("/params/sandboxPolicy/type"),
-        Some(&json!("dangerFullAccess"))
-    );
+    let custom = turn_start_for_mode(AgentPermissionMode::Custom, PathBuf::from("/tmp/project"));
+    assert_eq!(custom.pointer("/params/sandboxPolicy"), Some(&Value::Null));
+    assert_eq!(custom.pointer("/params/approvalPolicy"), Some(&Value::Null));
     assert_eq!(custom.pointer("/params/permissions"), Some(&Value::Null));
-    assert!(
-        custom
-            .pointer("/params/runtimeWorkspaceRoots")
-            .is_some_and(Value::is_array)
+    assert_eq!(
+        custom.pointer("/params/runtimeWorkspaceRoots"),
+        Some(&Value::Null)
     );
-    std::fs::remove_dir_all(temp).unwrap();
 }
 
 #[test]
@@ -511,7 +488,7 @@ fn existing_thread_switch_waits_for_and_returns_effective_settings() {
         .unwrap();
     assert_eq!(
         update.pointer("/params/approvalsReviewer"),
-        Some(&json!("guardian_subagent"))
+        Some(&json!("auto_review"))
     );
 }
 
@@ -529,6 +506,7 @@ fn permission_profile_list_maps_available_profiles() {
         profiles,
         vec![super::AgentPermissionProfile {
             id: ":workspace".into(),
+            description: None,
             allowed: true,
             extends: None
         }]

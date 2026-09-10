@@ -1372,3 +1372,38 @@ fn composer_context_escape_wins_over_the_application_fallback() {
         "scope-ok"
     );
 }
+
+#[test]
+fn full_access_confirmation_traps_keyboard_and_cancels_without_an_update() {
+    let mut app = TestApp::new();
+    app.update(|cx| {
+        cx.bind_keys([gpui::KeyBinding::new(
+            "escape",
+            super::DismissPermissionUi,
+            None,
+        )]);
+    });
+    let mut window = app.open_window_with_options(WindowOptions::default(), |_, cx| {
+        ChatApp::new(ThemeMode::Dark, false, cx)
+    });
+    window.update(|chat, _, cx| chat.open_permission_confirmation_for_capture(cx));
+    window.draw();
+    window.simulate_keystroke("tab");
+    assert_eq!(
+        window.read(|chat, _| chat.permission_confirmation_choice),
+        1
+    );
+    window.simulate_keystroke("shift-tab");
+    assert_eq!(
+        window.read(|chat, _| chat.permission_confirmation_choice),
+        0
+    );
+    window.simulate_keystroke("space");
+    assert!(!window.read(|chat, _| chat.permission_confirmation_open));
+    assert!(window.read(|chat, _| chat.permission_confirmation_target.is_none()));
+    window.update(|chat, _, cx| chat.open_permission_confirmation_for_capture(cx));
+    window.draw();
+    window.simulate_keystroke("escape");
+    assert!(!window.read(|chat, _| chat.permission_confirmation_open));
+    assert!(window.read(|chat, _| chat.permission_confirmation_target.is_none()));
+}

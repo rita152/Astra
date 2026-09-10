@@ -15,6 +15,17 @@ use crate::{
 };
 
 impl ComposerView {
+    pub(super) fn request_effort(&self) -> String {
+        if self.prompt_context.plan_mode == Some(true) && !self.conversation.model_user_selected {
+            self.conversation
+                .plan_default_effort
+                .clone()
+                .unwrap_or_else(|| self.conversation.selected_effort.clone())
+        } else {
+            self.conversation.selected_effort.clone()
+        }
+    }
+
     #[cfg(not(test))]
     pub(super) fn load_model_catalog(&mut self, cx: &mut Context<Self>) {
         let receiver = self.backend.load_model_catalog();
@@ -48,7 +59,24 @@ impl ComposerView {
             cx.notify();
             return;
         }
+        if self.conversation.thread_id.is_none()
+            && (self.permission_catalog_loading || self.permission_catalog_error.is_some())
+        {
+            self.submission_error = Some(
+                self.permission_catalog_error
+                    .clone()
+                    .unwrap_or_else(|| "正在读取新会话配置，输入已保留。".into()),
+            );
+            cx.notify();
+            return;
+        }
         let running = self.is_running();
+        if !running && self.conversation.permission_change.is_some() {
+            self.submission_error =
+                Some("权限变更尚未确认，输入已保留。请等待确认后发送新轮次。".into());
+            cx.notify();
+            return;
+        }
         let target = if running {
             match self.conversation.steer_target() {
                 Ok(target) => Some(target),
@@ -174,9 +202,9 @@ impl ComposerView {
                 project_id: self.conversation.project_id.clone(),
                 thread_id: self.conversation.thread_id.clone(),
                 model,
-                effort: self.conversation.selected_effort.clone(),
+                effort: self.request_effort(),
                 service_tier: self.conversation.selected_service_tier.clone(),
-                permission_mode: self.permission_mode.agent_mode(),
+                permission_mode: self.selected_agent_permission_mode(),
                 context: draft.context,
             });
             let (receiver, interrupt) = run.into_parts();
@@ -285,7 +313,7 @@ impl ComposerView {
         receiver: async_channel::Receiver<AgentConnectionEvent>,
         cx: &mut Context<Self>,
     ) {
-        cx.spawn(async move |this, cx| {
+        self.connection_event_task = Some(cx.spawn(async move |this, cx| {
             while let Ok(event) = receiver.recv().await {
                 let _ = this.update(cx, |this, cx| {
                     if this.apply_connection_event(event) {
@@ -294,8 +322,7 @@ impl ComposerView {
                     }
                 });
             }
-        })
-        .detach();
+        }));
     }
     pub(super) fn stop_generation(&mut self, cx: &mut Context<Self>) {
         if self.conversation.stop_generation() {

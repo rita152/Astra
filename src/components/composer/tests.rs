@@ -145,10 +145,8 @@ impl AgentBackend for RecordingBackend {
 
     fn update_thread_permissions(
         &self,
-        _thread_id: String,
-        _cwd: PathBuf,
-        _mode: AgentPermissionMode,
-    ) -> async_channel::Receiver<Result<AgentThreadSettings, String>> {
+        _request: crate::agent::AgentThreadPermissionUpdate,
+    ) -> async_channel::Receiver<Result<crate::agent::AgentThreadPermissionResult, String>> {
         async_channel::bounded(1).1
     }
 
@@ -379,6 +377,7 @@ fn transcript_keeps_prior_turns_and_first_start_uses_workspace_context() {
             None,
             cx,
         );
+        seed_permission_catalog(composer);
         composer.submit_prompt("first turn".to_owned(), cx);
     });
     let requests = backend.requests.lock().unwrap().clone();
@@ -2631,7 +2630,7 @@ fn permission_modes_update_the_label_and_outside_close_dismisses_the_menu() {
 
     assert_eq!(
         app.read_entity(&composer, |c, _| c.permission_mode_name()),
-        "full"
+        "custom"
     );
     app.update_entity(&composer, |composer, cx| {
         composer.enable_permission_ui_for_capture(cx);
@@ -2663,7 +2662,8 @@ fn failed_permission_switch_keeps_effective_permissions_and_shows_error() {
                 extends: None,
             }),
         });
-        composer.apply_permission_update_result(PermissionMode::Full, Err("RPC -32602".into()));
+        composer
+            .apply_permission_update_result(AgentPermissionMode::Full, Err("RPC -32602".into()));
     });
     assert!(app.read_entity(&composer, |composer, _| {
         composer.permission_mode == PermissionMode::Assist
@@ -2688,7 +2688,11 @@ fn production_permission_control_is_visible_and_interactive() {
             })),
             ..Default::default()
         },
-        |_, cx| ComposerView::new(ThemeMode::Dark, cx),
+        |_, cx| {
+            let mut composer = ComposerView::new(ThemeMode::Dark, cx);
+            seed_permission_catalog(&mut composer);
+            composer
+        },
     );
 
     assert!(window.read(|composer, _| composer.permission_ui_enabled));
@@ -2839,7 +2843,11 @@ fn permission_menu_supports_trigger_and_menu_keyboard_navigation() {
             })),
             ..Default::default()
         },
-        |_, cx| ComposerView::new(ThemeMode::Dark, cx),
+        |_, cx| {
+            let mut composer = ComposerView::new(ThemeMode::Dark, cx);
+            seed_permission_catalog(&mut composer);
+            composer
+        },
     );
 
     window.draw();
@@ -3321,4 +3329,64 @@ fn steer_failure_restores_comments_after_the_panels_programmatic_clear() {
             .prompt
             .contains("/tmp/demo.rs:R1–R2")
     );
+}
+
+fn seed_permission_catalog(composer: &mut ComposerView) {
+    composer.permission_catalog_loading = false;
+    composer.permission_catalog_error = None;
+    composer.permission_config = Some(crate::agent::AgentConfigSnapshot {
+        generation: 1,
+        cwd: composer.conversation.cwd.clone(),
+        effective: serde_json::json!({}),
+        origins: Default::default(),
+        layers: Some(Vec::new()),
+        requirements: None,
+        value_aliases: Default::default(),
+        value_defaults: Default::default(),
+        profile_parents: Default::default(),
+        required_fields: Default::default(),
+    });
+    composer.permission_profiles = vec![":workspace", ":danger-full-access"]
+        .into_iter()
+        .map(|id| crate::agent::AgentPermissionProfile {
+            id: id.into(),
+            description: None,
+            allowed: true,
+            extends: None,
+        })
+        .collect();
+}
+
+#[test]
+fn disallowed_named_profile_is_visible_but_cannot_change_draft_selection() {
+    let mut app = TestApp::new();
+    let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+    app.update_entity(&composer, |composer, cx| {
+        seed_permission_catalog(composer);
+        composer
+            .permission_profiles
+            .push(crate::agent::AgentPermissionProfile {
+                id: "org-disabled".into(),
+                description: None,
+                allowed: false,
+                extends: Some(":workspace".into()),
+            });
+        assert!(
+            composer
+                .permission_profiles
+                .iter()
+                .any(|profile| profile.id == "org-disabled")
+        );
+        composer
+            .activate_permission_selection(AgentPermissionMode::Profile("org-disabled".into()), cx);
+        assert!(composer.permission_selected_profile.is_none());
+        assert!(
+            composer
+                .conversation
+                .permission_error
+                .as_ref()
+                .unwrap()
+                .contains("不允许")
+        );
+    });
 }

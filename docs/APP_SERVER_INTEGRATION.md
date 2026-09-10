@@ -14,16 +14,16 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 
 | 状态 | 数量 | 判定 |
 |---|---|---|
-| 已接入 | 72 | 表中声明的产品行为已连通协议、领域数据和 UI／副作用；不表示消费全部可选字段 |
-| 后端已接入 | 2 | 已实现读取或校验，尚无对应可见 UI 调用方或展示 |
+| 已接入 | 76 | 表中声明的产品行为已连通协议、领域数据和 UI／副作用；不表示消费全部可选字段 |
+| 后端已接入 | 1 | 已实现读取或校验，尚无对应可见 UI 调用方或展示 |
 | 部分接入 | 3 | 只支持部分类型、有效变体或限定生命周期窗口 |
-| 未接入 | 171 | 客户端不发送；服务端请求按原 id 回复 `-32601` 并终止当前连接，服务端通知直接报错并终止连接 |
+| 未接入 | 168 | 客户端不发送；服务端请求按原 id 回复 `-32601` 并终止当前连接，服务端通知直接报错并终止连接；显式取消订阅的例外见对应行 |
 
 未接入行的“—”沿用上述规则。`tool/requestUserInput` 是兼容别名，不计入本版本 schema 的 248 项。
 
 ## 连接与状态
 
-- **连接**：`ChatApp` 持有一个共享 manager。每个 generation 启动一个 `codex app-server --stdio`，只握手一次；单 reader 读取 stdout，stdin 串行写入完整 JSONL。所有 RPC 共用递增 request id，响应可乱序；已消费的追加 RPC id 保留到 generation 结束，重复确认不再次更新提交。
+- **连接**：`ChatApp` 持有一个共享 manager。每个 generation 启动一个 `codex app-server --stdio`，只握手一次；单 reader 读取 stdout，stdin 串行写入完整 JSONL。所有 RPC 共用递增 request id，响应可乱序；已消费的追加、配置写入和线程设置 RPC id 保留到 generation 结束，重复响应不再次更新结果。初始化显式取消订阅尚无产品状态的 `thread/goal/cleared`、`thread/goal/updated`，避免恢复空闲线程时无关 goal 通知中断配置或权限操作。
 - **线程与轮次**：首次提示词执行 `thread/start → turn/start`；既有线程在当前 generation 未加载时先 resume，之后直接 start turn。同一线程最多一个活动 turn，不同线程可并行；start/resume/fork 共用串行生命周期注册表。
 - **归属与提前事件**：轮次事件按 `threadId + turnId` 路由；server request 按原始字符串／数字 id 记录所属轮次。`turn/start` 响应前的事件按 wire 顺序缓存，取得响应后验证并回放；错配 id、字段或枚举报错。
 - **审批与输入**：保留数字／字符串 request id 的区别，按到达顺序显示一张请求卡；键盘只响应当前可见请求。响应写入最多尝试一次，提交后等待 `serverRequest/resolved` 释放 responder；写入失败显示错误并阻止重复提交。文件审批关联同轮次、同 item 的原始 changes／patch，不使用聚合 turn diff 或当前磁盘内容代替。会话或轮次切换使旧点击失效；终态清理自身请求、响应句柄及临时关联。连接仅保留有上限的已释放 id／thread 标记，忽略已知重复或迟到的 resolved。
@@ -32,6 +32,36 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 - **状态通知**：应用／线程状态通过 `AgentConnectionEvent` 快照订阅，轮次事件进入各自 `AgentRun`。工作区通知可先于 RPC 响应；内存覆盖层防止迟到列表撤销重命名、移动、归档或删除。
 - **工作区与历史**：以服务端稳定 id 管理项目和线程；置顶使用服务端 `Pinned` 分区，当前 schema 无 `isPinned`。历史先 `thread/read(includeTurns=false)`，再分页读取 `thread/turns/list(itemsView=full)`；实际非 full 的轮次由 `thread/items/list` 补全。不维护本地会话数据库。
 - **临时侧边聊天**：`thread/fork → thread/inject_items` 完成后才允许发送。父历史仅供参考，侧边说明禁止延续父任务或调用子 agent；新消息明确要求的修改才属于侧边请求。关闭使用 `thread/unsubscribe`；临时 id 只在所属 generation 使用，失效后保留可读消息，禁止 resume。
+
+### 配置与权限
+
+设置页按当前会话工作目录调用 `config/read(includeLayers=true,cwd)`，并在同一 generation 调用 `configRequirements/read`。`config`、`origins`、`layers`、每层版本、disabledReason 和原始来源元数据分别保留；缺省、null、用户层显式值与更高层的有效值不混为一谈。已知来源在适配器归一化为用户、项目、系统、受管、会话与默认层，未知来源保持只读；当前 CLI 实测仅允许写用户配置文件，因此项目层不因 schema 接受 `filePath` 就显示为可写。选中 profile 的配置层、没有版本或没有绝对路径的来源也不可写。
+
+当前可编辑字段为 `approval_policy`、`sandbox_mode`、`web_search`、`model_verbosity`、`model_reasoning_summary`、`approvals_reviewer`、`default_permissions`、`model`、`model_reasoning_effort`、`plan_mode_reasoning_effort`、`service_tier`、`personality`。枚举来自本机 schema；模型、推理强度和服务档位结合实际模型目录。保留合法 granular approval policy 和可扩展字符串，不把旧 `on-failure` 列为当前 schema 的新选项；兼容已返回的值。`guardian_subagent` 与 `auto_review` 在比较时等价，granular 的两个缺省布尔值按 schema 补为 false。合法未知字段仍保留在快照与来源详情中，未提供通用 JSON 配置编辑器。
+
+受管允许值映射到批准策略／复核者、沙盒、网页搜索及权限 profile 的选项和禁用原因；`defaultPermissions`、`models.newThread` 的强制模型／推理强度／serviceTier 等约束显示为受管值。其余 feature、登录 shell、存储和网络等实际要求保留在详情中；没有对应编辑控件时不新增可提交入口。存在命名权限定义且其他有效层没有默认 profile 时，禁止删除必需的 `default_permissions`。服务端校验始终作为最终约束，客户端不自行放宽权限。
+
+所有保存统一使用 `config/batchWrite`。只提交用户明确修改的字段，带服务端用户层 `filePath`、`expectedVersion`，每个 edit 使用 `mergeStrategy=replace`；null 表示删除所选层字段以恢复继承。包括 granular 对象在内均整字段替换，避免合并残留旧权限开关。没有 `config/value/write` 旁路。响应保留 status、version、filePath、overriddenMetadata，随后在同一连接回读并核对用户层实际值、版本、有效值和来源；分别反馈写入成功、被覆盖或回读差异。
+
+仅修改模型、推理强度、Plan 推理强度、serviceTier、personality 时发送 `reloadUserConfig=false`；含其他已支持字段的用户层保存才请求重载。本机 schema 明确这些会话静态默认值不会通过重载热更新已有线程。尚未创建且用户未手动选择模型的草稿按自己的工作目录刷新默认值；已经创建的线程维持实际线程设置。配置回读成功不代表正在运行的轮次切换权限。
+
+读取、编辑、保存回执和线程有效权限分别建模。草稿按工作目录保存在内存；关闭设置再打开可以继续。冲突保留 edits，须重新读取并显式核对后再提交新版本；读取失败、连接变化和结果未知均阻止沿用旧版本保存。校验失败保留草稿；写入后回执缺失明确显示结果未知，不自动重试。配置 RPC 超时终止旧 generation，后续显式读取才重建。配置真源始终是 app-server，UI preferences 不持久化这些配置。
+
+`permissionProfile/list` 按 cwd 遍历 nextCursor，拒绝循环游标与重复 id。当前列表 schema 有 `id`、`allowed`、nullable `description`，没有 `extends`；解码兼容服务端可选 extends 扩展，继承关系也从有效配置的 `permissions.<id>.extends` 和 `ActivePermissionProfile.extends` 读取，缺失时不伪造。菜单显示服务端 profile 和禁用原因，提交前再校验 allowed。固定入口的映射如下：
+
+| 入口 | 请求权限 |
+|---|---|
+| 请求权限 | `:workspace`、on-request、user |
+| 智能协助 | `:workspace`、on-request、auto_review |
+| 完整访问权限 | `:danger-full-access`、never、user；先确认 |
+| 自定义 | 继承当前 cwd 的服务端默认配置；既有线程通过无模型轮次的临时 thread/start 解析后 unsubscribe |
+| 服务端命名 profile | 发送所选 id，其他未明确修改的线程设置由服务端决定 |
+
+首次发送与既有线程更新复用同一权限编码。已有线程先从 start/resume/fork 响应及设置通知建立有效权限快照，不能拿配置文件值替代线程状态。每线程独立串行权限队列，不阻塞其他线程；操作绑定原 threadId、generation 和本地 operationId。waiter 在写 RPC 前注册，RPC 成功与匹配的 `thread/settings/updated` 缺一不可；通知先于响应时暂存，失败不发布成功。匹配校验本次明确发送的 policy、reviewer、profile／sandbox，已确认重复／已知迟到通知不回退状态。
+
+本机通知没有 operationId 或服务端版本，无法从协议区分“与本次期望完全相同的外部修改”和本次操作回执；串行队列与字段匹配提供当前可实现的关联边界。通知等待超时关闭旧 generation，禁止其迟到回执满足新连接；切换会话、关闭侧边标签和线程关闭使旧视图操作失效。临时线程只使用原 generation，关闭取消 waiter 并 unsubscribe，不能自动 resume。权限更新只影响后续轮次，进行中的轮次保留原权限。原生菜单、主／侧边选择、等待反馈、失败恢复及完整访问确认均经过这条路径。
+
+配置领域位于 `src/agent/config.rs`，编解码位于 `config.rs`，连接操作位于 `manager/config.rs`、`manager/settings.rs`，草稿与回读判定位于 `src/configuration.rs`，交互位于设置和 Composer 视图。真实独立配置验证入口为 `python3 scripts/verify_config_permissions.py --output artifacts/config-permissions-smoke`。
 
 ### 运行中追加输入
 
@@ -107,11 +137,11 @@ Composer 在运行中有草稿时显示“追加输入”，无草稿时显示�
 | `command/exec/resize` | 默认 | 未接入 | — | — |
 | `command/exec/terminate` | 默认 | 未接入 | — | — |
 | `command/exec/write` | 默认 | 未接入 | — | — |
-| `config/batchWrite` | 默认 | 未接入 | — | — |
+| `config/batchWrite` | 默认 | 已接入 | 单项／多项统一 edits+replace，用户层 filePath、expectedVersion、适用的 reloadUserConfig；消费完整回执并回读，冲突或失败保留草稿。 | `manager/config`、`config` |
 | `config/mcpServer/reload` | 默认 | 未接入 | — | — |
-| `config/read` | 默认 | 未接入 | — | — |
+| `config/read` | 默认 | 已接入 | 当前 cwd、includeLayers=true；有效配置、origins、layers、版本与覆盖关系驱动设置及新线程默认值。 | `manager/config`、`config` |
 | `config/value/write` | 默认 | 未接入 | — | — |
-| `configRequirements/read` | 默认 | 未接入 | — | — |
+| `configRequirements/read` | 默认 | 已接入 | 同 generation 读取 nullable requirements，约束对应选项和强制值；其余要求在来源详情保留展示。 | `manager/config`、`config` |
 | `environment/add` | 实验 | 未接入 | — | — |
 | `environment/info` | 实验 | 未接入 | — | — |
 | `environment/status` | 实验 | 未接入 | — | — |
@@ -136,7 +166,7 @@ Composer 在运行中有草稿时显示“追加输入”，无草稿时显示�
 | `fuzzyFileSearch/sessionStop` | 实验 | 未接入 | — | — |
 | `fuzzyFileSearch/sessionUpdate` | 实验 | 未接入 | — | — |
 | `hooks/list` | 默认 | 未接入 | — | — |
-| `initialize` | 默认 | 已接入 | 每个连接 generation 一次；发送 clientInfo、experimentalApi=true、requestAttestation=false。 | `manager` |
+| `initialize` | 默认 | 已接入 | 每个连接 generation 一次；发送 clientInfo、experimentalApi=true、requestAttestation=false；显式 optOut goal/cleared、goal/updated。 | `manager` |
 | `marketplace/add` | 默认 | 未接入 | — | — |
 | `marketplace/remove` | 默认 | 未接入 | — | — |
 | `marketplace/upgrade` | 默认 | 未接入 | — | — |
@@ -150,7 +180,7 @@ Composer 在运行中有草稿时显示“追加输入”，无草稿时显示�
 | `mock/experimentalMethod` | 实验 | 未接入 | — | — |
 | `model/list` | 默认 | 已接入 | limit=50、includeHidden=false；遍历 nextCursor，拒绝循环游标；返回模型、默认值、推理强度及服务档位。 | `manager/catalog` |
 | `modelProvider/capabilities/read` | 默认 | 未接入 | — | — |
-| `permissionProfile/list` | 默认 | 后端已接入 | cursor=null、limit=100、cwd；返回 id/allowed/extends；存在下一页时报错。后端可调用，当前无可见 UI 调用方。 | `manager/catalog` |
+| `permissionProfile/list` | 默认 | 已接入 | cwd、limit=100、遍历 nextCursor，拒绝循环游标及重复 id；消费 id/allowed/description，兼容可选 extends；设置和权限菜单展示，提交前复核 allowed。 | `manager/catalog`、`catalog` |
 | `plugin/install` | 默认 | 未接入 | — | — |
 | `plugin/installed` | 默认 | 未接入 | — | — |
 | `plugin/list` | 默认 | 未接入 | — | — |
@@ -226,7 +256,7 @@ Composer 在运行中有草稿时显示“追加输入”，无草稿时显示�
 | `thread/search` | 实验 | 已接入 | 非空 searchTerm、archived、分页和排序；返回 thread 与 snippet。 | `manager/workspace` |
 | `thread/searchOccurrences` | 实验 | 未接入 | — | — |
 | `thread/section/move` | 默认 | 已接入 | threadId、nullable sectionId/beforeThreadId；用于置顶和取消置顶。 | `manager/workspace` |
-| `thread/settings/update` | 实验 | 已接入 | 更新已有线程权限：approvalPolicy、approvalsReviewer、profile 或 sandboxPolicy。先注册 waiter，等待对应 thread/settings/updated；临时线程沿用所属 generation。 | `manager/catalog`、`permissions` |
+| `thread/settings/update` | 实验 | 已接入 | 主／临时线程按线程队列更新 approvalPolicy、approvalsReviewer、permissions 或 sandboxPolicy；绑定 generation／操作，等待 RPC 成功和匹配的有效权限通知，影响后续轮次。 | `manager/settings`、`permissions` |
 | `thread/shellCommand` | 默认 | 未接入 | — | — |
 | `thread/start` | 默认 | 已接入 | 首条提示词才新建；发送 cwd、projectId、historyMode=paginated、ephemeral=false、serviceName、model、serviceTier；采用 result.thread.id。 | `manager/turn` |
 | `thread/timeline/list` | 实验 | 未接入 | — | — |
@@ -321,8 +351,8 @@ Composer 在运行中有草稿时显示“追加输入”，无草稿时显示�
 | `thread/deleted` | 默认 | 已接入 | 按 threadId 从所有集合移除；迟到列表不得恢复已删除线程。 | `manager/dispatch` |
 | `thread/environment/connected` | 默认 | 未接入 | — | — |
 | `thread/environment/disconnected` | 默认 | 未接入 | — | — |
-| `thread/goal/cleared` | 默认 | 部分接入 | 仅兼容既有线程 resume bootstrap：从 thread/resume 开始至随后 turn/start 响应处理完毕，要求 threadId 匹配；窗口外报错，不建立 goal 状态。 | `manager/dispatch`、`notifications` |
-| `thread/goal/updated` | 默认 | 未接入 | 未建立 goal 领域状态或 UI。 | — |
+| `thread/goal/cleared` | 默认 | 部分接入 | 正常初始化显式取消订阅；保留 resume bootstrap 内 threadId 校验的兼容分支，不建立 goal 状态，非订阅窗口收到仍报错。 | `manager/dispatch`、`notifications` |
+| `thread/goal/updated` | 默认 | 未接入 | 初始化显式取消订阅；未建立 goal 领域状态或 UI。 | `manager` |
 | `thread/name/updated` | 默认 | 已接入 | threadId、可省略或 null 的 threadName；即时更新名称并覆盖迟到快照。 | `manager/dispatch` |
 | `thread/project/updated` | 默认 | 已接入 | threadId、必需但 nullable 的 projectId；移动或移出项目并覆盖迟到快照。 | `manager/dispatch` |
 | `thread/queue/changed` | 默认 | 未接入 | — | — |
@@ -338,7 +368,7 @@ Composer 在运行中有草稿时显示“追加输入”，无草稿时显示�
 | `thread/realtime/transcript/delta` | 默认 | 未接入 | — | — |
 | `thread/realtime/transcript/done` | 默认 | 未接入 | — | — |
 | `thread/reverted` | 默认 | 未接入 | — | — |
-| `thread/settings/updated` | 默认 | 已接入 | 只同步目标线程的 model/effort/serviceTier/cwd 和有效权限；包含 permissions 时才满足权限更新 waiter。 | `manager/dispatch`、`notifications` |
+| `thread/settings/updated` | 默认 | 已接入 | 按原 threadId／generation 同步 model/effort/serviceTier/cwd 与有效权限；匹配本次期望值才满足 waiter，处理响应前通知、重复／已知迟到回执及关闭临时线程。 | `manager/dispatch`、`manager/settings`、`notifications` |
 | `thread/started` | 默认 | 已接入 | 校验 params.thread.id，关联当前 start/resume/fork；RPC 响应是最终 id 来源。已加载线程的迟到通知不得绑定到下一次生命周期请求。 | `manager/dispatch` |
 | `thread/status/changed` | 默认 | 已接入 | 按 threadId 保存 notLoaded/idle/systemError/active；active 仅接受 waitingOnApproval/waitingOnUserInput，不替代 turn 终态。 | `manager/dispatch`、`notifications` |
 | `thread/tokenUsage/updated` | 默认 | 已接入 | 按 threadId/turnId 保存 tokenUsage.total/last 与可选 context window；不创建活动或结束轮次。 | `notifications` |
