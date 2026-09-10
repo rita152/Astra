@@ -8,6 +8,7 @@ use crate::agent::{AgentAutoApprovalReviewStatus, AgentConnectionEvent};
 
 #[derive(Default)]
 pub(super) struct ConnectionEventHub {
+    pub(super) runtime: crate::agent::AgentRuntimeState,
     pub(super) subscribers: Vec<Sender<AgentConnectionEvent>>,
     pub(super) snapshots: HashMap<String, AgentConnectionEvent>,
 }
@@ -15,6 +16,9 @@ pub(super) struct ConnectionEventHub {
 impl ConnectionEventHub {
     pub(super) fn subscribe(&mut self) -> Receiver<AgentConnectionEvent> {
         let (sender, receiver) = async_channel::unbounded();
+        for event in self.runtime.snapshot() {
+            let _ = sender.send_blocking(AgentConnectionEvent::Runtime(event));
+        }
         for event in self.snapshots.values().cloned() {
             let _ = sender.send_blocking(event);
         }
@@ -57,10 +61,28 @@ impl ConnectionEventHub {
         self.subscribers
             .retain(|subscriber| subscriber.send_blocking(event.clone()).is_ok());
     }
+
+    pub(super) fn publish_runtime(
+        &mut self,
+        event: crate::agent::AgentRuntimeEvent,
+    ) -> anyhow::Result<()> {
+        if let Some(event) = self.runtime.apply(event).map_err(anyhow::Error::msg)? {
+            self.subscribers.retain(|subscriber| {
+                subscriber
+                    .send_blocking(AgentConnectionEvent::Runtime(event.clone()))
+                    .is_ok()
+            });
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn connection_event_key(event: &AgentConnectionEvent) -> String {
     match event {
+        AgentConnectionEvent::Runtime(_) => {
+            unreachable!("runtime observations use their generation-aware reducer")
+        }
+        AgentConnectionEvent::DeprecationNotice(notice) => format!("deprecation:{notice:?}"),
         AgentConnectionEvent::AutoApprovalReviewUpdated(review) => {
             format!("auto-review:{:?}", review.key)
         }

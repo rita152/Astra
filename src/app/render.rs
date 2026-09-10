@@ -374,7 +374,7 @@ impl Render for ChatApp {
                     this.permission_confirmation_open = false;
                     cx.notify();
                 } else {
-                    this.home.update(cx, |home, cx| { home.close_model_picker(cx); home.dismiss_plan_popovers(cx); });
+                    this.home.update(cx, |home, cx| { home.close_model_picker(cx); home.dismiss_plan_popovers(cx); home.dismiss_hook_tooltips(cx); });
                 }
             }))
             .when(self.showing_settings, |shell| {

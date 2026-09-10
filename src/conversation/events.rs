@@ -95,7 +95,20 @@ pub(crate) fn merge_account_rate_limits(
 
 impl ConversationState {
     pub(crate) fn apply_connection_event(&mut self, event: AgentConnectionEvent) -> bool {
+        if let AgentConnectionEvent::Runtime(event) = event {
+            return self.apply_runtime_event(event);
+        }
+        if let AgentConnectionEvent::DeprecationNotice(notice) = event {
+            if self.deprecation_notices.contains(&notice) {
+                return false;
+            }
+            self.deprecation_notices.push(notice);
+            return true;
+        }
         let scoped_thread_id = match &event {
+            AgentConnectionEvent::Runtime(_) | AgentConnectionEvent::DeprecationNotice(_) => {
+                unreachable!()
+            }
             AgentConnectionEvent::AutoApprovalReviewUpdated(review) => {
                 Some(review.key.thread_id.as_str())
             }
@@ -133,6 +146,9 @@ impl ConversationState {
             return false;
         }
         let event = match event {
+            AgentConnectionEvent::Runtime(_) | AgentConnectionEvent::DeprecationNotice(_) => {
+                unreachable!()
+            }
             AgentConnectionEvent::AutoApprovalReviewUpdated(review) => {
                 AgentEvent::AutoApprovalReviewUpdated(review)
             }
@@ -205,6 +221,7 @@ impl ConversationState {
                 self.phase = ConversationPhase::Streaming;
             }
             match event {
+                AgentEvent::HookPromptUpdated(prompt) => self.apply_hook_prompt(prompt),
                 AgentEvent::AutoApprovalReviewUpdated(review) => {
                     self.apply_auto_approval_review(*review)
                 }
@@ -224,6 +241,7 @@ impl ConversationState {
                     if self.thread_id.as_deref() == Some(identity.thread_id.as_str()) {
                         self.turn_id = Some(identity.turn_id.clone());
                         self.turn_identity = Some(identity.clone());
+                        self.sync_runtime_prompts();
                         self.replay_pending_reviews();
                         if self.phase == ConversationPhase::Starting {
                             self.phase = ConversationPhase::Thinking;
@@ -918,6 +936,7 @@ impl ConversationState {
                     });
                 }
                 AgentEvent::Completed => {
+                    self.close_runtime_turn(crate::agent::AgentLocalClosure::TurnCompleted);
                     super::activity::finish_progress_activities(
                         &mut self.activities,
                         crate::agent::AgentActivityStatus::Completed,
@@ -946,6 +965,7 @@ impl ConversationState {
                     continue;
                 }
                 AgentEvent::Interrupted => {
+                    self.close_runtime_turn(crate::agent::AgentLocalClosure::Interrupted);
                     super::activity::finish_progress_activities(
                         &mut self.activities,
                         crate::agent::AgentActivityStatus::Interrupted,
@@ -958,6 +978,7 @@ impl ConversationState {
                     continue;
                 }
                 AgentEvent::Failed(error) => {
+                    self.close_runtime_turn(crate::agent::AgentLocalClosure::Failed);
                     super::activity::finish_progress_activities(
                         &mut self.activities,
                         crate::agent::AgentActivityStatus::Failed,

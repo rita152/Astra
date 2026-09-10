@@ -406,6 +406,11 @@ fn main() {
         arg.strip_prefix("--progress-ui-state=")
             .map(ToOwned::to_owned)
     });
+    #[cfg(feature = "screenshot")]
+    let runtime_ui_state = args.iter().find_map(|arg| {
+        arg.strip_prefix("--runtime-ui-state=")
+            .map(ToOwned::to_owned)
+    });
     let image_generation_ui_state = args.iter().find_map(|arg| {
         arg.strip_prefix("--image-generation-ui-state=")
             .map(ToOwned::to_owned)
@@ -571,6 +576,7 @@ fn main() {
             components::side_chat::init(cx);
             // GPUI resolves equal keystrokes in reverse registration order.
             components::approval::init(cx);
+            components::home::init_runtime_keyboard(cx);
             cx.bind_keys([gpui::KeyBinding::new("cmd-p", app::OpenFiles, None)]);
             let bounds = Bounds::centered(None, size(px(window_width), px(window_height)), cx);
             let initial_bounds = if start_maximized {
@@ -727,6 +733,11 @@ fn main() {
                         if let Some(state) = progress_ui_state.as_deref() {
                             app.complete_startup_for_capture(cx);
                             app.set_progress_for_capture(state, cx);
+                        }
+                        #[cfg(feature = "screenshot")]
+                        if let Some(state) = runtime_ui_state.as_deref() {
+                            app.complete_startup_for_capture(cx);
+                            app.set_runtime_for_capture(state, cx);
                         }
                         if let Some(state) = image_generation_ui_state.as_deref() {
                             app.set_image_generation_for_capture(

@@ -193,6 +193,7 @@ pub enum UserMessageAttachment {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ThreadHistoryItem {
+    HookPrompt(super::runtime::AgentHookPrompt),
     UserMessage {
         item_id: String,
         client_message_id: Option<String>,

@@ -89,6 +89,7 @@ pub(super) enum ConversationListRow {
         id: String,
         message: String,
         completed_at: Option<String>,
+        hooks: Vec<crate::agent::AgentHookRun>,
     },
 }
 
@@ -193,6 +194,12 @@ pub(super) fn activity_stream_units(
 
     for activity in &activities {
         match activity {
+            ConversationActivity::HookPrompt(prompt)
+                if prompt
+                    .prompt
+                    .fragments
+                    .iter()
+                    .all(|fragment| fragment.text.trim().is_empty()) => {}
             ConversationActivity::Reasoning(reasoning) if reasoning.is_active() => {
                 // The desktop app treats the active reasoning row as a live
                 // cursor: it follows every newer JSON-RPC item instead of
@@ -214,7 +221,7 @@ pub(super) fn activity_stream_units(
                 }
                 units.push(ActivityStreamUnit::Standalone(activity.clone()));
             }
-            ConversationActivity::TurnPlan(_) => {}
+            ConversationActivity::TurnPlan(_) | ConversationActivity::HookSummary(_) => {}
             ConversationActivity::Plan(plan) => {
                 proposed_plan = Some(plan.clone());
             }
@@ -628,11 +635,22 @@ pub(super) fn conversation_list_rows(
                         .unwrap_or_else(|| format!("historical-{turn_index}")),
                     message: turn.assistant_message,
                     completed_at: turn.assistant_message_time,
+                    hooks: super::runtime::hook_runs(&turn.activities),
                 });
             }
         }
     }
-    if !user_message.is_empty() || !user_images.is_empty() || phase != ConversationPhase::Empty {
+    let hook_input = conversation_activity.iter().any(|activity| {
+        matches!(
+            activity,
+            ConversationActivity::HookPrompt(_) | ConversationActivity::HookSummary(_)
+        )
+    });
+    // Hook input never stands in for a missing human message.
+    if !user_message.is_empty()
+        || !user_images.is_empty()
+        || (phase != ConversationPhase::Empty && !hook_input)
+    {
         rows.push(ConversationListRow::CurrentUser {
             message: user_message,
             images: user_images,
@@ -674,6 +692,7 @@ pub(super) fn conversation_list_rows(
                     .unwrap_or_else(|| "current".to_owned()),
                 message: assistant_message,
                 completed_at: assistant_message_time,
+                hooks: super::runtime::hook_runs(conversation_activity),
             });
         }
     }
@@ -760,6 +779,12 @@ pub(super) fn append_turn_activity_rows(
     if let (ConversationPhase::Complete, Some(turn), Some(final_start)) =
         (phase, resumed, final_start)
         && final_start > 0
+        && units[..final_start].iter().any(|unit| {
+            !matches!(
+                unit,
+                ActivityStreamUnit::Standalone(ConversationActivity::HookPrompt(_))
+            )
+        })
     {
         let expanded = expanded_turns.contains(&turn.id);
         rows.push(ConversationListRow::ResumedWork {
@@ -775,6 +800,7 @@ pub(super) fn append_turn_activity_rows(
                     ActivityStreamUnit::Standalone(
                         ConversationActivity::QuestionReply { .. }
                             | ConversationActivity::UserMessage { .. }
+                            | ConversationActivity::HookPrompt(_)
                     )
                 ))
             .then_some(ConversationListRow::Activity {

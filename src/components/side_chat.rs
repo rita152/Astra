@@ -55,6 +55,7 @@ pub enum SideChatEvent {
     OpenPanel(SideChatDestination),
     OpenDiff(DiffReviewPresentation),
     OpenImage(PathBuf),
+    OpenHookSettings,
     FullAccess(Entity<ComposerView>),
     SkipCloseConfirmation(bool),
 }
@@ -216,6 +217,13 @@ impl SideChatPanel {
         cx.subscribe(&home, |_, _, event: &OpenImagePreview, cx| {
             cx.emit(SideChatEvent::OpenImage(event.0.clone()))
         })
+        .detach();
+        cx.subscribe(
+            &home,
+            |_, _, _: &crate::components::home::OpenHookSettings, cx| {
+                cx.emit(SideChatEvent::OpenHookSettings);
+            },
+        )
         .detach();
         let permission_composer = composer.clone();
         cx.subscribe(&home, move |_, _, _: &RequestFullAccessConfirmation, cx| {
@@ -457,6 +465,13 @@ impl SideChatPanel {
         }
         for tab in &self.tabs {
             tab.composer.update(cx, |c, cx| c.close_side_menus(cx));
+        }
+        if let Some(tab) = self.tabs.iter().find(|tab| Some(tab.id) == self.active)
+            && tab
+                .home
+                .update(cx, |home, cx| home.dismiss_hook_tooltips(cx))
+        {
+            return true;
         }
         false
     }

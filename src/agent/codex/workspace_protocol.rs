@@ -305,6 +305,9 @@ pub(super) fn parse_history_item(value: &Value) -> Result<ThreadHistoryItem> {
                 },
             })
         }
+        "hookPrompt" => Ok(ThreadHistoryItem::HookPrompt(
+            super::runtime::parse_hook_prompt(value, None)?,
+        )),
         "agentMessage" => Ok(ThreadHistoryItem::AssistantMessage {
             item_id,
             text: string_field(value, "text", "agentMessage item")?,

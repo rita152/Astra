@@ -158,6 +158,10 @@ impl ManagerInner {
             state.current = Some(connection.clone());
         }
 
+        self.publish_runtime(
+            generation,
+            crate::agent::AgentRuntimeObservation::GenerationStarted,
+        )?;
         let manager = Arc::downgrade(self);
         let reader_connection = connection.clone();
         std::thread::spawn(move || {
@@ -174,7 +178,8 @@ impl ManagerInner {
                 },
                 "capabilities": {
                     "experimentalApi": true,
-                    "requestAttestation": false
+                    "requestAttestation": false,
+                    "optOutNotificationMethods": super::runtime::OPT_OUT_NOTIFICATION_METHODS
                 }
             }),
         ) {
@@ -213,6 +218,10 @@ impl ManagerInner {
             None => message,
         };
         connection.fail_all(&message);
+        let _ = self.publish_runtime(
+            generation,
+            crate::agent::AgentRuntimeObservation::Disconnected,
+        );
         let closed_temporary = self
             .temporary_threads
             .lock()

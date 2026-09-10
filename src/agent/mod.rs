@@ -9,6 +9,7 @@ mod codex;
 mod events;
 mod message;
 mod requests;
+mod runtime;
 mod status;
 mod thread;
 
@@ -55,6 +56,11 @@ pub use requests::{
 pub(crate) use requests::{
     AgentApprovalControl, AgentFileApprovalControl, AgentPermissionsApprovalControl,
     AgentUserInputControl,
+};
+pub use runtime::{
+    AgentAuthRecovery, AgentDeprecationNotice, AgentHookOutput, AgentHookPrompt,
+    AgentHookPromptFragment, AgentHookRun, AgentHookStatus, AgentLocalClosure, AgentRuntimeEvent,
+    AgentRuntimeObservation, AgentRuntimeState, AgentScopedHookPrompt,
 };
 pub use status::{
     AgentAccountRateLimits, AgentConfigWarning, AgentCreditsSnapshot,

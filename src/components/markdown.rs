@@ -661,6 +661,14 @@ pub fn render_assistant_markdown(source: &str, theme: Theme, message_scope: &str
 
 pub fn render_selectable_plan(source: &str, theme: Theme, scope: &str) -> Div {
     let document = parse_markdown(source);
+    render_selectable_markdown_document(&document, theme, scope)
+}
+
+pub fn render_selectable_markdown_document(
+    document: &MarkdownDocument,
+    theme: Theme,
+    scope: &str,
+) -> Div {
     let mut style = MarkdownRenderStyle::new(theme);
     style.selectable = true;
     render_block_sequence(

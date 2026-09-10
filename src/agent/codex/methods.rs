@@ -101,6 +101,10 @@ pub(super) fn ensure_server_method_is_defined(message: &Value) -> Result<()> {
         );
     };
     match method {
+        "deprecationNotice" => super::runtime::parse_deprecation(message).map(|_| ()),
+        method if super::runtime::RUNTIME_METHODS.contains(&method) => {
+            super::runtime::parse_runtime(message).map(|_| ())
+        }
         "item/autoApprovalReview/started" | "item/autoApprovalReview/completed" => {
             super::auto_approval::parse_review(message).map(|_| ())
         }

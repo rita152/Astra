@@ -2151,7 +2151,6 @@ fn account_rate_limits_updated_is_validated_and_normalized() {
 #[test]
 fn unintegrated_notifications_remain_fail_fast() {
     for method in [
-        "deprecationNotice",
         "thread/goal/updated",
         "thread/goal/cleared",
         "protocol/arbitraryFutureNotification",
@@ -4361,7 +4360,6 @@ fn mcp_tool_call_failure_and_legacy_missing_metadata_are_valid() {
 #[test]
 fn every_unsupported_thread_item_type_fails_for_started_and_completed() {
     for item_type in [
-        "hookPrompt",
         "functionCallOutput",
         "dynamicToolCall",
         "enteredReviewMode",

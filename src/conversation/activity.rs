@@ -49,6 +49,8 @@ impl ReasoningActivityPresentation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConversationActivity {
+    HookPrompt(crate::agent::AgentScopedHookPrompt),
+    HookSummary(Vec<crate::agent::AgentHookRun>),
     AutoApprovalReview(Box<super::auto_approval::AutoApprovalReviewPresentation>),
     StrictReview(super::auto_approval::StrictReviewPresentation),
     GuardianWarning(crate::agent::AgentGuardianWarning),

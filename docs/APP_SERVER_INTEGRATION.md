@@ -2,7 +2,7 @@
 
 ## 基线与口径
 
-核对基线：`codex-cli 0.153.0`（2026-09-09）。方法与字段来自该 CLI 生成的 schema，接入状态来自仓库实现。schema 随 CLI 版本生成，见[官方协议说明](https://learn.chatgpt.com/docs/app-server#message-schema)；升级时重新导出并核对：
+核对基线：`codex-cli 0.153.0`（2026-09-10）。方法与字段来自该 CLI 生成的 schema，接入状态来自仓库实现。schema 随 CLI 版本生成，见[官方协议说明](https://learn.chatgpt.com/docs/app-server#message-schema)；升级时重新导出并核对：
 
 ```bash
 codex --version
@@ -15,9 +15,10 @@ codex app-server generate-json-schema --experimental --out artifacts/app-server-
 | 状态 | 数量 | 判定 |
 |---|---|---|
 | 已接入 | 72 | 表中声明的产品行为已连通协议、领域数据和 UI／副作用；不表示消费全部可选字段 |
-| 后端已接入 | 2 | 已实现读取或校验，尚无对应可见 UI 调用方或展示 |
-| 部分接入 | 3 | 只支持部分类型、有效变体或限定生命周期窗口 |
-| 未接入 | 171 | 客户端不发送；服务端请求按原 id 回复 `-32601` 并终止当前连接，服务端通知直接报错并终止连接 |
+| 后端已接入 | 5 | 已实现读取或校验，尚无对应可见 UI 调用方或展示 |
+| 部分接入 | 4 | 只支持部分类型、有效变体或限定生命周期窗口 |
+| 兼容退订 | 7 | initialize 按完整方法名退订；不代表对应产品能力已接入；保留明确的兼容窗口 |
+| 未接入 | 160 | 客户端不发送；服务端请求按原 id 回复 `-32601` 并终止当前连接，服务端通知直接报错并终止连接 |
 
 未接入行的“—”沿用上述规则。`tool/requestUserInput` 是兼容别名，不计入本版本 schema 的 248 项。
 
@@ -58,11 +59,12 @@ Composer 在运行中有草稿时显示“追加输入”，无草稿时显示�
 
 ## Item 与历史兼容
 
-实时 `item/started`／`item/completed` 与历史恢复支持下表类型。未知实时类型报错，未知历史类型保留为 `ThreadHistoryItem::Unsupported`。两个实时 item 方法仍因其余未接入类型标为“部分接入”。
+实时 `item/started`／`item/completed` 与历史恢复支持下表类型。未知实时类型报错，未知历史类型保留为 `ThreadHistoryItem::Unsupported`。本机 schema 共 19 个 ThreadItem 变体，其中 15 个已有实时／历史编解码与领域状态支持，4 个仍未接入；相邻版本的 collabToolCall 别名不计入这 19 项。两个实时 item 方法仍因其余未接入类型标为“部分接入”。
 
 | 类型 | 数据与兼容处理 | 展示行为 |
 |---|---|---|
 | `userMessage` | 校验 text/image/localImage/audio/localAudio/skill/mention；文本统一换行、解码显示转义并移除附件包络；从本应用路径包络及类型元数据恢复文件上下文，保留图片顺序（localImage 历史转换为 data URL 时也不重复生成文件卡） | 按 item.id/clientId 关联提交并去重；后续用户消息保留在当前 turn 的原始事件位置，历史不再合并到首条气泡 |
+| `hookPrompt` | 独立于 Hook 运行记录；fragments 逐项保留 hookRunId/text 及原始顺序。实时开始／完成按 thread/turn/item 原位更新；历史只使用服务端返回的 item，完成标记为未知 | 带“钩子反馈”链接的只读文本气泡，支持长文本展开、正文选择、整段复制和打开现有钩子设置；不创建用户提交、助手最终答复或审批 responder |
 | `agentMessage` | 实时按 item.id 记录流式／完成状态，后续无 delta 的完整消息仍显示；已完成 item 的重复完成或迟到 delta 不追加文本。历史保留 phase；最终答复优先取最后一条 final_answer，旧历史回退到最后一条未标注消息 | 仅已完成且可识别最终答复的轮次折叠过程前缀 |
 | `reasoning` | 按 item.id 与 summaryIndex/contentIndex 保存稀疏增量，保留开始／完成时间；不跨 item/index 合并 | 展示 summary，缺省时展示 content；完成后显示耗时 |
 | `commandExecution` | 保留 command、cwd、exitCode、commandActions；旧历史缺少 actions/cwd 时用空列表／线程目录 | 读取、搜索、列目录与 shell 分别显示，输出归属对应命令 |
@@ -76,11 +78,23 @@ Composer 在运行中有草稿时显示“追加输入”，无草稿时显示�
 | `webSearch` | 共享实时／历史解析，保留 query、action、results 和额外 JSON 字段；校验 search/openPage/findInPage/other 及 nullable 字段，results 为数组或 null | 单条显示查询／页面／查找目标及状态，多项沿用活动分组 |
 | `sleep` | durationMs 为 uint64；实时按 started/completed 更新，中断／失败只结束仍在运行的活动 | 等待时长及状态；中断明确标记“原定”时长，不把请求时长称为实际耗时 |
 
-当前 schema 中的 hookPrompt、functionCallOutput、dynamicToolCall、enteredReviewMode、exitedReviewMode 尚未接入实时 item 路径。协作枚举、字段校验与历史别名见 `items.rs`；历史解码见 `workspace_protocol.rs`。计划、搜索和等待共享 `progress.rs` 解码；样式、尺寸和交互入口见 README 与组件实现。
+当前 schema 中的 functionCallOutput、dynamicToolCall、enteredReviewMode、exitedReviewMode 尚未接入实时 item 路径。协作枚举、字段校验与历史别名见 `items.rs`；历史解码见 `workspace_protocol.rs`。计划、搜索和等待共享 `progress.rs` 解码；样式、尺寸和交互入口见 README 与组件实现。
 
 `turn/plan/updated` 的 explanation／步骤状态单独建模为 turn 进度，替换当前 turn 的上一份步骤快照，不覆盖 plan 文本，也不自动推断所有步骤完成。活动结束不替代 `turn/completed`；turn 终止时仅收束仍活动的 item，并把仍进行中的计划步骤恢复为 pending。相同生命周期事件只更新已有活动；跨 thread/turn 由 manager 路由隔离，已结束 turn 的迟到计划／搜索／等待通知及重复 turn 完成通知不会重新绑定新 turn。增量没有序号或偏移，合法重复字符必须保留，不能按字符串去重；最终 plan item 负责文本收敛。
 
 历史 `ThreadItem` 没有逐项开始／完成标记，也不携带 `turn/plan/updated` 步骤快照。恢复保留最终 plan 文本和搜索 JSON；尾项状态参考 turn 状态，前序记录按完成展示，不能还原并行活动的逐项终止时刻或实际等待耗时。本机 CLI 的中断样例在 full 历史中仅返回用户消息，未持久化未完成的 sleep；这类完全缺失的 item 无法跨应用重启恢复。步骤快照不从计划文本伪造，也不另建本地会话数据库。当前参考 ChatGPT 隐藏 sleep；GPUI 按产品要求保留等待行。计划文本的原生选择目前限于普通正文段落（含粗体／斜体样式），跨 Markdown 块及链接／代码混排片段的连续选择尚未实现；整份计划可用复制按钮取得。
+
+## 运行时观察与能力协商
+
+初始化保持 `experimentalApi=true`、`requestAttestation=false`，增加精确的 `optOutNotificationMethods`：`thread/goal/updated`、`thread/goal/cleared`、`thread/queue/changed`、`skills/changed`、`app/list/updated`、`turn/moderationMetadata`、`thread/compacted`。默认 schema 与 experimental schema 均包含这些通知方法；逐项理由见总表。退订只作用于通知，不能屏蔽请求、响应或错误；未实现的服务端请求仍按原 id 回复 `-32601`，随后进入现有连接失败处理。不会退订 item/started 或 item/completed，也不会忽略未知方法。
+
+Hook、认证恢复和 hookPrompt 快照通过带 generation 的观察通道交付。Hook 以 threadId/optional turnId/run.id 区分身份；缺省与 null 共同使用独立的无轮次键，同一 run.id 可以跨轮次存在，不把无 turnId 的记录迁移到前台或已知轮次。认证恢复以 threadId/turnId/provider 区分身份。两者可以早于 turn/start 响应，也可以晚于 turn/completed；不会建立或结束 turn。重复事件原位更新；服务端完成、终态 status 和较新完成时间不会被迟到 started 回退。turn 完成／中断／失败只收束该 turn 的本地等待；无 turnId 的 Hook 继续独立存在，在线程关闭或连接失效时本地收束。原始 status、message、output、时间和是否实际收到 completed 始终保留。
+
+连接快照先重放 generation，再重放已归约记录和本地收束状态。新 generation 清空连接级观察快照，旧 reader 的观察不能污染新连接；已有会话可在内存中保留旧 generation 的闭合记录，并只向相同 thread/turn 投影。应用级弃用提示独立保存并可供新订阅者读取，不进入会话历史。应用重启后不恢复这些通知：本机 Thread/Turn 历史没有定义 HookRunSummary 或认证恢复记录，ThreadExtra 也没有可依赖的已定义字段，禁止从提示词、配置、rollout 或本地数据库补造。
+
+Hook 字段范围：eventName 支持 preToolUse、permissionRequest、postToolUse、preCompact、postCompact、sessionStart、sessionEnd、userPromptSubmit、subagentStart、subagentStop、stop、interrupt；executionMode 支持 sync/async；handlerType 支持 command/mcpTool/prompt/agent；scope 支持 thread/turn。source 支持 system、user、project、mdm、sessionFlags、plugin、cloudRequirements、cloudManagedConfig、legacyManagedConfigFile、legacyManagedConfigMdm、unknown，缺省为 unknown。entries 的 warning/stop/feedback/context/error 均保留，展示时隐藏 context。completedAt、durationMs、statusMessage 允许缺省或 null，时间按 schema 的 int64 原样保留。
+
+当前 ChatGPT 参考中，认证恢复通知被退订，弃用提示被保存但未在已核查的首页／会话页显示，因此二者只标记为后端已接入。Hook 运行通知的 UI 目前限于有实际 turn 归属和回复操作栏的最终摘要；无 turnId 等未完成展示路径仍标为部分接入。组件参考通过专用 ChatGPT 实例与 CDP 采集；确定性数据驱动真实组件与自然后端触发是不同验收范围，不以模拟回放宣称真实认证恢复或 Hook 执行成功。
 
 ## 方法总表
 
@@ -273,11 +287,11 @@ Composer 在运行中有草稿时显示“追加输入”，无草稿时显示�
 | `account/login/completed` | 默认 | 未接入 | — | — |
 | `account/rateLimits/updated` | 默认 | 已接入 | 应用级稀疏快照：合并窗口、credits、spend control 等可用字段；nullable 字段不清除已知值，不依附活动轮次。 | `manager/dispatch`、`notifications` |
 | `account/updated` | 默认 | 未接入 | — | — |
-| `app/list/updated` | 默认 | 未接入 | — | — |
+| `app/list/updated` | 默认 | 兼容退订 | 完整方法名退订；当前没有 app/list 目录、缓存或刷新入口，静态设置页不消费此通知。 | `runtime::OPT_OUT_NOTIFICATION_METHODS` |
 | `autoApprovalReview/strictReviewRequired` | 默认 | 已接入 | 按 thread/turn/startedAtMs 保存独立复核提示，同一时间去重；只展示额外安全检查状态，无 request id 或人工审批 responder，不改变 turn 终态。 | `auto_approval`、`manager/dispatch` |
 | `command/exec/outputDelta` | 默认 | 未接入 | — | — |
 | `configWarning` | 默认 | 已接入 | 应用级 summary 及可选 details/path/range；无活动轮次仍显示配置警告。 | `manager/dispatch`、`notifications` |
-| `deprecationNotice` | 默认 | 未接入 | — | — |
+| `deprecationNotice` | 默认 | 后端已接入 | 应用级 summary 与 optional/nullable details；无活动线程也接收、去重并向新订阅者重放。独立于会话内容保存。当前 ChatGPT 接收并保存该通知，未观察到首页／会话页可见提示；GPUI 不新增无参考的提示卡。 | `runtime`、`manager/events` |
 | `error` | 默认 | 已接入 | 定向轮次的 error.message、details、willRetry；显示错误信息，终态仍等待 turn/completed。 | `notifications` |
 | `externalAgentConfig/import/completed` | 默认 | 未接入 | — | — |
 | `externalAgentConfig/import/progress` | 默认 | 未接入 | — | — |
@@ -285,8 +299,8 @@ Composer 在运行中有草稿时显示“追加输入”，无草稿时显示�
 | `fuzzyFileSearch/sessionCompleted` | 默认 | 未接入 | — | — |
 | `fuzzyFileSearch/sessionUpdated` | 默认 | 未接入 | — | — |
 | `guardianWarning` | 默认 | 已接入 | 线程级 message，允许无活动轮次；同一当前轮次去重，通用消息保留原文，反复拒绝提示显示状态分隔行。schema 无 turnId/reviewId，不推定归属或终态。 | `auto_approval`、`manager/dispatch` |
-| `hook/completed` | 默认 | 未接入 | — | — |
-| `hook/started` | 默认 | 未接入 | — | — |
+| `hook/completed` | 默认 | 部分接入 | 同一 run.id 原位收敛，保留 running/completed/failed/blocked/stopped 原始状态与实际收到 completed 的标记，不由方法名推断成功。匹配已结束轮次且存在回复操作栏时显示钩子图标和运行详情浮层；无 turnId 或没有对应回复操作栏的展示路径未完成。 | `agent/runtime/state`、`home/runtime` |
+| `hook/started` | 默认 | 部分接入 | 按 generation/threadId/run.id 和实际提供的 optional/nullable turnId 建模，保留完整运行身份、来源、事件、执行模式、状态、输出及时间。支持无活动 turn；不抢占 pending turn/start。运行中的独立提示在 ChatGPT 参考中不可见；无 turnId 记录目前只有运行时状态。 | `runtime`、`manager/dispatch` |
 | `item/agentMessage/delta` | 默认 | 已接入 | 按 thread/turn/item 追加 delta，进入所属会话的文本流。 | `notifications` |
 | `item/autoApprovalReview/completed` | 默认 | 已接入 | 以 threadId/turnId/reviewId 原位更新；保留完整 action、nullable targetItemId/rationale/riskLevel/userAuthorization、startedAtMs/completedAtMs 与 decisionSource=agent。处理 approved/denied/timedOut/aborted，不替代 turn/completed。 | `auto_approval`、`notifications`、`manager/dispatch` |
 | `item/autoApprovalReview/started` | 默认 | 已接入 | 支持 command/execve/writeStdin/applyPatch/networkAccess/mcpToolCall/requestPermissions 七类动作及共享的五种状态；targetItemId 可缺失或为 null。开始通知不得覆盖已完成结果。 | `auto_approval`、`notifications`、`manager/dispatch` |
@@ -307,25 +321,25 @@ Composer 在运行中有草稿时显示“追加输入”，无草稿时显示�
 | `model/rerouted` | 默认 | 已接入 | 定向轮次的 fromModel/toModel/reason，更新实际模型与提示。 | `notifications` |
 | `model/safetyBuffering/updated` | 默认 | 已接入 | 保留 model/useCases/reasons/showBufferingUi、nullable fasterModel；更新所属会话的安全检查状态。 | `notifications` |
 | `model/verification` | 默认 | 已接入 | 读取 verifications[]；目标 Composer 显示账户验证要求并进入失败状态。 | `notifications` |
-| `modelProvider/authRecoveryCompleted` | 默认 | 未接入 | — | — |
-| `modelProvider/authRecoveryStarted` | 默认 | 未接入 | — | — |
+| `modelProvider/authRecoveryCompleted` | 默认 | 后端已接入 | 保留完成 message 与原 started message；只停止该身份的认证等待，不代表请求成功或 turn 完成。迟到 started 不撤销完成结果；本地收束原因与服务端结果分别保留。 | `runtime`、`agent/runtime/state` |
+| `modelProvider/authRecoveryStarted` | 默认 | 后端已接入 | 按 generation/threadId/turnId/provider 保存恢复中的 message，不绑定 pending turn/start；早到与重复事件幂等归约。当前 ChatGPT 退订此通知，无对应可见 UI。 | `runtime`、`agent/runtime/state` |
 | `process/exited` | 默认 | 未接入 | — | — |
 | `process/outputDelta` | 默认 | 未接入 | — | — |
 | `project/changed` | 默认 | 已接入 | projectId、created/updated/deleted；刷新或移除项目，可先于 RPC 响应。 | `manager/dispatch` |
 | `remoteControl/status/changed` | 默认 | 后端已接入 | 校验 status/serverName/installationId、nullable environmentId，保存连接快照；无 Composer UI。 | `manager/dispatch`、`notifications` |
 | `serverRequest/resolved` | 默认 | 已接入 | 按原类型 requestId 找到所属轮次，再核对 thread/item/kind，释放命令／文件／权限审批或输入 responder 与活动 owner。已知同线程的重复及终态后迟到通知幂等忽略；未知 id 或错配 thread 报错；过期 handle 始终不可回复。 | `manager/dispatch`、`manager/connection`、`requests`、`registry` |
-| `skills/changed` | 默认 | 未接入 | — | — |
+| `skills/changed` | 默认 | 兼容退订 | 完整方法名退订；schema 定义为 skills/list 失效信号，当前没有该目录或缓存。将来接入技能目录时必须恢复订阅并重新查询。 | `runtime::OPT_OUT_NOTIFICATION_METHODS` |
 | `thread/archived` | 默认 | 已接入 | 按 threadId 移除最近、项目及置顶条目，刷新归档；覆盖迟到快照。 | `manager/dispatch` |
 | `thread/closed` | 默认 | 已接入 | 从当前 generation 的已加载集合移除并发布关闭状态；侧边聊天保留消息，禁用发送。 | `manager/dispatch` |
-| `thread/compacted` | 默认 | 未接入 | — | — |
+| `thread/compacted` | 默认 | 兼容退订 | 按本机 schema 的 Deprecated: Use ContextCompaction item type instead 说明退订；继续通过 contextCompaction item 展示，避免双重活动。 | `runtime::OPT_OUT_NOTIFICATION_METHODS` |
 | `thread/deleted` | 默认 | 已接入 | 按 threadId 从所有集合移除；迟到列表不得恢复已删除线程。 | `manager/dispatch` |
 | `thread/environment/connected` | 默认 | 未接入 | — | — |
 | `thread/environment/disconnected` | 默认 | 未接入 | — | — |
-| `thread/goal/cleared` | 默认 | 部分接入 | 仅兼容既有线程 resume bootstrap：从 thread/resume 开始至随后 turn/start 响应处理完毕，要求 threadId 匹配；窗口外报错，不建立 goal 状态。 | `manager/dispatch`、`notifications` |
-| `thread/goal/updated` | 默认 | 未接入 | 未建立 goal 领域状态或 UI。 | — |
+| `thread/goal/cleared` | 默认 | 兼容退订 | 完整方法名退订；保留既有 resume bootstrap 降级窗口：thread/resume 开始至随后 turn/start 响应处理完毕，仍严格校验 threadId 与通知身份。窗口外意外通知继续报错；不建立 goal 状态。 | `runtime`、`manager/dispatch` |
+| `thread/goal/updated` | 默认 | 兼容退订 | 完整方法名退订；没有 goal/get/set/clear 的产品路径、goal 状态或 UI，不影响当前 turn/steer 入口。 | `runtime::OPT_OUT_NOTIFICATION_METHODS` |
 | `thread/name/updated` | 默认 | 已接入 | threadId、可省略或 null 的 threadName；即时更新名称并覆盖迟到快照。 | `manager/dispatch` |
 | `thread/project/updated` | 默认 | 已接入 | threadId、必需但 nullable 的 projectId；移动或移出项目并覆盖迟到快照。 | `manager/dispatch` |
-| `thread/queue/changed` | 默认 | 未接入 | — | — |
+| `thread/queue/changed` | 默认 | 兼容退订 | 完整方法名退订；当前输入走 turn/steer，不使用 thread/queue/*，不存在服务端队列缓存需要失效。 | `runtime::OPT_OUT_NOTIFICATION_METHODS` |
 | `thread/realtime/closed` | 默认 | 未接入 | — | — |
 | `thread/realtime/error` | 默认 | 未接入 | — | — |
 | `thread/realtime/item/completed` | 默认 | 未接入 | — | — |
@@ -345,7 +359,7 @@ Composer 在运行中有草稿时显示“追加输入”，无草稿时显示�
 | `thread/unarchived` | 默认 | 已接入 | 从归档移除，刷新最近及项目列表；覆盖迟到快照。 | `manager/dispatch` |
 | `turn/completed` | 默认 | 已接入 | 接受 completed/interrupted/failed；失败读取 message/details。每轮只发送一个终态并清理自身请求，其他轮次及共享连接继续存活。 | `dispatch`、`manager/connection` |
 | `turn/diff/updated` | 默认 | 已接入 | 所属轮次最新聚合 unified diff；保留原始 patch，刷新文件卡与“上一轮”范围；空 diff 不清除已有 item changes。 | `dispatch` |
-| `turn/moderationMetadata` | 默认 | 未接入 | — | — |
+| `turn/moderationMetadata` | 默认 | 兼容退订 | 完整方法名退订；metadata 为任意 JSON，当前无消费路径。保留 error、model/safetyBuffering/updated、model/verification 等已接入状态，不用 metadata 推定成功或终态。 | `runtime::OPT_OUT_NOTIFICATION_METHODS` |
 | `turn/plan/updated` | 默认 | 已接入 | 独立 turn 步骤快照与 explanation；输入框上方显示步骤进度，悬停／点击／键盘查看步骤。 | `progress`、`dispatch` |
 | `turn/started` | 默认 | 已接入 | 要求 turn.status=inProgress；可早于 turn/start 响应，验证后使所属会话进入流式状态。 | `notifications`、`manager/turn` |
 | `warning` | 默认 | 已接入 | message、可选 threadId；应用级警告无活动轮次仍可见，线程级只进入目标 Composer。 | `manager/dispatch`、`notifications` |

@@ -24,6 +24,8 @@ use super::{
 /// loaded thread rather than to one particular turn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentConnectionEvent {
+    DeprecationNotice(super::runtime::AgentDeprecationNotice),
+    Runtime(super::runtime::AgentRuntimeEvent),
     AutoApprovalReviewUpdated(Box<AgentAutoApprovalReview>),
     StrictReviewRequired(AgentStrictReviewRequirement),
     GuardianWarning(AgentGuardianWarning),
@@ -68,6 +70,7 @@ pub enum AgentConnectionEvent {
 /// Agent-neutral output consumed by the UI.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
+    HookPromptUpdated(super::runtime::AgentHookPrompt),
     ThreadCreated {
         thread_id: String,
     },

@@ -365,6 +365,23 @@ impl Connection {
     }
 
     pub(super) fn finish_turn(&self, turn: &Arc<ManagedTurn>, result: Result<TurnOutcome>) {
+        if let Some(manager) = self.manager.upgrade()
+            && let Some(turn_id) = turn.turn_id()
+        {
+            let reason = match &result {
+                Ok(TurnOutcome::Completed) => crate::agent::AgentLocalClosure::TurnCompleted,
+                Ok(TurnOutcome::Interrupted) => crate::agent::AgentLocalClosure::Interrupted,
+                _ => crate::agent::AgentLocalClosure::Failed,
+            };
+            let _ = manager.publish_runtime(
+                self.generation,
+                crate::agent::AgentRuntimeObservation::TurnClosed {
+                    thread_id: turn.thread_id.clone(),
+                    turn_id,
+                    reason,
+                },
+            );
+        }
         if let Ok(mut state) = self.state.lock() {
             if let Some(turn_id) = turn.turn_id() {
                 state.finished_turns.insert(TurnKey {

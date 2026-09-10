@@ -28,6 +28,7 @@ cargo run --release -- --theme=light
 - **审批**：命令、终端输入、文件修改与附加权限使用原生审批卡，支持一次允许、会话允许及服务端提供的执行／网络策略。并发请求依次显示，提交后等待服务端释放；失败可见且不可重复提交，可停止当前轮次退出错误状态。文件行查看该次请求的原始补丁，长命令可展开、滚动、选择和复制。`Tab`／方向键导航，`Enter` 激活，`Esc` 关闭菜单或拒绝；文件审批的 `Shift+Esc` 拒绝并停止轮次。
 - **自动复核**：显示自动审核中的动作、拒绝／超时／停止结果，以及额外安全检查和 Guardian 提示；支持鼠标、Tab、Enter／Space 展开和说明文字选择复制；两层展开使用 300 ms 高度／透明度过渡，并遵循减少动态效果设置。通过态隐藏并保留内存记录，复核结果不结束会话轮次；严格复核不生成审批按钮。协议与恢复边界见接入总表。
 - **计划与活动**：计划文本流式更新，以最终 plan item 覆盖；步骤进度独立显示在输入框上方，支持悬停及 Enter／Space 查看。计划卡支持复制、显式下载和只读文件标签；正文普通段落支持拖选、双击、复制及 Shift+方向键调整选择，只读计划不自动保存到工作区。搜索保留查询、action、结果及扩展 JSON，等待显示时长与状态；历史缺失的逐项时间和步骤快照不伪造，详见接入总表。
+- **Hook 反馈**：服务端 hookPrompt 以带“钩子反馈”标识的只读气泡显示，保留 fragment 顺序，支持展开、选择复制与打开钩子设置。有实际轮次归属的 Hook 运行结果在回复操作栏提供摘要浮层；认证恢复和弃用通知的状态保留与当前展示边界见接入总表。
 - **文件保存**：停止输入约 400 ms 后自动保存，`Cmd+S` 立即保存；撤销／重做也写回磁盘。保留 UTF-8 BOM、CRLF 和权限，保存前检查外部修改。文本上限为 2 MiB、单行 64 KiB；仅访问本机文件系统。验收编辑行为时使用专用测试文件。
 - **Git 审查**：范围包括上一轮、未提交、未暂存、已暂存、已提交和分支；分支使用 merge-base。支持统一／拆分差异、文字差异、上下文展开和逐行评论；评论可单独或随提示词发送。写操作前校验工作区与 index，失败保留输入；还原新增文件时备份到 worktree Git 目录下的 `gpui-discarded/`。PR 创建使用本机 `gh`。
 - **面板生命周期**：收起面板或切换主会话保留终端、文件、审查和侧边聊天状态；应用退出后不恢复 shell 或临时侧边聊天。侧边标签支持拖动排序、`Ctrl+Tab`／`Ctrl+Shift+Tab` 切换、`Cmd+W` 关闭；有消息时确认关闭，连接失效后保留消息供查看和复制。
@@ -104,6 +105,7 @@ GPUI_UI_PREFERENCES_PATH="$PWD/artifacts/capture-preferences.json" \
 | `--settings-page=appearance` | 直接打开设置页，页面列表见 `src/settings/mod.rs` |
 | `--image-generation-ui-state=running/completed/failed/load-error` | 固定图像生成状态；完成态另传 `--image-generation-path=/absolute/image.png` |
 | `--auto-approval-ui-state=inProgress/approved/denied/timedOut/aborted/strict/warning` | 自动复核组件验收；`--auto-approval-expanded`、`--auto-approval-details-expanded` 选择展开层级，`--reduce-motion` 固定静态对照；可用 `--auto-approval-rationale-file=/absolute/text.txt` 检查长说明；`--auto-approval-motion-output=/absolute/trace.json` 记录交互后的原生高度采样 |
+| `--runtime-ui-state=completed/running/turnless/auth-started/auth-completed/interrupted/disconnected/history/long/deprecation` | 确定性 Hook、hookPrompt、认证恢复和应用级提示状态，不执行 Hook 或模型请求；`GPUI_RUNTIME_AUDIT_OUTPUT=/absolute/path.json` 输出原始状态与本地收束原因；history 只提供服务端可返回的 hookPrompt |
 | `--progress-ui-state=running/streaming/completed/interrupted` | 计划、搜索与等待的归约状态；streaming 定时产生增量、最终覆盖与 turn 完成，running 可通过停止按钮中断；实际历史用 `--resume-thread` 验证 |
 | `--typography-specimen`、`--typography-display=N` | 字体样本与目标显示器；实现及专用参数见 `src/typography.rs` |
 
