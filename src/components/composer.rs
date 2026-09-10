@@ -456,10 +456,11 @@ impl ComposerView {
 
     fn apply_connection_event(&mut self, event: AgentConnectionEvent) -> bool {
         if let AgentConnectionEvent::ThreadSettingsUpdated { generation, .. } = &event
-            && self
-                .permission_config
-                .as_ref()
-                .is_some_and(|config| config.generation > *generation)
+            && (*generation < self.conversation.runtime.generation
+                || self
+                    .permission_config
+                    .as_ref()
+                    .is_some_and(|config| config.generation > *generation))
         {
             return false;
         }

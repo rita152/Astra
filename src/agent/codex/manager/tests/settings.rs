@@ -117,7 +117,15 @@ fn rpc_failure_after_notification_does_not_publish_success_and_queue_recovers() 
             .unwrap_err()
             .contains("managed rejection")
     );
-    assert!(events.try_recv().is_err());
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok()).all(|event| matches!(
+            event,
+            AgentConnectionEvent::Runtime(crate::agent::AgentRuntimeEvent {
+                observation: crate::agent::AgentRuntimeObservation::GenerationStarted,
+                ..
+            })
+        ))
+    );
     let request = next_update(&mut endpoint);
     endpoint.respond(&request, json!({}));
     endpoint.send(notification("main", "org-b"));
@@ -274,5 +282,102 @@ fn duplicate_settings_rpc_response_does_not_break_the_next_operation() {
     endpoint.send(notification("main", "org-b"));
     assert_eq!(wait_value(&second).unwrap().operation_id, 2);
     assert_eq!(spawner.spawn_count.load(Ordering::Acquire), 1);
+    manager.shutdown();
+}
+
+#[test]
+fn permission_confirmation_and_runtime_events_share_connection_without_cross_talk() {
+    use crate::agent::{AgentLocalClosure, AgentRuntimeObservation, AgentRuntimeState};
+    let (manager, spawner) = manager_with_fake();
+    let observations = manager.subscribe_connection_events();
+    let (side_events, side_handle) = manager
+        .run_prompt(request("side input", Some("side")))
+        .into_parts();
+    let mut endpoint = spawner.next_endpoint();
+    handshake(&mut endpoint);
+    let resume = endpoint.recv();
+    endpoint.respond(&resume, json!({"thread":{"id":"side"}}));
+    let start = endpoint.recv();
+    assert_eq!(start["method"], "turn/start");
+    endpoint.respond(&start, json!({"turn":{"id":"side-turn"}}));
+    let pending = manager.update_thread_permissions(update("main", 1, "org-a"));
+    let change = next_update(&mut endpoint);
+    endpoint.send(super::runtime::hook("main", None, false));
+    endpoint.send(super::runtime::hook("side", Some("side-turn"), false));
+    endpoint.send(super::runtime::auth("side", "side-turn", false));
+    endpoint.send(super::runtime::auth("side", "side-turn", true));
+    endpoint.send(notification("main", "org-a"));
+    assert_empty(&pending);
+    endpoint.send(json!({"method":"item/agentMessage/delta","params":{"threadId":"side","turnId":"side-turn","itemId":"answer","delta":"Side remains active"}}));
+    complete(&endpoint, "side", "side-turn", "completed");
+    let side = collect_terminal(&side_events);
+    assert!(side.contains(&AgentEvent::TextDelta("Side remains active".into())));
+    assert_eq!(side.last(), Some(&AgentEvent::Completed));
+    assert_empty(&pending);
+    endpoint.respond(&change, json!({}));
+    assert_eq!(wait_value(&pending).unwrap().operation_id, 1);
+    let snapshot = manager.subscribe_connection_events();
+    let mut runtime = AgentRuntimeState::default();
+    let mut confirmed = Vec::new();
+    while let Ok(event) = snapshot.try_recv() {
+        match event {
+            AgentConnectionEvent::Runtime(event) => {
+                runtime.apply(event).unwrap();
+            }
+            AgentConnectionEvent::ThreadSettingsUpdated { thread_id, .. } => {
+                confirmed.push(thread_id)
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(confirmed, ["main"]);
+    assert!(
+        runtime
+            .hooks
+            .iter()
+            .find(|hook| hook.thread_id == "main")
+            .unwrap()
+            .is_waiting()
+    );
+    assert_eq!(
+        runtime
+            .hooks
+            .iter()
+            .find(|hook| hook.thread_id == "side")
+            .unwrap()
+            .closed_locally,
+        Some(AgentLocalClosure::TurnCompleted)
+    );
+    assert!(runtime.auth_recoveries[0].completed_message.is_some());
+    assert!(endpoint.process.is_alive());
+
+    let pending = manager.update_thread_permissions(update("main", 2, "org-b"));
+    let _ = next_update(&mut endpoint);
+    manager
+        .inner
+        .fail_generation(1, "combined disconnect".into());
+    assert!(wait_value(&pending).is_err());
+    let snapshot = manager.subscribe_connection_events();
+    let events: Vec<_> = std::iter::from_fn(|| snapshot.try_recv().ok()).collect();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentConnectionEvent::ThreadSettingsUpdated { .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentConnectionEvent::Runtime(crate::agent::AgentRuntimeEvent {
+            observation: AgentRuntimeObservation::Disconnected,
+            ..
+        })
+    )));
+    let mut runtime = AgentRuntimeState::default();
+    for event in std::iter::from_fn(|| observations.try_recv().ok()) {
+        if let AgentConnectionEvent::Runtime(event) = event {
+            runtime.apply(event).unwrap();
+        }
+    }
+    assert!(runtime.hooks.iter().all(|hook| !hook.is_waiting()));
+    drop(side_handle);
     manager.shutdown();
 }

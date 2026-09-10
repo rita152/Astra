@@ -170,7 +170,7 @@ pub(super) fn initialize_connection<R: BufRead, W: Write>(
                 "capabilities": {
                     "experimentalApi": true,
                     "requestAttestation": false,
-                    "optOutNotificationMethods": super::methods::UNRENDERED_NOTIFICATIONS
+                    "optOutNotificationMethods": super::runtime::OPT_OUT_NOTIFICATION_METHODS
                 }
             }
         }),
@@ -197,7 +197,7 @@ pub(super) fn initialize_turn_connection<R: BufRead, W: Write + Send + 'static>(
             "capabilities": {
                 "experimentalApi": true,
                 "requestAttestation": false,
-                    "optOutNotificationMethods": super::methods::UNRENDERED_NOTIFICATIONS
+                    "optOutNotificationMethods": super::runtime::OPT_OUT_NOTIFICATION_METHODS
             }
         }
     }))?;

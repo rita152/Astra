@@ -357,13 +357,17 @@ pub(super) fn conversation(
                 id,
                 message,
                 completed_at,
+                hooks,
             } => (
                 div()
                     .id(SharedString::from(format!("response-footer-{id}")))
                     .child(current_response_footer(
                         &id,
                         message,
-                        completed_at,
+                        super::messages::ResponseFooterMetadata {
+                            completed_at,
+                            hooks,
+                        },
                         response_feedback,
                         home_entity.clone(),
                         theme,

@@ -149,7 +149,6 @@ impl ConfigEditor {
         }
         self.receipt = None;
         self.feedback = None;
-        self.feedback = None;
         Ok(())
     }
 

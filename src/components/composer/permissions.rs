@@ -43,11 +43,16 @@ impl ComposerView {
                 this.permission_catalog_loading = false;
                 match (config, profiles) {
                     (Ok(Ok(config)), Ok(Ok(profiles))) => {
-                        this.conversation.apply_config_defaults(&config);
-                        this.permission_config = Some(config);
-                        this.permission_profiles = profiles;
-                        this.permission_catalog_error = None;
-                        this.load_effective_permissions(cx);
+                        if config.generation < this.conversation.runtime.generation {
+                            this.permission_catalog_error =
+                                Some("连接已变化，请重新读取权限配置".into());
+                        } else {
+                            this.conversation.apply_config_defaults(&config);
+                            this.permission_config = Some(config);
+                            this.permission_profiles = profiles;
+                            this.permission_catalog_error = None;
+                            this.load_effective_permissions(cx);
+                        }
                     }
                     (Ok(Err(error)), _) => this.permission_catalog_error = Some(error.message),
                     (_, Ok(Err(error))) => this.permission_catalog_error = Some(error),
@@ -91,6 +96,7 @@ impl ComposerView {
                 match result {
                     Ok(Ok(snapshot)) => {
                         if snapshot.generation != generation
+                            || snapshot.generation < this.conversation.runtime.generation
                             || this
                                 .permission_config
                                 .as_ref()
@@ -170,6 +176,9 @@ impl ComposerView {
         let Some(config) = &self.permission_config else {
             return Some("权限配置尚未读取".into());
         };
+        if config.generation < self.conversation.runtime.generation {
+            return Some("连接已变化，请重新读取权限配置".into());
+        }
         let profile = match selection {
             Mode::Request | Mode::Assist => Some(":workspace"),
             Mode::Full => Some(":danger-full-access"),
@@ -294,6 +303,7 @@ impl ComposerView {
                 }
                 if let Ok(result) = &result
                     && (!pending.confirms(result)
+                        || result.generation < this.conversation.runtime.generation
                         || this
                             .permission_config
                             .as_ref()

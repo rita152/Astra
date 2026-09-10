@@ -177,7 +177,11 @@ impl ConversationState {
         })
     }
     pub(crate) fn transcript_render_snapshot(&self) -> Vec<ConversationTranscriptTurn> {
-        self.transcript.clone()
+        let mut transcript = self.transcript.clone();
+        for turn in &mut transcript {
+            self.project_runtime(turn.turn_id.as_deref(), turn.phase, &mut turn.activities);
+        }
+        transcript
     }
     pub(crate) fn thread_id(&self) -> Option<&str> {
         self.thread_id.as_deref()
@@ -199,9 +203,17 @@ impl ConversationState {
         project_id: Option<ProjectId>,
         thread_id: Option<String>,
     ) {
+        self.change_runtime_scope(thread_id.as_deref());
         self.cwd = cwd;
         self.project_id = project_id;
         self.thread_id = thread_id;
+        if let Some(thread) = self.thread_id.as_ref()
+            && let Some(pending) = self.pending_connection_events.remove(thread)
+        {
+            for event in pending {
+                self.apply_connection_event(event);
+            }
+        }
     }
     pub(crate) fn set_history_loading(&mut self, loading: bool) {
         self.history_loading = loading;
@@ -221,11 +233,20 @@ impl ConversationState {
         self.phase = ConversationPhase::Failed;
     }
     pub(crate) fn hydrate_history(&mut self, history: ThreadHistory) {
+        self.change_runtime_scope(Some(&history.thread.thread_id));
         self.reconcile_history_submissions(&history);
         if self.active_turn.is_none() {
             self.turn_identity = None;
         }
         self.thread_id = Some(history.thread.thread_id.clone());
+        if let Some(pending) = self
+            .pending_connection_events
+            .remove(&history.thread.thread_id)
+        {
+            for event in pending {
+                self.apply_connection_event(event);
+            }
+        }
         self.cwd = history.thread.cwd.clone();
         self.project_id = history.thread.project_id.clone();
         self.history_loading = false;
@@ -242,6 +263,7 @@ impl ConversationState {
                 let mut activities = Vec::new();
                 for (item_index, item) in turn.items.iter().enumerate() {
                     match item {
+                        ThreadHistoryItem::HookPrompt(prompt) => super::runtime::upsert_prompt(&mut activities, crate::agent::AgentScopedHookPrompt {thread_id:history.thread.thread_id.clone(),turn_id:turn.turn_id.clone(),prompt:prompt.clone()}),
                         ThreadHistoryItem::UserMessage {
                             item_id,
                             client_message_id,
@@ -494,13 +516,15 @@ impl ConversationState {
             String::new()
         };
 
+        let mut activities = self.activities.clone();
+        self.project_runtime(self.turn_id.as_deref(), self.phase, &mut activities);
         (
             self.phase,
             self.user_message.clone(),
             self.user_message_time.clone(),
             assistant_message,
             self.assistant_message_time.clone(),
-            self.activities.clone(),
+            activities,
         )
     }
 }

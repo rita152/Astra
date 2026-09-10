@@ -31,6 +31,7 @@ const WAIT: Duration = Duration::from_secs(3);
 
 mod auto_approval;
 mod config;
+mod runtime;
 mod settings;
 mod side_conversation;
 mod steer;
@@ -732,7 +733,10 @@ fn workspace_notifications_can_precede_their_response_without_failing_the_connec
     );
     assert_eq!(wait_value(&projects).unwrap().data.len(), 1);
 
-    let received = (0..7).map(|_| wait_value(&events)).collect::<Vec<_>>();
+    let received = std::iter::from_fn(|| Some(wait_value(&events)))
+        .filter(|event| !matches!(event, AgentConnectionEvent::Runtime(_)))
+        .take(7)
+        .collect::<Vec<_>>();
     assert!(received.iter().any(|event| matches!(
         event,
         AgentConnectionEvent::ThreadArchived { thread_id } if thread_id == "thr-before"
@@ -2086,6 +2090,13 @@ fn app_scoped_events_are_published_without_an_active_turn_and_replayed_as_snapsh
     endpoint.respond(&model_request, model_page());
     assert!(wait_value(&catalog).is_ok());
 
+    assert!(matches!(
+        wait_value(&first_subscription),
+        AgentConnectionEvent::Runtime(crate::agent::AgentRuntimeEvent {
+            observation: crate::agent::AgentRuntimeObservation::GenerationStarted,
+            ..
+        })
+    ));
     let first = wait_value(&first_subscription);
     let second = wait_value(&first_subscription);
     assert!(matches!(
@@ -2099,6 +2110,13 @@ fn app_scoped_events_are_published_without_an_active_turn_and_replayed_as_snapsh
         )
     ));
     let replay = manager.subscribe_connection_events();
+    assert!(matches!(
+        wait_value(&replay),
+        AgentConnectionEvent::Runtime(crate::agent::AgentRuntimeEvent {
+            observation: crate::agent::AgentRuntimeObservation::GenerationStarted,
+            ..
+        })
+    ));
     let replayed = HashSet::from([
         format!("{:?}", wait_value(&replay)),
         format!("{:?}", wait_value(&replay)),

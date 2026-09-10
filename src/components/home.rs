@@ -16,6 +16,8 @@ mod notices;
 mod progress;
 mod reasoning;
 mod requests;
+mod runtime;
+pub(crate) use runtime::init_keyboard as init_runtime_keyboard;
 mod timeline;
 mod tools;
 
@@ -31,6 +33,9 @@ use gpui::{
     Context, Div, Entity, FocusHandle, Focusable, KeyDownEvent, ListState, MouseButton, Render,
     ScrollHandle, Window, div, point, prelude::*, px, relative,
 };
+
+pub struct OpenHookSettings;
+impl gpui::EventEmitter<OpenHookSettings> for HomeView {}
 
 use crate::{
     agent::{AgentBackend, CommandExecutionStatus},
@@ -85,6 +90,10 @@ pub struct HomeView {
     thinking_shimmer_running: bool,
     response_feedback: i8,
     response_feedback_menu: Option<u64>,
+    hook_tooltip_focus: Option<FocusHandle>,
+    dismissed_hook_tooltips: HashSet<String>,
+    hook_hover_started: HashMap<String, Instant>,
+    hook_control_focus: HashMap<String, FocusHandle>,
     user_message_actions_visible_for_capture: bool,
     conversation_rows: Rc<Vec<ConversationListRow>>,
     conversation_phase: ConversationPhase,
@@ -243,6 +252,8 @@ impl HomeView {
             matches!(
                 activity,
                 ConversationActivity::Plan(_)
+                    | ConversationActivity::HookPrompt(_)
+                    | ConversationActivity::HookSummary(_)
                     | ConversationActivity::TurnPlan(_)
                     | ConversationActivity::AutoApprovalReview(_)
                     | ConversationActivity::StrictReview(_)
@@ -261,6 +272,7 @@ impl HomeView {
                     unit: ActivityStreamUnit::ToolGroup(group),
                     ..
                 } => group.activities.iter().any(interactive),
+                ConversationListRow::CurrentResponseFooter { hooks, .. } => !hooks.is_empty(),
                 _ => false,
             })
     }
@@ -361,6 +373,10 @@ impl HomeView {
             thinking_shimmer_running: false,
             response_feedback: 0,
             response_feedback_menu: None,
+            hook_tooltip_focus: None,
+            dismissed_hook_tooltips: HashSet::new(),
+            hook_hover_started: HashMap::new(),
+            hook_control_focus: HashMap::new(),
             user_message_actions_visible_for_capture: false,
             conversation_rows: Rc::new(Vec::new()),
             conversation_phase: ConversationPhase::Empty,
@@ -504,6 +520,10 @@ impl HomeView {
         self.tool_group_disclosure_transitions.clear();
         self.tool_group_scroll_handles.clear();
         self.expanded_commands.clear();
+        self.hook_control_focus.clear();
+        self.hook_hover_started.clear();
+        self.dismissed_hook_tooltips.clear();
+        self.hook_tooltip_focus = None;
         self.command_scroll_handles.clear();
         self.expanded_collaborations.clear();
         let needs_shimmer = composer.conversation_phase() == ConversationPhase::Thinking
@@ -557,7 +577,11 @@ impl HomeView {
             cx.stop_propagation();
         } else if self.conversation_rows.iter().any(|row| match row {
             ConversationListRow::Activity {
-                unit: ActivityStreamUnit::Standalone(ConversationActivity::AutoApprovalReview(_)),
+                unit:
+                    ActivityStreamUnit::Standalone(
+                        ConversationActivity::AutoApprovalReview(_)
+                        | ConversationActivity::HookPrompt(_),
+                    ),
                 ..
             } => true,
             ConversationListRow::Activity {
@@ -567,6 +591,7 @@ impl HomeView {
                 .activities
                 .iter()
                 .any(|a| matches!(a, ConversationActivity::AutoApprovalReview(_))),
+            ConversationListRow::CurrentResponseFooter { hooks, .. } => !hooks.is_empty(),
             _ => false,
         }) {
             crate::components::auto_approval::navigate_tab(event, window, cx);
@@ -1742,6 +1767,11 @@ impl HomeView {
     pub fn set_progress_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
         self.composer
             .update(cx, |view, cx| view.set_progress_for_capture(state, cx));
+        cx.notify();
+    }
+    pub fn set_runtime_for_capture(&mut self, state: &str, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |view, cx| view.set_runtime_for_capture(state, cx));
         cx.notify();
     }
 }

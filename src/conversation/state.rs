@@ -15,6 +15,9 @@ use crate::agent::{
 };
 
 pub(crate) struct ConversationState {
+    pub(crate) runtime: crate::agent::AgentRuntimeState,
+    pub(crate) retired_runtime: Vec<crate::agent::AgentRuntimeState>,
+    pub(crate) deprecation_notices: Vec<crate::agent::AgentDeprecationNotice>,
     pub(crate) user_message: Option<String>,
     pub(crate) user_images: Vec<crate::agent::UserMessageAttachment>,
     pub(crate) user_message_time: Option<String>,
@@ -68,6 +71,9 @@ pub(crate) struct ConversationState {
 impl Default for ConversationState {
     fn default() -> Self {
         Self {
+            runtime: Default::default(),
+            retired_runtime: Vec::new(),
+            deprecation_notices: Vec::new(),
             user_message: None,
             user_images: Vec::new(),
             user_message_time: None,

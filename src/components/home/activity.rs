@@ -78,6 +78,13 @@ pub(super) fn render_activity_stream_unit(
             .into_any_element()
         }
         ActivityStreamUnit::Standalone(activity) => match activity {
+            ConversationActivity::HookPrompt(prompt) => super::runtime::HookPromptBubble {
+                prompt,
+                home: home_entity,
+                theme,
+            }
+            .into_any_element(),
+            ConversationActivity::HookSummary(_) => div().into_any_element(),
             ConversationActivity::AutoApprovalReview(review) => div()
                 .w_full()
                 .children(

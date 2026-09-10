@@ -57,7 +57,9 @@ impl ManagerInner {
                     "message": "This client does not implement this server-initiated request"
                 }
             }))?;
-            return ensure_server_method_is_defined(message);
+            return Err(super::super::methods::undefined_server_method_error(
+                method, message,
+            ));
         }
         let thread_id = message
             .pointer("/params/threadId")
@@ -90,6 +92,64 @@ impl ManagerInner {
         message: &Value,
     ) -> Result<()> {
         match method {
+            "item/started" | "item/completed"
+                if message.pointer("/params/item/type").and_then(Value::as_str)
+                    == Some("hookPrompt") =>
+            {
+                let thread_id = required_param_string(message, "threadId", method)?;
+                let turn_id = required_param_string(message, "turnId", method)?;
+                let prompt = super::super::runtime::parse_hook_prompt(
+                    message
+                        .pointer("/params/item")
+                        .context("hookPrompt 缺少 item")?,
+                    Some(method == "item/completed"),
+                )
+                .map_err(|error| super::super::items::turn_item_protocol_error(message, error))?;
+                let active = connection
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("connection state 锁已损坏"))?
+                    .turns
+                    .get(&TurnKey {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                    })
+                    .cloned();
+                if let Some(active) = active
+                    && active
+                        .dispatch
+                        .lock()
+                        .map_err(|_| anyhow!("turn dispatch 锁已损坏"))?
+                        .accepted
+                {
+                    // Preserve item order on the accepted turn's existing channel.
+                    // The observation snapshot remains authoritative for early/late replay.
+                    let _ = active
+                        .events
+                        .send_blocking(AgentEvent::HookPromptUpdated(prompt.clone()));
+                }
+                self.publish_runtime(
+                    connection.generation,
+                    crate::agent::AgentRuntimeObservation::HookPrompt(
+                        crate::agent::AgentScopedHookPrompt {
+                            thread_id,
+                            turn_id,
+                            prompt,
+                        },
+                    ),
+                )
+            }
+            "deprecationNotice" => {
+                self.publish_connection_event(AgentConnectionEvent::DeprecationNotice(
+                    super::super::runtime::parse_deprecation(message)?,
+                ));
+                Ok(())
+            }
+            method if super::super::runtime::RUNTIME_METHODS.contains(&method) => self
+                .publish_runtime(
+                    connection.generation,
+                    super::super::runtime::parse_runtime(message)?,
+                ),
             "guardianWarning" => {
                 self.publish_connection_event(AgentConnectionEvent::GuardianWarning(
                     super::super::auto_approval::parse_guardian_warning(message)?,
@@ -166,6 +226,12 @@ impl ManagerInner {
                             .try_send(Err("线程已关闭，权限更新未确认".into()));
                     }
                 }
+                self.publish_runtime(
+                    connection.generation,
+                    crate::agent::AgentRuntimeObservation::ThreadClosed {
+                        thread_id: thread_id.clone(),
+                    },
+                )?;
                 self.publish_connection_event(AgentConnectionEvent::ThreadClosed { thread_id });
                 Ok(())
             }
@@ -407,5 +473,19 @@ impl ManagerInner {
         if let Ok(mut hub) = self.connection_events.lock() {
             hub.publish(event);
         }
+    }
+
+    pub(super) fn publish_runtime(
+        &self,
+        generation: u64,
+        observation: crate::agent::AgentRuntimeObservation,
+    ) -> Result<()> {
+        self.connection_events
+            .lock()
+            .map_err(|_| anyhow!("connection event hub 锁已损坏"))?
+            .publish_runtime(crate::agent::AgentRuntimeEvent {
+                generation,
+                observation,
+            })
     }
 }

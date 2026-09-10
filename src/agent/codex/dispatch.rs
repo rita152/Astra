@@ -73,6 +73,18 @@ pub(super) fn process_turn_message<W: Write + Send + 'static>(
             let item = required_turn_item(message)?;
             let item_type = required_turn_item_type(message, item)?;
             match item_type {
+                "hookPrompt" => {
+                    let prompt = super::runtime::parse_hook_prompt(
+                        &Value::Object(item.clone()),
+                        Some(false),
+                    )
+                    .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::HookPromptUpdated(prompt),
+                        "item/started hookPrompt",
+                    )?;
+                }
                 "userMessage" => {
                     forward_user_message(session, item, events)
                         .map_err(|error| turn_item_protocol_error(message, error))?;
@@ -337,6 +349,16 @@ pub(super) fn process_turn_message<W: Write + Send + 'static>(
             let item = required_turn_item(message)?;
             let item_type = required_turn_item_type(message, item)?;
             match item_type {
+                "hookPrompt" => {
+                    let prompt =
+                        super::runtime::parse_hook_prompt(&Value::Object(item.clone()), Some(true))
+                            .map_err(|error| turn_item_protocol_error(message, error))?;
+                    send_turn_event(
+                        events,
+                        AgentEvent::HookPromptUpdated(prompt),
+                        "item/completed hookPrompt",
+                    )?;
+                }
                 "userMessage" => {
                     forward_user_message(session, item, events)
                         .map_err(|error| turn_item_protocol_error(message, error))?;

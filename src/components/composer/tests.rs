@@ -3390,3 +3390,44 @@ fn disallowed_named_profile_is_visible_but_cannot_change_draft_selection() {
         );
     });
 }
+
+#[test]
+fn generation_rebuild_rejects_stale_permission_selection_before_catalog_reload() {
+    let mut app = TestApp::new();
+    let composer = app.new_entity(|cx| ComposerView::new(ThemeMode::Dark, cx));
+    app.update_entity(&composer, |composer, _| {
+        seed_permission_catalog(composer);
+        composer.conversation.thread_id = Some("main".into());
+        composer.permission_mode = PermissionMode::Request;
+        composer.apply_connection_event(AgentConnectionEvent::Runtime(
+            crate::agent::AgentRuntimeEvent {
+                generation: 2,
+                observation: crate::agent::AgentRuntimeObservation::GenerationStarted,
+            },
+        ));
+        assert!(
+            !composer.apply_connection_event(AgentConnectionEvent::ThreadSettingsUpdated {
+                thread_id: "main".into(),
+                generation: 1,
+                settings: crate::agent::AgentThreadSettings {
+                    model: "retired-model".into(),
+                    effort: None,
+                    service_tier: None,
+                    cwd: "/tmp".into(),
+                    permissions: Some(crate::agent::AgentEffectivePermissions {
+                        approval_policy: serde_json::json!("never"),
+                        approvals_reviewer: "user".into(),
+                        sandbox_policy: None,
+                        active_permission_profile: Some(
+                            crate::agent::AgentActivePermissionProfile {
+                                id: ":danger-full-access".into(),
+                                extends: None,
+                            }
+                        ),
+                    }),
+                },
+            })
+        );
+        assert_eq!(composer.permission_mode, PermissionMode::Request);
+    });
+}

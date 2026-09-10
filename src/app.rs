@@ -184,6 +184,16 @@ impl ChatApp {
             this.open_settings(cx);
         })
         .detach();
+        cx.subscribe(
+            &home,
+            |this, _, _: &crate::components::home::OpenHookSettings, cx| {
+                this.settings
+                    .update(cx, |settings, cx| settings.select("hooks-settings", cx));
+                this.showing_settings = true;
+                cx.notify();
+            },
+        )
+        .detach();
         cx.subscribe(&sidebar, |this, _, _: &OpenProjectCreation, cx| {
             this.open_project_creation(cx);
         })

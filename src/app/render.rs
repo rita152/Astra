@@ -391,7 +391,7 @@ impl Render for ChatApp {
                 } else if this.project_creation.open {
                     this.close_project_creation(cx);
                 } else {
-                    this.home.update(cx, |home, cx| { home.close_model_picker(cx); home.dismiss_plan_popovers(cx); });
+                    this.home.update(cx, |home, cx| { home.close_model_picker(cx); home.dismiss_plan_popovers(cx); home.dismiss_hook_tooltips(cx); });
                 }
             }))
             .when(self.showing_settings, |shell| {

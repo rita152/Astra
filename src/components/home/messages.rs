@@ -442,15 +442,24 @@ pub(super) fn current_user_message(
         )
 }
 
+pub(super) struct ResponseFooterMetadata {
+    pub completed_at: Option<String>,
+    pub hooks: Vec<crate::agent::AgentHookRun>,
+}
+
 pub(super) fn current_response_footer(
     turn_scope: &str,
     assistant_message: String,
-    completed_at: Option<String>,
+    metadata: ResponseFooterMetadata,
     response_feedback: i8,
     home_entity: Entity<HomeView>,
     theme: Theme,
-    cx: &App,
+    cx: &mut App,
 ) -> Div {
+    let ResponseFooterMetadata {
+        completed_at,
+        hooks,
+    } = metadata;
     use std::hash::{Hash, Hasher};
     let mut hash = std::hash::DefaultHasher::new();
     turn_scope.hash(&mut hash);
@@ -458,6 +467,7 @@ pub(super) fn current_response_footer(
     let feedback_id = hash.finish();
     let feedback_open = home_entity.read(cx).response_feedback_menu == Some(feedback_id);
     let feedback_home = home_entity.clone();
+    let hook_home = home_entity.clone();
     div()
         .group("response-footer")
         .relative()
@@ -545,6 +555,11 @@ pub(super) fn current_response_footer(
                     },
                 ),
         )
+        .when(!hooks.is_empty(), |footer| {
+            footer.child(super::runtime::hook_button(
+                turn_scope, hooks, theme, hook_home, cx,
+            ))
+        })
         .when_some(completed_at, |footer, completed_at| {
             footer.child(
                 div()

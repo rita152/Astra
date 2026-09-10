@@ -17,12 +17,21 @@ impl ConversationState {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         };
-        if let Some(model) = string("model") {
-            self.selected_model = model;
-        }
-        if let Some(effort) = string("model_reasoning_effort") {
-            self.selected_effort = effort;
-        }
+        self.selected_model = string("model")
+            .or_else(|| {
+                self.models
+                    .iter()
+                    .find(|model| model.is_default)
+                    .or_else(|| self.models.first())
+                    .map(|model| model.model.clone())
+            })
+            .unwrap_or_default();
+        self.selected_effort = string("model_reasoning_effort")
+            .or_else(|| {
+                self.selected_model_entry()
+                    .map(|model| model.default_reasoning_effort.clone())
+            })
+            .unwrap_or_default();
         self.selected_service_tier = string("service_tier");
         self.plan_default_effort = config
             .effective
@@ -174,5 +183,49 @@ mod config_default_tests {
         state.model_user_selected = true;
         state.apply_config_defaults(&config);
         assert_eq!(state.selected_model, "model-a");
+    }
+
+    #[test]
+    fn clearing_config_defaults_restores_catalog_model_and_effort() {
+        let model = |name: &str, is_default| AgentModel {
+            id: name.into(),
+            model: name.into(),
+            display_name: name.into(),
+            description: String::new(),
+            supported_reasoning_efforts: vec![crate::agent::AgentReasoningEffort {
+                id: "medium".into(),
+                description: String::new(),
+            }],
+            default_reasoning_effort: "medium".into(),
+            service_tiers: Vec::new(),
+            default_service_tier: None,
+            is_default,
+        };
+        let mut state = ConversationState::default();
+        state.apply_model_catalog(AgentModelCatalog {
+            models: vec![model("catalog-default", true), model("configured", false)],
+        });
+        let mut config = crate::agent::AgentConfigSnapshot {
+            generation: 1,
+            cwd: "/work".into(),
+            effective: serde_json::json!({"model":"configured","model_reasoning_effort":"ultra"}),
+            origins: Default::default(),
+            layers: None,
+            requirements: None,
+            value_aliases: Default::default(),
+            value_defaults: Default::default(),
+            profile_parents: Default::default(),
+            required_fields: Default::default(),
+        };
+        state.apply_config_defaults(&config);
+        assert_eq!(state.selected_model, "configured");
+        config.effective = serde_json::json!({"model":null,"model_reasoning_effort":null});
+        state.apply_config_defaults(&config);
+        assert_eq!(state.selected_model, "catalog-default");
+        assert_eq!(state.selected_effort, "medium");
+        config.effective = serde_json::json!({"model":"configured"});
+        state.apply_config_defaults(&config);
+        assert_eq!(state.selected_model, "configured");
+        assert_eq!(state.selected_effort, "medium");
     }
 }

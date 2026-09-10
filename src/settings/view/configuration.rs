@@ -594,9 +594,6 @@ impl SettingsView {
                 .id("config-choice-menu")
                 .role(Role::Menu)
                 .track_focus(&self.config_menu_focus)
-                .absolute()
-                .right_0()
-                .top(px(32.))
                 .w(px(360.))
                 .max_h(px(320.))
                 .overflow_y_scroll()
@@ -688,7 +685,14 @@ impl SettingsView {
                     });
                 menu = menu.child(row);
             }
-            control = control.child(deferred(menu));
+            let mut popup = gpui::anchored()
+                .anchor(gpui::Anchor::TopRight)
+                .snap_to_window_with_margin(px(8.))
+                .child(menu);
+            if let Some(bounds) = self.config_control_bounds.borrow().get(key) {
+                popup = popup.position(bounds.bottom_right() + gpui::point(px(0.), px(6.)));
+            }
+            control = control.child(deferred(popup));
         }
         control.into_any_element()
     }

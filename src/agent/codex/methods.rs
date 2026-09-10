@@ -9,11 +9,6 @@ use super::notifications::{
     validate_remote_control_status_changed,
 };
 
-// Goal state has no product view yet. Resume emits these even without a turn;
-// use the protocol's explicit subscription control instead of misclassifying them.
-pub(super) const UNRENDERED_NOTIFICATIONS: &[&str] =
-    &["thread/goal/cleared", "thread/goal/updated"];
-
 pub(super) const UNDEFINED_METHOD_PARAMS_LIMIT: usize = 2_000;
 
 pub(super) const TURN_SCOPED_SERVER_METHODS: &[&str] = &[
@@ -106,6 +101,10 @@ pub(super) fn ensure_server_method_is_defined(message: &Value) -> Result<()> {
         );
     };
     match method {
+        "deprecationNotice" => super::runtime::parse_deprecation(message).map(|_| ()),
+        method if super::runtime::RUNTIME_METHODS.contains(&method) => {
+            super::runtime::parse_runtime(message).map(|_| ())
+        }
         "item/autoApprovalReview/started" | "item/autoApprovalReview/completed" => {
             super::auto_approval::parse_review(message).map(|_| ())
         }

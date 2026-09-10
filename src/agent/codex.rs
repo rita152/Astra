@@ -17,6 +17,7 @@ mod permissions;
 mod progress;
 mod registry;
 mod requests;
+mod runtime;
 mod session;
 mod transport;
 mod workspace_protocol;
