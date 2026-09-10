@@ -4,7 +4,7 @@
 
 ## 项目背景
 
-Astra 是基于 Rust 与 GPUI 的独立原生桌面 Agent 应用，沿用 ChatGPT 的交互习惯，目标是统一管理本机 coding agent 的发现、配置、启动、会话与运行状态。当前只接入 Codex app-server 的部分能力，其他 agent 尚未接入；扩展以产品需求和实际协议为依据。
+Echora 是基于 Rust 与 GPUI 的独立原生桌面 Agent 应用，GUI 完全由 GPT-6-Astra 制作。项目以通过 Codex app-server 完整复刻 ChatGPT App 的交互体验为目标，后续接入其他 coding agent，让用户在同一套熟悉的工作流中使用不同厂商的产品，并统一管理本机 agent 的发现、配置、启动、会话与运行状态。当前只接入 Codex app-server 的部分能力，完整交互复刻尚未完成，其他 agent 尚未接入；扩展以产品需求和实际协议为依据。
 
 ## 文档职责
 

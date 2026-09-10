@@ -1,38 +1,45 @@
-<h1 align="center">Astra</h1>
+<h1 align="center">Echora</h1>
 
-<p align="center"><strong>Your coding agents. One familiar workspace.</strong></p>
-<p align="center">A native desktop app built with Rust and GPUI.<br>Powered by Codex app-server today. Designed to welcome more coding agents tomorrow.</p>
+<p align="center"><strong>ChatGPT’s interaction experience, rebuilt in native GPUI.</strong></p>
+<p align="center"><strong>GUI built entirely by GPT-6-Astra.</strong><br>Powered by Codex app-server. Working toward the complete ChatGPT app experience.<br>More coding agents will join the same familiar workflow.</p>
 <p align="center"><strong>English</strong> · <a href="README.zh-CN.md">简体中文</a></p>
 
 <p align="center">
-  <a href="https://github.com/rita152/Astra"><img alt="Status: early development" src="https://img.shields.io/badge/status-early_development-8b7cf8"></a>
+  <img alt="GUI built entirely by GPT-6-Astra" src="https://img.shields.io/badge/GUI_by-GPT--6--Astra-8b7cf8">
+  <a href="https://github.com/rita152/Echora"><img alt="Status: early development" src="https://img.shields.io/badge/status-early_development-8b7cf8"></a>
   <a href="rust-toolchain.toml"><img alt="Rust 1.97.1" src="https://img.shields.io/badge/Rust-1.97.1-dea584"></a>
   <a href="Cargo.toml"><img alt="UI: GPUI" src="https://img.shields.io/badge/UI-GPUI-5ca9a2"></a>
   <img alt="Development platform: macOS" src="https://img.shields.io/badge/platform-macOS-999999">
 </p>
 
-![Astra's native GPUI workspace in dark mode](docs/images/astra-dark.png)
+![Echora's native GPUI workspace in dark mode](docs/images/workspace-dark.png)
 
-## Why Astra
+## The idea behind Echora
 
-Astra takes its name from the stars: different agents, brought into one shared space. Its starting idea is equally simple: **let Astra help build Astra**, using coding agents through app-server to develop the GPUI application around them.
+**The GUI in this repository was created entirely by GPT-6-Astra.** Echora is the product name; GPT-6-Astra is the model that built it. The name draws on *echo*: bringing the ChatGPT app’s interaction experience into a native Rust and GPUI application.
 
-You should be able to keep the way you work: choose a project, start a conversation, inspect changes, run commands, and continue where you left off. Astra brings that flow into an independent native application with the familiar interaction patterns of the ChatGPT desktop app. As support expands, the goal is to use coding agent products from different providers in the same workspace, without learning a new interface for each one.
+The ambition is to **recreate the complete ChatGPT desktop app interaction experience through Codex app-server**. That means the details of the workflow as well as the appearance: starting and restoring conversations, streaming replies, steering active turns, approving actions, editing files, using terminals, reviewing changes, and navigating settings.
 
-- **Native UI.** Rust and GPUI render the application, including the conversation, editor, terminal, and review panels.
-- **A familiar flow.** Projects, conversations, files, approvals, and changes stay close to the work.
-- **Room for more agents.** A shared backend contract separates the workspace from provider-specific protocols.
+As more coding agents are integrated, users should be able to keep that same workflow while working with products from different providers. The interface stays familiar as the choice of agents grows.
 
-**Current scope:** Astra is in active development. Only part of Codex app-server is connected today; other coding agents are planned. Some navigation and settings entries are still placeholders. Astra is an independent project, not an official OpenAI product or an extension running inside ChatGPT.
+| Part of the project | Role |
+|---|---|
+| **GPT-6-Astra** | Created the GUI implementation in this repository. |
+| **Rust + GPUI** | Render the native application and handle its interactions. |
+| **Codex app-server** | Connects the GUI to Codex’s backend capabilities. |
+| **ChatGPT app** | The reference for the complete interaction experience being recreated. |
+| **Other coding agents** | Future integrations through provider-specific adapters. |
+
+**Implementation status:** full interaction parity is the goal. Today, only part of Codex app-server is connected; some navigation and settings entries remain placeholders, and other coding agents are not integrated yet. [The integration table](docs/APP_SERVER_INTEGRATION.md) records the actual coverage. Echora is an independent application, not an official OpenAI product or an extension running inside ChatGPT.
 
 <details>
 <summary>See the light theme</summary>
 
-![Astra's native GPUI workspace in light mode](docs/images/astra-light.png)
+![Echora's native GPUI workspace in light mode](docs/images/workspace-light.png)
 
 </details>
 
-Both images are captured from the current native application using the dedicated `GPUI Capture.app` build and a local example conversation replayed offline, without model requests. The interface currently retains some Codex labels; Astra is the project name. These are application screenshots, not design mockups.
+Both images are captured from the current native application using the dedicated `GPUI Capture.app` build and a deterministic example of conversation and tool activity, without running the displayed commands or sending model requests. The interface currently retains some Codex labels. These are application screenshots, not design mockups.
 
 ## What you can do today
 
@@ -54,8 +61,8 @@ The exact protocol coverage and compatibility rules live in [the app-server inte
 The current development and verification platform is **macOS**. Install the Rust toolchain pinned in [rust-toolchain.toml](rust-toolchain.toml), the macOS build tools, and a logged-in Codex CLI available on `PATH`. The current integration baseline is `codex-cli 0.153.0`; see the integration table before changing CLI versions.
 
 ```bash
-git clone https://github.com/rita152/Astra.git
-cd Astra
+git clone https://github.com/rita152/Echora.git
+cd Echora
 
 rustc --version
 codex --version
@@ -64,7 +71,7 @@ cargo run --release -- --theme=dark
 
 Use `--theme=light` for the light theme. `cargo run -- --theme=dark` uses the optimized development profile for local iteration. Launch from the repository root for the examples below.
 
-Astra starts `codex app-server --stdio` and uses the local Codex installation for backend configuration and sessions. Git review requires Git; creating pull requests also requires an authenticated `gh`. Python, Node.js, and Electron are development verification tools, not requirements for running the native interface.
+Echora starts `codex app-server --stdio` and uses the local Codex installation for backend configuration and sessions. Git review requires Git; creating pull requests also requires an authenticated `gh`. Python, Node.js, and Electron are development verification tools, not requirements for running the native interface.
 
 The Cargo package and executable are still named `gpui-chat-clone`, so the existing build and capture commands continue to use that name. Prebuilt releases and cross-platform verification are not provided yet.
 
@@ -112,7 +119,7 @@ GPUI application · projects · conversations · native panels
                Local Codex configuration & sessions
 ```
 
-`ChatApp` assembles shared services and injects `AgentBackend` into the views. The backend owns project and conversation data. Astra persists UI preferences locally and does not maintain its own conversation database. Future adapters will implement the shared contract according to their actual protocols and product needs.
+`ChatApp` assembles shared services and injects `AgentBackend` into the views. The backend owns project and conversation data. Echora persists UI preferences locally and does not maintain its own conversation database. Future adapters will implement the shared contract according to their actual protocols and product needs.
 
 | Location | Responsibility |
 |---|---|
@@ -233,8 +240,9 @@ Scrolling benchmarks measure event/layout time in a GPUI test window, not screen
 
 </details>
 
-## Where Astra is heading
+## Where Echora is heading
 
+- Recreate the complete ChatGPT app interaction experience in native GPUI, including its detailed interaction behavior.
 - Support more coding agent providers through their real protocols and capabilities.
 - Unify local agent discovery, configuration, launch, sessions, and runtime status.
 - Keep familiar conversation and review workflows as the choice of agents grows.

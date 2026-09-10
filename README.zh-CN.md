@@ -1,38 +1,45 @@
-<h1 align="center">Astra</h1>
+<h1 align="center">Echora</h1>
 
-<p align="center"><strong>多个 Coding Agent，一个熟悉的工作空间。</strong></p>
-<p align="center">基于 Rust 与 GPUI 的原生桌面应用。<br>今天由 Codex app-server 驱动，未来接入更多 Coding Agent。</p>
+<p align="center"><strong>以原生 GPUI，重现 ChatGPT App 的交互体验。</strong></p>
+<p align="center"><strong>GUI 完全由 GPT-6-Astra 制作。</strong><br>通过 Codex app-server 驱动，以完整复刻 ChatGPT App 交互体验为目标。<br>未来接入更多 Coding Agent，延续同一套熟悉的工作流。</p>
 <p align="center"><a href="README.md">English</a> · <strong>简体中文</strong></p>
 
 <p align="center">
-  <a href="https://github.com/rita152/Astra"><img alt="状态：早期开发" src="https://img.shields.io/badge/status-early_development-8b7cf8"></a>
+  <img alt="GUI 完全由 GPT-6-Astra 制作" src="https://img.shields.io/badge/GUI_by-GPT--6--Astra-8b7cf8">
+  <a href="https://github.com/rita152/Echora"><img alt="状态：早期开发" src="https://img.shields.io/badge/status-early_development-8b7cf8"></a>
   <a href="rust-toolchain.toml"><img alt="Rust 1.97.1" src="https://img.shields.io/badge/Rust-1.97.1-dea584"></a>
   <a href="Cargo.toml"><img alt="界面框架：GPUI" src="https://img.shields.io/badge/UI-GPUI-5ca9a2"></a>
   <img alt="开发平台：macOS" src="https://img.shields.io/badge/platform-macOS-999999">
 </p>
 
-![Astra 原生 GPUI 工作区：深色主题](docs/images/astra-dark.png)
+![Echora 原生 GPUI 工作区：深色主题](docs/images/workspace-dark.png)
 
-## 为什么叫 Astra
+## Echora 的想法
 
-Astra 取意于群星：让不同的 Agent 汇聚在同一个工作空间。它也始于一个朴素的想法：**让 Astra 参与构建 Astra 自己**，通过 app-server 使用 Coding Agent，持续开发承载这些 Agent 的 GPUI 应用。
+**这个仓库中的 GUI 完全由 GPT-6-Astra 制作。** Echora 是产品名称，GPT-6-Astra 是制作它的模型。Echora 取自 *Echo* 的「回响」意象：使用 Rust 与 GPUI，在原生应用中重现 ChatGPT App 的交互体验。
 
-你可以保留熟悉的工作方式：选择项目、开始对话、检查改动、运行命令，再从上次停下的地方继续。Astra 沿用 ChatGPT 桌面应用的交互习惯，将这套流程带入一个独立的原生应用。随着接入范围扩大，我们希望用户能在同一个工作区内使用不同厂商的 Coding Agent 产品，无需为每个 Agent 重新学习一套界面。
+项目的目标是**通过 Codex app-server，完整复刻 ChatGPT 桌面应用的交互体验**。复刻范围既包含外观，也包含工作流中的具体行为：创建和恢复对话、流式回复、运行中追加输入、审批操作、编辑文件、使用终端、审查改动与设置导航。
 
-- **原生界面。** 使用 Rust 与 GPUI 绘制应用，包括对话、编辑器、终端和审查面板。
-- **熟悉的流程。** 项目、会话、文件、审批和代码改动围绕当前工作组织。
-- **为更多 Agent 留出空间。** 通用后端契约将工作区与各厂商的具体协议分离。
+未来接入更多 Coding Agent 后，用户仍然可以沿用这套工作流，在同一个界面中使用不同厂商的 Agent 产品。Agent 的选择不断增加，熟悉的操作方式得以保留。
 
-**当前范围：** Astra 正处于持续开发阶段，目前仅接入 Codex app-server 的部分能力，其他 Coding Agent 尚未接入。部分导航和设置入口仍为占位。Astra 是独立项目，并非 OpenAI 官方产品，也不是运行在 ChatGPT 内部的扩展。
+| 项目中的组成 | 角色 |
+|---|---|
+| **GPT-6-Astra** | 制作了这个仓库中的 GUI 实现。 |
+| **Rust + GPUI** | 负责原生应用的界面绘制与交互。 |
+| **Codex app-server** | 将 GUI 连接到 Codex 的后端能力。 |
+| **ChatGPT App** | 完整交互体验的复刻参考。 |
+| **其他 Coding Agent** | 未来通过各厂商对应的适配器接入。 |
+
+**实现状态：** 完整交互复刻是项目目标。目前仅接入 Codex app-server 的部分能力，部分导航与设置仍为占位，其他 Coding Agent 尚未接入。实际覆盖范围以 [接入总表](docs/APP_SERVER_INTEGRATION.md) 为准。Echora 是独立应用，并非 OpenAI 官方产品，也不是运行在 ChatGPT 内部的扩展。
 
 <details>
 <summary>查看浅色主题</summary>
 
-![Astra 原生 GPUI 工作区：浅色主题](docs/images/astra-light.png)
+![Echora 原生 GPUI 工作区：浅色主题](docs/images/workspace-light.png)
 
 </details>
 
-两张图片均由当前原生应用的专用 `GPUI Capture.app` 构建实机截取，使用本地示例对话进行离线回放，不发送模型请求。界面目前仍保留部分 Codex 字样，Astra 是项目名称。图片为实际应用截图，并非设计稿。
+两张图片均由当前原生应用的专用 `GPUI Capture.app` 构建实机截取，使用固定的对话与工具活动示例，不执行图中命令，也不发送模型请求。界面目前仍保留部分 Codex 字样。图片为实际应用截图，并非设计稿。
 
 ## 现在可以做什么
 
@@ -54,8 +61,8 @@ Astra 取意于群星：让不同的 Agent 汇聚在同一个工作空间。它�
 当前开发与验收平台为 **macOS**。需要 [rust-toolchain.toml](rust-toolchain.toml) 固定的 Rust 工具链、macOS 构建工具，以及已安装、已登录且位于 `PATH` 的 Codex CLI。当前接入基线为 `codex-cli 0.153.0`，更换 CLI 版本前请核对接入总表。
 
 ```bash
-git clone https://github.com/rita152/Astra.git
-cd Astra
+git clone https://github.com/rita152/Echora.git
+cd Echora
 
 rustc --version
 codex --version
@@ -64,7 +71,7 @@ cargo run --release -- --theme=dark
 
 浅色主题使用 `--theme=light`。本地开发可运行 `cargo run -- --theme=dark`，使用已优化的开发 profile。以下示例均从仓库根目录执行。
 
-Astra 启动 `codex app-server --stdio`，使用本机 Codex 安装提供的后端配置与会话。Git 审查需要本机 Git，创建 PR 另需已登录的 `gh`。Python、Node.js 和 Electron 用于开发验证，不是运行原生界面的必要依赖。
+Echora 启动 `codex app-server --stdio`，使用本机 Codex 安装提供的后端配置与会话。Git 审查需要本机 Git，创建 PR 另需已登录的 `gh`。Python、Node.js 和 Electron 用于开发验证，不是运行原生界面的必要依赖。
 
 Cargo 包和可执行文件目前仍名为 `gpui-chat-clone`，现有构建与截图命令继续沿用该名称。暂未提供预编译发布包，也尚未完成跨平台验证。
 
@@ -112,7 +119,7 @@ GPUI 应用 · 项目 · 会话 · 原生面板
         本机 Codex 配置与会话
 ```
 
-`ChatApp` 装配共享服务，通过 `AgentBackend` 注入视图。项目和会话数据由后端管理；Astra 只在本地持久化 UI 偏好，不维护自己的会话数据库。未来适配器将依据真实协议与产品需求实现通用契约。
+`ChatApp` 装配共享服务，通过 `AgentBackend` 注入视图。项目和会话数据由后端管理；Echora 只在本地持久化 UI 偏好，不维护自己的会话数据库。未来适配器将依据真实协议与产品需求实现通用契约。
 
 | 位置 | 职责 |
 |---|---|
@@ -235,6 +242,7 @@ python3 scripts/compare_typography.py \
 
 ## 接下来的方向
 
+- 在原生 GPUI 中完整复刻 ChatGPT App 的交互体验，包括具体交互细节。
 - 依据真实协议与能力，接入更多厂商的 Coding Agent。
 - 统一管理本机 Agent 的发现、配置、启动、会话与运行状态。
 - 随着 Agent 选择增多，继续保持熟悉的对话与审查流程。
