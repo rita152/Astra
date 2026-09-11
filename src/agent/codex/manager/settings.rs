@@ -100,10 +100,8 @@ impl CodexAppServerManager {
         thread_id: String,
         generation: u64,
     ) -> Receiver<Result<crate::agent::AgentThreadSettingsSnapshot, String>> {
-        let (sender, receiver) = async_channel::bounded(1);
-        let manager = self.clone();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<crate::agent::AgentThreadSettingsSnapshot> {
+        self.spawn_one_shot_call(move |manager| {
+            (|| -> Result<crate::agent::AgentThreadSettingsSnapshot> {
                 let connection = manager.inner.ensure_connection()?;
                 if connection.generation != generation {
                     bail!("连接已变化，请重新读取权限配置");
@@ -127,10 +125,8 @@ impl CodexAppServerManager {
                     settings,
                 })
             })()
-            .map_err(|error| format!("{error:#}"));
-            let _ = sender.send_blocking(result);
-        });
-        receiver
+            .map_err(|error| format!("{error:#}"))
+        })
     }
 
     pub(in crate::agent::codex) fn update_thread_permissions(

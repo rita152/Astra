@@ -23,17 +23,13 @@ impl CodexAppServerManager {
         &self,
         cwd: PathBuf,
     ) -> Receiver<Result<AgentConfigSnapshot, AgentConfigError>> {
-        let (sender, receiver) = async_channel::bounded(1);
-        let manager = self.clone();
-        std::thread::spawn(move || {
-            let result = manager
+        self.spawn_one_shot_call(move |manager| {
+            manager
                 .inner
                 .ensure_connection()
                 .map_err(|error| connection_error(error, false))
-                .and_then(|connection| Self::read_config_on(&connection, cwd));
-            let _ = sender.send_blocking(result);
-        });
-        receiver
+                .and_then(|connection| Self::read_config_on(&connection, cwd))
+        })
     }
 
     pub(super) fn read_config_on(
@@ -53,37 +49,31 @@ impl CodexAppServerManager {
         &self,
         write: AgentConfigWrite,
     ) -> Receiver<Result<AgentConfigSaveResult, AgentConfigError>> {
-        let (sender, receiver) = async_channel::bounded(1);
-        let manager = self.clone();
-        std::thread::spawn(move || {
-            let result = (|| {
-                let params = write_params(&write)?;
-                let connection = manager
-                    .inner
-                    .ensure_connection()
-                    .map_err(|error| connection_error(error, false))?;
-                if connection.generation != write.generation {
-                    return Err(AgentConfigError {
-                        kind: AgentConfigErrorKind::Connection,
-                        message: "连接已重建，请重新读取配置并核对草稿后保存".into(),
-                        data: None,
-                        outcome_unknown: false,
-                    });
+        self.spawn_one_shot_call(move |manager| {
+            let params = write_params(&write)?;
+            let connection = manager
+                .inner
+                .ensure_connection()
+                .map_err(|error| connection_error(error, false))?;
+            if connection.generation != write.generation {
+                return Err(AgentConfigError {
+                    kind: AgentConfigErrorKind::Connection,
+                    message: "连接已重建，请重新读取配置并核对草稿后保存".into(),
+                    data: None,
+                    outcome_unknown: false,
+                });
+            }
+            let response = connection
+                .request("config/batchWrite", params)
+                .map_err(|error| connection_error(error, true))?;
+            let receipt = decode_receipt(response).map_err(|mut error| {
+                if error.kind == AgentConfigErrorKind::Protocol {
+                    error.outcome_unknown = true;
                 }
-                let response = connection
-                    .request("config/batchWrite", params)
-                    .map_err(|error| connection_error(error, true))?;
-                let receipt = decode_receipt(response).map_err(|mut error| {
-                    if error.kind == AgentConfigErrorKind::Protocol {
-                        error.outcome_unknown = true;
-                    }
-                    error
-                })?;
-                let readback = Self::read_config_on(&connection, write.cwd);
-                Ok(AgentConfigSaveResult { receipt, readback })
-            })();
-            let _ = sender.send_blocking(result);
-        });
-        receiver
+                error
+            })?;
+            let readback = Self::read_config_on(&connection, write.cwd);
+            Ok(AgentConfigSaveResult { receipt, readback })
+        })
     }
 }

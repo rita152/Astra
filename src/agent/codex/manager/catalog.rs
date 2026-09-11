@@ -19,15 +19,11 @@ impl CodexAppServerManager {
     pub(in crate::agent::codex) fn load_model_catalog(
         &self,
     ) -> Receiver<Result<AgentModelCatalog, String>> {
-        let (sender, receiver) = async_channel::bounded(1);
-        let manager = self.clone();
-        std::thread::spawn(move || {
-            let result = manager
+        self.spawn_one_shot_call(move |manager| {
+            manager
                 .load_model_catalog_blocking()
-                .map_err(|error| format!("{error:#}"));
-            let _ = sender.send_blocking(result);
-        });
-        receiver
+                .map_err(|error| format!("{error:#}"))
+        })
     }
     pub(super) fn load_model_catalog_blocking(&self) -> Result<AgentModelCatalog> {
         let connection = self.inner.ensure_connection()?;
@@ -81,15 +77,11 @@ impl CodexAppServerManager {
         &self,
         cwd: PathBuf,
     ) -> Receiver<Result<Vec<AgentPermissionProfile>, String>> {
-        let (sender, receiver) = async_channel::bounded(1);
-        let manager = self.clone();
-        std::thread::spawn(move || {
-            let result = manager
+        self.spawn_one_shot_call(move |manager| {
+            manager
                 .load_permission_profiles_blocking(&cwd)
-                .map_err(|error| format!("{error:#}"));
-            let _ = sender.send_blocking(result);
-        });
-        receiver
+                .map_err(|error| format!("{error:#}"))
+        })
     }
     pub(super) fn load_permission_profiles_blocking(
         &self,
