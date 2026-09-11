@@ -340,6 +340,22 @@ impl CodexAppServerManager {
         }
     }
 
+    /// Spawn a one-shot operation without changing its result or error policy.
+    /// Per-thread permission and steer queues keep their separate ordering.
+    fn spawn_one_shot_call<T: Send + 'static>(
+        &self,
+        call: impl FnOnce(&Self) -> T + Send + 'static,
+    ) -> Receiver<T> {
+        let (sender, receiver) = async_channel::bounded(1);
+        let manager = self.clone();
+        std::thread::spawn(move || {
+            // Borrow the clone so it stays alive through result delivery.
+            let result = call(&manager);
+            let _ = sender.send_blocking(result);
+        });
+        receiver
+    }
+
     pub fn shutdown(&self) {
         self.inner.shutdown();
     }
@@ -376,6 +392,9 @@ impl CodexAppServerManager {
         ])
     }
 }
+
+#[cfg(test)]
+mod one_shot_tests;
 
 #[cfg(test)]
 mod tests;
