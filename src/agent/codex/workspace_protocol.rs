@@ -13,8 +13,8 @@ use super::{parse_collaboration, parse_image_generation, parse_mcp_tool_call};
 use crate::agent::{
     AgentFileChange, AgentFileChangeEntry, AgentFileChangeKind, AgentFileChangeStatus,
     AgentImageView, AgentThreadActiveFlag, FilterValue, HistoryItemDetail, HistoryTurnStatus,
-    Project, SortDirection, ThreadActivity, ThreadHistoryItem, ThreadListRequest, ThreadSection,
-    ThreadSectionAppearance, ThreadSummary, ThreadTurn, UserMessageAttachment,
+    Page, Project, SortDirection, ThreadActivity, ThreadHistoryItem, ThreadListRequest,
+    ThreadSection, ThreadSectionAppearance, ThreadSummary, ThreadTurn, UserMessageAttachment,
     normalize_user_message_for_display,
 };
 
@@ -423,6 +423,29 @@ pub(super) fn response_result<'a>(response: &'a Value, method: &str) -> Result<&
         .with_context(|| format!("{method} 响应缺少 result"))
 }
 
+/// Decode the shared workspace page envelope without owning connection policy.
+/// Entries are decoded before cursors so the first error stays unchanged.
+pub(super) fn parse_page<T>(
+    response: &Value,
+    method: &str,
+    parse_entry: impl FnMut(&Value) -> Result<T>,
+) -> Result<Page<T>> {
+    let result = response_result(response, method)?;
+    let context = format!("{method} result");
+    let data = object_field(result, "data", &context)?
+        .as_array()
+        .with_context(|| format!("{context}.data 必须是数组"))?
+        .iter()
+        .map(parse_entry)
+        .collect::<Result<Vec<_>>>()?;
+    let (next_cursor, backwards_cursor) = page_cursors(result, &context)?;
+    Ok(Page {
+        data,
+        next_cursor,
+        backwards_cursor,
+    })
+}
+
 pub(super) fn page_cursors(
     result: &Value,
     method: &str,
@@ -488,6 +511,9 @@ pub(super) fn thread_list_params(request: &ThreadListRequest) -> Value {
     insert_filter_value(&mut params, "sectionId", &request.section);
     Value::Object(params)
 }
+
+#[cfg(test)]
+mod page_tests;
 
 #[cfg(test)]
 mod resumed_rendering_metadata_tests {

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use super::{
     super::workspace_protocol::{
-        object_field, page_cursors, parse_history_item, parse_history_turn, parse_project,
+        object_field, parse_history_item, parse_history_turn, parse_page, parse_project,
         parse_thread_section, parse_thread_summary, response_result, sort_direction, string_field,
         thread_list_params, thread_sort_key,
     },
@@ -72,21 +72,7 @@ impl CodexAppServerManager {
         validate_workspace_response(
             &connection,
             "project/list",
-            (|| {
-                let result = response_result(&response, "project/list")?;
-                let data = object_field(result, "data", "project/list result")?
-                    .as_array()
-                    .context("project/list result.data 必须是数组")?
-                    .iter()
-                    .map(parse_project)
-                    .collect::<Result<Vec<_>>>()?;
-                let (next_cursor, backwards_cursor) = page_cursors(result, "project/list result")?;
-                Ok(Page {
-                    data,
-                    next_cursor,
-                    backwards_cursor,
-                })
-            })(),
+            parse_page(&response, "project/list", parse_project),
         )
     }
     pub(in crate::agent::codex) fn create_project(
@@ -218,21 +204,7 @@ impl CodexAppServerManager {
         validate_workspace_response(
             &connection,
             "thread/list",
-            (|| {
-                let result = response_result(&response, "thread/list")?;
-                let data = object_field(result, "data", "thread/list result")?
-                    .as_array()
-                    .context("thread/list result.data 必须是数组")?
-                    .iter()
-                    .map(parse_thread_summary)
-                    .collect::<Result<Vec<_>>>()?;
-                let (next_cursor, backwards_cursor) = page_cursors(result, "thread/list result")?;
-                Ok(Page {
-                    data,
-                    next_cursor,
-                    backwards_cursor,
-                })
-            })(),
+            parse_page(&response, "thread/list", parse_thread_summary),
         )
     }
     pub(in crate::agent::codex) fn search_threads(
@@ -265,30 +237,16 @@ impl CodexAppServerManager {
         validate_workspace_response(
             &connection,
             "thread/search",
-            (|| {
-                let result = response_result(&response, "thread/search")?;
-                let data = object_field(result, "data", "thread/search result")?
-                    .as_array()
-                    .context("thread/search result.data 必须是数组")?
-                    .iter()
-                    .map(|entry| {
-                        Ok(ThreadSearchResult {
-                            thread: parse_thread_summary(object_field(
-                                entry,
-                                "thread",
-                                "thread/search entry",
-                            )?)?,
-                            snippet: string_field(entry, "snippet", "thread/search entry")?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let (next_cursor, backwards_cursor) = page_cursors(result, "thread/search result")?;
-                Ok(Page {
-                    data,
-                    next_cursor,
-                    backwards_cursor,
+            parse_page(&response, "thread/search", |entry| {
+                Ok(ThreadSearchResult {
+                    thread: parse_thread_summary(object_field(
+                        entry,
+                        "thread",
+                        "thread/search entry",
+                    )?)?,
+                    snippet: string_field(entry, "snippet", "thread/search entry")?,
                 })
-            })(),
+            }),
         )
     }
     pub(in crate::agent::codex) fn read_thread(
@@ -349,22 +307,7 @@ impl CodexAppServerManager {
         validate_workspace_response(
             &connection,
             "thread/turns/list",
-            (|| {
-                let result = response_result(&response, "thread/turns/list")?;
-                let data = object_field(result, "data", "thread/turns/list result")?
-                    .as_array()
-                    .context("thread/turns/list result.data 必须是数组")?
-                    .iter()
-                    .map(parse_history_turn)
-                    .collect::<Result<Vec<_>>>()?;
-                let (next_cursor, backwards_cursor) =
-                    page_cursors(result, "thread/turns/list result")?;
-                Ok(Page {
-                    data,
-                    next_cursor,
-                    backwards_cursor,
-                })
-            })(),
+            parse_page(&response, "thread/turns/list", parse_history_turn),
         )
     }
     pub(in crate::agent::codex) fn list_thread_items(
@@ -397,31 +340,16 @@ impl CodexAppServerManager {
         validate_workspace_response(
             &connection,
             "thread/items/list",
-            (|| {
-                let result = response_result(&response, "thread/items/list")?;
-                let data = object_field(result, "data", "thread/items/list result")?
-                    .as_array()
-                    .context("thread/items/list result.data 必须是数组")?
-                    .iter()
-                    .map(|entry| {
-                        Ok(ThreadHistoryItemEntry {
-                            turn_id: string_field(entry, "turnId", "thread/items/list entry")?,
-                            item: parse_history_item(object_field(
-                                entry,
-                                "item",
-                                "thread/items/list entry",
-                            )?)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let (next_cursor, backwards_cursor) =
-                    page_cursors(result, "thread/items/list result")?;
-                Ok(Page {
-                    data,
-                    next_cursor,
-                    backwards_cursor,
+            parse_page(&response, "thread/items/list", |entry| {
+                Ok(ThreadHistoryItemEntry {
+                    turn_id: string_field(entry, "turnId", "thread/items/list entry")?,
+                    item: parse_history_item(object_field(
+                        entry,
+                        "item",
+                        "thread/items/list entry",
+                    )?)?,
                 })
-            })(),
+            }),
         )
     }
     pub(in crate::agent::codex) fn set_thread_name(
@@ -521,22 +449,7 @@ impl CodexAppServerManager {
             validate_workspace_response(
                 &connection,
                 "threadSection/list",
-                (|| {
-                    let result = response_result(&response, "threadSection/list")?;
-                    let data = object_field(result, "data", "threadSection/list result")?
-                        .as_array()
-                        .context("threadSection/list result.data 必须是数组")?
-                        .iter()
-                        .map(parse_thread_section)
-                        .collect::<Result<Vec<_>>>()?;
-                    let (next_cursor, backwards_cursor) =
-                        page_cursors(result, "threadSection/list result")?;
-                    Ok(Page {
-                        data,
-                        next_cursor,
-                        backwards_cursor,
-                    })
-                })(),
+                parse_page(&response, "threadSection/list", parse_thread_section),
             )
         })
     }
