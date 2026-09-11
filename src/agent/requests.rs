@@ -2,6 +2,60 @@
 
 use std::{fmt, sync::Arc};
 
+// Keep the four response types distinct while sharing their handle mechanics.
+// Equality deliberately includes control identity: reused request IDs from a
+// different connection must never compare equal. Debug must not expose controls.
+macro_rules! response_handle {
+    ($handle:ident, $control:ident, $response:ty, $argument:ident) => {
+        pub(crate) trait $control: Send + Sync {
+            fn respond(
+                &self,
+                request_id: &AgentServerRequestId,
+                $argument: $response,
+            ) -> Result<(), String>;
+        }
+
+        #[derive(Clone)]
+        pub struct $handle {
+            request_id: AgentServerRequestId,
+            control: Arc<dyn $control>,
+        }
+
+        impl $handle {
+            pub(crate) fn new(
+                request_id: AgentServerRequestId,
+                control: Arc<dyn $control>,
+            ) -> Self {
+                Self {
+                    request_id,
+                    control,
+                }
+            }
+
+            pub fn respond(&self, $argument: $response) -> Result<(), String> {
+                self.control.respond(&self.request_id, $argument)
+            }
+        }
+
+        impl fmt::Debug for $handle {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_struct(stringify!($handle))
+                    .field("request_id", &self.request_id)
+                    .finish_non_exhaustive()
+            }
+        }
+
+        impl PartialEq for $handle {
+            fn eq(&self, other: &Self) -> bool {
+                self.request_id == other.request_id && Arc::ptr_eq(&self.control, &other.control)
+            }
+        }
+
+        impl Eq for $handle {}
+    };
+}
+
 /// JSON-RPC request ids are deliberately not normalized: a numeric `7` and a
 /// string `"7"` identify different server requests and must be echoed with
 /// their original type.
@@ -128,99 +182,19 @@ pub enum AgentFileApprovalChoice {
     Cancel,
 }
 
-pub(crate) trait AgentFileApprovalControl: Send + Sync {
-    fn respond(
-        &self,
-        request_id: &AgentServerRequestId,
-        choice: AgentFileApprovalChoice,
-    ) -> Result<(), String>;
-}
+response_handle!(
+    AgentFileApprovalHandle,
+    AgentFileApprovalControl,
+    AgentFileApprovalChoice,
+    choice
+);
 
-#[derive(Clone)]
-pub struct AgentFileApprovalHandle {
-    request_id: AgentServerRequestId,
-    control: Arc<dyn AgentFileApprovalControl>,
-}
-
-impl AgentFileApprovalHandle {
-    pub(crate) fn new(
-        request_id: AgentServerRequestId,
-        control: Arc<dyn AgentFileApprovalControl>,
-    ) -> Self {
-        Self {
-            request_id,
-            control,
-        }
-    }
-
-    pub fn respond(&self, choice: AgentFileApprovalChoice) -> Result<(), String> {
-        self.control.respond(&self.request_id, choice)
-    }
-}
-
-impl fmt::Debug for AgentFileApprovalHandle {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AgentFileApprovalHandle")
-            .field("request_id", &self.request_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PartialEq for AgentFileApprovalHandle {
-    fn eq(&self, other: &Self) -> bool {
-        self.request_id == other.request_id && Arc::ptr_eq(&self.control, &other.control)
-    }
-}
-
-impl Eq for AgentFileApprovalHandle {}
-
-pub(crate) trait AgentApprovalControl: Send + Sync {
-    fn respond(
-        &self,
-        request_id: &AgentServerRequestId,
-        choice: AgentCommandApprovalChoice,
-    ) -> Result<(), String>;
-}
-
-#[derive(Clone)]
-pub struct AgentApprovalHandle {
-    request_id: AgentServerRequestId,
-    control: Arc<dyn AgentApprovalControl>,
-}
-
-impl AgentApprovalHandle {
-    pub(crate) fn new(
-        request_id: AgentServerRequestId,
-        control: Arc<dyn AgentApprovalControl>,
-    ) -> Self {
-        Self {
-            request_id,
-            control,
-        }
-    }
-
-    pub fn respond(&self, choice: AgentCommandApprovalChoice) -> Result<(), String> {
-        self.control.respond(&self.request_id, choice)
-    }
-}
-
-impl fmt::Debug for AgentApprovalHandle {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AgentApprovalHandle")
-            .field("request_id", &self.request_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PartialEq for AgentApprovalHandle {
-    fn eq(&self, other: &Self) -> bool {
-        self.request_id == other.request_id && Arc::ptr_eq(&self.control, &other.control)
-    }
-}
-
-impl Eq for AgentApprovalHandle {}
+response_handle!(
+    AgentApprovalHandle,
+    AgentApprovalControl,
+    AgentCommandApprovalChoice,
+    choice
+);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentUserInputOption {
@@ -280,52 +254,12 @@ impl fmt::Debug for AgentUserInputResponse {
     }
 }
 
-pub(crate) trait AgentUserInputControl: Send + Sync {
-    fn respond(
-        &self,
-        request_id: &AgentServerRequestId,
-        response: AgentUserInputResponse,
-    ) -> Result<(), String>;
-}
-
-#[derive(Clone)]
-pub struct AgentUserInputHandle {
-    request_id: AgentServerRequestId,
-    control: Arc<dyn AgentUserInputControl>,
-}
-
-impl AgentUserInputHandle {
-    pub(crate) fn new(
-        request_id: AgentServerRequestId,
-        control: Arc<dyn AgentUserInputControl>,
-    ) -> Self {
-        Self {
-            request_id,
-            control,
-        }
-    }
-
-    pub fn respond(&self, response: AgentUserInputResponse) -> Result<(), String> {
-        self.control.respond(&self.request_id, response)
-    }
-}
-
-impl fmt::Debug for AgentUserInputHandle {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AgentUserInputHandle")
-            .field("request_id", &self.request_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PartialEq for AgentUserInputHandle {
-    fn eq(&self, other: &Self) -> bool {
-        self.request_id == other.request_id && Arc::ptr_eq(&self.control, &other.control)
-    }
-}
-
-impl Eq for AgentUserInputHandle {}
+response_handle!(
+    AgentUserInputHandle,
+    AgentUserInputControl,
+    AgentUserInputResponse,
+    response
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentFileSystemAccess {
@@ -401,55 +335,18 @@ pub enum AgentPermissionsApprovalChoice {
     Decline,
 }
 
-pub(crate) trait AgentPermissionsApprovalControl: Send + Sync {
-    fn respond(
-        &self,
-        request_id: &AgentServerRequestId,
-        choice: AgentPermissionsApprovalChoice,
-    ) -> Result<(), String>;
-}
-
-#[derive(Clone)]
-pub struct AgentPermissionsApprovalHandle {
-    request_id: AgentServerRequestId,
-    control: Arc<dyn AgentPermissionsApprovalControl>,
-}
-
-impl AgentPermissionsApprovalHandle {
-    pub(crate) fn new(
-        request_id: AgentServerRequestId,
-        control: Arc<dyn AgentPermissionsApprovalControl>,
-    ) -> Self {
-        Self {
-            request_id,
-            control,
-        }
-    }
-
-    pub fn respond(&self, choice: AgentPermissionsApprovalChoice) -> Result<(), String> {
-        self.control.respond(&self.request_id, choice)
-    }
-}
-
-impl fmt::Debug for AgentPermissionsApprovalHandle {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AgentPermissionsApprovalHandle")
-            .field("request_id", &self.request_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PartialEq for AgentPermissionsApprovalHandle {
-    fn eq(&self, other: &Self) -> bool {
-        self.request_id == other.request_id && Arc::ptr_eq(&self.control, &other.control)
-    }
-}
-
-impl Eq for AgentPermissionsApprovalHandle {}
+response_handle!(
+    AgentPermissionsApprovalHandle,
+    AgentPermissionsApprovalControl,
+    AgentPermissionsApprovalChoice,
+    choice
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentServerRequestFailureKind {
     Cancelled,
     Failed,
 }
+
+#[cfg(test)]
+mod tests;
